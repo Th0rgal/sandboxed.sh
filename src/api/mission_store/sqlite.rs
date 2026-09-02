@@ -3988,7 +3988,7 @@ impl MissionStore for SqliteMissionStore {
                     |row| row.get(0),
                 )
                 .ok();
-            if clear_first_viewed_at {
+            let updated = if clear_first_viewed_at {
                 conn.execute(
                     "UPDATE missions SET status = ?1, updated_at = ?2, interrupted_at = ?3, resumable = ?4, terminal_reason = ?5, first_viewed_at = NULL, awaiting_kind = CASE WHEN ?7 THEN NULL ELSE awaiting_kind END, last_status_change_at = CASE WHEN status <> ?1 THEN ?2 ELSE last_status_change_at END WHERE id = ?6",
                     params![
@@ -4001,7 +4001,7 @@ impl MissionStore for SqliteMissionStore {
                         clear_awaiting_kind,
                     ],
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
             } else {
                 conn.execute(
                     "UPDATE missions SET status = ?1, updated_at = ?2, interrupted_at = ?3, resumable = ?4, terminal_reason = ?5, awaiting_kind = CASE WHEN ?7 THEN NULL ELSE awaiting_kind END, last_status_change_at = CASE WHEN status <> ?1 THEN ?2 ELSE last_status_change_at END WHERE id = ?6",
@@ -4015,7 +4015,13 @@ impl MissionStore for SqliteMissionStore {
                         clear_awaiting_kind,
                     ],
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+            };
+            if updated != 1 {
+                return Err(format!(
+                    "mission {id} not found while updating status to {}",
+                    status_to_string(status)
+                ));
             }
             // Only reset cooldown on a *genuine* status transition. Best
             // effort — if the table is missing or the row is gone, nothing
@@ -16641,6 +16647,21 @@ mod tests {
                 .as_deref(),
             Some("Fix, commit and push the original PR")
         );
+    }
+
+    #[tokio::test]
+    async fn updating_missing_mission_status_fails_closed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "missing-status")
+            .await
+            .expect("sqlite store");
+
+        let missing = Uuid::new_v4();
+        let error = store
+            .update_mission_status(missing, MissionStatus::Acknowledged)
+            .await
+            .expect_err("missing mission status update must not report success");
+        assert!(error.contains("not found"), "unexpected error: {error}");
     }
 
     #[tokio::test]

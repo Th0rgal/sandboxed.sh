@@ -14,6 +14,13 @@ Delegate coding/automation tasks to **isolated containerised missions** via the 
 
 A conversational `start_mission` is a **worker of this chat**. Hermes stamps `origin_session_id`, enrolls the mission, and the terminal webhook folds the result back here. End the turn after dispatch — do not poll, and do not invent a cron just to wait. Controller/cron ticks are different: they pass `project` and report on the next tick / project route.
 
+When dispatching against a project roadmap, also pass the declared `track`,
+its `acceptance_criteria`, and a stable retry-safe `idempotency_key`. The
+server reserves the track owner and links the mission as one durable intent;
+reusing the key returns the original launch instead of duplicating work.
+Mission completion alone does not satisfy the track. Accepted criterion
+evidence at the governed artifact version must be recorded separately.
+
 This is **not** the same as delegating to a CLI coding agent (Claude Code, Codex, OpenCode) via the `terminal` tool. The MCP runs an entire conversation loop inside the container; the CLI agents are interactive programs you spawn in a single `terminal()` call. Use this skill for isolated multi-step research/coding, or work that needs a specific pre-baked workspace (e.g. `tailscale-ubuntu`, `minecraft`, `dgx-spark`).
 
 ## When to use
@@ -126,7 +133,7 @@ mcp_sandboxed_assistant_start_mission(
 # zai, minimax, kimi, spark
 ```
 
-**Fable 5 via `claudecode` only.** Virtuals is deprecated and no longer available. To use Fable 5, launch via `backend="claudecode"` with `model_override="claude-fable-5"`. Do NOT use `opencode` + `virtuals/claude-fable-5` — Virtuals has been removed from the provider catalog.
+**Fable 5.1 via `claudecode` only.** Virtuals is deprecated and no longer available. For demanding reasoning and long-horizon agentic work, launch via `backend="claudecode"` with the exact catalog ID `model_override="claude-fable-5-1"`. The older `claude-fable-5` remains available only for explicit compatibility. Do NOT use `opencode` + `virtuals/claude-fable-5-1` — Virtuals has been removed from the provider catalog.
 
 **Model ID gotchas:**
 - Z.AI: `glm-5.2`, `glm-5.1`, `glm-5-turbo` (lowercase, hyphenated)
@@ -375,6 +382,8 @@ The Ask sidecar can recover worktree facts or a final report missing from `get_m
 A mission can self-report “validation/build/background waiter running” and then become `acknowledged`. Treat that as an observability/lifecycle smell, not completion. `acknowledged` is terminal: **never call `resume_mission` for it** (the API intentionally accepts only `interrupted`, `blocked`, or `failed`). First reconcile registered processes, durable jobs, GitHub artifacts, and any active successor. If productive background work still has a durable owner, attach a callback/waiter and do not duplicate it. If there is no external artifact yet and no live owner, launch exactly one bounded replacement against the preserved branch/worktree after the normal ownership preflight; carry forward immutable receipts and require it to inspect the actual process/log state before rerunning anything. Do not tell Thomas the issue is fixed from “implementation done, build running”; live GitHub/API state wins.
 
 **False TurnComplete around detached builds.** A native `TurnComplete` can still report that a Lean/build process is live after that process has died without an exit-status file or target artifact. Before treating the terminal message as a legitimate external wait, run one strict read-only Ask inspection of the preserved worktree. Reduce it to: branch/HEAD, changed-file names, process-group liveness, PID/status/log paths, terminal exit code if recorded, and expected artifact presence. Never request argv, environment, raw logs, or credentials. If the group is live, preserve it and dispatch nothing. If it is gone with no status/artifact, classify the predecessor as `terminal-without-validation`, preserve its WIP, and launch exactly one bounded existing-branch continuation after normal duplicate/resource preflight. The continuation must reuse/inspect the preserved diff, confirm no process remains before starting one bounded build, write durable PID/exit-status/log artifacts, and inherit all no-merge/no-force-push/no-new-PR constraints. Patch the tracker immediately: terminal predecessor as history, verified continuation as the sole live owner.
+
+**Never hand `/tmp` state to a successor mission.** A mission's `/tmp` may be a private nspawn tmpfs and is not a durable cross-mission namespace. A path such as `/tmp/pr27-univ` can disappear or resolve to unrelated state in the successor, even when both missions target the same named workspace. Persist handoff worktrees, PID/status/log receipts, and patches beneath the mounted workspace (for example `/workspaces/mission-<id>/...` or a repository-local `.paloma/attempts/<id>/` directory), and record the remote branch plus immutable head SHA. Before a successor trusts any handed-off path, require it to verify repository identity (`git remote get-url origin`), PR number/head, branch, and expected receipt manifest. If the predecessor used `/tmp`, treat that path as unavailable: reconstruct from the exact remote PR branch/commit and durable receipts instead of inspecting or resuming it.
 
 For GitHub-producing missions, check the target fork/repository in parallel with mission status: branch existence, commit SHA, fork PR, and upstream PR are stronger evidence than a transcript saying work is local or tests are running. If none exists, report “no verifiable artifact yet,” not “nearly done.”
 

@@ -778,6 +778,18 @@ async fn acquire_pinned_profile(
     events_tx: &broadcast::Sender<AgentEvent>,
     cancel: &CancellationToken,
 ) -> Result<profile_pool::ProfileLock, AgentResult> {
+    if !profile_pool::profile_is_auth_ready(profile_dir) {
+        return Err(AgentResult::failure(
+            "The ChatGPT UI profile that owns this conversation requires a verified login.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::AuthError)
+        .with_data(serde_json::json!({
+            "provider_error_source": "chatgpt_ui_profile_pool",
+            "failure_class": FailureClass::AuthError,
+            "classification_source": "durable_profile_health",
+        })));
+    }
     let mut announced_wait = false;
     loop {
         availability::wait_until_available(profile_dirs, mission_id, events_tx, cancel).await?;

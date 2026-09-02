@@ -11,6 +11,15 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+fn successful_empty_terminal_result(
+    cancelled: bool,
+    had_error: bool,
+    saw_terminal_result_event: bool,
+    final_result: &str,
+) -> bool {
+    !cancelled && !had_error && saw_terminal_result_event && final_result.trim().is_empty()
+}
+
 use crate::agents::{AgentResult, CompletionConfidence, CompletionSignal, TerminalReason};
 use crate::api::control::AgentEvent;
 use tokio::sync::RwLock;
@@ -2699,8 +2708,28 @@ pub fn run_claudecode_turn<'a>(
         }
 
         if !cancelled && final_result.trim().is_empty() && !had_error {
-            had_error = true;
-            if !non_json_output.is_empty() {
+            // A successful terminal Result is the protocol-level completion
+            // signal. Claude may legitimately leave its `result` field empty
+            // after a tool-only/background-task notification, and lingering
+            // descendants can then make our bounded teardown SIGKILL the PTY
+            // process group. Do not reinterpret that runner-owned cleanup as
+            // an LLM/OS failure (mission 822c46f4 did exactly this after it had
+            // already pushed its successor and emitted a successful Result).
+            if successful_empty_terminal_result(
+                cancelled,
+                had_error,
+                saw_terminal_result_event,
+                &final_result,
+            ) {
+                tracing::info!(
+                    mission_id = %mission_id,
+                    exit_status = ?exit_status,
+                    "Claude Code completed successfully without textual output"
+                );
+                final_result =
+                    "Claude Code completed successfully without a textual response.".to_string();
+            } else if !non_json_output.is_empty() {
+                had_error = true;
                 tracing::warn!(
                     mission_id = %mission_id,
                     exit_status = ?exit_status,
@@ -2711,6 +2740,7 @@ pub fn run_claudecode_turn<'a>(
                     non_json_output.join(" | ")
                 );
             } else if !malformed_json_output.is_empty() {
+                had_error = true;
                 tracing::warn!(
                     mission_id = %mission_id,
                     exit_status = ?exit_status,
@@ -2721,6 +2751,7 @@ pub fn run_claudecode_turn<'a>(
                     malformed_json_output.join(" | ")
                 );
             } else {
+                had_error = true;
                 let exit_summary = describe_pty_exit_status(&exit_status);
                 let mut message = format!(
                     "Claude Code produced no output. Exit status: {}.",
@@ -3358,7 +3389,22 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
 
 #[cfg(test)]
 mod background_task_tests {
-    use super::parse_background_task_start;
+    use super::{parse_background_task_start, successful_empty_terminal_result};
+
+    #[test]
+    fn successful_empty_terminal_result_survives_runner_teardown() {
+        assert!(successful_empty_terminal_result(false, false, true, " \n"));
+    }
+
+    #[test]
+    fn empty_output_without_successful_terminal_result_remains_an_error() {
+        assert!(!successful_empty_terminal_result(false, false, false, ""));
+        assert!(!successful_empty_terminal_result(false, true, true, ""));
+        assert!(!successful_empty_terminal_result(true, false, true, ""));
+        assert!(!successful_empty_terminal_result(
+            false, false, true, "answer"
+        ));
+    }
 
     #[test]
     fn parses_real_marker() {

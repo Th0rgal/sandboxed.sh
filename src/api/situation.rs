@@ -552,6 +552,7 @@ mod tests {
         ProjectItem {
             key: key.into(),
             kind: "track",
+            position: None,
             desired_state: None,
             status: status.map(str::to_string),
             title: None,

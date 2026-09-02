@@ -1838,6 +1838,12 @@ pub async fn run_opencode_turn(
     if let Ok(status) = exit_status {
         if !status.success() && !sse_complete_seen {
             had_error = true;
+            // A non-zero CLI exit is authoritative unless a later recovery
+            // obtains an actual assistant message from session storage or the
+            // SSE text stream. In particular, raw shell diagnostics such as
+            // `sh: ...: not found` are stdout text, but they are not a model
+            // response and must never turn a launch failure into TurnComplete.
+            final_result_from_nonzero_exit = true;
             if opencode_output_needs_fallback(&final_result) {
                 if let Some(err_msg) = stderr_error_message.lock().unwrap().clone() {
                     final_result = err_msg;
@@ -1853,7 +1859,6 @@ pub async fn run_opencode_turn(
                 } else {
                     final_result = format!("OpenCode CLI exited with status: {}", status);
                 }
-                final_result_from_nonzero_exit = true;
             }
         }
     }

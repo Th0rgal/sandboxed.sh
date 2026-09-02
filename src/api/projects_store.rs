@@ -31,6 +31,9 @@ pub const TRACKER_PARSER_VERSION: i64 = 1;
 
 pub type SharedProjectsStore = Arc<ProjectsStore>;
 
+pub const TRACK_VERIFIER_CLASSES: [&str; 5] =
+    ["external_state", "command", "review", "operator", "manual"];
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS project_bindings (
     slug               TEXT PRIMARY KEY NOT NULL,
@@ -129,6 +132,8 @@ CREATE TABLE IF NOT EXISTS project_tracks (
     acceptance_criteria  TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(acceptance_criteria)),
     depends_on           TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(depends_on)),
     revision             INTEGER NOT NULL DEFAULT 0,
+    position             INTEGER NOT NULL DEFAULT 0,
+    governed_artifact_version TEXT,
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL,
     UNIQUE (slug, track)
@@ -228,6 +233,46 @@ CREATE TABLE IF NOT EXISTS project_imports (
     receipt_id      TEXT,
     PRIMARY KEY (slug, source_path, source_hash, parser_version)
 );
+
+-- Evidence is attached to the acceptance-criterion text rather than its array
+-- position. Reordering a contract cannot accidentally make an old receipt
+-- satisfy a different criterion.
+CREATE TABLE IF NOT EXISTS project_track_evidence (
+    evidence_id       TEXT PRIMARY KEY NOT NULL,
+    slug              TEXT NOT NULL,
+    track             TEXT NOT NULL,
+    track_revision    INTEGER NOT NULL,
+    criterion         TEXT NOT NULL,
+    verifier_class    TEXT NOT NULL,
+    evidence_ref      TEXT NOT NULL,
+    artifact_version  TEXT,
+    observed_at       TEXT NOT NULL,
+    accepted_at       TEXT NOT NULL,
+    accepted_by       TEXT NOT NULL,
+    FOREIGN KEY (slug, track) REFERENCES project_tracks(slug, track) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_track_evidence_contract
+    ON project_track_evidence(slug, track, track_revision, criterion, artifact_version);
+
+-- A durable dispatch intent is committed before the mission-store mutation.
+-- If the process dies between stores, the `reserved` row is visible and can
+-- be reconciled instead of silently losing ownership/linkage.
+CREATE TABLE IF NOT EXISTS project_track_dispatches (
+    idempotency_key  TEXT PRIMARY KEY NOT NULL,
+    slug             TEXT NOT NULL,
+    track            TEXT NOT NULL,
+    track_revision   INTEGER NOT NULL,
+    owner_lease_id   TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    state            TEXT NOT NULL, -- reserved|started|failed|superseded
+    mission_id       TEXT,
+    receipt          TEXT,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    FOREIGN KEY (slug, track) REFERENCES project_tracks(slug, track) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_track_dispatch_owner
+    ON project_track_dispatches(slug, track, state, lease_expires_at);
 
 -- The decision ledger. Two kinds of rows share it: escalations (questions the
 -- controller batched for the owner, `authority = 'escalation'`) and autonomous
@@ -425,12 +470,34 @@ impl ProjectsStore {
         if table_exists.is_none() {
             return Ok(false);
         }
-        let mut statement = connection.prepare("PRAGMA table_info(project_tracks)")?;
-        let has_lifecycle = statement
+        // v2 rows carry a stable `id`. The interim evidence-driven schema
+        // (2026-09-01, `feat/roadmap-evidence-projection`) already had a
+        // `lifecycle` column, so that is not the marker.
+        Ok(!Self::table_has_column(connection, "project_tracks", "id")?)
+    }
+
+    fn table_has_column(
+        connection: &Connection,
+        table: &str,
+        column: &str,
+    ) -> rusqlite::Result<bool> {
+        let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+        let found = statement
             .query_map([], |row| row.get::<_, String>(1))?
             .filter_map(Result::ok)
-            .any(|name| name == "lifecycle");
-        Ok(!has_lifecycle)
+            .any(|name| name == column);
+        Ok(found)
+    }
+
+    fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
+        Ok(connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// Rebuild `project_tracks` into the v2 shape.
@@ -465,6 +532,8 @@ impl ProjectsStore {
                     acceptance_criteria  TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(acceptance_criteria)),
                     depends_on           TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(depends_on)),
                     revision             INTEGER NOT NULL DEFAULT 0,
+                    position             INTEGER NOT NULL DEFAULT 0,
+                    governed_artifact_version TEXT,
                     created_at           TEXT NOT NULL,
                     updated_at           TEXT NOT NULL,
                     UNIQUE (slug, track)
@@ -479,13 +548,25 @@ impl ProjectsStore {
                 acceptance_criteria: Option<String>,
                 depends_on: Option<String>,
                 updated_at: String,
+                // Interim evidence-driven schema (2026-09-01): present only
+                // when the columns exist.
+                lifecycle: Option<String>,
+                position: Option<i64>,
+                governed_artifact_version: Option<String>,
+                revision: Option<i64>,
             }
+            let interim = Self::table_has_column(connection, "project_tracks", "lifecycle")?;
             let legacy: Vec<Legacy> = {
-                let mut statement = connection.prepare(
+                let select = if interim {
                     "SELECT slug, track, desired_state, status, title, acceptance_criteria, \
-                            depends_on, updated_at \
-                     FROM project_tracks ORDER BY slug, updated_at DESC, track",
-                )?;
+                            depends_on, updated_at, lifecycle, position, governed_artifact_version, revision \
+                     FROM project_tracks ORDER BY slug, updated_at DESC, track"
+                } else {
+                    "SELECT slug, track, desired_state, status, title, acceptance_criteria, \
+                            depends_on, updated_at, NULL, NULL, NULL, NULL \
+                     FROM project_tracks ORDER BY slug, updated_at DESC, track"
+                };
+                let mut statement = connection.prepare(select)?;
                 let rows = statement.query_map([], |row| {
                     Ok(Legacy {
                         slug: row.get(0)?,
@@ -496,10 +577,69 @@ impl ProjectsStore {
                         acceptance_criteria: row.get(5)?,
                         depends_on: row.get(6)?,
                         updated_at: row.get(7)?,
+                        lifecycle: row.get(8)?,
+                        position: row.get(9)?,
+                        governed_artifact_version: row.get(10)?,
+                        revision: row.get(11)?,
                     })
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()?
             };
+            struct InterimEvidence {
+                criterion: String,
+                verifier_class: String,
+                evidence_ref: String,
+                artifact_version: String,
+                observed_at: String,
+                accepted_at: String,
+                accepted_by: String,
+            }
+            let mut interim_evidence: HashMap<(String, String), Vec<InterimEvidence>> =
+                HashMap::new();
+            if Self::table_exists(connection, "project_track_evidence")? {
+                let mut statement = connection.prepare(
+                    "SELECT slug, track, criterion, verifier_class, evidence_ref, artifact_version, \
+                            observed_at, accepted_at, accepted_by \
+                     FROM project_track_evidence ORDER BY accepted_at",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                        InterimEvidence {
+                            criterion: row.get(2)?,
+                            verifier_class: row.get(3)?,
+                            evidence_ref: row.get(4)?,
+                            artifact_version: row.get(5)?,
+                            observed_at: row.get(6)?,
+                            accepted_at: row.get(7)?,
+                            accepted_by: row.get(8)?,
+                        },
+                    ))
+                })?;
+                for row in rows {
+                    let (key, evidence) = row?;
+                    interim_evidence.entry(key).or_default().push(evidence);
+                }
+            }
+            let mut interim_dispatches: Vec<(String, String, String, String, String)> = Vec::new();
+            if Self::table_exists(connection, "project_track_dispatches")? {
+                let mut statement = connection.prepare(
+                    "SELECT slug, track, idempotency_key, mission_id, lease_expires_at \
+                     FROM project_track_dispatches \
+                     WHERE state IN ('reserved', 'started') AND mission_id IS NOT NULL",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?;
+                interim_dispatches = rows.collect::<Result<Vec<_>, _>>()?;
+            }
+            let mut lease_rows: Vec<(String, String, String, String, String)> = Vec::new();
             // Per project: corrections for the reconcile receipt.
             let mut corrections: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
             // Alias rows reference `project_tracks(id)`, which the legacy
@@ -534,10 +674,21 @@ impl ProjectsStore {
                     .as_deref()
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
-                let lifecycle = match status {
-                    Some("cancelled") => "cancelled",
+                let interim_lifecycle = row
+                    .lifecycle
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase);
+                let lifecycle = match (interim_lifecycle.as_deref(), status) {
+                    (Some("cancelled"), _) | (None, Some("cancelled")) => "cancelled",
                     _ => "active",
                 };
+                let blocker: Option<&str> = match interim_lifecycle.as_deref() {
+                    Some("blocked") => Some("blocked"),
+                    _ => None,
+                };
+                let position = row.position.unwrap_or(0).max(0);
+                let start_revision = row.revision.unwrap_or(0).max(0);
                 let title = row
                     .title
                     .as_deref()
@@ -575,8 +726,9 @@ impl ProjectsStore {
                 connection.execute(
                     "INSERT INTO project_tracks_v2 \
                        (id, slug, track, title, desired_state, lifecycle, origin, explicit_blocker, \
-                        acceptance_criteria, depends_on, revision, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'declared', NULL, ?7, ?8, 0, ?9, ?9)",
+                        acceptance_criteria, depends_on, revision, position, governed_artifact_version, \
+                        created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'declared', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
                     params![
                         id,
                         row.slug,
@@ -584,11 +736,85 @@ impl ProjectsStore {
                         title,
                         row.desired_state,
                         lifecycle,
+                        blocker,
                         serde_json::to_string(&criteria).unwrap_or_else(|_| "[]".into()),
                         serde_json::to_string(&depends).unwrap_or_else(|_| "[]".into()),
+                        start_revision,
+                        position,
+                        row.governed_artifact_version,
                         row.updated_at,
                     ],
                 )?;
+                // Interim evidence becomes real accept receipts (verified),
+                // one per accepted criterion; an interim `satisfied` without
+                // evidence is a claim only.
+                let evidence = interim_evidence
+                    .remove(&(row.slug.clone(), row.track.clone()))
+                    .unwrap_or_default();
+                let mut imported_evidence = 0usize;
+                for (index, item) in evidence.iter().enumerate() {
+                    let criterion_id = if item.criterion == "__track__" {
+                        None
+                    } else {
+                        Some(item.criterion.clone())
+                    };
+                    let verifier_kind = match item.verifier_class.as_str() {
+                        "review" | "command" | "external_state" | "manual" => {
+                            item.verifier_class.as_str()
+                        }
+                        _ => "operator",
+                    };
+                    Self::insert_receipt_row(
+                        connection,
+                        &NewReceipt {
+                            idempotency_key: format!(
+                                "accept:interim:{}:{}:{}:{}",
+                                row.slug, key, index, item.accepted_at
+                            ),
+                            kind: "accept".into(),
+                            project_slug: Some(row.slug.clone()),
+                            track_id: Some(id.clone()),
+                            criterion_id,
+                            subject_type: evidence_subject_type(verifier_kind).into(),
+                            subject_id: format!("{}@{}", item.evidence_ref, item.artifact_version),
+                            outcome: "succeeded".into(),
+                            actor_type: "operator".into(),
+                            actor_id: item.accepted_by.clone(),
+                            verifier: Some(item.verifier_class.clone()),
+                            supersedes_receipt_id: None,
+                            observed_at: item.observed_at.clone(),
+                            payload: serde_json::json!({
+                                "evidence_kind": item.verifier_class,
+                                "evidence_ref": item.evidence_ref,
+                                "artifact_version": item.artifact_version,
+                                "accepted_at": item.accepted_at,
+                                "track": key,
+                                "source": "project_track_evidence",
+                            }),
+                        },
+                        &now,
+                    )?;
+                    imported_evidence += 1;
+                }
+                if imported_evidence > 0 {
+                    slug_corrections.push(serde_json::json!({
+                        "op": "interim_evidence_imported",
+                        "track": key,
+                        "receipts": imported_evidence,
+                    }));
+                }
+                for (dslug, _dtrack, dkey, mission_id, lease_until) in interim_dispatches
+                    .iter()
+                    .filter(|(dslug, dtrack, _, _, _)| dslug == &row.slug && dtrack == &row.track)
+                {
+                    lease_rows.push((
+                        dslug.clone(),
+                        id.clone(),
+                        mission_id.clone(),
+                        format!("lease:dispatch:{dkey}"),
+                        lease_until.clone(),
+                    ));
+                }
                 if key != row.track {
                     aliases.push((row.slug.clone(), row.track.clone(), id.clone(), "renamed"));
                     slug_corrections.push(serde_json::json!({
@@ -597,8 +823,11 @@ impl ProjectsStore {
                         "from": row.track,
                     }));
                 }
-                match status {
-                    Some("done") | Some("closed") => {
+                let interim_satisfied = interim_lifecycle.as_deref() == Some("satisfied");
+                let claims_done =
+                    matches!(status, Some("done") | Some("closed")) || interim_satisfied;
+                match (claims_done && imported_evidence == 0, status) {
+                    (true, _) => {
                         Self::insert_receipt_row(
                             connection,
                             &NewReceipt {
@@ -629,11 +858,12 @@ impl ProjectsStore {
                             "op": "legacy_done_to_claim_only",
                             "track": key,
                             "legacy_status": status,
+                            "interim_lifecycle": interim_lifecycle,
                         }));
                     }
-                    Some("cancelled") => {}
-                    other => {
-                        if !matches!(other, None | Some("open")) {
+                    (false, Some("cancelled")) => {}
+                    (false, other) => {
+                        if imported_evidence == 0 && !matches!(other, None | Some("open")) {
                             slug_corrections.push(serde_json::json!({
                                 "op": "status_normalized",
                                 "track": key,
@@ -679,6 +909,25 @@ impl ProjectsStore {
                     "INSERT OR IGNORE INTO project_track_aliases \
                        (slug, alias_key, track_id, reason, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![slug, alias, track_id, reason, now],
+                )?;
+            }
+            // Interim dispatch intents that still owned a track become writer
+            // leases so the running mission keeps its exclusivity.
+            for (slug, track_id, mission_id, key, lease_until) in lease_rows {
+                connection.execute(
+                    "INSERT OR IGNORE INTO track_leases \
+                       (id, slug, track_id, mutation_domain, attempt_id, mode, state, lease_until, \
+                        idempotency_key, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, 'track', ?4, 'writer', 'active', ?5, ?6, ?7, ?7)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        slug,
+                        track_id,
+                        mission_id,
+                        lease_until,
+                        key,
+                        now
+                    ],
                 )?;
             }
             Self::stamp_schema_version(connection)?;
@@ -1771,10 +2020,28 @@ impl ProjectsStore {
             .prepare(TRACK_SELECT)
             .map_err(|e| e.to_string())?;
         let rows = statement
-            .query_map(params![slug], track_from_row)
+            .query_map(params![slug], track_row)
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())
+        let mut claims: HashMap<String, Vec<StandingClaim>> = HashMap::new();
+        let mut statement = connection
+            .prepare(STANDING_CLAIMS_FOR_SLUG)
+            .map_err(|e| e.to_string())?;
+        for entry in statement
+            .query_map(params![slug], standing_claim_from_row)
+            .map_err(|e| e.to_string())?
+        {
+            let (track_id, claim) = entry.map_err(|e| e.to_string())?;
+            claims.entry(track_id).or_default().push(claim);
+        }
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let standing = claims.get(&row.id).map(Vec::as_slice).unwrap_or(&[]);
+                finish_track(row, standing)
+            })
+            .collect())
     }
 
     /// One track by normalized key or alias, within `slug`.
@@ -1791,10 +2058,23 @@ impl ProjectsStore {
         let Some(id) = Self::resolve_track_id_on(connection, slug, key)? else {
             return Ok(None);
         };
-        connection
-            .query_row(TRACK_SELECT_BY_ID, params![id], track_from_row)
+        let Some(row) = connection
+            .query_row(TRACK_SELECT_BY_ID, params![id], track_row)
             .optional()
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        let mut statement = connection
+            .prepare(STANDING_CLAIMS_FOR_TRACK)
+            .map_err(|e| e.to_string())?;
+        let claims: Vec<StandingClaim> = statement
+            .query_map(params![id], standing_claim_from_row)
+            .map_err(|e| e.to_string())?
+            .map(|entry| entry.map(|(_, claim)| claim))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(Some(finish_track(row, &claims)))
     }
 
     /// Resolve a caller-supplied key (any spelling) to the row id. Exact
@@ -1946,8 +2226,9 @@ impl ProjectsStore {
                 tx.execute(
                     "INSERT INTO project_tracks \
                        (id, slug, track, title, desired_state, lifecycle, origin, explicit_blocker, \
-                        acceptance_criteria, depends_on, revision, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'declared', ?7, ?8, ?9, 0, ?10, ?10)",
+                        acceptance_criteria, depends_on, revision, position, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'declared', ?7, ?8, ?9, 0, \
+                       (SELECT COALESCE(MAX(position), -1) + 1 FROM project_tracks WHERE slug = ?2), ?10, ?10)",
                     params![
                         id,
                         slug,
@@ -2007,24 +2288,39 @@ impl ProjectsStore {
             let existing = Self::resolve_track_id_on(&tx, slug, &item.track)?;
             match existing {
                 Some(id) => {
-                    tx.execute(
-                        "UPDATE project_tracks SET \
-                           title = ?2, desired_state = ?3, acceptance_criteria = ?4, depends_on = ?5, \
-                           lifecycle = 'active', origin = 'declared', explicit_blocker = NULL, \
-                           revision = revision + 1, updated_at = ?6 \
-                         WHERE id = ?1",
-                        params![id, title, item.desired_state, criteria, depends, now],
-                    )
-                    .map_err(|e| e.to_string())?;
+                    // Planning never reopens or revises a satisfied track:
+                    // its standing evidence stays authoritative. It may
+                    // still reorder it.
+                    let satisfied = Self::track_on(&tx, slug, &item.track)?
+                        .is_some_and(|track| track.claim.as_deref() == Some("accept"));
+                    if satisfied {
+                        tx.execute(
+                            "UPDATE project_tracks SET position = COALESCE(?2, position) WHERE id = ?1",
+                            params![id, item.position],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    } else {
+                        tx.execute(
+                            "UPDATE project_tracks SET \
+                               title = ?2, desired_state = ?3, acceptance_criteria = ?4, depends_on = ?5, \
+                               origin = 'declared', explicit_blocker = NULL, \
+                               position = COALESCE(?7, position), \
+                               revision = revision + 1, updated_at = ?6 \
+                             WHERE id = ?1",
+                            params![id, title, item.desired_state, criteria, depends, now, item.position],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
                 }
                 None => {
                     let id = Uuid::new_v4().to_string();
                     tx.execute(
                         "INSERT INTO project_tracks \
                            (id, slug, track, title, desired_state, lifecycle, origin, explicit_blocker, \
-                            acceptance_criteria, depends_on, revision, created_at, updated_at) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, 'active', 'declared', NULL, ?6, ?7, 0, ?8, ?8)",
-                        params![id, slug, key, title, item.desired_state, criteria, depends, now],
+                            acceptance_criteria, depends_on, revision, position, created_at, updated_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, 'active', 'declared', NULL, ?6, ?7, 0, \
+                           COALESCE(?9, (SELECT COALESCE(MAX(position), -1) + 1 FROM project_tracks WHERE slug = ?2)), ?8, ?8)",
+                        params![id, slug, key, title, item.desired_state, criteria, depends, now, item.position],
                     )
                     .map_err(|e| e.to_string())?;
                     if key != item.track.trim() {
@@ -2272,18 +2568,10 @@ impl ProjectsStore {
                     }
                 }
             }
-            let missing: Vec<String> = covered
-                .iter()
-                .enumerate()
-                .filter(|(_, done)| !**done)
-                .map(|(i, _)| format!("c{}: {}", i + 1, track.acceptance_criteria[i]))
-                .collect();
-            if !missing.is_empty() {
-                return Err(AcceptError::Invalid(format!(
-                    "criteria without evidence: {}",
-                    missing.join("; ")
-                )));
-            }
+            // Partial acceptance is allowed: receipts accumulate per
+            // criterion and the track reads satisfied only once every
+            // declared criterion has standing evidence (see `derive_claim`).
+            let _ = covered;
         }
         let mut receipts = Vec::with_capacity(request.evidence.len());
         let mut replayed = 0usize;
@@ -2538,8 +2826,9 @@ impl ProjectsStore {
         tx.execute(
             "INSERT INTO project_tracks \
                (id, slug, track, title, desired_state, lifecycle, origin, explicit_blocker, \
-                acceptance_criteria, depends_on, revision, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, NULL, 'active', 'absorbed', NULL, '[]', '[]', 0, ?5, ?5)",
+                acceptance_criteria, depends_on, revision, position, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, NULL, 'active', 'absorbed', NULL, '[]', '[]', 0, \
+               (SELECT COALESCE(MAX(position), -1) + 1 FROM project_tracks WHERE slug = ?2), ?5, ?5)",
             params![id, slug, normalized, title, now],
         )
         .map_err(|e| e.to_string())?;
@@ -2774,6 +3063,215 @@ impl ProjectsStore {
             .map_err(|e| e.to_string())
     }
 
+    // ── Evidence-driven compatibility surface (2026-09-01 API) ───────────
+
+    /// True when every current criterion has standing accepted evidence.
+    pub fn track_contract_satisfied(&self, slug: &str, track: &str) -> Result<bool, String> {
+        Ok(self
+            .track(slug, track)?
+            .is_some_and(|row| row.claim.as_deref() == Some("accept")))
+    }
+
+    /// Accept evidence for one criterion (the per-criterion shape the
+    /// `accept_project_track_evidence` tool speaks). Delegates to
+    /// [`Self::accept_track_evidence`]; the track reads satisfied once every
+    /// criterion is covered.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_track_criterion_evidence(
+        &self,
+        slug: &str,
+        track: &str,
+        criterion: Option<&str>,
+        verifier_class: &str,
+        evidence_ref: &str,
+        artifact_version: &str,
+        observed_at: Option<&str>,
+        accepted_by: &str,
+    ) -> Result<AcceptResult, AcceptError> {
+        let verifier_class = verifier_class.trim();
+        if !TRACK_VERIFIER_CLASSES.contains(&verifier_class) {
+            return Err(AcceptError::Invalid(format!(
+                "invalid verifier_class '{verifier_class}'; expected {}",
+                TRACK_VERIFIER_CLASSES.join(", ")
+            )));
+        }
+        let evidence_ref = evidence_ref.trim();
+        let artifact_version = artifact_version.trim();
+        if evidence_ref.is_empty() || artifact_version.is_empty() {
+            return Err(AcceptError::Invalid(
+                "evidence_ref and artifact_version are required".into(),
+            ));
+        }
+        let Some(current) = self.track(slug, track).map_err(AcceptError::Store)? else {
+            return Err(AcceptError::NotFound);
+        };
+        let criterion_id = match (
+            criterion
+                .map(str::trim)
+                .filter(|v| !v.is_empty() && *v != "__track__"),
+            current.acceptance_criteria.len(),
+        ) {
+            (Some(value), _) => Some(value.to_string()),
+            (None, 0) => None,
+            (None, 1) => Some(current.acceptance_criteria[0].clone()),
+            (None, _) => {
+                return Err(AcceptError::Invalid(
+                    "criterion is required when a track has multiple acceptance criteria".into(),
+                ))
+            }
+        };
+        if let Some(governed) = current
+            .governed_artifact_version
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+        {
+            if governed != artifact_version {
+                return Err(AcceptError::Invalid(format!(
+                    "evidence artifact '{artifact_version}' does not match governed artifact '{governed}'"
+                )));
+            }
+        }
+        let kind = match verifier_class {
+            "review" => "review",
+            "command" => "command",
+            "external_state" => "external_state",
+            "manual" => "manual",
+            _ => "operator",
+        };
+        let idempotency_key = {
+            use sha2::Digest;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(
+                format!(
+                    "{slug}\0{}\0{}\0{evidence_ref}\0{artifact_version}",
+                    current.track,
+                    criterion_id.as_deref().unwrap_or("")
+                )
+                .as_bytes(),
+            );
+            format!("evidence:{}", hex::encode(hasher.finalize()))
+        };
+        self.accept_track_evidence(
+            slug,
+            track,
+            &AcceptRequest {
+                idempotency_key,
+                expected_revision: None,
+                evidence: vec![EvidenceInput {
+                    criterion_id,
+                    kind: kind.to_string(),
+                    subject_id: format!("{evidence_ref}@{artifact_version}"),
+                    verifier: Some(verifier_class.to_string()),
+                    payload: serde_json::json!({
+                        "evidence_ref": evidence_ref,
+                        "artifact_version": artifact_version,
+                    }),
+                }],
+                actor_type: "operator".into(),
+                actor_id: accepted_by.trim().to_string(),
+                observed_at: observed_at.map(str::to_string),
+            },
+        )
+    }
+
+    /// Reopen a satisfied or cancelled track: every standing claim is
+    /// invalidated with the reason, a cancelled lifecycle returns to active,
+    /// the revision moves. Nothing is deleted.
+    pub fn reopen_track(
+        &self,
+        slug: &str,
+        track: &str,
+        reason: &str,
+        governed_artifact_version: Option<&str>,
+        reopened_by: &str,
+    ) -> Result<ProjectTrack, AcceptError> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(AcceptError::Invalid("reopen reason is required".into()));
+        }
+        let Some(current) = self.track(slug, track).map_err(AcceptError::Store)? else {
+            return Err(AcceptError::NotFound);
+        };
+        if current.lifecycle != "cancelled" && current.claim.is_none() {
+            return Err(AcceptError::Invalid(format!(
+                "track '{slug}/{track}' is unknown or not terminal"
+            )));
+        }
+        let all = self
+            .receipts_for_track(slug, track)
+            .map_err(AcceptError::Store)?;
+        let invalidated: std::collections::HashSet<String> = all
+            .iter()
+            .filter(|r| r.outcome == "invalidated")
+            .filter_map(|r| r.supersedes_receipt_id.clone())
+            .collect();
+        for receipt in all
+            .iter()
+            .filter(|r| matches!(r.kind.as_str(), "accept" | "legacy_import"))
+            .filter(|r| !invalidated.contains(&r.id))
+        {
+            self.invalidate_track_evidence(
+                slug,
+                track,
+                &receipt.id,
+                &format!("reopened: {reason}"),
+                "operator",
+                reopened_by,
+            )?;
+        }
+        let now = Utc::now().to_rfc3339();
+        {
+            let connection = self.lock().map_err(AcceptError::Store)?;
+            connection
+                .execute(
+                    "UPDATE project_tracks SET lifecycle = 'active', explicit_blocker = NULL, \
+                       governed_artifact_version = ?3, revision = revision + 1, updated_at = ?2 \
+                     WHERE id = ?1",
+                    params![current.id, now, governed_artifact_version],
+                )
+                .map_err(|e| AcceptError::Store(e.to_string()))?;
+        }
+        self.insert_receipt(&NewReceipt {
+            idempotency_key: format!("reopen:{}:{}", current.id, now),
+            kind: "reconcile".into(),
+            project_slug: Some(slug.to_string()),
+            track_id: Some(current.id.clone()),
+            criterion_id: None,
+            subject_type: "operator".into(),
+            subject_id: format!("reopen:{}", current.track),
+            outcome: "observed".into(),
+            actor_type: "operator".into(),
+            actor_id: reopened_by.into(),
+            verifier: None,
+            supersedes_receipt_id: None,
+            observed_at: now,
+            payload: serde_json::json!({
+                "corrections": [{ "op": "reopened", "track": current.track, "reason": reason }],
+            }),
+        })
+        .map_err(|e| AcceptError::Store(e.to_string()))?;
+        self.track(slug, track)
+            .map_err(AcceptError::Store)?
+            .ok_or(AcceptError::NotFound)
+    }
+
+    /// The live lease taken under a dispatch key, if any (create_mission
+    /// coalesces a retried dispatch onto the mission that holds it).
+    pub fn lease_by_key(&self, idempotency_key: &str) -> Result<Option<TrackLease>, String> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                &format!(
+                    "{LEASE_SELECT} WHERE l.idempotency_key = ?1 \
+                       AND l.state IN ('reserved','active') AND l.lease_until > ?2"
+                ),
+                params![idempotency_key, Utc::now().to_rfc3339()],
+                lease_from_row,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
     // ── Aliases, refs, imports ──────────────────────────────────────────
 
     pub fn add_track_alias(
@@ -2939,8 +3437,9 @@ impl ProjectsStore {
                 tx.execute(
                     "INSERT INTO project_tracks \
                        (id, slug, track, title, desired_state, lifecycle, origin, explicit_blocker, \
-                        acceptance_criteria, depends_on, revision, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, NULL, 'active', 'imported', NULL, '[]', '[]', 0, ?5, ?5)",
+                        acceptance_criteria, depends_on, revision, position, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, NULL, 'active', 'imported', NULL, '[]', '[]', 0, \
+                       (SELECT COALESCE(MAX(position), -1) + 1 FROM project_tracks WHERE slug = ?2), ?5, ?5)",
                     params![id, slug, normalized, title, now],
                 )
                 .map_err(|e| e.to_string())?;
@@ -2996,6 +3495,8 @@ impl ProjectsStore {
         }
         Ok(created)
     }
+
+    #[allow(clippy::too_many_arguments)]
 
     pub fn get_grant(&self, slug: &str) -> Result<Option<ProjectGrant>, String> {
         let connection = self.lock()?;
@@ -3599,48 +4100,190 @@ pub struct RoadmapProposal {
 
 const TRACK_SELECT: &str =
     "SELECT t.id, t.track, t.desired_state, t.title, t.acceptance_criteria, t.depends_on, \
-     t.updated_at, t.lifecycle, t.origin, t.explicit_blocker, t.revision, \
-     (SELECT r.kind FROM receipts r \
-        WHERE r.track_id = t.id AND r.kind IN ('legacy_import', 'accept') \
-          AND r.outcome IN ('observed', 'succeeded') \
-          AND NOT EXISTS (SELECT 1 FROM receipts i \
-                          WHERE i.supersedes_receipt_id = r.id AND i.outcome = 'invalidated') \
-        ORDER BY r.observed_at DESC, r.created_at DESC LIMIT 1) AS claim \
-     FROM project_tracks t WHERE t.slug = ?1 ORDER BY t.track";
+     t.updated_at, t.lifecycle, t.origin, t.explicit_blocker, t.revision, t.position, \
+     t.governed_artifact_version \
+     FROM project_tracks t WHERE t.slug = ?1 ORDER BY t.position, t.track";
 
 const TRACK_SELECT_BY_ID: &str =
     "SELECT t.id, t.track, t.desired_state, t.title, t.acceptance_criteria, t.depends_on, \
-     t.updated_at, t.lifecycle, t.origin, t.explicit_blocker, t.revision, \
-     (SELECT r.kind FROM receipts r \
-        WHERE r.track_id = t.id AND r.kind IN ('legacy_import', 'accept') \
-          AND r.outcome IN ('observed', 'succeeded') \
-          AND NOT EXISTS (SELECT 1 FROM receipts i \
-                          WHERE i.supersedes_receipt_id = r.id AND i.outcome = 'invalidated') \
-        ORDER BY r.observed_at DESC, r.created_at DESC LIMIT 1) AS claim \
+     t.updated_at, t.lifecycle, t.origin, t.explicit_blocker, t.revision, t.position, \
+     t.governed_artifact_version \
      FROM project_tracks t WHERE t.id = ?1";
 
-fn track_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectTrack> {
+/// Standing (un-invalidated) claim receipts, keyed by track id.
+const STANDING_CLAIMS_FOR_SLUG: &str =
+    "SELECT r.track_id, r.kind, r.criterion_id, r.observed_at, r.payload FROM receipts r \
+     JOIN project_tracks t ON t.id = r.track_id \
+     WHERE t.slug = ?1 AND r.kind IN ('legacy_import', 'accept') \
+       AND r.outcome IN ('observed', 'succeeded') \
+       AND NOT EXISTS (SELECT 1 FROM receipts i \
+                       WHERE i.supersedes_receipt_id = r.id AND i.outcome = 'invalidated') \
+     ORDER BY r.observed_at, r.created_at";
+
+const STANDING_CLAIMS_FOR_TRACK: &str =
+    "SELECT r.track_id, r.kind, r.criterion_id, r.observed_at, r.payload FROM receipts r \
+     WHERE r.track_id = ?1 AND r.kind IN ('legacy_import', 'accept') \
+       AND r.outcome IN ('observed', 'succeeded') \
+       AND NOT EXISTS (SELECT 1 FROM receipts i \
+                       WHERE i.supersedes_receipt_id = r.id AND i.outcome = 'invalidated') \
+     ORDER BY r.observed_at, r.created_at";
+
+#[derive(Debug, Clone)]
+struct StandingClaim {
+    kind: String,
+    criterion_id: Option<String>,
+    observed_at: String,
+    artifact_version: Option<String>,
+}
+
+fn standing_claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, StandingClaim)> {
+    let payload: String = row.get(4)?;
+    let artifact_version = serde_json::from_str::<serde_json::Value>(&payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("artifact_version")
+                .or_else(|| value.get("details").and_then(|d| d.get("artifact_version")))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    Ok((
+        row.get(0)?,
+        StandingClaim {
+            kind: row.get(1)?,
+            criterion_id: row.get(2)?,
+            observed_at: row.get(3)?,
+            artifact_version,
+        },
+    ))
+}
+
+/// Resolve a criterion reference (`c<n>` or the criterion text) to its index.
+fn criterion_index(criteria: &[String], reference: &str) -> Option<usize> {
+    let reference = reference.trim();
+    criteria
+        .iter()
+        .position(|declared| declared.trim() == reference)
+        .or_else(|| {
+            reference
+                .strip_prefix('c')
+                .and_then(|n| n.parse::<usize>().ok())
+                .filter(|n| *n >= 1 && *n <= criteria.len())
+                .map(|n| n - 1)
+        })
+}
+
+/// Derive the standing claim of a track from its un-invalidated receipts:
+/// `accept` when every declared criterion is covered (or none is declared
+/// and at least one accept stands), else `legacy_import` when a pre-receipt
+/// claim stands, else none. Returns (claim, accepted_at, artifact_version).
+fn derive_claim(
+    criteria: &[String],
+    claims: &[StandingClaim],
+) -> (Option<String>, Option<String>, Option<String>) {
+    let accepts: Vec<&StandingClaim> = claims.iter().filter(|c| c.kind == "accept").collect();
+    let covered = if criteria.is_empty() {
+        !accepts.is_empty()
+    } else {
+        let mut seen = vec![false; criteria.len()];
+        for accept in &accepts {
+            match accept.criterion_id.as_deref() {
+                Some(reference) => {
+                    if let Some(index) = criterion_index(criteria, reference) {
+                        seen[index] = true;
+                    }
+                }
+                // An accept without a criterion on a track that declares
+                // some (interim `__track__` evidence) covers the contract as
+                // it stood when it was accepted.
+                None => seen.iter_mut().for_each(|s| *s = true),
+            }
+        }
+        seen.iter().all(|s| *s)
+    };
+    if covered {
+        let newest = accepts.iter().max_by_key(|c| c.observed_at.clone());
+        return (
+            Some("accept".into()),
+            newest.map(|c| c.observed_at.clone()),
+            newest.and_then(|c| c.artifact_version.clone()),
+        );
+    }
+    if let Some(legacy) = claims
+        .iter()
+        .filter(|c| c.kind == "legacy_import")
+        .max_by_key(|c| c.observed_at.clone())
+    {
+        return (
+            Some("legacy_import".into()),
+            Some(legacy.observed_at.clone()),
+            None,
+        );
+    }
+    (None, None, None)
+}
+
+struct TrackRow {
+    id: String,
+    track: String,
+    desired_state: Option<String>,
+    title: Option<String>,
+    acceptance_criteria: Vec<String>,
+    depends_on: Vec<String>,
+    updated_at: String,
+    lifecycle: String,
+    origin: String,
+    explicit_blocker: Option<String>,
+    revision: u64,
+    position: u64,
+    governed_artifact_version: Option<String>,
+}
+
+fn track_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
     let criteria: Option<String> = row.get(4)?;
     let depends: Option<String> = row.get(5)?;
-    let lifecycle: String = row.get(7)?;
-    let explicit_blocker: Option<String> = row.get(9)?;
-    let claim: Option<String> = row.get(11)?;
-    let status = derived_track_status(&lifecycle, explicit_blocker.as_deref(), claim.as_deref());
-    Ok(ProjectTrack {
+    Ok(TrackRow {
         id: row.get(0)?,
         track: row.get(1)?,
         desired_state: row.get(2)?,
-        status: Some(status.to_string()),
         title: row.get(3)?,
         acceptance_criteria: parse_string_list(criteria),
         depends_on: parse_string_list(depends),
         updated_at: row.get(6)?,
-        lifecycle,
+        lifecycle: row.get(7)?,
         origin: row.get(8)?,
-        explicit_blocker,
+        explicit_blocker: row.get(9)?,
         revision: row.get::<_, i64>(10)?.max(0) as u64,
-        claim,
+        position: row.get::<_, i64>(11)?.max(0) as u64,
+        governed_artifact_version: row.get(12)?,
     })
+}
+
+fn finish_track(row: TrackRow, claims: &[StandingClaim]) -> ProjectTrack {
+    let (claim, accepted_at, artifact) = derive_claim(&row.acceptance_criteria, claims);
+    let status = derived_track_status(
+        &row.lifecycle,
+        row.explicit_blocker.as_deref(),
+        claim.as_deref(),
+    );
+    ProjectTrack {
+        id: row.id,
+        track: row.track,
+        desired_state: row.desired_state,
+        status: Some(status.to_string()),
+        title: row.title,
+        acceptance_criteria: row.acceptance_criteria,
+        depends_on: row.depends_on,
+        updated_at: row.updated_at,
+        lifecycle: row.lifecycle,
+        origin: row.origin,
+        explicit_blocker: row.explicit_blocker,
+        revision: row.revision,
+        position: row.position,
+        governed_artifact_version: artifact.or(row.governed_artifact_version),
+        accepted_at,
+        claim,
+    }
 }
 
 /// The legacy status vocabulary, derived from stored facts. Readers that
@@ -3733,7 +4376,8 @@ impl TrackTransition {
         match status.map(str::trim).filter(|value| !value.is_empty()) {
             None => Ok(Self::Keep),
             Some(
-                "open" | "active" | "running" | "in-progress" | "in_progress" | "ready" | "waiting",
+                "open" | "active" | "running" | "in-progress" | "in_progress" | "ready" | "waiting"
+                | "planned" | "executing" | "pending" | "proposed" | "settled",
             ) => Ok(Self::Activate),
             Some("blocked") => Ok(Self::Block),
             Some("cancelled" | "canceled") => Ok(Self::Cancel),
@@ -4129,6 +4773,7 @@ pub struct PlannedTrack {
     pub desired_state: String,
     pub acceptance_criteria: Vec<String>,
     pub depends_on: Vec<String>,
+    pub position: Option<i64>,
 }
 
 /// JSON-array column → Vec, treating NULL/garbage as empty rather than erroring
@@ -4186,8 +4831,18 @@ pub struct ProjectTrack {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explicit_blocker: Option<String>,
     pub revision: u64,
-    /// Kind of the newest un-invalidated claim receipt (`legacy_import` |
-    /// `accept`), if any.
+    /// Roadmap order (explicit via planning, else insertion order).
+    pub position: u64,
+    /// Immutable artifact version the standing evidence was accepted at
+    /// (normally a commit SHA). Derived from the newest standing accept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub governed_artifact_version: Option<String>,
+    /// When the standing claim was accepted (newest standing receipt).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_at: Option<String>,
+    /// Kind of the standing claim: `accept` only when every declared
+    /// criterion has un-invalidated accepted evidence (or the track declares
+    /// none and has at least one), `legacy_import` for pre-receipt claims.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claim: Option<String>,
 }
@@ -5539,6 +6194,7 @@ mod tests {
                     desired_state: "merge after certify".into(),
                     acceptance_criteria: vec!["CI green".into(), "review resolved".into()],
                     depends_on: vec!["freeze-head".into()],
+                    position: None,
                 }],
             )
             .expect("plan");
@@ -5565,6 +6221,7 @@ mod tests {
                     desired_state: "merge after certify".into(),
                     acceptance_criteria: vec!["exact-head clean".into()],
                     depends_on: vec![],
+                    position: None,
                 }],
             )
             .expect("replan");
@@ -5572,6 +6229,43 @@ mod tests {
         assert_eq!(tracks[0].title.as_deref(), Some("Land #2332 (retry)"));
         assert_eq!(tracks[0].acceptance_criteria, vec!["exact-head clean"]);
         assert!(tracks[0].depends_on.is_empty());
+    }
+
+    #[test]
+    fn explicit_positions_define_the_server_roadmap_order() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_planned_tracks(
+                "lido",
+                &[
+                    PlannedTrack {
+                        track: "ux2".into(),
+                        title: "UX2".into(),
+                        desired_state: "accepted".into(),
+                        acceptance_criteria: vec![],
+                        depends_on: vec!["ux1".into()],
+                        position: Some(1),
+                    },
+                    PlannedTrack {
+                        track: "ux1".into(),
+                        title: "UX1".into(),
+                        desired_state: "merged".into(),
+                        acceptance_criteria: vec![],
+                        depends_on: vec![],
+                        position: Some(0),
+                    },
+                ],
+            )
+            .expect("plan ordered roadmap");
+        assert_eq!(
+            store
+                .tracks("lido")
+                .expect("tracks")
+                .iter()
+                .map(|track| track.track.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ux1", "ux2"]
+        );
     }
 
     #[test]
@@ -5857,7 +6551,7 @@ mod tests {
     }
 
     #[test]
-    fn accept_requires_every_criterion_then_satisfies_and_replays() {
+    fn accept_accumulates_per_criterion_then_satisfies_and_replays() {
         let store = ProjectsStore::open_in_memory().expect("store");
         store
             .upsert_project("lido", None, None, None, None)
@@ -5873,23 +6567,17 @@ mod tests {
                 None,
             )
             .expect("declare");
+        // Partial acceptance is recorded but does not satisfy: the second
+        // criterion still has no standing evidence.
         let partial = accept("k1", vec![evidence(Some("c1"), "o/r#229@abc")], None);
-        let error = store
+        let first = store
             .accept_track_evidence("lido", "UX1", &partial)
-            .expect_err("one criterion missing");
-        assert!(
-            matches!(error, AcceptError::Invalid(ref m) if m.contains("deployed")),
-            "{error}"
-        );
-        assert_eq!(
-            store
-                .track("lido", "ux1")
-                .unwrap()
-                .unwrap()
-                .status
-                .as_deref(),
-            Some("open")
-        );
+            .expect("partial accept is a receipt");
+        assert_eq!(first.receipts.len(), 1);
+        assert_eq!(first.track.claim, None);
+        assert_eq!(first.track.status.as_deref(), Some("open"));
+        assert!(!store.track_contract_satisfied("lido", "ux1").unwrap());
+        assert_eq!(first.track.revision, 1);
 
         let full = accept(
             "k2",
@@ -5897,7 +6585,7 @@ mod tests {
                 evidence(Some("review clean"), "o/r#229@abc"),
                 evidence(Some("c2"), "o/r#229@abc"),
             ],
-            Some(0),
+            Some(1),
         );
         let result = store
             .accept_track_evidence("lido", "ux1", &full)
@@ -5906,13 +6594,14 @@ mod tests {
         assert_eq!(result.receipts.len(), 2);
         assert_eq!(result.track.status.as_deref(), Some("satisfied"));
         assert_eq!(result.track.claim.as_deref(), Some("accept"));
-        assert_eq!(result.track.revision, 1);
+        assert_eq!(result.track.revision, 2);
+        assert!(store.track_contract_satisfied("lido", "ux1").unwrap());
 
         let again = store
             .accept_track_evidence("lido", "ux1", &full)
             .expect("retry");
         assert!(again.replayed, "same key + body replays");
-        assert_eq!(again.track.revision, 1);
+        assert_eq!(again.track.revision, 2);
         assert!(matches!(
             store.accept_track_evidence(
                 "lido",
@@ -5921,7 +6610,7 @@ mod tests {
             ),
             Err(AcceptError::StaleRevision {
                 expected: 0,
-                current: 1
+                current: 2
             })
         ));
         let mut changed = full.clone();
@@ -5947,31 +6636,234 @@ mod tests {
             Err(AcceptError::Invalid(_))
         ));
 
-        // Invalidation reopens without deleting anything.
-        let target = result.receipts[0].id.clone();
+        // Invalidation reopens without deleting anything. Two accepts cover
+        // c1 (k1 and k2); one covers c2.
+        let c2_receipt = result
+            .receipts
+            .iter()
+            .find(|r| r.criterion_id.as_deref() == Some("c2"))
+            .unwrap()
+            .id
+            .clone();
         let invalidated = store
-            .invalidate_track_evidence("lido", "ux1", &target, "head moved", "system", "watch")
+            .invalidate_track_evidence("lido", "ux1", &c2_receipt, "head moved", "system", "watch")
             .expect("invalidate");
         assert_eq!(invalidated.outcome, "invalidated");
         assert_eq!(
             invalidated.supersedes_receipt_id.as_deref(),
-            Some(target.as_str())
+            Some(c2_receipt.as_str())
         );
         let track = store.track("lido", "ux1").unwrap().unwrap();
-        // One of two accept receipts is invalidated; the other still stands as
-        // the newest un-invalidated claim, so the track still reads satisfied
-        // until that one is invalidated too.
-        assert_eq!(track.claim.as_deref(), Some("accept"));
-        let other = result.receipts[1].id.clone();
-        store
-            .invalidate_track_evidence("lido", "ux1", &other, "head moved", "system", "watch")
-            .expect("invalidate second");
-        let track = store.track("lido", "ux1").unwrap().unwrap();
-        assert_eq!(track.claim, None);
+        assert_eq!(track.claim, None, "c2 lost its evidence");
         assert_eq!(track.status.as_deref(), Some("open"));
         assert_eq!(track.revision, 3);
-        assert_eq!(store.active_accept_receipts("pr").unwrap().len(), 0);
+        assert_eq!(store.active_accept_receipts("pr").unwrap().len(), 2);
         assert_eq!(store.receipts_for_track("lido", "ux1").unwrap().len(), 4);
+    }
+
+    #[test]
+    fn per_criterion_evidence_and_reopen_use_the_same_receipts() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido", None, None, None, None)
+            .expect("seed");
+        store
+            .patch_track(
+                "lido",
+                "s3",
+                None,
+                Some("open"),
+                Some("S3"),
+                Some(&["proved".into(), "merged".into()]),
+                None,
+            )
+            .expect("declare");
+        let first = store
+            .accept_track_criterion_evidence(
+                "lido",
+                "s3",
+                Some("proved"),
+                "operator",
+                "https://github.com/o/r/pull/1",
+                "abc123",
+                None,
+                "user:prod",
+            )
+            .expect("first criterion");
+        assert_eq!(first.track.claim, None, "one of two criteria");
+        let replay = store
+            .accept_track_criterion_evidence(
+                "lido",
+                "s3",
+                Some("proved"),
+                "operator",
+                "https://github.com/o/r/pull/1",
+                "abc123",
+                None,
+                "user:prod",
+            )
+            .expect("replay");
+        assert!(replay.replayed);
+        assert!(matches!(
+            store.accept_track_criterion_evidence("lido", "s3", None, "operator", "x", "abc123", None, "u"),
+            Err(AcceptError::Invalid(ref m)) if m.contains("criterion is required")
+        ));
+        assert!(matches!(
+            store.accept_track_criterion_evidence("lido", "s3", Some("merged"), "vibes", "x", "abc123", None, "u"),
+            Err(AcceptError::Invalid(ref m)) if m.contains("verifier_class")
+        ));
+        let second = store
+            .accept_track_criterion_evidence(
+                "lido",
+                "s3",
+                Some("merged"),
+                "review",
+                "https://github.com/o/r/pull/1#review",
+                "abc123",
+                None,
+                "user:prod",
+            )
+            .expect("second criterion");
+        assert_eq!(second.track.claim.as_deref(), Some("accept"));
+        assert_eq!(
+            second.track.governed_artifact_version.as_deref(),
+            Some("abc123")
+        );
+        assert!(store.track_contract_satisfied("lido", "s3").unwrap());
+        assert!(matches!(
+            store.accept_track_criterion_evidence("lido", "s3", Some("merged"), "review", "y", "def456", None, "u"),
+            Err(AcceptError::Invalid(ref m)) if m.contains("governed artifact")
+        ));
+        // Planning never reopens or revises a satisfied track.
+        store
+            .upsert_planned_tracks(
+                "lido",
+                &[PlannedTrack {
+                    track: "s3".into(),
+                    title: "S3 renamed".into(),
+                    desired_state: "x".into(),
+                    acceptance_criteria: vec!["something else".into()],
+                    depends_on: vec![],
+                    position: Some(4),
+                }],
+            )
+            .expect("plan");
+        let still = store.track("lido", "s3").unwrap().unwrap();
+        assert_eq!(still.claim.as_deref(), Some("accept"));
+        assert_eq!(still.title.as_deref(), Some("S3"));
+        assert_eq!(still.position, 4, "reordering is allowed");
+        assert!(matches!(
+            store.reopen_track("lido", "s3", "  ", None, "u"),
+            Err(AcceptError::Invalid(_))
+        ));
+        let reopened = store
+            .reopen_track("lido", "s3", "head moved", Some("def456"), "user:thomas")
+            .expect("reopen");
+        assert_eq!(reopened.claim, None);
+        assert_eq!(reopened.status.as_deref(), Some("open"));
+        assert_eq!(
+            reopened.governed_artifact_version.as_deref(),
+            Some("def456")
+        );
+        assert!(!store.track_contract_satisfied("lido", "s3").unwrap());
+        assert!(matches!(
+            store.reopen_track("lido", "s3", "again", None, "u"),
+            Err(AcceptError::Invalid(ref m)) if m.contains("not terminal")
+        ));
+        store
+            .set_track("lido", "s3", None, Some("cancelled"))
+            .expect("cancel");
+        let back = store
+            .reopen_track("lido", "s3", "needed after all", None, "u")
+            .expect("uncancel");
+        assert_eq!(back.lifecycle, "active");
+    }
+
+    #[test]
+    fn the_interim_evidence_schema_migrates_to_receipts_and_leases() {
+        let connection = Connection::open_in_memory().expect("conn");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("fk");
+        connection
+            .execute_batch(
+                "CREATE TABLE projects (slug TEXT PRIMARY KEY, title TEXT, objective TEXT, \
+                    status TEXT NOT NULL DEFAULT 'active', mode TEXT, wait_ticks INTEGER NOT NULL DEFAULT 0, \
+                    next_action TEXT, blocker TEXT, controller_cron_id TEXT, repository TEXT, \
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                 INSERT INTO projects (slug, created_at, updated_at) VALUES ('verity-lido', 'x', 'x');
+                 CREATE TABLE project_tracks (
+                    slug TEXT NOT NULL, track TEXT NOT NULL, desired_state TEXT, status TEXT,
+                    updated_at TEXT NOT NULL, title TEXT, acceptance_criteria TEXT, depends_on TEXT,
+                    lifecycle TEXT NOT NULL DEFAULT 'planned', revision INTEGER NOT NULL DEFAULT 1,
+                    position INTEGER NOT NULL DEFAULT 0, governed_artifact_version TEXT,
+                    accepted_at TEXT, reopened_at TEXT, reopen_reason TEXT, reopened_by TEXT,
+                    PRIMARY KEY (slug, track));
+                 INSERT INTO project_tracks (slug, track, desired_state, status, updated_at, title, lifecycle, revision, position, governed_artifact_version, accepted_at) VALUES
+                    ('verity-lido', 's0', 'removed', 'done', '2026-09-01T00:00:00Z', 'S0 P-DEREF-1 removal', 'satisfied', 1, 3, 'fb4021', '2026-09-01T01:00:00Z'),
+                    ('verity-lido', 'ux1', 'accepted', 'running', '2026-09-02T00:00:00Z', 'UX1', 'executing', 2, 1, NULL, NULL),
+                    ('verity-lido', 'ux2', NULL, 'open', '2026-09-02T00:00:00Z', 'UX2', 'planned', 1, 2, NULL, NULL),
+                    ('verity-lido', 'ghost', NULL, 'done', '2026-09-02T00:00:00Z', 'Ghost', 'satisfied', 1, 5, NULL, NULL),
+                    ('verity-lido', 'blk', NULL, 'blocked', '2026-09-02T00:00:00Z', 'Blocked', 'blocked', 1, 6, NULL, NULL),
+                    ('verity-lido', 'wave-1', NULL, 'cancelled', '2026-08-01T00:00:00Z', 'Wave 1', 'cancelled', 1, 0, NULL, NULL);
+                 CREATE TABLE project_track_evidence (
+                    evidence_id TEXT PRIMARY KEY NOT NULL, slug TEXT NOT NULL, track TEXT NOT NULL,
+                    track_revision INTEGER NOT NULL, criterion TEXT NOT NULL, verifier_class TEXT NOT NULL,
+                    evidence_ref TEXT NOT NULL, artifact_version TEXT, observed_at TEXT NOT NULL,
+                    accepted_at TEXT NOT NULL, accepted_by TEXT NOT NULL);
+                 INSERT INTO project_track_evidence VALUES
+                    ('e1', 'verity-lido', 's0', 1, '__track__', 'operator', 'https://github.com/o/r/pull/215', 'fb4021', '2026-09-01T00:30:00Z', '2026-09-01T01:00:00Z', 'user:prod');
+                 CREATE TABLE project_track_dispatches (
+                    idempotency_key TEXT PRIMARY KEY NOT NULL, slug TEXT NOT NULL, track TEXT NOT NULL,
+                    track_revision INTEGER NOT NULL, owner_lease_id TEXT NOT NULL, lease_expires_at TEXT NOT NULL,
+                    state TEXT NOT NULL, mission_id TEXT, receipt TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                 INSERT INTO project_track_dispatches VALUES
+                    ('verity-lido-ux1-v1', 'verity-lido', 'ux1', 2, 'l1', '2099-01-01T00:00:00Z', 'started', '914dcc48-4f27-4ac3-96a4-613544fbf8d7', NULL, 'x', 'x'),
+                    ('verity-lido-ux1-v0', 'verity-lido', 'ux1', 1, 'l0', '2099-01-01T00:00:00Z', 'superseded', '8fd9bffd-43e7-4894-b2a9-a7920ba42b1c', NULL, 'x', 'x');",
+            )
+            .expect("interim schema");
+        ProjectsStore::initialize(&connection).expect("migrate");
+        let store = ProjectsStore {
+            connection: Mutex::new(connection),
+        };
+        let tracks = store.tracks("verity-lido").expect("tracks");
+        let by = |key: &str| tracks.iter().find(|t| t.track == key).expect(key).clone();
+        assert_eq!(
+            tracks.iter().map(|t| t.track.as_str()).collect::<Vec<_>>(),
+            vec!["wave-1", "ux1", "ux2", "s0", "ghost", "blk"]
+        );
+        let s0 = by("s0");
+        assert_eq!(s0.claim.as_deref(), Some("accept"));
+        assert_eq!(s0.status.as_deref(), Some("satisfied"));
+        assert_eq!(s0.governed_artifact_version.as_deref(), Some("fb4021"));
+        assert_eq!(s0.accepted_at.as_deref(), Some("2026-09-01T00:30:00Z"));
+        assert_eq!(by("ghost").claim.as_deref(), Some("legacy_import"));
+        assert_eq!(by("ghost").status.as_deref(), Some("done"));
+        assert_eq!(by("ux1").lifecycle, "active");
+        assert_eq!(by("ux1").revision, 2, "interim revision carried");
+        assert_eq!(by("blk").status.as_deref(), Some("blocked"));
+        assert_eq!(by("wave-1").lifecycle, "cancelled");
+        let leases = store.live_leases(Some("verity-lido")).expect("leases");
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].attempt_id, "914dcc48-4f27-4ac3-96a4-613544fbf8d7");
+        assert_eq!(leases[0].track, "ux1");
+        assert_eq!(leases[0].mode, "writer");
+        assert!(store
+            .lease_by_key("lease:dispatch:verity-lido-ux1-v1")
+            .unwrap()
+            .is_some());
+        let reconcile = store
+            .latest_unacked_reconcile("verity-lido")
+            .unwrap()
+            .expect("reconcile receipt");
+        let ops: Vec<&str> = reconcile.payload["corrections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["op"].as_str())
+            .collect();
+        assert!(ops.contains(&"interim_evidence_imported"));
+        assert!(ops.contains(&"legacy_done_to_claim_only"));
     }
 
     fn lease(slug: &str, track: &str, attempt: &str, mode: &str, key: &str) -> LeaseRequest {

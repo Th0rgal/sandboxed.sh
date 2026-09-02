@@ -189,6 +189,16 @@ and any live surface read *this*, not a parsed trailer. Once per tick:
   rejected (`400 track_required`) once `SANDBOXED_TRACK_REQUIRED` is on.
   `link_mission_to_project(mission_id, slug, track)` moves a mission and its
   lease onto another item.
+- Per-criterion acceptance is the same receipt store under the older shape:
+  `accept_project_track_evidence(slug, track, criterion?, verifier_class,
+  evidence_ref, artifact_version)` records one criterion at a time and the
+  track reads satisfied once every current criterion has standing evidence
+  at one governed artifact version. `reopen_project_track(slug, track, reason)`
+  invalidates every standing claim with an audited reason (a cancelled track
+  returns to active). Planning (`plan_project_tasks`) never reopens or
+  revises a satisfied track; it may only reorder it. `get_project_tasks`
+  still lists live undeclared work as `unplanned_attempts` and honesty gaps as
+  `inconsistencies` (claims without current evidence, leftover proposals).
 - At your first tick (or after the prompt changed), read `get_project_grant(slug)` — the
   merge authority, budget, and any PAUSED live there and outrank the prompt.
 - Each tick, `set_project_track` for every **current** open in-scope item (and
