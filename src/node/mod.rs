@@ -6,6 +6,7 @@
 pub mod job_store;
 pub mod lean;
 pub mod runner;
+pub mod slot;
 
 pub use job_store::{JobRecord, JobState, JobStore};
 pub use lean::{cached_toolchains, lean_runtime_ready, spawn_cache_gc};

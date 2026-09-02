@@ -11,6 +11,26 @@
 # (injected by the backend when the workspace has spark_offload enabled).
 set -u
 
+# Fleet path (plan step 8): the DGX Spark is the `dgx-spark` runner node, so a
+# lake/lean build goes through remote-lean-build like any other node — durable
+# job, content identity, receipts, one live job per identity. Only the legacy
+# offload (rsync + arbiter /build) remains below, for non-lake commands, until
+# /api/spark/offload is retired.
+case "$(basename "${1:-}")" in
+  lake|lean)
+    if [ -n "${REMOTE_BUILD_URL:-}" ] && [ -n "${REMOTE_BUILD_TOKEN:-}" ] && \
+       [ -n "${REMOTE_BUILD_MISSION_ID:-}" ] && command -v remote-lean-build >/dev/null 2>&1; then
+      echo "spark-build: dispatching to fleet node dgx-spark via remote-lean-build" >&2
+      REMOTE_BUILD_NODE_ID="${SPARK_BUILD_NODE_ID:-dgx-spark}" remote-lean-build "$@"
+      rc=$?
+      # remote-lean-build: 75 = fleet unavailable → keep this script's 91 contract.
+      [ "$rc" -eq 75 ] && exit 91
+      [ "$rc" -eq 90 ] && rc=1
+      exit "$rc"
+    fi
+    ;;
+esac
+
 if [ -z "${SPARK_OFFLOAD_URL:-}" ] || [ -z "${SPARK_OFFLOAD_TOKEN:-}" ] || \
    [ -z "${SPARK_OFFLOAD_MISSION_ID:-}" ] || [ -z "${SPARK_WORKSPACE_HOST_DIR:-}" ] || \
    [ -z "${SPARK_WORKSPACE_GUEST_DIR:-}" ]; then
