@@ -76,6 +76,9 @@ pub struct JobRunner {
     cancels: Mutex<HashMap<Uuid, CancellationToken>>,
     queued: AtomicU32,
     active: AtomicU32,
+    /// External slot provider (`SANDBOXED_NODE_SLOT_PROVIDER`); `None` means
+    /// the node admits on its own.
+    slot_provider: Option<Arc<super::slot::SlotProvider>>,
 }
 
 impl JobRunner {
@@ -122,6 +125,13 @@ impl JobRunner {
             cancels: Mutex::new(HashMap::new()),
             queued: AtomicU32::new(0),
             active: AtomicU32::new(0),
+            slot_provider: match super::slot::SlotProvider::from_env() {
+                Ok(provider) => provider.map(Arc::new),
+                Err(error) => {
+                    tracing::error!(%error, "slot provider misconfigured; node admits on its own");
+                    None
+                }
+            },
         });
         let dispatcher = Arc::clone(&runner);
         tokio::spawn(async move {
@@ -305,6 +315,12 @@ impl JobRunner {
         token: &CancellationToken,
     ) -> anyhow::Result<(JobState, Option<i32>, Option<String>, Option<String>)> {
         let log_path = self.log_path(job.id);
+        // Ask the external slot provider (the Spark arbiter) to make room
+        // before anything runs; the lease releases the slot when we return.
+        let _slot = match &self.slot_provider {
+            Some(provider) => Some(provider.acquire(job.id, token).await?),
+            None => None,
+        };
         match &job.payload {
             JobPayload::RawCommand {
                 command,
