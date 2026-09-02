@@ -42,7 +42,24 @@ from pathlib import Path
 BACKEND_CONFIG = os.environ.get(
     "SANDBOXED_BACKEND_CONFIG", "/root/.sandboxed-sh/backend_config.json"
 )
-ENV_FILE = os.environ.get("SANDBOXED_ENV_FILE", "/etc/open_agent/open_agent.env")
+HOST_ENV_CANDIDATES = (
+    "/etc/sandboxed-sh/sandboxed-sh-prod.env",
+    "/etc/sandboxed_sh/sandboxed_sh.env",
+    "/etc/open_agent/open_agent.env",
+)
+
+
+def resolve_host_env() -> str:
+    override = os.environ.get("SANDBOXED_ENV_FILE")
+    if override:
+        return override
+    for path in HOST_ENV_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+    return HOST_ENV_CANDIDATES[-1]
+
+
+ENV_FILE = resolve_host_env()
 STATE_FILE = Path(
     os.environ.get("CHATGPT_POOL_HEALTH_STATE", "/var/lib/sandboxed-sh/chatgpt-pool-health.json")
 )
@@ -65,7 +82,8 @@ DOM_PROBE = """() => {
   return {
     login_visible: texts.some((t) => /^(log in|se connecter|sign up|s'inscrire)$/i.test(t)),
     authed_nav: texts.includes('Library') || texts.includes('Scheduled'),
-    account_picker: /choose an account to continue|welcome back/i.test(body),
+    account_picker: /choose an account to continue|welcome back|log in to another account/i.test(body)
+      || texts.some((t) => /log in to another account/i.test(t)),
     challenge: /verify you are human|verifying\\.\\.\\.|just a moment/i.test(body)
       || /just a moment|verifying/i.test(title)
       || !!document.querySelector('iframe[src*="challenges.cloudflare.com"]'),
@@ -134,6 +152,10 @@ def slot_in_use(profile_dir: str) -> bool:
 
 def probe(profile_dir: str, proxy: str, settle_ms: int) -> str:
     from playwright.sync_api import sync_playwright
+    try:
+        from chatgpt_ui_relogin import direct_chromium_command, reserve_loopback_port
+    except ImportError:
+        from scripts.chatgpt_ui_relogin import direct_chromium_command, reserve_loopback_port
 
     src = Path(profile_dir)
     dst = SCRATCH / src.name
@@ -148,14 +170,28 @@ def probe(profile_dir: str, proxy: str, settle_ms: int) -> str:
 
     try:
         with sync_playwright() as pw:
-            context = pw.chromium.launch_persistent_context(
-                user_data_dir=str(dst),
-                headless=False,
-                viewport={"width": 1440, "height": 1000},
-                args=["--disable-background-networking"],
-                proxy={"server": proxy},
+            port = reserve_loopback_port()
+            process = subprocess.Popen(
+                direct_chromium_command(
+                    pw.chromium.executable_path, dst, proxy, port
+                ),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
+            browser = None
             try:
+                endpoint = f"http://127.0.0.1:{port}"
+                for _ in range(120):
+                    if process.poll() is not None:
+                        raise RuntimeError("Chromium exited before CDP was ready")
+                    try:
+                        browser = pw.chromium.connect_over_cdp(endpoint, timeout=1_000)
+                        break
+                    except Exception:
+                        time.sleep(0.25)
+                if browser is None or not browser.contexts:
+                    raise RuntimeError("Chromium CDP endpoint was not ready")
+                context = browser.contexts[0]
                 page = context.pages[0] if context.pages else context.new_page()
                 page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=90_000)
                 # The welcome-back picker is often 15–20s after domcontentloaded.
@@ -172,7 +208,18 @@ def probe(profile_dir: str, proxy: str, settle_ms: int) -> str:
                         break
                     page.wait_for_timeout(500)
             finally:
-                context.close()
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=10)
     except Exception as exc:  # noqa: BLE001 - a probe failure is never fatal
         log(f"{src.name}: probe error: {type(exc).__name__}: {exc}")
         return "unknown"
@@ -216,6 +263,20 @@ def deliver_webhook(payload: dict) -> None:
         time.sleep(0.25 * attempt)
 
 
+def request_relogin() -> None:
+    """Start the oneshot repair unit without waiting out the login."""
+    try:
+        from chatgpt_ui_relogin import start_relogin
+    except ImportError:
+        try:
+            from scripts.chatgpt_ui_relogin import start_relogin
+        except ImportError:
+            log("auto-relogin helper not installed")
+            return
+    result = start_relogin()
+    log(f"auto-relogin {result}")
+
+
 def alert(slot: str, state: str, healthy: int, total: int, recovered: bool) -> None:
     if recovered:
         message = (
@@ -226,7 +287,8 @@ def alert(slot: str, state: str, healthy: int, total: int, recovered: bool) -> N
         message = (
             f"ChatGPT UI pool slot {slot} is signed OUT — missions routed to it will "
             f"fail in seconds ({healthy}/{total} slots known healthy). "
-            f"Re-login one profile and clone it over the dead ones."
+            f"Automatic relogin will try to repair idle dead slots from Bitwarden; "
+            f"VNC on :93 only if that unit fails."
         )
     deliver_webhook(
         {
@@ -301,8 +363,17 @@ def main() -> int:
         # Cloudflare challenge would silently "clear" a dead slot.
         if observed in {"challenge", "unknown"}:
             entry["last_inconclusive_at"] = now
+            entry["consecutive_inconclusive"] = int(
+                entry.get("consecutive_inconclusive", 0)
+            ) + 1
+            if entry["consecutive_inconclusive"] >= 3:
+                entry["state"] = observed
+                entry["checked_at"] = now
+                if previous != observed:
+                    entry["since"] = now
             continue
 
+        entry.pop("consecutive_inconclusive", None)
         entry["state"] = observed
         entry["checked_at"] = now
         if previous != observed:
@@ -323,6 +394,8 @@ def main() -> int:
     healthy = [n for n, s in state.get("slots", {}).items() if s.get("state") == "logged_in"]
     dead = [n for n, s in state.get("slots", {}).items() if s.get("state") == "logged_out"]
     log(f"known healthy={len(healthy)} dead={len(dead)}{' ' + ','.join(dead) if dead else ''}")
+    if dead:
+        request_relogin()
     return 0
 
 

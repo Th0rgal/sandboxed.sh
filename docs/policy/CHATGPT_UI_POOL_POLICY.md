@@ -1,6 +1,6 @@
 # ChatGPT UI pool operational policy
 
-Version: 1.3.0
+Version: 1.4.0
 
 This document is the human-readable form of the versioned operational policy
 for the `chatgpt_ui` backend pool. The machine-readable form lives beside it in
@@ -95,6 +95,12 @@ anti-automation controls. The affected profile is quarantined for 1800 seconds
 requested mission so an operator-reprovisioned login can recover; cooldown
 expiry alone is not proof that authentication was repaired. A slot whose last
 failure is auth must not be selected for a compatibility retry.
+
+Session repair is a separate host path, not a mission retry. Pool health
+starts `chatgpt-ui-relogin.service`, which logs in one idle profile from
+Bitwarden `CHATGPT_USERNAME` / `CHATGPT_PASSWORD` / `CHATGPT_OTP` and clones
+that profile over other idle dead slots. Cloudflare, CAPTCHA, and emailed
+MFA still fail closed and need the operator.
 
 ## 5. Rate limits: wait, do not churn
 

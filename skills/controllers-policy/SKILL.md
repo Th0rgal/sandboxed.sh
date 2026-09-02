@@ -155,18 +155,26 @@ and any live surface read *this*, not a parsed trailer. Once per tick:
   `coldcard-rng-cracker`). Nicknames (`verity`, `lido`, `lido-audit`) resolve, but
   do not invent a new slug. Same mode vocabulary as the trailer; the store counts
   your consecutive-tick `wait`.
-- The project's **items are the only roadmap**. `get_project` / `get_project_tasks`
-  return the same list (tracks + live attempts). `plan_project_tasks` upserts an
-  item (`project_tracks`). Do not create a second plan (no extra cron "roadmap
-  watcher", no `/goal` as the program, no new `project=` for a workstream — that
-  is a `track`).
+- The project's **items are the only roadmap** — the right-rail checklist is
+  `project_tracks` (+ live attempts). `get_project` / `get_project_tasks` return
+  that list. `plan_project_tasks` upserts a key; `set_project_track(..., status=cancelled)`
+  retires a key. Editing `projects/active/<slug>.md` does **not** change the
+  board. That file is narrative (IDs, heads, GRANT). If the owner says "clean
+  the roadmap", mutate `project_tracks` in the same turn: cancel every obsolete
+  open key, then `plan_project_tasks` the new keys. `plan_project_tasks` does
+  not replace the list — leftover `wave-*` / `pr-*` keys stay visible until
+  cancelled. Do not create a second plan (no extra cron "roadmap watcher", no
+  `/goal` as the program, no new `project=` for a workstream — that is a
+  `track`).
 - For every mission you dispatch this tick, `link_mission_to_project(mission_id, slug,
   track)` so it appears on that item. An unlinked worker is invisible.
 - At your first tick (or after the prompt changed), read `get_project_grant(slug)` — the
   merge authority, budget, and any PAUSED live there and outrank the prompt.
-- Each tick, `set_project_track` for every open in-scope PR and issue so the roadmap
-  stays populated even when no mission is live. Open tracks must not be dropped just
-  because the writer finished.
+- Each tick, `set_project_track` for every **current** open in-scope item (and
+  cancel tracks that are no longer the campaign). Open tracks must not be
+  dropped just because the writer finished — but a retired campaign (old
+  Wave 1–10 after a DAG rewrite) must be cancelled, or the rail keeps showing
+  it.
 
 Keep emitting the two text trailers below during this transition (dual-write); the
 structured call is authoritative, the trailers are the compatibility path.
@@ -209,7 +217,8 @@ any prompt rewrite — see `references/controller-setup-questions.md`.
 
 ## Controller tick
 
-1. Read this policy, then the project tracker by section (never in full).
+1. Read this policy, then `get_project_tasks` (the checklist) plus the
+   tracker markdown by section for IDs/heads (never the markdown in full).
 2. Load only the references the router matches — at most four per tick.
 3. Check hard gates, ownership (one semantic owner per PR: do not fill an apparent gap
    another controller may own; inventories lag), and compute placement.
@@ -219,8 +228,11 @@ any prompt rewrite — see `references/controller-setup-questions.md`.
    Lean builds. A `terminal_reason` without `terminal_evidence` is missing data: report
    "no evidence recorded", never a guessed cause. A launch response or a mission's own
    self-report is not artifact evidence.
-6. Patch paired trackers from the final snapshot. Deliver only verified IDs, immutable
-   heads, receipts, or owner decisions; otherwise `[SILENT]`. Always append the trailer.
+6. Patch paired **narrative** trackers (markdown IDs/heads) from the final
+   snapshot. If the plan itself changed, write `project_tracks` in the same
+   turn — markdown-only is not a roadmap update. Deliver only verified IDs,
+   immutable heads, receipts, or owner decisions; otherwise `[SILENT]`. Always
+   append the trailer.
 
 Context budget: bounded reads only — `get_project` is already a capped snapshot
 (`items_omitted` / `item_counts`); do not follow it with an unfiltered `list_missions`.
@@ -273,7 +285,7 @@ repeated failure `repeat-loop-guard` · tool-call limits `context-budget`.
 - **Never cancel operator-relaunched missions without explicit confirmation.** If a mission you previously owned was relaunched or resumed by the operator, it is no longer yours to reap: do not cancel, pause, or supersede it unless the operator explicitly confirms. When in doubt, ask and keep your own work in a separate mission.
 - **Campaigns are one host-workspace mission with `track=campaign` — never hand-written systemd units.** Long-running or recurring campaign work runs as a single mission on a host workspace tagged `track=campaign`; do not create ad-hoc systemd services/timers for it. The API enforces campaign uniqueness and returns **409 Conflict** on a duplicate — treat a 409 as "the campaign already exists", not an error to retry around.
 - **STATE_SIGNATURE key = your project canonical roster slug, always.** Use exactly the slug of the project you drive (e.g. `verity-core`, `verity-lido`, `lean-silicon`, `verity-benchmark`, `coldcard-rng-cracker`). Never invent new keys (no camelCase names, phase names, or sub-tracks as keys — use the `track` field for that); a novel key creates a duplicate project on every surface. Nicknames (`coldcard`, `ec-defensive-research`) are aliases — they must resolve to the roster slug, never replace it.
-- **One list, one controller.** Do not add a second cron that "watches the roadmap". The bound conversation already is the project. A `/goal` is not a second roadmap.
+- **One list, one controller.** The right-rail roadmap is `project_tracks`. Do not add a second cron that "watches the roadmap". Do not treat the markdown tracker as that list. The bound conversation already is the project. A `/goal` is not a second roadmap.
 - **Deliver into the project session, never `origin` without an origin.** Cron jobs for a project use `deliver: project:<slug>`. `deliver: origin` with `origin: None` is a silent drop (Coldcard skip-scan watch, 2026-08-13). If you cannot capture origin, you must name the project.
 - **Do not delete the project's controller because it is noisy.** A repeating `blocked` trailer is a stall to escalate, not spam to silence. Removing the cron removes the only path that can write into the dedicated session.
 - **Acknowledge what you have absorbed.** When a failed/interrupted mission has been superseded (retry dispatched, work re-planned, or intentionally dropped), immediately mark it `acknowledged` — an unacknowledged terminal mission is an open operator alert. The attention surface only counts UNacknowledged failures; leaving absorbed failures unacknowledged cries wolf on every board.

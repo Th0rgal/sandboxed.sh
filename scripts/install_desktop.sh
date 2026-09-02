@@ -189,13 +189,27 @@ echo "i3 configuration written to:"
 echo "  - /root/.config/i3/config"
 echo "  - /var/lib/opencode/.config/i3/config"
 
-# Add DESKTOP_ENABLED to environment file
+# Add DESKTOP_ENABLED to the live environment file. Production still uses the
+# legacy /etc/open_agent filename; newer installs may use /etc/sandboxed-sh.
 echo "Enabling desktop in environment..."
-if ! grep -q "DESKTOP_ENABLED" /etc/open_agent/open_agent.env 2>/dev/null; then
-    echo "" >> /etc/open_agent/open_agent.env
-    echo "# Desktop automation" >> /etc/open_agent/open_agent.env
-    echo "DESKTOP_ENABLED=true" >> /etc/open_agent/open_agent.env
-    echo "DESKTOP_RESOLUTION=1920x1080" >> /etc/open_agent/open_agent.env
+ENV_FILE=""
+for candidate in \
+    "${SANDBOXED_ENV_FILE:-}" \
+    /etc/sandboxed-sh/sandboxed-sh-prod.env \
+    /etc/sandboxed_sh/sandboxed_sh.env \
+    /etc/open_agent/open_agent.env
+do
+    [ -n "$candidate" ] || continue
+    if [ -f "$candidate" ]; then
+        ENV_FILE="$candidate"
+        break
+    fi
+done
+if [ -n "$ENV_FILE" ] && ! grep -q "DESKTOP_ENABLED" "$ENV_FILE" 2>/dev/null; then
+    echo "" >> "$ENV_FILE"
+    echo "# Desktop automation" >> "$ENV_FILE"
+    echo "DESKTOP_ENABLED=true" >> "$ENV_FILE"
+    echo "DESKTOP_RESOLUTION=1920x1080" >> "$ENV_FILE"
 fi
 
 # Create work and screenshots directories
@@ -230,7 +244,7 @@ python3 -c "import gi; print('OK')" 2>/dev/null || echo "MISSING"
 
 echo ""
 echo "=== Installation complete ==="
-echo "Run: systemctl restart open_agent"
+echo "Run: systemctl restart sandboxed-sh-prod   # or sandboxed-sh-dev / sandboxed-sh"
 echo "To test manually:"
 echo "  Xvfb :99 -screen 0 1920x1080x24 &"
 echo "  DISPLAY=:99 i3 &"

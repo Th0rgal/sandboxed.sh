@@ -21,6 +21,30 @@ export const FINISHED_STATUSES: MissionStatus[] = [
   'not_feasible',
 ];
 
+/** Statuses where a goal-loop automation may still legitimately fire. */
+export const LIVE_AUTOMATION_STATUSES: MissionStatus[] = [
+  'pending',
+  'active',
+  'awaiting_user',
+  'blocked',
+  'waiting_background',
+];
+
+/**
+ * An automation should not promote its host into Running / Active unless
+ * the harness is alive or the stored status is still in the live set.
+ * Stale `agent_finished` rows on acknowledged missions used to inflate
+ * Overview "Active" to 100+.
+ */
+export function isLiveAutomationHost(
+  status: MissionStatus | undefined,
+  isActuallyRunning: boolean,
+): boolean {
+  if (isActuallyRunning) return true;
+  if (!status) return false;
+  return LIVE_AUTOMATION_STATUSES.includes(status);
+}
+
 const FINISHED_GREEN_STATUSES: MissionStatus[] = ['completed', 'acknowledged'];
 
 /**

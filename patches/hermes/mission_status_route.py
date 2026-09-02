@@ -8,10 +8,16 @@ None so the webhook adapter can keep its isolated-session behaviour.
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any, Optional
+import re
+from pathlib import Path
+from typing import Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+_PENDING_DIRNAME = "pending_mission_callbacks"
+_SAFE_MISSION_RE = re.compile(r"[^A-Za-z0-9._:-]+")
 
 _TERMINAL = {
     "completed",
@@ -23,6 +29,19 @@ _TERMINAL = {
     "awaiting_user",
     "awaitinguser",
 }
+
+# Legacy cap kept for tests/import compatibility. The wake prompt is now a
+# one-or-two-sentence notice that forbids tools, so a large operator session
+# must still be woken — otherwise callbacks append silently and the chat
+# looks dead (Lido/EIP-8282, 2026-08-24). Only a compression lock skips.
+PROJECT_OPERATOR_WAKE_MESSAGE_CAP = 80
+
+MISSION_CALLBACK_WAKE_PROMPT = (
+    "A routed mission-complete callback was just appended to this conversation. "
+    "In one or two sentences, tell the operator what finished and whether they "
+    "need to act. Do not inspect the mission, do not run tools, and do not "
+    "continue the work in this chat — the project controller owns follow-up."
+)
 
 
 def extract_origin_session(payload: dict) -> str:
@@ -48,6 +67,19 @@ def is_routable_mission_status(payload: dict) -> bool:
     if not str(payload.get("mission_id") or "").strip():
         return False
     return extract_status(payload) in _TERMINAL
+
+
+def sync_session_db(session_db: Any) -> Any:
+    """Prefer the underlying sync SessionDB.
+
+    The gateway runner exposes ``AsyncSessionDB``, whose ``__getattr__``
+    wraps every method in ``asyncio.to_thread``. Calling those from this
+    sync router yields a coroutine (truthy!) instead of a session row —
+    that is how origin-route crashed in production (TAP smoke, 2026-08-15)
+    and fell through to a throwaway webhook session.
+    """
+    inner = getattr(session_db, "_db", None)
+    return inner if inner is not None else session_db
 
 
 def resolve_live_session_id(session_id: str, session_db: Any) -> Optional[str]:
@@ -92,6 +124,24 @@ def _recent_message_texts(session_db: Any, session_id: str, limit: int = 400):
     return texts
 
 
+def _parent_session_id(session_db: Any, session_id: str) -> str:
+    getter = getattr(session_db, "get_session", None)
+    if not callable(getter):
+        return ""
+    try:
+        row = getter(session_id)
+    except Exception:
+        return ""
+    if not row:
+        return ""
+    parent = (
+        row.get("parent_session_id")
+        if isinstance(row, dict)
+        else getattr(row, "parent_session_id", None)
+    )
+    return str(parent or "").strip()
+
+
 def session_references_mission(session_db: Any, session_id: str, mission_id: str) -> bool:
     """Ownership proof for origin routing: the session must already mention
     the mission (the dispatch tool result and prior callbacks embed its id).
@@ -99,14 +149,28 @@ def session_references_mission(session_db: Any, session_id: str, mission_id: str
     HMAC authenticates the *payload*, not the origin hint inside it — any
     mission creator could name an unrelated conversation. Fail-open only when
     the store exposes no message reader (legacy DBs), fail-closed otherwise.
+
+    Walks ``parent_session_id`` so a compression continuation still owns a
+    mission started in the pre-compression parent.
     """
     mission = (mission_id or "").strip()
     if not mission:
         return False
-    texts = _recent_message_texts(session_db, session_id)
-    if texts is None:
-        return True  # cannot inspect — legacy store, keep prior behaviour
-    return any(mission in text for text in texts)
+    current = (session_id or "").strip()
+    seen: set[str] = set()
+    inspected = False
+    while current and current not in seen:
+        seen.add(current)
+        texts = _recent_message_texts(session_db, current)
+        if texts is None:
+            if not inspected:
+                return True  # cannot inspect — legacy store, keep prior behaviour
+            break
+        inspected = True
+        if any(mission in text for text in texts):
+            return True
+        current = _parent_session_id(session_db, current)
+    return False
 
 
 def extract_event_id(payload: dict) -> str:
@@ -140,6 +204,7 @@ def extract_wake_session(payload: dict) -> str:
 
 def resolve_mission_delivery_session(payload: dict, session_db: Any) -> Optional[str]:
     """Pick the dedicated conversation for this mission-status event."""
+    session_db = sync_session_db(session_db)
     if not is_routable_mission_status(payload):
         return None
     # Producer-resolved tip (project binding, else origin). Use the id as-is
@@ -185,6 +250,7 @@ def format_mission_callback(payload: dict) -> str:
         payload.get("terminal_evidence") if status != "completed" else None,
     ]
     body = "\n".join(str(b).strip() for b in bits if b and str(b).strip())
+    mode = "active" if status == "completed" else "blocked"
     event_id = extract_event_id(payload)
     lines = [
         f"[Mission callback: {title}]",
@@ -194,37 +260,80 @@ def format_mission_callback(payload: dict) -> str:
     ]
     if body:
         lines.append(body)
-    # No [CTRL:] — ingest would project mode=blocked from a parked turn.
-    emit_ctrl = status not in {
-        "awaiting_user",
-        "awaitinguser",
-        "acknowledged",
-        "interrupted",
-    }
     if status != "completed":
         lines.append(
             "If this is infra (missing CLI, auth, workspace), fix or "
             "[DECISION:] — do not stay silent in another session."
         )
-    if emit_ctrl:
-        mode = "active" if status == "completed" else "blocked"
-        lines.append(
-            f"[CTRL: {project} | mode={mode} | wait=0 | next=inspect {mission_id}]"
-        )
+    lines.append(
+        f"[CTRL: {project} | mode={mode} | wait=0 | next=inspect {mission_id}]"
+    )
     lines.append(
         f"[STATE_SIGNATURE: {project}|mission-callback|{mission_id}|{status}|inspect]"
     )
     return "\n".join(lines)
 
 
-def append_mission_callback(session_id: str, payload: dict, session_db: Any) -> str:
-    """Persist the callback on the live session. Returns the live id.
+def _last_message_role(session_db: Any, session_id: str) -> Optional[str]:
+    reader = getattr(session_db, "get_messages", None) or getattr(
+        session_db, "list_messages", None
+    )
+    if not callable(reader):
+        return None
+    try:
+        rows = reader(session_id) or []
+    except Exception:
+        return None
+    if not rows:
+        return None
+    last = rows[-1]
+    role = last.get("role") if isinstance(last, dict) else getattr(last, "role", None)
+    return str(role).strip().lower() if role else None
+
+
+def should_wake_mission_callback(session_db: Any, live_id: str) -> bool:
+    """Whether to start an agent turn after appending a mission callback.
+
+    Append always happens. The wake prompt is a one-or-two-sentence notice
+    that forbids tools. Skip only while another writer holds the compression
+    lock — a large operator session must still be told that a mission finished.
+    """
+    sid = (live_id or "").strip()
+    if not sid:
+        return False
+    db = sync_session_db(session_db)
+    holder_fn = getattr(db, "get_compression_lock_holder", None)
+    if callable(holder_fn):
+        try:
+            if holder_fn(sid):
+                logger.info(
+                    "skip mission wake for %s: compression lock held", sid
+                )
+                return False
+        except Exception:
+            logger.debug("compression-lock check failed for %s", sid, exc_info=True)
+    return True
+
+
+def append_mission_callback(
+    session_id: str, payload: dict, session_db: Any
+) -> Tuple[str, bool]:
+    """Persist the callback on the live session.
+
+    Returns ``(live_id, appended)``. ``appended`` is False when this exact
+    delivery is already in the transcript — callers must not schedule a
+    second wake.
 
     Idempotent per delivery: the producer retries at-least-once on a lost
     HTTP response, so an ``event=<id>`` already present in the transcript
-    means this exact delivery landed — appending again would double the
-    callback and schedule a second autonomous wake.
+    means this exact delivery landed.
+
+    Role-safe: never writes assistant→assistant. If the tip is already an
+    assistant turn, a user separator is inserted first so
+    ``repair_message_sequence`` cannot merge the callback into the previous
+    model answer.
     """
+    session_db = sync_session_db(session_db)
     live = resolve_live_session_id(session_id, session_db) or session_id
     event_id = extract_event_id(payload)
     if event_id:
@@ -237,7 +346,54 @@ def append_mission_callback(session_id: str, payload: dict, session_db: Any) -> 
                     event_id,
                     live,
                 )
-                return live
+                return live, False
     content = format_mission_callback(payload)
+    if _last_message_role(session_db, live) == "assistant":
+        session_db.append_message(
+            session_id=live,
+            role="user",
+            content="A mission you started has finished. The result follows.",
+        )
     session_db.append_message(session_id=live, role="assistant", content=content)
-    return live
+    return live, True
+
+
+def _pending_callback_path(mission_id: str) -> Path:
+    from hermes_constants import get_hermes_home
+
+    safe = _SAFE_MISSION_RE.sub("_", (mission_id or "").strip())[:128] or "unknown"
+    return get_hermes_home() / _PENDING_DIRNAME / f"{safe}.json"
+
+
+def stash_unroutable_callback(mission_id: str, payload: dict) -> None:
+    """Keep a terminal webhook that arrived before enroll/ownership proof."""
+    mid = (mission_id or "").strip()
+    if not mid or not isinstance(payload, dict):
+        return
+    path = _pending_callback_path(mid)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        logger.debug("failed to stash pending mission callback %s", mid, exc_info=True)
+
+
+def take_stashed_callback(mission_id: str) -> Optional[dict]:
+    """Pop a previously stashed terminal callback, or None."""
+    mid = (mission_id or "").strip()
+    if not mid:
+        return None
+    path = _pending_callback_path(mid)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        data = None
+    try:
+        path.unlink()
+    except Exception:
+        pass
+    return data if isinstance(data, dict) else None

@@ -1,0 +1,139 @@
+diff --git a/hermes_state.py b/hermes_state.py
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -9115,6 +9115,78 @@
+             ).fetchone()
+         return int(row[0] if row else 0)
+ 
++    def compact_lineage_for_resume(
++        self,
++        session_id: str,
++        keep: Optional[int] = None,
++    ) -> int:
++        """Archive the oldest active lineage rows so resume stays under budget.
++
++        Legacy compression forked a child and left every ancestor ``active=1``.
++        Resume then counted the whole chain and hit ``sessions.max_resume_messages``
++        (default 20000) even when the live tip was a few hundred rows. In-place
++        compression is the long-term path; this is the mechanical compact that
++        unblocks resume: ``active=0``, ``compacted=1`` on the dropped tail.
++        Search still finds those rows.
++
++        *keep* defaults to ``compression.hygiene_hard_message_limit`` (400).
++        Returns the remaining active lineage count.
++        """
++        if not session_id:
++            return 0
++        if keep is None:
++            try:
++                from hermes_cli.config import load_config_readonly
++
++                compression = load_config_readonly().get("compression") or {}
++                raw = compression.get("hygiene_hard_message_limit", 400)
++                keep = int(raw)
++            except Exception:
++                keep = 400
++        if keep < 20:
++            keep = 400
++
++        session_ids = self._session_lineage_root_to_tip(session_id)
++        placeholders = ",".join("?" for _ in session_ids)
++
++        def _do(conn):
++            rows = conn.execute(
++                f"SELECT id FROM messages WHERE session_id IN ({placeholders}) "
++                "AND active = 1 ORDER BY id",
++                tuple(session_ids),
++            ).fetchall()
++            msg_ids = [
++                row["id"] if hasattr(row, "keys") else row[0] for row in rows
++            ]
++            if len(msg_ids) <= keep:
++                return len(msg_ids)
++            drop = msg_ids[:-keep]
++            for offset in range(0, len(drop), 500):
++                chunk = drop[offset : offset + 500]
++                conn.execute(
++                    "UPDATE messages SET active = 0, compacted = 1 "
++                    f"WHERE id IN ({','.join('?' for _ in chunk)}) AND active = 1",
++                    chunk,
++                )
++            conn.execute(
++                "UPDATE sessions SET message_count = ("
++                "SELECT COUNT(*) FROM messages "
++                "WHERE messages.session_id = sessions.id AND active = 1"
++                f") WHERE id IN ({placeholders})",
++                tuple(session_ids),
++            )
++            logger.warning(
++                "Auto-compacted resume lineage %s: archived %d of %d active "
++                "messages (kept %d)",
++                session_id,
++                len(drop),
++                len(msg_ids),
++                keep,
++            )
++            return keep
++
++        return int(self._execute_write(_do))
++
+     def assert_resume_safe(
+         self,
+         session_id: str,
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -399,7 +399,25 @@
+                 if resume_limit and stored_message_count > resume_limit:
+                     raise SessionResumeTooLargeError(stored_message_count, resume_limit)
+         except SessionResumeTooLargeError as exc:
+-            return _err(rid, 4130, str(exc))
++            compact = getattr(db, "compact_lineage_for_resume", None)
++            if callable(compact):
++                try:
++                    compact(target)
++                    if callable(safety_check):
++                        safety_check(target)
++                    else:
++                        raise exc
++                except SessionResumeTooLargeError as exc2:
++                    return _err(rid, 4130, str(exc2))
++                except Exception as compact_exc:
++                    logger.warning(
++                        "auto-compact failed for %s; keeping resume guard: %s",
++                        target,
++                        compact_exc,
++                    )
++                    return _err(rid, 4130, str(exc))
++            else:
++                return _err(rid, 4130, str(exc))
+         except Exception as exc:
+             # Fail OPEN: a transient guard failure (locked DB, schema skew on
+             # an adaptor store) must not turn the safety check into a new way
+diff --git a/hermes_cli/cli_agent_setup_mixin.py b/hermes_cli/cli_agent_setup_mixin.py
+--- a/hermes_cli/cli_agent_setup_mixin.py
++++ b/hermes_cli/cli_agent_setup_mixin.py
+@@ -631,6 +631,23 @@
+                     return None
+                 safety_check(self.session_id)
+         except SessionResumeTooLargeError as exc:
++            compact = getattr(self._session_db, "compact_lineage_for_resume", None)
++            if callable(compact):
++                try:
++                    compact(self.session_id)
++                    if tip_only:
++                        tip_check(self.session_id, max_messages=limit)
++                    else:
++                        safety_check(self.session_id)
++                    return None
++                except SessionResumeTooLargeError as exc2:
++                    return str(exc2)
++                except Exception as compact_exc:
++                    logger.warning(
++                        "auto-compact failed for %s; keeping resume guard: %s",
++                        self.session_id,
++                        compact_exc,
++                    )
+             return str(exc)
+         except Exception as exc:
+             logger.warning(

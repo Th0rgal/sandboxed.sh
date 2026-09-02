@@ -48,6 +48,7 @@ import {
   getMissionTextColor,
   getMissionTitle,
   isFinishedStatus,
+  isLiveAutomationHost,
   type MissionCategory,
 } from '@/lib/mission-status';
 import { inferMissionRole } from '@/lib/mission-role';
@@ -350,6 +351,19 @@ function OverviewPageContent() {
     }
   );
 
+  // Default listing hides acknowledged/completed, so Finished would be a
+  // wall of failures. Pull a short recency window of actual successes.
+  const { data: recentAck = [] } = useSWR(
+    'missions-recent-ack',
+    () => listMissions({ status: 'acknowledged', limit: 8 }),
+    { refreshInterval: 5000, revalidateOnFocus: false, compare: stableJsonCompare }
+  );
+  const { data: recentCompleted = [] } = useSWR(
+    'missions-recent-completed',
+    () => listMissions({ status: 'completed', limit: 8 }),
+    { refreshInterval: 5000, revalidateOnFocus: false, compare: stableJsonCompare }
+  );
+
   const { data: runningMissions = [] } = useSWR(
     'running-missions',
     getRunningMissions,
@@ -393,14 +407,28 @@ function OverviewPageContent() {
     return new Set(activeAutomations.map((automation) => automation.mission_id));
   }, [activeAutomations]);
 
-  // Union: runtime running + active automations
+  const missionById = useMemo(() => {
+    const map = new Map(missions.map((mission) => [mission.id, mission]));
+    return map;
+  }, [missions]);
+
+  // Union: runtime running + automations whose host is still live.
+  // Do not treat a leftover goal-loop on an acknowledged mission as Running.
   const runningLikeMissionIds = useMemo(() => {
     const combined = new Set(runningMissionIds);
-    for (const missionId of automationMissionIds) {
-      combined.add(missionId);
+    for (const automation of activeAutomations) {
+      const host = missionById.get(automation.mission_id);
+      if (
+        isLiveAutomationHost(
+          host?.status,
+          runningMissionIds.has(automation.mission_id),
+        )
+      ) {
+        combined.add(automation.mission_id);
+      }
     }
     return combined;
-  }, [runningMissionIds, automationMissionIds]);
+  }, [runningMissionIds, activeAutomations, missionById]);
 
   // Categorize missions using shared utility
   const categorized = useMemo(
@@ -452,8 +480,16 @@ function OverviewPageContent() {
       );
     }
 
+    const seenFinished = new Set(result.finished.map((mission) => mission.id));
+    for (const extra of [...recentAck, ...recentCompleted]) {
+      if (seenFinished.has(extra.id)) continue;
+      if (extra.parent_mission_id && missionIds.has(extra.parent_mission_id)) continue;
+      result.finished.push(extra);
+      seenFinished.add(extra.id);
+    }
+
     return result;
-  }, [categorized, missionIds]);
+  }, [categorized, missionIds, recentAck, recentCompleted]);
 
   // Build column data for display
   const columnData = useMemo(() => {
@@ -706,7 +742,7 @@ function OverviewPageContent() {
         <div className="flex-shrink-0">
           <LastDaySummary
             missions={missions}
-            runningMissionIds={runningLikeMissionIds}
+            runningMissionIds={runningMissionIds}
           />
         </div>
         <div className="min-h-0 flex-1">

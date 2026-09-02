@@ -9,9 +9,18 @@ else
 fi
 
 OPENCODE_CONFIG_DIR=""
-if [ -f /etc/open_agent/open_agent.env ]; then
-  OPENCODE_CONFIG_DIR=$(grep -E '^OPENCODE_CONFIG_DIR=' /etc/open_agent/open_agent.env | tail -n1 | cut -d= -f2- || true)
-fi
+for env_file in \
+  "${SANDBOXED_ENV_FILE:-}" \
+  /etc/sandboxed-sh/sandboxed-sh-prod.env \
+  /etc/sandboxed_sh/sandboxed_sh.env \
+  /etc/open_agent/open_agent.env
+do
+  [ -n "$env_file" ] || continue
+  if [ -f "$env_file" ]; then
+    OPENCODE_CONFIG_DIR=$(grep -E '^OPENCODE_CONFIG_DIR=' "$env_file" | tail -n1 | cut -d= -f2- || true)
+    break
+  fi
+done
 
 if [ -n "$OPENCODE_CONFIG_DIR" ]; then
   OPENCODE_HOME="$(cd "$(dirname "$OPENCODE_CONFIG_DIR")/.." && pwd -P)"

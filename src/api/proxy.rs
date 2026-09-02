@@ -410,6 +410,12 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/deferred/:id", get(get_deferred_request))
         .route("/deferred/:id", delete(cancel_deferred_request))
         .route("/models", axum::routing::get(list_models))
+        // OpenAI retrieve-model: GET /v1/models/{id}. Hermes-cli and OpenCode
+        // probe the selected id (e.g. `xai/grok-4.6`) after listing. Without
+        // this route the request falls through to JWT `require_auth`, which
+        // rejects a valid proxy key as "Invalid or expired token" (HTTP 401)
+        // even though POST /v1/chat/completions for the same model succeeds.
+        .route("/models/*model_id", axum::routing::get(get_model))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -749,6 +755,46 @@ async fn list_models(
     if let Err(resp) = verify_proxy_auth(&headers, &state).await {
         return resp;
     }
+    let data = collect_proxy_models(&state).await;
+    Json(ModelsResponse {
+        object: "list",
+        data,
+    })
+    .into_response()
+}
+
+async fn get_model(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+    Path(model_id): Path<String>,
+) -> Response {
+    if let Err(resp) = verify_proxy_auth(&headers, &state).await {
+        return resp;
+    }
+    let id = normalize_retrieved_model_id(&model_id);
+    if id.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Model id is required".to_string(),
+            "invalid_request_error",
+        );
+    }
+    let data = collect_proxy_models(&state).await;
+    match data.into_iter().find(|m| m.id == id) {
+        Some(model) => Json(model).into_response(),
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            format!("The model '{id}' does not exist"),
+            "model_not_found",
+        ),
+    }
+}
+
+fn normalize_retrieved_model_id(raw: &str) -> String {
+    raw.trim().trim_start_matches('/').to_string()
+}
+
+async fn collect_proxy_models(state: &Arc<super::routes::AppState>) -> Vec<ModelObject> {
     let chains = state.chain_store.list().await;
     let mut seen = HashSet::new();
     let mut data = Vec::new();
@@ -765,8 +811,8 @@ async fn list_models(
     }
 
     let direct_models =
-        crate::api::providers::catalog_model_options_for_state(&state, true, true).await;
-    let direct_models = routable_direct_catalog_models(&state, direct_models).await;
+        crate::api::providers::catalog_model_options_for_state(state, true, true).await;
+    let direct_models = routable_direct_catalog_models(state, direct_models).await;
     append_direct_models_to_proxy_models(
         &mut data,
         &mut seen,
@@ -789,11 +835,7 @@ async fn list_models(
     }
 
     data.sort_by(|a, b| a.id.cmp(&b.id));
-    Json(ModelsResponse {
-        object: "list",
-        data,
-    })
-    .into_response()
+    data
 }
 
 async fn routable_direct_catalog_models(
@@ -1451,11 +1493,43 @@ async fn native_protocol_proxy(
         return preserved_upstream_error_response(status, &response_headers, response_body);
     }
     let message = if supported_entries == 0 {
-        format!("Chain '{chain_id}' has no entries with native support for this protocol")
+        unsupported_native_protocol_message(protocol, &chain_id, &entries)
     } else {
         format!("All native protocol providers in chain '{chain_id}' failed")
     };
     error_response(StatusCode::BAD_GATEWAY, message, "unsupported_protocol")
+}
+
+fn native_protocol_path(protocol: NativeProtocol) -> &'static str {
+    match protocol {
+        NativeProtocol::Responses => "/v1/responses",
+        NativeProtocol::AnthropicMessages => "/v1/messages",
+    }
+}
+
+/// Explain a protocol miss so clients do not treat a missing wire format as a
+/// dead model. Anthropic never implements OpenAI Responses; MiniMax-style Chat
+/// cohorts should stay on `/v1/chat/completions`.
+fn unsupported_native_protocol_message(
+    protocol: NativeProtocol,
+    chain_id: &str,
+    entries: &[crate::provider_health::ResolvedEntry],
+) -> String {
+    let path = native_protocol_path(protocol);
+    let all_anthropic = !entries.is_empty()
+        && entries.iter().all(|entry| {
+            ProviderType::from_id(&entry.provider_id) == Some(ProviderType::Anthropic)
+        });
+    let mut message =
+        format!("Chain '{chain_id}' has no entries with native support for POST {path}");
+    if matches!(protocol, NativeProtocol::Responses) && all_anthropic {
+        message.push_str(
+            ". Anthropic models do not implement OpenAI Responses; use POST /v1/messages (native) or POST /v1/chat/completions (portable). Discover protocols via GET /v1/capabilities.",
+        );
+    } else {
+        message.push_str(". Discover protocols via GET /v1/capabilities.");
+    }
+    message
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -6253,10 +6327,56 @@ mod tests {
         assert!(protocol_url(NativeProtocol::Responses, ProviderType::Kimi, None).is_none());
         assert!(!native_protocol_supported(
             NativeProtocol::Responses,
+            ProviderType::Anthropic,
+            true,
+            false,
+        ));
+        assert!(!native_protocol_supported(
+            NativeProtocol::Responses,
+            ProviderType::Anthropic,
+            false,
+            true,
+        ));
+        assert!(!native_protocol_supported(
+            NativeProtocol::Responses,
+            ProviderType::Anthropic,
+            true,
+            true,
+        ));
+        assert!(native_protocol_supported(
+            NativeProtocol::AnthropicMessages,
+            ProviderType::Anthropic,
+            true,
+            false,
+        ));
+        assert!(!native_protocol_supported(
+            NativeProtocol::Responses,
             ProviderType::OpenAI,
             false,
             true
         ));
+    }
+
+    #[test]
+    fn unsupported_responses_on_anthropic_points_at_messages_or_chat() {
+        let entries = [crate::provider_health::ResolvedEntry {
+            provider_id: "anthropic".to_string(),
+            model_id: "claude-opus-5".to_string(),
+            account_id: uuid::Uuid::nil(),
+            api_key: Some("sk-ant-test".to_string()),
+            has_oauth: false,
+            base_url: None,
+            subscription_key: None,
+        }];
+        let message = unsupported_native_protocol_message(
+            NativeProtocol::Responses,
+            "anthropic/claude-opus-5",
+            &entries,
+        );
+        assert!(message.contains("POST /v1/responses"));
+        assert!(message.contains("POST /v1/messages"));
+        assert!(message.contains("POST /v1/chat/completions"));
+        assert!(message.contains("GET /v1/capabilities"));
     }
 
     #[test]
@@ -6573,6 +6693,17 @@ mod tests {
         assert_eq!(cli_proxy_xai_model_id("grok-4.5-latest"), "grok-4.5");
         assert_eq!(cli_proxy_xai_model_id("grok-build-latest"), "grok-4.5");
         assert_eq!(cli_proxy_xai_model_id("grok-4.3"), "grok-4.3");
+    }
+
+    #[test]
+    fn retrieve_model_path_keeps_provider_slash() {
+        assert_eq!(normalize_retrieved_model_id("xai/grok-4.6"), "xai/grok-4.6");
+        assert_eq!(
+            normalize_retrieved_model_id("/xai/grok-4.6-latest"),
+            "xai/grok-4.6-latest"
+        );
+        assert_eq!(normalize_retrieved_model_id("  grok-4.6  "), "grok-4.6");
+        assert_eq!(normalize_retrieved_model_id("/"), "");
     }
 
     #[test]

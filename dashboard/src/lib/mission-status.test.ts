@@ -8,6 +8,7 @@ import {
   getMissionDotColor,
   getMissionTextColor,
   statusLabel,
+  isLiveAutomationHost,
   FINISHED_STATUSES,
   NEEDS_ATTENTION_STATUSES,
 } from './mission-status';
@@ -321,6 +322,23 @@ describe('mission-status', () => {
 
     it('NEEDS_ATTENTION_STATUSES is empty — Needs You is needs_operator, not a status list', () => {
       expect(NEEDS_ATTENTION_STATUSES).toEqual([]);
+    });
+  });
+
+  describe('isLiveAutomationHost', () => {
+    it('keeps a running harness even if stored status is finished', () => {
+      expect(isLiveAutomationHost('acknowledged', true)).toBe(true);
+    });
+
+    it('does not promote acknowledged/failed hosts into Running', () => {
+      expect(isLiveAutomationHost('acknowledged', false)).toBe(false);
+      expect(isLiveAutomationHost('failed', false)).toBe(false);
+      expect(isLiveAutomationHost(undefined, false)).toBe(false);
+    });
+
+    it('keeps live stored statuses', () => {
+      expect(isLiveAutomationHost('active', false)).toBe(true);
+      expect(isLiveAutomationHost('awaiting_user', false)).toBe(true);
     });
   });
 

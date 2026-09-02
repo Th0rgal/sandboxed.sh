@@ -534,6 +534,39 @@ pub struct MissionStatusCounts {
     pub active: usize,
     pub completed: usize,
     pub failed: usize,
+    /// Agent-declared done waiting for operator ack. Counted as success for
+    /// `success_rate` and, when `since` is set, folded into `completed_tasks`
+    /// so the 24h panel is not an all-time `completed`-only dump.
+    #[serde(default)]
+    pub acknowledged: usize,
+}
+
+impl MissionStatusCounts {
+    pub fn record(&mut self, status: crate::api::control::events::MissionStatus) {
+        self.add(status, 1);
+    }
+
+    pub fn add(&mut self, status: crate::api::control::events::MissionStatus, n: usize) {
+        use crate::api::control::events::MissionStatus;
+        self.total += n;
+        match status {
+            MissionStatus::Active => self.active += n,
+            MissionStatus::Completed => self.completed += n,
+            MissionStatus::Acknowledged => self.acknowledged += n,
+            MissionStatus::Failed | MissionStatus::NotFeasible => self.failed += n,
+            _ => {}
+        }
+    }
+
+    pub fn success_rate(&self) -> f64 {
+        let ok = self.completed + self.acknowledged;
+        let finished = ok + self.failed;
+        if finished == 0 {
+            1.0
+        } else {
+            ok as f64 / finished as f64
+        }
+    }
 }
 
 fn default_backend() -> String {
@@ -766,6 +799,10 @@ pub struct TelegramTriggerConfig {
 pub enum StopPolicy {
     /// Never auto-disable this automation.
     Never,
+    /// Auto-disable once the host mission leaves the live set (ack / complete
+    /// / fail / interrupt / not_feasible / paused). Native goal-loops use this
+    /// so a finished writer cannot keep a spinner on Overview.
+    WhenMissionTerminal,
     /// Auto-disable after N consecutive failures.
     WhenFailingConsecutively {
         /// Number of consecutive failures before stopping (default: 2)
@@ -1932,6 +1969,22 @@ pub trait MissionStore: Send + Sync {
 
     /// Count missions by status without applying list pagination.
     async fn count_missions_by_status(&self) -> Result<MissionStatusCounts, String>;
+
+    /// Counts restricted to rows whose `updated_at` is `>= since` (RFC3339).
+    /// Default scans `list_missions`; sqlite overrides with a SQL filter.
+    async fn count_missions_updated_since(
+        &self,
+        since: &str,
+    ) -> Result<MissionStatusCounts, String> {
+        let snapshot = self.list_missions(usize::MAX, 0).await?;
+        let mut counts = MissionStatusCounts::default();
+        for mission in snapshot {
+            if mission.updated_at.as_str() >= since {
+                counts.record(mission.status);
+            }
+        }
+        Ok(counts)
+    }
 
     /// Get a single mission by ID.
     async fn get_mission(&self, id: Uuid) -> Result<Option<Mission>, String>;

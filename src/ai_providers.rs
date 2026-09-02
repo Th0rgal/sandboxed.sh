@@ -286,10 +286,10 @@ impl ProviderType {
             ],
             Self::Xai => vec![
                 AuthMethod {
-                    label: "Grok Build OAuth".to_string(),
+                    label: "xAI SuperGrok OAuth".to_string(),
                     method_type: AuthMethodType::Oauth,
                     description: Some(
-                        "Use your grok.com account through Grok Build device authorization"
+                        "Use your grok.com SuperGrok login. OpenCode xai/* and the grok CLI share this account; Grok Build is the CLI harness, not a second login."
                             .to_string(),
                     ),
                 },

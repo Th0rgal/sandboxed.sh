@@ -86,12 +86,7 @@ impl MissionStore for InMemoryMissionStore {
             ..MissionStatusCounts::default()
         };
         for mission in missions.values() {
-            match mission.status {
-                MissionStatus::Active => counts.active += 1,
-                MissionStatus::Completed => counts.completed += 1,
-                MissionStatus::Failed => counts.failed += 1,
-                _ => {}
-            }
+            counts.record(mission.status);
         }
         Ok(counts)
     }

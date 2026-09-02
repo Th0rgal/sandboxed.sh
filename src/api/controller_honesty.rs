@@ -120,6 +120,40 @@ pub fn normalize_decision_question(question: &str) -> String {
         .join(" ")
 }
 
+/// Identity used to dedupe owner escalations.
+///
+/// Controllers rephrase the same ticket every tick (`VL-002 — rétablir…` vs
+/// `restaurer l'OAuth Codex…`). Whitespace-only normalize then inserts a new
+/// `pending_user` row and the project rail stacks duplicate NEEDS YOU cards.
+/// Prefer a leading ticket (`VL-001`, `LSC1-03`); otherwise the normalized
+/// full question.
+pub fn decision_identity(question: &str) -> String {
+    let normalized = normalize_decision_question(question);
+    if let Some(ticket) = leading_decision_ticket(&normalized) {
+        return format!("ticket:{ticket}");
+    }
+    normalized
+}
+
+fn leading_decision_ticket(normalized: &str) -> Option<&str> {
+    let token = normalized
+        .split(|c: char| c.is_whitespace() || matches!(c, '—' | '–' | ':'))
+        .next()?
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+    if token.is_empty() {
+        return None;
+    }
+    // VL-001, LSC1-03. Do not split the hyphen out of the token.
+    let (head, tail) = token.split_once('-')?;
+    let head_ok = !head.is_empty() && head.chars().all(|c| c.is_ascii_alphanumeric());
+    let tail_ok = (2..=4).contains(&tail.len()) && tail.chars().all(|c| c.is_ascii_digit());
+    if head_ok && tail_ok {
+        Some(token)
+    } else {
+        None
+    }
+}
+
 /// `inspect <mission-uuid>` — a controller parking on a dead writer instead
 /// of redispaching. Not a project-level no-lane.
 pub fn is_inspect_next_action(next: Option<&str>) -> bool {
@@ -343,6 +377,22 @@ mod tests {
         assert_eq!(
             normalize_decision_question("Relancer  coldcard_skip depuis le checkpoint ?"),
             normalize_decision_question("relancer coldcard_skip depuis le checkpoint ?")
+        );
+    }
+
+    #[test]
+    fn decision_identity_collapses_ticket_paraphrases() {
+        assert_eq!(
+            decision_identity("VL-002 — rétablir l'OAuth Codex, ou la facturation Muse."),
+            decision_identity("VL-002 — restaurer Codex OAuth sandboxed.sh ou Muse billing")
+        );
+        assert_eq!(
+            decision_identity("VL-001 — réparer le chemin OpenCode/Spark SIGTERM"),
+            "ticket:vl-001"
+        );
+        assert_ne!(
+            decision_identity("VL-001 — spark"),
+            decision_identity("VL-002 — oauth")
         );
     }
 

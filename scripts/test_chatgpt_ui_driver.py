@@ -329,13 +329,21 @@ class AccountPickerHeading:
 
 
 class AccountPickerPage:
-    def __init__(self, heading_visible: bool = True, picker_after: int = 0) -> None:
+    def __init__(
+        self,
+        heading_visible: bool = True,
+        picker_after: int = 0,
+        saved_label: str = "Ada\nada@example.com",
+        login_visible: bool = True,
+    ) -> None:
         self.heading_visible = heading_visible
         self.picker_after = picker_after
         self.waits = 0
-        self.login = FakePickerButton("Log in")
-        self.saved = FakePickerButton("Ada\nada@example.com")
-        self.other = FakePickerButton("Log in to another account")
+        self.login = FakePickerButton("Log in", visible=login_visible and heading_visible)
+        self.saved = FakePickerButton(saved_label)
+        self.other = FakePickerButton(
+            "Log in to another account", visible=heading_visible or not login_visible
+        )
 
     def get_by_text(self, _text, exact=False):
         return AccountPickerHeading(self)
@@ -343,15 +351,21 @@ class AccountPickerPage:
     def get_by_role(self, role, name=None, exact=False):
         if role != "button":
             raise AssertionError(role)
+        buttons = [self.login, self.saved, self.other]
         if name is not None:
-            return self.login
-        return FakePickerButtons([self.login, self.saved, self.other])
+            matches = [
+                button
+                for button in buttons
+                if button.visible and name.search(button.text.split("\n")[0].strip())
+            ]
+            return matches[0] if matches else FakePickerButton("", visible=False)
+        return FakePickerButtons(buttons)
 
     def locator(self, selector):
         if "library" in selector or "scheduled" in selector or "accounts-profile" in selector:
-            if self.heading_visible:
-                return FakePickerButtons([])
-            return FakePickerButtons([FakePickerButton("Library")])
+            if self.saved.clicked:
+                return FakePickerButtons([FakePickerButton("Library")])
+            return FakePickerButtons([])
         raise AssertionError(selector)
 
     async def wait_for_timeout(self, _timeout) -> None:
@@ -359,8 +373,11 @@ class AccountPickerPage:
         if self.saved.clicked:
             self.heading_visible = False
             self.login.visible = False
+            self.other.visible = False
         elif self.picker_after and self.waits >= self.picker_after:
             self.heading_visible = True
+            self.other.visible = True
+            self.login.visible = True
 
 
 class ChatGptUiDriverTests(unittest.TestCase):
@@ -378,6 +395,9 @@ class ChatGptUiDriverTests(unittest.TestCase):
         self.assertFalse(is_saved_account_choice("Sign up for free"))
         self.assertFalse(is_saved_account_choice("Remove account"))
         self.assertFalse(is_saved_account_choice(""))
+        self.assertTrue(is_saved_account_choice("Fricoben"))
+        self.assertFalse(is_saved_account_choice("ChatGPT"))
+        self.assertFalse(is_saved_account_choice("New chat"))
 
     def test_cloudflare_wait_returns_once_the_interstitial_clears(self) -> None:
         page = CloudflareClearingPage()
@@ -396,6 +416,17 @@ class ChatGptUiDriverTests(unittest.TestCase):
         self.assertFalse(page.login.clicked)
         self.assertFalse(page.other.clicked)
         self.assertFalse(page.heading_visible)
+
+    def test_saved_account_picker_clicks_display_name_without_heading(self) -> None:
+        page = AccountPickerPage(
+            heading_visible=False,
+            saved_label="Fricoben",
+            login_visible=False,
+        )
+        selected = asyncio.run(complete_saved_account_picker(page))
+        self.assertTrue(selected)
+        self.assertTrue(page.saved.clicked)
+        self.assertFalse(page.other.clicked)
 
     def test_saved_account_picker_waits_for_late_welcome_back_overlay(self) -> None:
         page = AccountPickerPage(heading_visible=False, picker_after=3)

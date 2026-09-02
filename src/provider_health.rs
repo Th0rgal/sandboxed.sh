@@ -1395,10 +1395,16 @@ impl ModelChainStore {
                 let kimi_oauth_routable =
                     matches!(provider_type, crate::ai_providers::ProviderType::Kimi)
                         && account.oauth.is_some();
+                let xai_oauth_cli_proxy_routable =
+                    matches!(provider_type, crate::ai_providers::ProviderType::Xai)
+                        && account.api_key.is_none()
+                        && account.oauth.is_some()
+                        && crate::api::ai_providers::xai_cli_proxy_account_available();
                 if account.api_key.is_none()
                     && !oauth_is_fresh
                     && !google_oauth_routable
                     && !kimi_oauth_routable
+                    && !xai_oauth_cli_proxy_routable
                 {
                     tracing::debug!(
                         account_id = %account.id,
@@ -1446,7 +1452,7 @@ impl ModelChainStore {
                 let xai_oauth_cli_proxy_routable =
                     matches!(provider_type, crate::ai_providers::ProviderType::Xai)
                         && account.api_key.is_none()
-                        && oauth_is_fresh
+                        && account.oauth.is_some()
                         && crate::api::ai_providers::xai_cli_proxy_account_available();
                 let entry_has_oauth = credential_is_oauth_token
                     || google_oauth_routable
@@ -1992,6 +1998,58 @@ mod tests {
             ),
             cli_proxy_available
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_chain_keeps_expired_xai_oauth_when_cli_proxy_is_refreshable() {
+        let auth_dir = TempDir::new().unwrap();
+        std::fs::write(
+            auth_dir.path().join("xai-thomas.json"),
+            serde_json::json!({
+                "type": "xai",
+                "access_token": "proxy-access",
+                "refresh_token": "proxy-refresh"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let previous = std::env::var("CLI_PROXY_AUTH_DIR").ok();
+        std::env::set_var("CLI_PROXY_AUTH_DIR", auth_dir.path());
+
+        let mut xai = AIProvider::new(ProviderType::Xai, "xAI (Grok Build OAuth)".to_string());
+        xai.oauth = Some(OAuthCredentials {
+            access_token: "stale-store-copy".to_string(),
+            refresh_token: "shared-refresh".to_string(),
+            expires_at: past_ms(2),
+        });
+        xai.status = ProviderStatus::Connected;
+
+        let store = store_with(vec![xai]).await;
+        let chains = store_with_chain(
+            "grok-4.6",
+            vec![ChainEntry {
+                provider_id: "xai".to_string(),
+                model_id: "grok-4.6".to_string(),
+            }],
+        )
+        .await;
+        let tracker = ProviderHealthTracker::new();
+        let resolved = chains
+            .resolve_chain("grok-4.6", &store, &[], &tracker)
+            .await;
+
+        match previous {
+            Some(value) => std::env::set_var("CLI_PROXY_AUTH_DIR", value),
+            None => std::env::remove_var("CLI_PROXY_AUTH_DIR"),
+        }
+
+        assert_eq!(
+            resolved.len(),
+            1,
+            "expired store copy must not drop SuperGrok when CLIProxyAPI can refresh"
+        );
+        assert!(resolved[0].api_key.is_none());
+        assert!(resolved[0].has_oauth);
     }
 
     #[tokio::test]

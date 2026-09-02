@@ -520,6 +520,25 @@ fn grok_auth_email(entry: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn xai_oauth_display_name(email: Option<&str>) -> String {
+    match email.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(email) => format!("xAI SuperGrok ({email})"),
+        None => "xAI SuperGrok".to_string(),
+    }
+}
+
+fn xai_supergrok_reconnect_reason(refresh_rejected: bool) -> String {
+    if refresh_rejected {
+        "xAI SuperGrok OAuth refresh was rejected; reconnect xAI. OpenCode xai/* and the grok CLI share this login — Grok Build is a harness, not a second account.".to_string()
+    } else {
+        "xAI SuperGrok OAuth is unusable; reconnect xAI. OpenCode xai/* and the grok CLI share this login — Grok Build is a harness, not a second account.".to_string()
+    }
+}
+
+fn is_legacy_grok_build_oauth_label(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("grok build")
+}
+
 fn grok_auth_expires_at_millis(entry: &serde_json::Value) -> i64 {
     entry
         .get("expires_at")
@@ -683,8 +702,9 @@ mod oauth_deadletter_tests {
 #[cfg(test)]
 mod grok_oauth_tests {
     use super::{
-        build_response_from_store, get_xai_api_key_for_grok, grok_auth_expires_at_millis,
-        grok_cli_reconcile_due, has_refreshable_cli_proxy_account_in_dirs,
+        build_response_from_store, collapse_duplicate_xai_oauth_accounts, get_xai_api_key_for_grok,
+        grok_auth_expires_at_millis, grok_cli_reconcile_due,
+        has_refreshable_cli_proxy_account_in_dirs, is_legacy_grok_build_oauth_label,
         oauth_refresh_clear_dead, oauth_refresh_mark_token_dead, oauth_refresh_token_fingerprint,
         parse_grok_device_auth_line, remove_legacy_grok_oauth_entry, sync_grok_auth_files,
         ProviderStatusResponse, GROK_CLI_RECONCILE_INTERVAL, GROK_OAUTH_CLIENT_KEY,
@@ -957,6 +977,70 @@ mod grok_oauth_tests {
     }
 
     #[test]
+    fn expired_grok_oauth_with_refresh_token_stays_connected() {
+        let mut provider = AIProvider::new(ProviderType::Xai, "xAI (Grok Build OAuth)".to_string());
+        provider.oauth = Some(OAuthCredentials {
+            access_token: "stale-access".to_string(),
+            refresh_token: "still-valid-refresh".to_string(),
+            expires_at: chrono::Utc::now().timestamp_millis() - 60_000,
+        });
+
+        let response = build_response_from_store(&provider);
+
+        assert!(
+            matches!(response.status, ProviderStatusResponse::Connected),
+            "stale grok CLI expires_at must not look like a second dead SuperGrok login: {:?}",
+            response.status
+        );
+    }
+
+    #[tokio::test]
+    async fn collapse_duplicate_xai_oauth_merges_grok_build_label_into_supergrok() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store =
+            crate::ai_providers::AIProviderStore::new(tmp.path().join("ai_providers.json")).await;
+
+        let mut grok_build =
+            AIProvider::new(ProviderType::Xai, "xAI (Grok Build OAuth)".to_string());
+        grok_build.oauth = Some(OAuthCredentials {
+            access_token: "old-cli".to_string(),
+            refresh_token: "shared-refresh".to_string(),
+            expires_at: chrono::Utc::now().timestamp_millis() - 60_000,
+        });
+        grok_build.use_for_backends = Some(vec!["grok".to_string()]);
+        grok_build.account_email = Some("me@x.ai".to_string());
+
+        let mut opencode = AIProvider::new(ProviderType::Xai, "xAI SuperGrok".to_string());
+        opencode.oauth = Some(OAuthCredentials {
+            access_token: "live-opencode".to_string(),
+            refresh_token: "shared-refresh".to_string(),
+            expires_at: chrono::Utc::now().timestamp_millis() + 60 * 60 * 1000,
+        });
+        opencode.use_for_backends = Some(vec!["opencode".to_string()]);
+        opencode.account_email = Some("me@x.ai".to_string());
+
+        store.add(grok_build).await;
+        store.add(opencode).await;
+
+        let disabled = collapse_duplicate_xai_oauth_accounts(&store).await;
+        assert_eq!(disabled, 1);
+
+        let remaining: Vec<_> = store
+            .get_all_by_type(ProviderType::Xai)
+            .await
+            .into_iter()
+            .filter(|account| account.enabled)
+            .collect();
+        assert_eq!(remaining.len(), 1);
+        let keeper = &remaining[0];
+        assert!(!is_legacy_grok_build_oauth_label(&keeper.name));
+        let backends = keeper.use_for_backends.clone().unwrap_or_default();
+        assert!(backends.iter().any(|b| b == "opencode"));
+        assert!(backends.iter().any(|b| b == "grok"));
+        std::mem::forget(tmp);
+    }
+
+    #[test]
     fn rejected_grok_refresh_fingerprint_survives_store_serialization() {
         let mut provider = AIProvider::new(ProviderType::Xai, "xAI OAuth".to_string());
         provider.oauth = Some(OAuthCredentials {
@@ -1224,7 +1308,8 @@ async fn upsert_grok_oauth_provider(
             )
         })?;
     let account_email = grok_auth_email(entry);
-    let backends = use_for_backends.unwrap_or_else(|| vec!["grok".to_string()]);
+    let backends =
+        use_for_backends.unwrap_or_else(|| default_backends_for_provider(ProviderType::Xai));
 
     // When reconnect targets a specific row (UUID), update *that* row so the
     // health probe checks the same id the user clicked. Otherwise fall back to
@@ -1236,14 +1321,11 @@ async fn upsert_grok_oauth_provider(
         .unwrap_or_else(|| {
             crate::ai_providers::AIProvider::new(
                 ProviderType::Xai,
-                "xAI (Grok Build OAuth)".to_string(),
+                xai_oauth_display_name(account_email.as_deref()),
             )
         });
 
-    provider.name = account_email
-        .as_ref()
-        .map(|email| format!("xAI ({email})"))
-        .unwrap_or_else(|| "xAI (Grok Build OAuth)".to_string());
+    provider.name = xai_oauth_display_name(account_email.as_deref());
     provider.account_email = account_email;
     provider.api_key = None;
     provider.oauth = Some(crate::ai_providers::OAuthCredentials {
@@ -3909,20 +3991,23 @@ fn build_response_from_store(provider: &crate::ai_providers::AIProvider) -> Prov
             .oauth
             .as_ref()
             .is_some_and(|oauth| oauth_refresh_token_is_dead(provider.id, &oauth.refresh_token));
+    let _ = oauth_expired;
     let status = if has_oauth && !has_api_key && oauth_refresh_rejected {
         ProviderStatusResponse::NeedsReauth {
-            reason: format!(
-                "{} OAuth refresh token was rejected; reconnect the provider",
-                pt.display_name()
-            ),
-            auth_url: None,
-        }
-    } else if pt == ProviderType::Xai && has_oauth && !has_api_key && oauth_expired {
-        ProviderStatusResponse::NeedsReauth {
-            reason: "xAI OAuth token expired; reconnect Grok Build".to_string(),
+            reason: if pt == ProviderType::Xai {
+                xai_supergrok_reconnect_reason(true)
+            } else {
+                format!(
+                    "{} OAuth refresh token was rejected; reconnect the provider",
+                    pt.display_name()
+                )
+            },
             auth_url: None,
         }
     } else if has_api_key || has_oauth || provider.base_url.is_some() {
+        // An expired access token is not a second dead login. SuperGrok is one
+        // OAuth account shared by OpenCode `xai/*` and the grok CLI; CLIProxyAPI
+        // refreshes it. Only a rejected refresh token is NeedsReauth.
         ProviderStatusResponse::Connected
     } else {
         ProviderStatusResponse::NeedsAuth { auth_url: None }
@@ -6717,14 +6802,158 @@ pub async fn reconcile_xai_store_from_grok_cli(
                 refresh_token: refresh.to_string(),
                 expires_at: cli_expires_at,
             });
+            if is_legacy_grok_build_oauth_label(&updated.name) {
+                updated.name = xai_oauth_display_name(updated.account_email.as_deref());
+            }
+            let mut backends = updated
+                .use_for_backends
+                .take()
+                .unwrap_or_else(|| default_backends_for_provider(ProviderType::Xai));
+            for backend in default_backends_for_provider(ProviderType::Xai) {
+                if !backends.iter().any(|existing| existing == &backend) {
+                    backends.push(backend);
+                }
+            }
+            updated.use_for_backends = Some(backends);
             ai_providers.update(account.id, updated).await;
             tracing::info!(
                 account_id = %account.id,
                 cli_expires_at,
-                "Reconciled xAI OAuth token from Grok CLI auth file"
+                "Reconciled xAI SuperGrok OAuth token from Grok CLI auth file"
             );
         }
     }
+    collapse_duplicate_xai_oauth_accounts(ai_providers).await;
+}
+
+fn xai_oauth_identity(account: &crate::ai_providers::AIProvider) -> Option<String> {
+    if let Some(email) = account
+        .account_email
+        .as_ref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(format!("email:{email}"));
+    }
+    account.oauth.as_ref().and_then(|oauth| {
+        let refresh = oauth.refresh_token.trim();
+        if refresh.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "refresh:{}",
+                oauth_refresh_token_fingerprint(refresh)
+            ))
+        }
+    })
+}
+
+/// One SuperGrok login must not appear as two providers (CLI "Grok Build" row
+/// plus OpenCode xAI row). Keep the freshest OAuth row, merge backends, disable
+/// the extras.
+pub async fn collapse_duplicate_xai_oauth_accounts(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+) -> u32 {
+    let accounts: Vec<_> = ai_providers
+        .get_all_by_type(ProviderType::Xai)
+        .await
+        .into_iter()
+        .filter(|account| {
+            account.enabled
+                && account.has_oauth()
+                && account
+                    .api_key
+                    .as_ref()
+                    .map(|key| key.trim().is_empty())
+                    .unwrap_or(true)
+        })
+        .collect();
+    if accounts.len() < 2 {
+        return 0;
+    }
+
+    let mut groups: HashMap<String, Vec<crate::ai_providers::AIProvider>> = HashMap::new();
+    let mut unlabeled = Vec::new();
+    for account in accounts {
+        if let Some(identity) = xai_oauth_identity(&account) {
+            groups.entry(identity).or_default().push(account);
+        } else {
+            unlabeled.push(account);
+        }
+    }
+    if unlabeled.len() >= 2 {
+        let grok_build: Vec<_> = unlabeled
+            .iter()
+            .filter(|account| is_legacy_grok_build_oauth_label(&account.name))
+            .cloned()
+            .collect();
+        let others: Vec<_> = unlabeled
+            .iter()
+            .filter(|account| !is_legacy_grok_build_oauth_label(&account.name))
+            .cloned()
+            .collect();
+        if grok_build.len() == 1 && others.len() == 1 {
+            groups
+                .entry("legacy-grok-build-pair".to_string())
+                .or_default()
+                .extend(grok_build.into_iter().chain(others));
+        }
+    }
+
+    let mut disabled = 0u32;
+    for members in groups.into_values() {
+        if members.len() < 2 {
+            continue;
+        }
+        let mut ranked = members;
+        ranked.sort_by(|left, right| {
+            let left_exp = left.oauth.as_ref().map(|o| o.expires_at).unwrap_or(0);
+            let right_exp = right.oauth.as_ref().map(|o| o.expires_at).unwrap_or(0);
+            right_exp
+                .cmp(&left_exp)
+                .then_with(|| {
+                    is_legacy_grok_build_oauth_label(&left.name)
+                        .cmp(&is_legacy_grok_build_oauth_label(&right.name))
+                })
+                .then_with(|| left.created_at.cmp(&right.created_at))
+        });
+        let mut keeper = ranked.remove(0);
+        let mut backends = keeper
+            .use_for_backends
+            .clone()
+            .unwrap_or_else(|| default_backends_for_provider(ProviderType::Xai));
+        for extra in &ranked {
+            if let Some(extra_backends) = extra.use_for_backends.as_ref() {
+                for backend in extra_backends {
+                    if !backends.iter().any(|existing| existing == backend) {
+                        backends.push(backend.clone());
+                    }
+                }
+            }
+            if keeper.account_email.is_none() {
+                keeper.account_email = extra.account_email.clone();
+            }
+        }
+        for backend in default_backends_for_provider(ProviderType::Xai) {
+            if !backends.iter().any(|existing| existing == &backend) {
+                backends.push(backend);
+            }
+        }
+        keeper.use_for_backends = Some(backends);
+        if is_legacy_grok_build_oauth_label(&keeper.name) {
+            keeper.name = xai_oauth_display_name(keeper.account_email.as_deref());
+        }
+        ai_providers.update(keeper.id, keeper).await;
+        for extra in ranked {
+            let mut disabled_account = extra;
+            disabled_account.enabled = false;
+            ai_providers
+                .update(disabled_account.id, disabled_account)
+                .await;
+            disabled += 1;
+        }
+    }
+    disabled
 }
 
 fn grok_cli_reconcile_due(last_check: Option<Instant>, now: Instant) -> bool {
@@ -6759,6 +6988,7 @@ async fn list_providers(
     // Keep the xAI provider's stored token in sync with the Grok CLI's own
     // refreshed auth file so it doesn't show a false "needs reauth".
     maybe_reconcile_xai_store_from_grok_cli(&state.ai_providers).await;
+    collapse_duplicate_xai_oauth_accounts(&state.ai_providers).await;
 
     // Claude Code may have rotated Anthropic's single-use refresh token in the
     // shared tiers since the last background cycle. Reconcile before deriving
@@ -7109,6 +7339,9 @@ async fn get_provider_usage(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    maybe_reconcile_xai_store_from_grok_cli(&state.ai_providers).await;
+    collapse_duplicate_xai_oauth_accounts(&state.ai_providers).await;
+
     // Resolve provider credentials: check AIProviderStore first, then OpenCode auth.
     // `provider_uuid` is `Some` when the credentials live in AIProviderStore and we
     // can persist a refreshed OAuth back into that specific record.
@@ -8254,20 +8487,19 @@ async fn get_provider_usage(
 
             let mut snap = crate::api::xai_usage::XaiUsageSnapshot::default();
 
+            let store_token_still_stale = oauth.as_ref().is_some_and(|o| {
+                oauth_token_expired(o.expires_at)
+                    && oauth_token.as_deref() == Some(o.access_token.as_str())
+            });
+            let supergrok_live_via_cli_proxy = xai_cli_proxy_account_available();
+
             if let Some(token) = oauth_token.as_ref() {
-                if refresh_rejected
-                    || (oauth
-                        .as_ref()
-                        .is_some_and(|o| oauth_token_expired(o.expires_at))
-                        && oauth_token.as_deref()
-                            == oauth.as_ref().map(|o| o.access_token.as_str()))
-                {
+                if refresh_rejected {
                     info["status"] = serde_json::json!("needs_reauth");
-                    info["error"] = serde_json::json!(if refresh_rejected {
-                        "xAI OAuth refresh token was rejected; reconnect Grok Build"
-                    } else {
-                        "xAI OAuth token expired; reconnect Grok Build"
-                    });
+                    info["error"] = serde_json::json!(xai_supergrok_reconnect_reason(true));
+                } else if store_token_still_stale && !supergrok_live_via_cli_proxy {
+                    info["status"] = serde_json::json!("needs_reauth");
+                    info["error"] = serde_json::json!(xai_supergrok_reconnect_reason(false));
                 } else {
                     let billing = client
                         .get(crate::api::xai_usage::BILLING_URL)
@@ -8286,10 +8518,17 @@ async fn get_provider_usage(
                         Ok(r) => {
                             let status = r.status().as_u16();
                             if status == 401 || status == 403 {
-                                info["status"] = serde_json::json!("needs_reauth");
-                                info["error"] = serde_json::json!(format!(
-                                    "Grok billing endpoint returned HTTP {status}"
-                                ));
+                                if supergrok_live_via_cli_proxy {
+                                    // Store copy of the grok CLI token can be stale while
+                                    // CLIProxyAPI still has a refreshable SuperGrok login
+                                    // used by OpenCode `xai/*`.
+                                    info["status"] = serde_json::json!("connected");
+                                } else {
+                                    info["status"] = serde_json::json!("needs_reauth");
+                                    info["error"] = serde_json::json!(format!(
+                                        "Grok billing endpoint returned HTTP {status}"
+                                    ));
+                                }
                             } else {
                                 info["status"] = serde_json::json!("connected");
                             }

@@ -1,5 +1,10 @@
 # Agents and Execution Architecture
 
+> Workspace-level map of Paloma (Hermes coordinator + sandboxed.sh executor,
+> production layout, local checkouts) lives in
+> [`../AGENTS.md`](../AGENTS.md). This file is the sandboxed.sh execution
+> contract.
+
 > **⚠️ Debugging Issues?** Before investigating any runtime problems, **always
 > read [DEBUGGING.md](DEBUGGING.md) first**. It contains:
 > - Remote server SSH access (Thomas/Ben servers)
