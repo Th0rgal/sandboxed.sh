@@ -608,6 +608,7 @@ pub async fn mark_terminal_wake_suppressed(
     if receipt.wake_delivered_at.is_none() {
         receipt.wake_delivered_at = Some(chrono::Utc::now());
         receipt.wake_suppressed_by = Some(superseding_job_id);
+        sql::mirror_wake(working_dir, job_id, "suppressed", Some(superseding_job_id));
         store_receipts(working_dir, &receipts).await?;
     }
     Ok(true)
