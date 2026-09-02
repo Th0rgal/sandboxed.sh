@@ -9481,7 +9481,11 @@ async fn bind_mission_to_track(
     match state.projects.acquire_track_lease(&request) {
         Ok(_) => Ok(outcome.key),
         Err(super::projects_store::LeaseError::Store(error)) => Err(internal_error(error)),
-        Err(error) => {
+        Err(super::projects_store::LeaseError::NotFound) => Err(internal_error(format!(
+            "track '{}' of '{project}' vanished between absorption and lease",
+            outcome.key
+        ))),
+        Err(error @ super::projects_store::LeaseError::Owned { .. }) => {
             interrupt_new_mission(control, mission.id, "track_owned").await;
             Err((
                 StatusCode::CONFLICT,
@@ -12313,7 +12317,13 @@ pub async fn update_mission_project(
             Err(super::projects_store::LeaseError::Store(error)) => {
                 return Err(internal_error(error))
             }
-            Err(error) => {
+            Err(super::projects_store::LeaseError::NotFound) => {
+                return Err(internal_error(format!(
+                    "track '{}' of '{slug}' vanished between absorption and lease",
+                    outcome.key
+                )))
+            }
+            Err(error @ super::projects_store::LeaseError::Owned { .. }) => {
                 return Err((
                     StatusCode::CONFLICT,
                     super::track_leases::owned_body(slug, &outcome.key, &error).to_string(),
@@ -12326,6 +12336,14 @@ pub async fn update_mission_project(
             .map_err(internal_error)?;
         Some(Some(outcome.key))
     } else {
+        if track_changed {
+            // The mission left its project or cleared its track: whatever it
+            // held no longer governs anything.
+            state
+                .projects
+                .release_leases_for_attempt(&id.to_string())
+                .map_err(internal_error)?;
+        }
         track
     };
 

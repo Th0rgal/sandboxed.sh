@@ -204,10 +204,14 @@ CREATE TABLE IF NOT EXISTS track_leases (
     mode             TEXT NOT NULL CHECK (mode IN ('reader','writer')),
     state            TEXT NOT NULL CHECK (state IN ('reserved','active','released','expired')),
     lease_until      TEXT NOT NULL,
-    idempotency_key  TEXT NOT NULL UNIQUE,
+    idempotency_key  TEXT NOT NULL,
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
+-- One live lease per dispatch key; a released/expired row keeps its key as
+-- history and never satisfies a retry.
+CREATE UNIQUE INDEX IF NOT EXISTS track_leases_live_key
+    ON track_leases(idempotency_key) WHERE state IN ('reserved','active');
 CREATE INDEX IF NOT EXISTS track_leases_domain
     ON track_leases(track_id, mutation_domain, state, lease_until);
 CREATE INDEX IF NOT EXISTS track_leases_attempt
@@ -2577,16 +2581,31 @@ impl ProjectsStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| LeaseError::Store(e.to_string()))?;
         let result = (|| -> Result<TrackLease, LeaseError> {
+            // Idempotent replay only for a *live* lease of the *same* attempt.
+            // A released/expired row is history; a live row under the same key
+            // held by another attempt means the dispatch key was reused by a
+            // retry that created a second mission — exactly the duplicate the
+            // lease exists to refuse.
             if let Some(existing) = connection
                 .query_row(
-                    &format!("{LEASE_SELECT} WHERE l.idempotency_key = ?1"),
-                    params![request.idempotency_key],
+                    &format!(
+                        "{LEASE_SELECT} WHERE l.idempotency_key = ?1 \
+                           AND l.state IN ('reserved','active') AND l.lease_until > ?2"
+                    ),
+                    params![request.idempotency_key, now_text],
                     lease_from_row,
                 )
                 .optional()
                 .map_err(|e| LeaseError::Store(e.to_string()))?
             {
-                return Ok(existing);
+                if existing.attempt_id == request.attempt_id {
+                    return Ok(existing);
+                }
+                return Err(LeaseError::Owned {
+                    holder_attempt_id: existing.attempt_id,
+                    lease_until: existing.lease_until,
+                    lease_id: existing.id,
+                });
             }
             let Some(track_id) =
                 Self::resolve_track_id_on(&connection, &request.slug, &request.track)
@@ -6068,10 +6087,21 @@ mod tests {
             Err(LeaseError::NotFound)
         ));
         assert_eq!(store.live_leases(Some("lido")).unwrap().len(), 2);
+        // The same dispatch key from another attempt (a retried create that
+        // made a second mission) is the duplicate, not a replay.
+        assert!(matches!(
+            store.acquire_track_lease(&lease("lido", "ux1", "m9", "writer", "k1")),
+            Err(LeaseError::Owned { ref holder_attempt_id, .. }) if holder_attempt_id == "m1"
+        ));
         assert_eq!(store.release_leases_for_attempt("m1").unwrap(), 1);
         store
             .acquire_track_lease(&lease("lido", "ux1", "m2", "writer", "k2b"))
             .expect("writer after release");
+        // A released row never satisfies its old key again; the key can be
+        // taken by a fresh lease (partial unique index on live rows only).
+        store
+            .acquire_track_lease(&lease("lido", "ux1", "m2", "reader", "k1"))
+            .expect("old key reusable once its lease is released");
         assert!(
             !store.expire_lease(&first.id).unwrap(),
             "released is not live"

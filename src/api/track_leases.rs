@@ -151,9 +151,13 @@ pub fn owned_body(slug: &str, track: &str, error: &LeaseError) -> serde_json::Va
 pub struct LeaseSweepReport {
     pub live: usize,
     pub renewed: usize,
+    /// Missions (not leases) released because they ended.
     pub released_terminal: usize,
+    /// Missions released because no store knows them.
     pub released_missing: usize,
     pub expired_overdue: usize,
+    /// Leases whose attempt id is not a mission id.
+    pub expired_invalid: usize,
 }
 
 /// One pass: renew leases of live missions, release those whose mission is
@@ -162,10 +166,15 @@ pub async fn sweep(state: &Arc<AppState>) -> Result<LeaseSweepReport, String> {
     let mut report = LeaseSweepReport::default();
     let leases: Vec<TrackLease> = state.projects.live_leases(None)?;
     report.live = leases.len();
+    // A mission may hold several leases; look it up and count it once.
+    let mut released: std::collections::HashSet<String> = std::collections::HashSet::new();
     for lease in &leases {
+        if released.contains(&lease.attempt_id) {
+            continue;
+        }
         let Ok(mission_id) = uuid::Uuid::parse_str(&lease.attempt_id) else {
             state.projects.expire_lease(&lease.id)?;
-            report.expired_overdue += 1;
+            report.expired_invalid += 1;
             continue;
         };
         match state.control.find_mission_any_store(mission_id).await {
@@ -174,6 +183,7 @@ pub async fn sweep(state: &Arc<AppState>) -> Result<LeaseSweepReport, String> {
                     state
                         .projects
                         .release_leases_for_attempt(&lease.attempt_id)?;
+                    released.insert(lease.attempt_id.clone());
                     report.released_terminal += 1;
                 } else if state.projects.renew_lease(&lease.id, LEASE_TTL_SECS)? {
                     report.renewed += 1;
@@ -183,6 +193,7 @@ pub async fn sweep(state: &Arc<AppState>) -> Result<LeaseSweepReport, String> {
                 state
                     .projects
                     .release_leases_for_attempt(&lease.attempt_id)?;
+                released.insert(lease.attempt_id.clone());
                 report.released_missing += 1;
             }
             Err(error) => {
