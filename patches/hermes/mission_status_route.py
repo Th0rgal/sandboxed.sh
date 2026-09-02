@@ -36,6 +36,13 @@ _TERMINAL = {
 # looks dead (Lido/EIP-8282, 2026-08-24). Only a compression lock skips.
 PROJECT_OPERATOR_WAKE_MESSAGE_CAP = 80
 
+# Display typing for the rows this route writes. The desktop renders
+# `mission_callback` under a "mission finished" divider, `mission_callback_wake`
+# as a timeline line (never the prompt text), and `hidden` not at all.
+MISSION_CALLBACK_DISPLAY_KIND = "mission_callback"
+MISSION_CALLBACK_WAKE_DISPLAY_KIND = "mission_callback_wake"
+MISSION_CALLBACK_SEPARATOR_DISPLAY_KIND = "hidden"
+
 MISSION_CALLBACK_WAKE_PROMPT = (
     "A routed mission-complete callback was just appended to this conversation. "
     "In one or two sentences, tell the operator what finished and whether they "
@@ -274,6 +281,43 @@ def format_mission_callback(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def mission_callback_display_metadata(payload: dict) -> dict:
+    """Compact, renderable facts about the callback for ``display_metadata``.
+
+    Lets a client show "mission finished · title · status" and open the mission
+    without parsing the prose — and even when the woken model ignores the
+    one-or-two-sentence instruction.
+    """
+    metadata = {
+        "mission_id": str(payload.get("mission_id") or "").strip(),
+        "status": extract_status(payload),
+        "title": str(payload.get("title") or "mission").strip(),
+        "project": extract_project_slug(payload) or None,
+    }
+    event_id = extract_event_id(payload)
+    if event_id:
+        metadata["event_id"] = event_id
+    workspace = str(payload.get("workspace_name") or "").strip()
+    if workspace:
+        metadata["workspace"] = workspace
+    summary = str(
+        payload.get("result_summary") or payload.get("short_description") or ""
+    ).strip()
+    if summary:
+        metadata["summary"] = summary[:400]
+    return {k: v for k, v in metadata.items() if v is not None}
+
+
+def _append_typed(session_db: Any, **kwargs: Any) -> None:
+    """``append_message`` with display typing, tolerating older DB shims."""
+    try:
+        session_db.append_message(**kwargs)
+    except TypeError:
+        kwargs.pop("display_kind", None)
+        kwargs.pop("display_metadata", None)
+        session_db.append_message(**kwargs)
+
+
 def _last_message_role(session_db: Any, session_id: str) -> Optional[str]:
     reader = getattr(session_db, "get_messages", None) or getattr(
         session_db, "list_messages", None
@@ -348,13 +392,24 @@ def append_mission_callback(
                 )
                 return live, False
     content = format_mission_callback(payload)
+    metadata = mission_callback_display_metadata(payload)
     if _last_message_role(session_db, live) == "assistant":
-        session_db.append_message(
+        _append_typed(
+            session_db,
             session_id=live,
             role="user",
             content="A mission you started has finished. The result follows.",
+            display_kind=MISSION_CALLBACK_SEPARATOR_DISPLAY_KIND,
+            display_metadata=metadata,
         )
-    session_db.append_message(session_id=live, role="assistant", content=content)
+    _append_typed(
+        session_db,
+        session_id=live,
+        role="assistant",
+        content=content,
+        display_kind=MISSION_CALLBACK_DISPLAY_KIND,
+        display_metadata=metadata,
+    )
     return live, True
 
 

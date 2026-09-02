@@ -278,3 +278,82 @@ def test_wake_prompt_does_not_order_an_inspect_loop():
     assert "do not run tools" in lower
     assert "continue autonomously" not in lower
     assert "if you can continue" not in lower
+
+
+class _TypedDB:
+    """Records every append with its display typing."""
+
+    def __init__(self, last_role=None):
+        self.appended = []
+        self._last_role = last_role
+
+    def get_session(self, session_id):
+        return {"id": session_id}
+
+    def get_messages(self, session_id):
+        if self._last_role is None:
+            return []
+        return [{"role": self._last_role, "content": "x"}]
+
+    def append_message(self, **kwargs):
+        self.appended.append(kwargs)
+
+
+def test_callback_rows_are_typed_for_display():
+    from gateway.platforms.mission_status_route import (
+        MISSION_CALLBACK_DISPLAY_KIND,
+        MISSION_CALLBACK_SEPARATOR_DISPLAY_KIND,
+        append_mission_callback,
+        mission_callback_display_metadata,
+    )
+
+    payload = {
+        "mission_id": "693cc6e8-a6cf-4491-86a7-6585625db99e",
+        "status": "completed",
+        "title": "PR #233 repair",
+        "project": "verity-lido",
+        "workspace_name": "verity",
+        "short_description": "prove SUCCESS, GitHub CLEAN",
+        "event_id": "evt-233",
+    }
+    db = _TypedDB(last_role="assistant")
+    live, appended = append_mission_callback("s1", payload, db)
+    assert appended and live == "s1"
+    separator, callback = db.appended
+    assert separator["role"] == "user"
+    assert separator["display_kind"] == MISSION_CALLBACK_SEPARATOR_DISPLAY_KIND == "hidden"
+    assert callback["role"] == "assistant"
+    assert callback["display_kind"] == MISSION_CALLBACK_DISPLAY_KIND == "mission_callback"
+    meta = callback["display_metadata"]
+    assert meta == mission_callback_display_metadata(payload)
+    assert meta["mission_id"] == payload["mission_id"]
+    assert meta["status"] == "completed"
+    assert meta["title"] == "PR #233 repair"
+    assert meta["project"] == "verity-lido"
+    assert meta["event_id"] == "evt-233"
+    assert meta["workspace"] == "verity"
+    assert meta["summary"] == "prove SUCCESS, GitHub CLEAN"
+    # The prose still carries the machine trailer for the controller.
+    assert "[Mission callback: PR #233 repair]" in callback["content"]
+
+
+def test_callback_typing_tolerates_an_old_db_shim():
+    from gateway.platforms.mission_status_route import append_mission_callback
+
+    class _OldDB:
+        def __init__(self):
+            self.appended = []
+
+        def get_session(self, session_id):
+            return {"id": session_id}
+
+        def get_messages(self, session_id):
+            return []
+
+        def append_message(self, session_id, role, content):
+            self.appended.append((session_id, role, content))
+
+    db = _OldDB()
+    append_mission_callback("s1", {"mission_id": "m1", "status": "failed"}, db)
+    assert len(db.appended) == 1
+    assert db.appended[0][1] == "assistant"
