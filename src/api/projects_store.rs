@@ -699,7 +699,45 @@ impl ProjectsStore {
         now: &str,
     ) -> rusqlite::Result<Receipt> {
         let id = Uuid::new_v4().to_string();
-        let payload = serde_json::to_string(&receipt.payload).unwrap_or_else(|_| "{}".into());
+        // `receipts.project_slug` references `projects(slug)`. Tracks (and
+        // legacy rows) can live under alias/orphan slugs that have no roster
+        // record; such receipts keep the slug in the payload and leave the
+        // FK column NULL instead of failing the whole transaction.
+        let project_slug = match receipt.project_slug.as_deref() {
+            Some(slug) => {
+                let known: Option<i64> = connection
+                    .query_row(
+                        "SELECT 1 FROM projects WHERE slug = ?1",
+                        params![slug],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if known.is_some() {
+                    Some(slug.to_string())
+                } else {
+                    tracing::warn!(
+                        slug,
+                        kind = %receipt.kind,
+                        "receipt for a slug with no roster record; stored without project link"
+                    );
+                    None
+                }
+            }
+            None => None,
+        };
+        let mut payload_value = receipt.payload.clone();
+        if project_slug.is_none() {
+            if let (Some(slug), Some(object)) = (
+                receipt.project_slug.as_deref(),
+                payload_value.as_object_mut(),
+            ) {
+                object.insert(
+                    "unlinked_slug".into(),
+                    serde_json::Value::String(slug.into()),
+                );
+            }
+        }
+        let payload = serde_json::to_string(&payload_value).unwrap_or_else(|_| "{}".into());
         let request_hash = receipt.request_hash();
         connection.execute(
             "INSERT INTO receipts \
@@ -712,7 +750,7 @@ impl ProjectsStore {
                 receipt.idempotency_key,
                 request_hash,
                 receipt.kind,
-                receipt.project_slug,
+                project_slug,
                 receipt.track_id,
                 receipt.criterion_id,
                 receipt.subject_type,
@@ -731,7 +769,7 @@ impl ProjectsStore {
             id,
             idempotency_key: receipt.idempotency_key.clone(),
             kind: receipt.kind.clone(),
-            project_slug: receipt.project_slug.clone(),
+            project_slug,
             track_id: receipt.track_id.clone(),
             criterion_id: receipt.criterion_id.clone(),
             subject_type: receipt.subject_type.clone(),
@@ -5154,6 +5192,7 @@ mod tests {
                     desired_state TEXT, status TEXT, updated_at TEXT NOT NULL,
                     PRIMARY KEY (slug, track));
                  INSERT INTO project_tracks VALUES
+                    ('orphan-alias', 'x1', 'done elsewhere', 'done', '2026-08-01T00:00:00Z'),
                     ('lido', 'P-ETH-1', 'proved', 'in-progress', '2026-08-01T00:00:00Z'),
                     ('lido', 'S3', 'token bound', 'done', '2026-08-02T00:00:00Z'),
                     ('lido', 'wave-1', NULL, 'cancelled', '2026-08-03T00:00:00Z'),
@@ -5173,6 +5212,13 @@ mod tests {
             connection: Mutex::new(connection),
         };
         assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
+        // A slug with no roster record (alias / orphan) migrates too: its
+        // claim receipt is stored without the FK link instead of aborting.
+        let orphan = store
+            .track("orphan-alias", "x1")
+            .expect("orphan")
+            .expect("row");
+        assert_eq!(orphan.claim.as_deref(), Some("legacy_import"));
         let tracks = store.tracks("lido").expect("read");
         let by_key = |key: &str| tracks.iter().find(|t| t.track == key).expect(key).clone();
 
