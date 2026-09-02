@@ -1065,8 +1065,61 @@ async fn equivalent_remote_validation_response(
                         mission_id = %req.mission_id,
                         canonical_mission_id = %handle.mission_id,
                         job_id = %handle.job_id,
+                        wait = req.wait,
                         "attached to the live equivalent remote validation"
                     );
+                    if req.wait {
+                        // A synchronous caller wants the outcome, not a
+                        // job id: park on the canonical job's observer and
+                        // return this mission's own terminal receipt.
+                        for _ in 0..WAIT_MAX_POLLS {
+                            tokio::time::sleep(WAIT_POLL_INTERVAL).await;
+                            match crate::remote_node::job_ledger::terminal_receipt_for_mission(
+                                &state.config.working_dir,
+                                handle.job_id,
+                                req.mission_id,
+                            )
+                            .await
+                            {
+                                Ok(Some(receipt)) => {
+                                    let duration_secs = (receipt.finished_at - receipt.started_at)
+                                        .num_seconds()
+                                        .max(0)
+                                        as u64;
+                                    return Some(
+                                        (
+                                            StatusCode::OK,
+                                            Json(RemoteBuildWaitResponse {
+                                                exit_code: receipt.exit_status,
+                                                state: receipt.state,
+                                                duration_secs,
+                                                log_tail: "attached to the live equivalent job; terminal receipt"
+                                                    .to_string(),
+                                                node_id: receipt.node_id,
+                                                job_id: receipt.job_id,
+                                                artifacts: receipt.artifacts,
+                                            }),
+                                        )
+                                            .into_response(),
+                                    );
+                                }
+                                Ok(None) => continue,
+                                Err(error) => {
+                                    tracing::warn!(%error, "attached wait: ledger read failed");
+                                }
+                            }
+                        }
+                        return Some(
+                            (
+                                StatusCode::GATEWAY_TIMEOUT,
+                                format!(
+                                    "attached to job {} but it did not finish within the synchronous wait window",
+                                    handle.job_id
+                                ),
+                            )
+                                .into_response(),
+                        );
+                    }
                     Some(
                         (
                             StatusCode::ACCEPTED,
