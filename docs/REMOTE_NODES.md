@@ -583,3 +583,26 @@ Before production deploy, this needs remote workspace synchronization, remote
 AI backend process supervision, streamed event forwarding, durable node lease
 tracking, capacity-aware queueing, TLS or private-network enforcement, and
 operator UI for selecting nodes.
+
+
+### Content identity (plan step 6)
+
+A build's identity is a versioned, canonical document hashed byte-for-byte
+(`RemoteJobIdentity::identity_hash`): `base_tree_sha` (the root tree of the
+commit; the commit itself is provenance only), `cwd_rel`, the exact `argv`,
+sorted `artifacts`, `toolchain`, the overlay digest, `builder_image_digest`,
+`build_protocol_version` and `behavior_env_digest` (an allowlisted,
+credential-free environment digest computed by `remote-lean-build`). The
+bundled wrapper sends `base_tree_sha`, `build_protocol_version` and
+`behavior_env_digest`; the node verifies `HEAD^{tree}` against
+`base_tree_sha` before building (`BASE_TREE_MISMATCH` otherwise).
+
+Receipts written before identity v1 carry `version: 0`. They still block a
+duplicate in-flight submission but are never replayed as success for a v1
+request.
+
+The JSON ledger (`remote-jobs.json`, `remote-job-receipts.json`) is mirrored
+into `projects.db` (`remote_jobs`, `remote_job_subscribers`, `receipts`
+kind=`build`) on every mutation; boot reconciliation backfills and logs a
+parity report. The JSON files stay authoritative until one production
+restart shows zero drift (plan step 9 retires them).

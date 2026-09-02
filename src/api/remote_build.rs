@@ -404,6 +404,20 @@ pub struct RemoteBuildRequest {
     /// successful build.
     #[serde(default)]
     pub artifacts: Vec<String>,
+    /// Root tree of `commit` (`git rev-parse <commit>^{tree}`). Content
+    /// identity: two commits with the same tree are the same build. The node
+    /// verifies the checkout against it.
+    #[serde(default)]
+    pub base_tree_sha: Option<String>,
+    /// Builder image digest, when the wrapper knows it.
+    #[serde(default)]
+    pub builder_image_digest: Option<String>,
+    /// Wrapper build-protocol revision.
+    #[serde(default)]
+    pub build_protocol_version: Option<String>,
+    /// Digest over the allowlisted behaviour-affecting environment.
+    #[serde(default)]
+    pub behavior_env_digest: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -454,9 +468,18 @@ fn repository_url_has_credentials(repo: &str) -> bool {
 fn remote_job_identity(
     req: &RemoteBuildRequest,
 ) -> crate::remote_node::job_ledger::RemoteJobIdentity {
+    let clean = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
     crate::remote_node::job_ledger::RemoteJobIdentity {
+        version: crate::remote_node::job_ledger::IDENTITY_VERSION,
         repository: repository_identity(&req.repo),
         commit: req.commit.clone(),
+        base_tree_sha: clean(&req.base_tree_sha).map(|tree| tree.to_ascii_lowercase()),
         cwd_rel_known: true,
         cwd_rel: req.cwd_rel.clone(),
         command: req.command.clone(),
@@ -466,6 +489,19 @@ fn remote_job_identity(
             .source_bundle
             .as_ref()
             .map(source_bundle_identity_digest),
+        builder_image_digest: clean(&req.builder_image_digest),
+        build_protocol_version: clean(&req.build_protocol_version),
+        behavior_env_digest: clean(&req.behavior_env_digest),
+    }
+}
+
+fn validate_base_tree_sha(value: Option<&str>) -> Result<(), String> {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(tree) if tree.len() == 40 && tree.chars().all(|c| c.is_ascii_hexdigit()) => Ok(()),
+        Some(tree) => Err(format!(
+            "base_tree_sha must be a 40-char hex tree id, got '{tree}'"
+        )),
+        None => Ok(()),
     }
 }
 
@@ -1058,6 +1094,9 @@ async fn submit_remote_build(
     if let Err(message) = validate_expected_head(&req.commit, req.expected_head.as_deref()) {
         return (StatusCode::CONFLICT, message).into_response();
     }
+    if let Err(error) = validate_base_tree_sha(req.base_tree_sha.as_deref()) {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
     let max_estimated_disk_bytes =
         env_gib("REMOTE_BUILD_MAX_ESTIMATED_DISK_GB", MAX_ESTIMATED_DISK_GB);
     if req.estimated_disk_bytes == 0 || req.estimated_disk_bytes > max_estimated_disk_bytes {
@@ -1147,6 +1186,12 @@ async fn submit_remote_build(
                 commit: req.commit.clone(),
                 archive: req.source_archive.clone().map(Box::new),
                 bundle: req.source_bundle.clone(),
+                base_tree_sha: req
+                    .base_tree_sha
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.to_ascii_lowercase()),
             }),
             cwd_rel: req.cwd_rel.clone(),
             command: req.command.clone(),
@@ -2088,6 +2133,11 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
                 state: "succeeded".to_string(),
                 exit_status: Some(0),
                 identity: crate::remote_node::job_ledger::RemoteJobIdentity {
+                    version: 0,
+                    base_tree_sha: None,
+                    builder_image_digest: None,
+                    build_protocol_version: None,
+                    behavior_env_digest: None,
                     repository: "https://github.com/example/verity.git".to_string(),
                     commit: "a".repeat(40),
                     cwd_rel_known: true,

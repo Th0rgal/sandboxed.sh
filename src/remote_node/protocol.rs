@@ -136,6 +136,11 @@ pub struct JobSource {
     /// pushing a Git commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<SourceBundle>,
+    /// Root tree of `commit` as the submitter saw it. The node verifies the
+    /// checked-out `HEAD^{tree}` against it before building, so content
+    /// identity (tree, not commit) is what a receipt proves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_tree_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -514,6 +519,7 @@ mod tests {
     fn lean_build_payload_round_trips_with_defaults() {
         let payload = JobPayload::LeanBuild {
             source: Box::new(JobSource {
+                base_tree_sha: None,
                 repo: "https://github.com/example/verity.git".to_string(),
                 commit: "a".repeat(40),
                 archive: None,

@@ -476,6 +476,38 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Content-addressed checkout directory for `(repo, commit)`.
+/// The submitter pinned a root tree; the checkout must have exactly that
+/// tree or the receipt would prove something about different content.
+/// Legacy submissions carry no tree and skip the check.
+async fn verify_base_tree(source: &JobSource, checkout: &Path) -> anyhow::Result<()> {
+    let Some(expected) = source
+        .base_tree_sha
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let output = tokio::process::Command::new("git")
+        .args(["rev-parse", "HEAD^{tree}"])
+        .current_dir(checkout)
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!("could not resolve the checked-out tree for base tree verification");
+    }
+    let actual = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    if actual != expected.to_ascii_lowercase() {
+        anyhow::bail!(
+            "BASE_TREE_MISMATCH: submitter pinned tree {expected} but commit {} checks out tree {actual}",
+            source.commit
+        );
+    }
+    Ok(())
+}
+
 pub fn checkout_dir(work_root: &Path, repo: &str, commit: &str) -> PathBuf {
     let repo_hash = sha256_hex(repo.as_bytes());
     work_root
@@ -1102,6 +1134,7 @@ async fn import_source_archive(
         token,
     )
     .await?;
+    verify_base_tree(source, tmp).await?;
     tokio::fs::write(
         tmp.join(".git/sandboxed-source-archive"),
         format!("{}\n", archive.sha256),
@@ -1215,6 +1248,7 @@ async fn ensure_checkout(
             token,
         )
         .await?;
+        verify_base_tree(source, &tmp).await?;
         // Best-effort: many Lean repos have no submodules and lakefile deps
         // are fetched by lake itself.
         let _ = run_git_step(
@@ -1863,6 +1897,7 @@ mod tests {
             commit: commit.to_string(),
             archive: None,
             bundle: None,
+            base_tree_sha: None,
         }
     }
 
@@ -1988,6 +2023,7 @@ mod tests {
         let work_root = tempfile::tempdir().unwrap();
         let log = work_root.path().join("job.log");
         let mut source = JobSource {
+            base_tree_sha: None,
             repo: "https://127.0.0.1:9/private/repository.git".to_string(),
             commit: commit.clone(),
             archive: Some(Box::new(archive)),
@@ -2075,6 +2111,7 @@ mod tests {
         let (_source_repo, commit, archive) = committed_archive();
         let other_commit = "b".repeat(40);
         let mut source = JobSource {
+            base_tree_sha: None,
             repo: "https://127.0.0.1:9/private/repository.git".to_string(),
             commit: other_commit.clone(),
             archive: Some(Box::new(archive.clone())),
@@ -2448,6 +2485,7 @@ mod tests {
             assert!(
                 validate_lean_build(
                     &JobSource {
+                        base_tree_sha: None,
                         repo: bad.to_string(),
                         commit: "a".repeat(40),
                         archive: None,
@@ -2470,6 +2508,7 @@ mod tests {
             assert!(
                 validate_lean_build(
                     &JobSource {
+                        base_tree_sha: None,
                         repo: good.to_string(),
                         commit: "a".repeat(40),
                         archive: None,
@@ -2664,18 +2703,21 @@ mod tests {
     fn lake_cache_key_is_partitioned_by_project_and_target() {
         let dependency_key = "same-toolchain-and-manifest";
         let source_a = JobSource {
+            base_tree_sha: None,
             repo: "https://example.com/a.git".to_string(),
             commit: "a".repeat(40),
             archive: None,
             bundle: None,
         };
         let source_a_next_commit = JobSource {
+            base_tree_sha: None,
             repo: source_a.repo.clone(),
             commit: "b".repeat(40),
             archive: None,
             bundle: None,
         };
         let source_b = JobSource {
+            base_tree_sha: None,
             repo: "https://example.com/b.git".to_string(),
             commit: "a".repeat(40),
             archive: None,
