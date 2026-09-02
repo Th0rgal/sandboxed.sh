@@ -744,7 +744,7 @@ PY
 )"
     poll_url="$poll_url&expected_head=$encoded_expected_head"
 fi
-poll_secs="${REMOTE_BUILD_POLL_SECS:-3}"
+poll_secs="${REMOTE_BUILD_POLL_SECS:-15}"
 client_timeout_secs="${REMOTE_BUILD_CLIENT_TIMEOUT_SECS:-7500}"
 case "$poll_secs" in
     ''|*[!0-9]*) die "REMOTE_BUILD_POLL_SECS must be a positive integer" ;;
@@ -757,6 +757,15 @@ esac
 if [ "$receipt_state" != "succeeded" ] && [ "$receipt_state" != "stale_success" ] \
     && [ "$receipt_state" != "failed" ] \
     && [ "$receipt_state" != "cancelled" ] && [ "$receipt_state" != "lost" ]; then
+    # Passive mode (REMOTE_BUILD_PASSIVE=1): do not poll from inside the
+    # harness. The submission is durable, core owns one observer per job, and
+    # the mission is parked and woken when the job ends; re-running this exact
+    # command then collects the receipt. Exit 75 (EX_TEMPFAIL) marks "not
+    # finished, not failed". Opt-in until the runner treats 75 as a park.
+    if [ "${REMOTE_BUILD_PASSIVE:-0}" = "1" ]; then
+        echo "remote-lean-build: job $job_id on node '$node_id' is running; not polling (REMOTE_BUILD_PASSIVE=1). The mission is woken when it ends — re-run this exact command to collect the result." >&2
+        exit 75
+    fi
     deadline=$(( $(date +%s) + client_timeout_secs ))
 
     while :; do

@@ -435,6 +435,10 @@ struct RemoteBuildWaitResponse {
 struct RemoteBuildAcceptedResponse {
     job_id: Uuid,
     node_id: String,
+    /// True when this submission attached to an already-live job with the
+    /// same content identity instead of dispatching a second execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attached: Option<bool>,
     repository: String,
     commit: String,
     command: Vec<String>,
@@ -1043,7 +1047,52 @@ async fn equivalent_remote_validation_response(
             }
         }
         Ok(Some(crate::remote_node::job_ledger::EquivalentRemoteValidation::Active(handle))) => {
-            Some(active_conflict(&handle))
+            // One live job per identity: attach this mission to the canonical
+            // job instead of refusing. A retrying harness or a stray helper
+            // then never creates a second build and never sees an error it
+            // has to route around; it polls / parks on the same job id.
+            let expects_continuation = req.wait || req.resume_mission_on_terminal;
+            match crate::remote_node::job_ledger::attach(
+                &state.config.working_dir,
+                handle.job_id,
+                req.mission_id,
+                expects_continuation,
+            )
+            .await
+            {
+                Ok(Some(attached)) => {
+                    tracing::info!(
+                        mission_id = %req.mission_id,
+                        canonical_mission_id = %handle.mission_id,
+                        job_id = %handle.job_id,
+                        "attached to the live equivalent remote validation"
+                    );
+                    Some(
+                        (
+                            StatusCode::ACCEPTED,
+                            Json(RemoteBuildAcceptedResponse {
+                                job_id: attached.job_id,
+                                node_id: attached.node_id,
+                                attached: Some(true),
+                                repository: identity.repository.clone(),
+                                commit: identity.commit.clone(),
+                                command: identity.command.clone(),
+                                toolchain: identity.toolchain.clone(),
+                                source_bundle_digest: identity.source_bundle_digest.clone(),
+                            }),
+                        )
+                            .into_response(),
+                    )
+                }
+                Ok(None) => Some(active_conflict(&handle)),
+                Err(error) => Some(
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("could not attach to the live remote validation: {error}"),
+                    )
+                        .into_response(),
+                ),
+            }
         }
         Ok(None) => None,
         Err(error) => Some(
@@ -1354,6 +1403,7 @@ async fn submit_remote_build(
             Json(RemoteBuildAcceptedResponse {
                 job_id,
                 node_id: node.id.clone(),
+                attached: None,
                 repository: identity.repository,
                 commit: identity.commit,
                 command: identity.command,
@@ -1585,7 +1635,15 @@ async fn get_remote_build(
     };
     // The capability token is mission-scoped: never leak another mission's
     // job status through it.
-    if status.mission_id != query.mission_id {
+    if status.mission_id != query.mission_id
+        && !crate::remote_node::job_ledger::mission_subscribed(
+            &state.config.working_dir,
+            job_id,
+            query.mission_id,
+        )
+        .await
+        .unwrap_or(false)
+    {
         return Err((
             StatusCode::FORBIDDEN,
             "job does not belong to this mission".to_string(),

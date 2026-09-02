@@ -5672,8 +5672,12 @@ async fn recoverable_remote_continuation(
     let Some(receipt) = receipt else {
         return Ok(None);
     };
-    if crate::remote_node::job_ledger::require_terminal_receipt_wake(working_dir, receipt.job_id)
-        .await?
+    if crate::remote_node::job_ledger::require_terminal_receipt_wake(
+        working_dir,
+        receipt.job_id,
+        receipt.mission_id,
+    )
+    .await?
     {
         Ok(Some(receipt.job_id))
     } else {
@@ -5762,7 +5766,9 @@ async fn arm_unresolved_remote_build_wake(working_dir: &std::path::Path, mission
         }
     };
 
-    match crate::remote_node::job_ledger::require_terminal_wake(working_dir, job_id).await {
+    match crate::remote_node::job_ledger::require_terminal_wake(working_dir, job_id, mission_id)
+        .await
+    {
         Ok(true) => true,
         Ok(false) => false,
         Err(error) => {
@@ -9672,6 +9678,69 @@ pub async fn create_mission(
         }
     }
 
+    // Lineage guard: a child spawned by a mission that is parked on a remote
+    // build, on the same project/track, is a poller in disguise. Refuse it
+    // with the job id so the parent attaches or waits instead. Lineage is the
+    // explicit parent_mission_id, never origin_session_id (which sibling
+    // missions share).
+    if let (Some(parent_id), Some(project), Some(track)) = (
+        req.parent_mission_id,
+        req.project
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        req.track
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    ) {
+        let control_state = control_for_user(&state, &user).await;
+        if let Ok(Some(parent)) = control_state.mission_store.get_mission(parent_id).await {
+            let same_project = parent
+                .project
+                .project
+                .as_deref()
+                .map(super::projects_overview::canonicalize_project_slug)
+                .is_some_and(|slug| {
+                    slug == super::projects_overview::canonicalize_project_slug(project)
+                });
+            let same_track = parent
+                .project
+                .track
+                .as_deref()
+                .map(super::projects_store::normalize_track_key)
+                .is_some_and(|key| key == super::projects_store::normalize_track_key(track));
+            if same_project && same_track {
+                if let Ok(Some(handle)) =
+                    crate::remote_node::job_ledger::current_remote_build_wait_handle(
+                        &state.config.working_dir,
+                        parent_id,
+                    )
+                    .await
+                {
+                    tracing::info!(
+                        parent_mission_id = %parent_id,
+                        job_id = %handle.job_id,
+                        project,
+                        track,
+                        "create_mission rejected: parent is waiting on a remote build for this track"
+                    );
+                    return Err((
+                        StatusCode::CONFLICT,
+                        serde_json::json!({
+                            "error": "BUILD_IN_PROGRESS",
+                            "job_id": handle.job_id,
+                            "node_id": handle.node_id,
+                            "parent_mission_id": parent_id,
+                            "message": "the parent mission already waits on a remote build for this track; do not spawn a helper to poll it — the parent is woken when the job ends, and re-running the same build command attaches to it",
+                        })
+                        .to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
     // Campaign uniqueness guard: at most one non-terminal campaign mission per
     // project. Checked on the explicit request tags (project inherited from a
     // bound conversation never carries track="campaign").
@@ -11156,6 +11225,7 @@ pub(crate) async fn deliver_pending_remote_build_wakes(state: &AppState) {
                 match crate::remote_node::job_ledger::mark_terminal_wake_suppressed(
                     &state.config.working_dir,
                     receipt.job_id,
+                    receipt.mission_id,
                     superseding_job_id,
                 )
                 .await
@@ -11214,6 +11284,7 @@ pub(crate) async fn deliver_pending_remote_build_wakes(state: &AppState) {
                 if let Err(error) = crate::remote_node::job_ledger::mark_terminal_wake_delivered(
                     &state.config.working_dir,
                     receipt.job_id,
+                    receipt.mission_id,
                 )
                 .await
                 {
@@ -11694,6 +11765,7 @@ async fn reconcile_pending_handles(
                     if let Err(error) = crate::remote_node::job_ledger::require_terminal_wake(
                         working_dir,
                         handle.job_id,
+                        handle.mission_id,
                     )
                     .await
                     {
@@ -27720,9 +27792,13 @@ mod tests {
             mission_has_unresolved_remote_build(dir.path(), synchronous_mission_id).await,
             "a synchronous waiter must keep its mission continuation recoverable"
         );
-        crate::remote_node::job_ledger::require_terminal_wake(dir.path(), synchronous_job_id)
-            .await
-            .unwrap();
+        crate::remote_node::job_ledger::require_terminal_wake(
+            dir.path(),
+            synchronous_job_id,
+            synchronous_mission_id,
+        )
+        .await
+        .unwrap();
         assert!(mission_has_unresolved_remote_build(dir.path(), synchronous_mission_id).await);
 
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());

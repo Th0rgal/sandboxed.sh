@@ -358,3 +358,13 @@ par défaut**. C'est TON travail de la débloquer :
 Objectif : les « needs you » qui remontent à l'opérateur deviennent **rares et
 qualifiés**. Une mission qui attend une réponse que tu peux fournir et que tu
 laisses pourrir/escalader est une erreur de supervision.
+
+## Remote builds: attach, never poll
+
+- Re-running the same `remote-lean-build` command while an identical build is live
+  returns `202` with `"attached": true` and the canonical `job_id`. There is never a
+  second execution and never a 409 to route around. Your mission is woken when the
+  job ends.
+- `start_mission` for a helper on the same project/track while you are parked on a
+  build answers `409 BUILD_IN_PROGRESS {job_id}`. Do not spawn pollers; wait for the
+  wake or read the job status with the `job_id`.

@@ -396,6 +396,39 @@ pub async fn terminal_receipt(
         .find(|receipt| receipt.job_id == job_id))
 }
 
+/// The terminal receipt a specific (possibly attached) mission holds for a job.
+pub async fn terminal_receipt_for_mission(
+    working_dir: &Path,
+    job_id: Uuid,
+    mission_id: Uuid,
+) -> anyhow::Result<Option<RemoteJobReceipt>> {
+    Ok(load_receipts_result(working_dir)
+        .await?
+        .into_iter()
+        .find(|receipt| receipt.job_id == job_id && receipt.mission_id == mission_id))
+}
+
+/// Whether `mission_id` holds (or held) a handle or receipt for `job_id`:
+/// the submitter, or a mission that attached to it.
+pub async fn mission_subscribed(
+    working_dir: &Path,
+    job_id: Uuid,
+    mission_id: Uuid,
+) -> anyhow::Result<bool> {
+    let _guard = lock().lock().await;
+    if load_result(working_dir)
+        .await?
+        .iter()
+        .any(|handle| handle.job_id == job_id && handle.mission_id == mission_id)
+    {
+        return Ok(true);
+    }
+    Ok(load_receipts_result(working_dir)
+        .await?
+        .iter()
+        .any(|receipt| receipt.job_id == job_id && receipt.mission_id == mission_id))
+}
+
 pub async fn terminal_receipts_for_mission(
     working_dir: &Path,
     mission_id: Uuid,
@@ -510,10 +543,14 @@ pub async fn recoverable_terminal_continuations(
 pub async fn require_terminal_receipt_wake(
     working_dir: &Path,
     job_id: Uuid,
+    mission_id: Uuid,
 ) -> anyhow::Result<bool> {
     let _guard = lock().lock().await;
     let mut receipts = load_receipts_result(working_dir).await?;
-    let Some(receipt) = receipts.iter_mut().find(|receipt| receipt.job_id == job_id) else {
+    let Some(receipt) = receipts
+        .iter_mut()
+        .find(|receipt| receipt.job_id == job_id && receipt.mission_id == mission_id)
+    else {
         return Ok(false);
     };
     if receipt.wake_delivered_at.is_some()
@@ -598,17 +635,27 @@ pub async fn terminal_wake_disposition(
 pub async fn mark_terminal_wake_suppressed(
     working_dir: &Path,
     job_id: Uuid,
+    mission_id: Uuid,
     superseding_job_id: Uuid,
 ) -> anyhow::Result<bool> {
     let _guard = lock().lock().await;
     let mut receipts = load_receipts_result(working_dir).await?;
-    let Some(receipt) = receipts.iter_mut().find(|receipt| receipt.job_id == job_id) else {
+    let Some(receipt) = receipts
+        .iter_mut()
+        .find(|receipt| receipt.job_id == job_id && receipt.mission_id == mission_id)
+    else {
         return Ok(false);
     };
     if receipt.wake_delivered_at.is_none() {
         receipt.wake_delivered_at = Some(chrono::Utc::now());
         receipt.wake_suppressed_by = Some(superseding_job_id);
-        sql::mirror_wake(working_dir, job_id, "suppressed", Some(superseding_job_id));
+        sql::mirror_wake(
+            working_dir,
+            job_id,
+            mission_id,
+            "suppressed",
+            Some(superseding_job_id),
+        );
         store_receipts(working_dir, &receipts).await?;
     }
     Ok(true)
@@ -617,15 +664,19 @@ pub async fn mark_terminal_wake_suppressed(
 pub async fn mark_terminal_wake_delivered(
     working_dir: &Path,
     job_id: Uuid,
+    mission_id: Uuid,
 ) -> anyhow::Result<bool> {
     let _guard = lock().lock().await;
     let mut receipts = load_receipts_result(working_dir).await?;
-    let Some(receipt) = receipts.iter_mut().find(|receipt| receipt.job_id == job_id) else {
+    let Some(receipt) = receipts
+        .iter_mut()
+        .find(|receipt| receipt.job_id == job_id && receipt.mission_id == mission_id)
+    else {
         return Ok(false);
     };
     if receipt.wake_delivered_at.is_none() {
         receipt.wake_delivered_at = Some(chrono::Utc::now());
-        sql::mirror_wake(working_dir, job_id, "delivered", None);
+        sql::mirror_wake(working_dir, job_id, mission_id, "delivered", None);
         store_receipts(working_dir, &receipts).await?;
     }
     Ok(true)
@@ -654,45 +705,61 @@ pub async fn finalize_with_artifacts(
 
     let _guard = lock().lock().await;
     let mut handles = load_result(working_dir).await?;
-    let Some(index) = handles.iter().position(|handle| handle.job_id == job_id) else {
+    if !handles.iter().any(|handle| handle.job_id == job_id) {
         return Ok(false);
-    };
-    let handle = handles.remove(index);
-    if handle.kind != JobHandleKind::RemoteBuild {
-        sql::mirror_terminal_without_receipt(working_dir, job_id, state);
     }
-    if handle.kind == JobHandleKind::RemoteBuild {
+    // Every subscribed mission gets its own terminal receipt (and therefore
+    // its own wake); the execution itself happened once.
+    let closing: Vec<JobHandle> = handles
+        .iter()
+        .filter(|handle| handle.job_id == job_id)
+        .cloned()
+        .collect();
+    handles.retain(|handle| handle.job_id != job_id);
+    let mut receipts = load_receipts_result(working_dir).await?;
+    let finished_at = chrono::Utc::now();
+    let mut wrote_receipt = false;
+    for handle in closing {
+        if handle.kind != JobHandleKind::RemoteBuild {
+            continue;
+        }
         let continuation_expected = handle.expects_mission_continuation();
-        let Some(identity) = handle.identity else {
-            sql::mirror_terminal_without_receipt(working_dir, job_id, state);
-            store(working_dir, &handles).await?;
-            return Ok(true);
+        let Some(identity) = handle.identity.clone() else {
+            continue;
         };
-        let mut receipts = load_receipts_result(working_dir).await?;
         let previous_wake_delivered_at = receipts
             .iter()
-            .find(|receipt| receipt.job_id == job_id)
+            .find(|receipt| receipt.job_id == job_id && receipt.mission_id == handle.mission_id)
             .and_then(|receipt| receipt.wake_delivered_at);
-        receipts.retain(|receipt| receipt.job_id != job_id);
+        receipts
+            .retain(|receipt| receipt.job_id != job_id || receipt.mission_id != handle.mission_id);
         receipts.push(RemoteJobReceipt {
             mission_id: handle.mission_id,
             node_id: handle.node_id,
             job_id,
             started_at: handle.started_at,
             submission_sequence: handle.submission_sequence,
-            finished_at: chrono::Utc::now(),
+            finished_at,
             state: state.to_string(),
             exit_status,
             identity,
-            artifacts,
+            artifacts: artifacts.clone(),
             continuation_expected,
-            wake_required: handle.kind == JobHandleKind::RemoteBuild && handle.wake_on_terminal,
+            wake_required: handle.wake_on_terminal,
             wake_delivered_at: previous_wake_delivered_at,
             wake_suppressed_by: None,
         });
         if let Some(receipt) = receipts.last() {
             sql::mirror_receipt(working_dir, receipt);
         }
+        wrote_receipt = true;
+    }
+    if !wrote_receipt {
+        sql::mirror_terminal_without_receipt(working_dir, job_id, state);
+        store(working_dir, &handles).await?;
+        return Ok(true);
+    }
+    {
         if receipts.len() > MAX_RECEIPTS {
             receipts.sort_by_key(|receipt| receipt.finished_at);
             let mut excess = receipts.len() - MAX_RECEIPTS;
@@ -712,7 +779,7 @@ pub async fn finalize_with_artifacts(
     Ok(true)
 }
 
-/// Record a job handle (idempotent on job_id).
+/// Record a job handle (idempotent on (job_id, mission_id)).
 pub async fn record(working_dir: &Path, handle: JobHandle) -> anyhow::Result<()> {
     let _guard = lock().lock().await;
     let mut handles = load_result(working_dir).await?;
@@ -741,10 +808,60 @@ pub async fn record(working_dir: &Path, handle: JobHandle) -> anyhow::Result<()>
                 .saturating_add(1)
         };
     }
-    handles.retain(|existing| existing.job_id != handle.job_id);
+    // A job may carry one handle per subscribed mission (see [`attach`]);
+    // the submitter's handle and every attached handle share the job id and
+    // are told apart by mission id.
+    handles.retain(|existing| {
+        existing.job_id != handle.job_id || existing.mission_id != handle.mission_id
+    });
     sql::mirror_handle(working_dir, &handle);
     handles.push(handle);
     store(working_dir, &handles).await
+}
+
+/// Subscribe `mission_id` to an already-live job: a second submission of the
+/// same content identity attaches to the canonical job instead of failing.
+/// The attached handle is a clone of the canonical one under the attaching
+/// mission, so parking (`waiting_remote_job`), supersession and the terminal
+/// wake all work per mission without a second execution. Idempotent.
+pub async fn attach(
+    working_dir: &Path,
+    job_id: Uuid,
+    mission_id: Uuid,
+    expects_continuation: bool,
+) -> anyhow::Result<Option<JobHandle>> {
+    let _guard = lock().lock().await;
+    let mut handles = load_result(working_dir).await?;
+    if let Some(existing) = handles
+        .iter()
+        .find(|handle| handle.job_id == job_id && handle.mission_id == mission_id)
+    {
+        return Ok(Some(existing.clone()));
+    }
+    let Some(canonical) = handles
+        .iter()
+        .filter(|handle| {
+            handle.job_id == job_id
+                && matches!(
+                    handle.kind,
+                    JobHandleKind::RemoteBuild | JobHandleKind::Tentative
+                )
+        })
+        .min_by_key(|handle| validation_order(handle.submission_sequence, handle.started_at))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let attached = JobHandle {
+        mission_id,
+        wait_for_completion: Some(expects_continuation),
+        wake_on_terminal: false,
+        ..canonical
+    };
+    sql::mirror_subscriber(working_dir, job_id, mission_id, expects_continuation);
+    handles.push(attached.clone());
+    store(working_dir, &handles).await?;
+    Ok(Some(attached))
 }
 
 /// Remove a job handle once its mission is finalized.
@@ -771,26 +888,43 @@ pub async fn remove(working_dir: &Path, job_id: Uuid) {
 pub async fn heartbeat(working_dir: &Path, job_id: Uuid) -> anyhow::Result<bool> {
     let _guard = lock().lock().await;
     let mut handles = load_result(working_dir).await?;
-    let Some(handle) = handles.iter_mut().find(|handle| handle.job_id == job_id) else {
-        return Ok(false);
-    };
     let now = chrono::Utc::now();
-    if handle
-        .heartbeat_at
-        .is_some_and(|previous| now - previous < chrono::Duration::seconds(15))
-    {
-        return Ok(true);
+    let mut touched = false;
+    let mut found = false;
+    for handle in handles.iter_mut().filter(|handle| handle.job_id == job_id) {
+        found = true;
+        if handle
+            .heartbeat_at
+            .is_some_and(|previous| now - previous < chrono::Duration::seconds(15))
+        {
+            continue;
+        }
+        handle.heartbeat_at = Some(now);
+        touched = true;
     }
-    handle.heartbeat_at = Some(now);
-    sql::mirror_handle(working_dir, handle);
-    store(working_dir, &handles).await?;
+    if !found {
+        return Ok(false);
+    }
+    if touched {
+        if let Some(handle) = handles.iter().find(|handle| handle.job_id == job_id) {
+            sql::mirror_handle(working_dir, handle);
+        }
+        store(working_dir, &handles).await?;
+    }
     Ok(true)
 }
 
-pub async fn require_terminal_wake(working_dir: &Path, job_id: Uuid) -> anyhow::Result<bool> {
+pub async fn require_terminal_wake(
+    working_dir: &Path,
+    job_id: Uuid,
+    mission_id: Uuid,
+) -> anyhow::Result<bool> {
     let _guard = lock().lock().await;
     let mut handles = load_result(working_dir).await?;
-    let Some(handle) = handles.iter_mut().find(|handle| handle.job_id == job_id) else {
+    let Some(handle) = handles
+        .iter_mut()
+        .find(|handle| handle.job_id == job_id && handle.mission_id == mission_id)
+    else {
         return Ok(false);
     };
     if !handle.wake_on_terminal {
@@ -865,6 +999,31 @@ pub mod sql {
 
     fn upsert_handle(connection: &Connection, handle: &JobHandle) -> rusqlite::Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
+        // An attached handle (same job, another mission) is a subscriber row,
+        // never a second job row.
+        let submitter: Option<String> = connection
+            .query_row(
+                "SELECT mission_id FROM remote_jobs WHERE job_id = ?1",
+                params![handle.job_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(submitter) = submitter {
+            if submitter != handle.mission_id.to_string() {
+                connection.execute(
+                    "INSERT OR IGNORE INTO remote_job_subscribers \
+                       (job_id, mission_id, wake_required, wake_state, attached_at) \
+                     VALUES (?1, ?2, ?3, 'pending', ?4)",
+                    params![
+                        handle.job_id.to_string(),
+                        handle.mission_id.to_string(),
+                        handle.wake_on_terminal as i64,
+                        now
+                    ],
+                )?;
+                return Ok(());
+            }
+        }
         let identity_json = handle
             .identity
             .as_ref()
@@ -1057,6 +1216,7 @@ pub mod sql {
     pub fn mirror_wake(
         working_dir: &Path,
         job_id: Uuid,
+        mission_id: Uuid,
         disposition: &str,
         suppressed_by: Option<Uuid>,
     ) {
@@ -1064,22 +1224,75 @@ pub mod sql {
             return;
         };
         let now = chrono::Utc::now().to_rfc3339();
-        let result = match disposition {
-            "delivered" => connection.execute(
-                "UPDATE remote_jobs SET wake_delivered_at = ?2, updated_at = ?2 WHERE job_id = ?1",
-                params![job_id.to_string(), now],
-            ),
-            _ => connection.execute(
-                "UPDATE remote_jobs SET wake_suppressed_by = ?2, updated_at = ?3 WHERE job_id = ?1",
+        // The submitter's wake lives on the job row; an attached mission's on
+        // its subscriber row.
+        let submitter: Option<String> = connection
+            .query_row(
+                "SELECT mission_id FROM remote_jobs WHERE job_id = ?1",
+                params![job_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let result = if submitter.as_deref() == Some(mission_id.to_string().as_str()) {
+            match disposition {
+                "delivered" => connection.execute(
+                    "UPDATE remote_jobs SET wake_delivered_at = ?2, updated_at = ?2 WHERE job_id = ?1",
+                    params![job_id.to_string(), now],
+                ),
+                _ => connection.execute(
+                    "UPDATE remote_jobs SET wake_suppressed_by = ?2, updated_at = ?3 WHERE job_id = ?1",
+                    params![
+                        job_id.to_string(),
+                        suppressed_by.map(|id| id.to_string()),
+                        now
+                    ],
+                ),
+            }
+        } else {
+            connection.execute(
+                "UPDATE remote_job_subscribers SET wake_state = ?3, delivered_at = ?4 \
+                 WHERE job_id = ?1 AND mission_id = ?2",
                 params![
                     job_id.to_string(),
-                    suppressed_by.map(|id| id.to_string()),
+                    mission_id.to_string(),
+                    if disposition == "delivered" {
+                        "delivered"
+                    } else {
+                        "suppressed"
+                    },
                     now
                 ],
-            ),
+            )
         };
         if let Err(error) = result {
-            tracing::warn!(%job_id, %error, "remote job SQL mirror: wake update failed");
+            tracing::warn!(%job_id, %mission_id, %error, "remote job SQL mirror: wake update failed");
+        }
+    }
+
+    /// Record an attached mission as a durable subscriber of a live job.
+    pub fn mirror_subscriber(
+        working_dir: &Path,
+        job_id: Uuid,
+        mission_id: Uuid,
+        wake_required: bool,
+    ) {
+        let Some(connection) = open(working_dir) else {
+            return;
+        };
+        if let Err(error) = connection.execute(
+            "INSERT OR IGNORE INTO remote_job_subscribers \
+               (job_id, mission_id, wake_required, wake_state, attached_at) \
+             VALUES (?1, ?2, ?3, 'pending', ?4)",
+            params![
+                job_id.to_string(),
+                mission_id.to_string(),
+                wake_required as i64,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        ) {
+            tracing::warn!(%job_id, %mission_id, %error, "remote job SQL mirror: subscriber insert failed");
         }
     }
 
@@ -1454,9 +1667,11 @@ mod tests {
         assert!(receipt.wake_required);
         assert_eq!(receipt.wake_delivered_at, None);
         assert_eq!(pending_terminal_wakes(dir.path()).await.unwrap().len(), 1);
-        assert!(mark_terminal_wake_delivered(dir.path(), job_id)
-            .await
-            .unwrap());
+        assert!(
+            mark_terminal_wake_delivered(dir.path(), job_id, receipt.mission_id)
+                .await
+                .unwrap()
+        );
         assert!(pending_terminal_wakes(dir.path()).await.unwrap().is_empty());
         assert_eq!(
             terminal_receipts_for_mission(dir.path(), mission_id)
@@ -1705,7 +1920,7 @@ mod tests {
             TerminalWakeDisposition::SupersededBy(new_job_id)
         );
         assert!(
-            mark_terminal_wake_suppressed(dir.path(), old_job_id, new_job_id)
+            mark_terminal_wake_suppressed(dir.path(), old_job_id, mission_id, new_job_id)
                 .await
                 .unwrap()
         );
@@ -2288,5 +2503,106 @@ mod tests {
         assert_eq!(report.sql_live_not_in_json, 0);
         let again = sql_parity_backfill(dir.path()).await.unwrap();
         assert_eq!(again.backfilled_receipts, 0, "parity is idempotent");
+    }
+
+    #[tokio::test]
+    async fn attached_missions_get_their_own_receipts_and_wakes() {
+        let dir = tempfile::tempdir().unwrap();
+        let job_id = Uuid::new_v4();
+        let submitter = Uuid::new_v4();
+        let attacher = Uuid::new_v4();
+        let identity = identity_v1("a".repeat(40).as_str(), Some(&"e".repeat(64)));
+        record(
+            dir.path(),
+            JobHandle {
+                mission_id: submitter,
+                node_id: "spark".to_string(),
+                job_id,
+                started_at: chrono::Utc::now(),
+                submission_sequence: 0,
+                accepted_at: Some(chrono::Utc::now()),
+                heartbeat_at: None,
+                disk_reservation_bytes: 0,
+                kind: JobHandleKind::RemoteBuild,
+                identity: Some(identity.clone()),
+                wait_for_completion: Some(true),
+                wake_on_terminal: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(attach(dir.path(), Uuid::new_v4(), attacher, true)
+            .await
+            .unwrap()
+            .is_none());
+        let attached = attach(dir.path(), job_id, attacher, true)
+            .await
+            .unwrap()
+            .expect("attached");
+        assert_eq!(attached.mission_id, attacher);
+        assert_eq!(attached.job_id, job_id);
+        assert!(!attached.wake_on_terminal);
+        // Idempotent.
+        attach(dir.path(), job_id, attacher, true).await.unwrap();
+        assert_eq!(load(dir.path()).await.unwrap().len(), 2);
+        assert!(mission_subscribed(dir.path(), job_id, attacher)
+            .await
+            .unwrap());
+        assert!(!mission_subscribed(dir.path(), job_id, Uuid::new_v4())
+            .await
+            .unwrap());
+        // The attacher parks on the same job.
+        let wait = current_remote_build_wait_handle(dir.path(), attacher)
+            .await
+            .unwrap()
+            .expect("attached wait handle");
+        assert_eq!(wait.job_id, job_id);
+        assert!(require_terminal_wake(dir.path(), job_id, attacher)
+            .await
+            .unwrap());
+        // One execution, one receipt per subscribed mission, each with its own wake.
+        finalize(dir.path(), job_id, "succeeded", Some(0))
+            .await
+            .unwrap();
+        assert!(load(dir.path()).await.unwrap().is_empty());
+        let pending = pending_terminal_wakes(dir.path()).await.unwrap();
+        let mut waiting: Vec<Uuid> = pending.iter().map(|r| r.mission_id).collect();
+        waiting.sort();
+        let mut expected = vec![submitter, attacher];
+        expected.sort();
+        assert_eq!(waiting, expected);
+        assert!(mark_terminal_wake_delivered(dir.path(), job_id, attacher)
+            .await
+            .unwrap());
+        let still: Vec<Uuid> = pending_terminal_wakes(dir.path())
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.mission_id)
+            .collect();
+        assert_eq!(
+            still,
+            vec![submitter],
+            "the submitter's wake is independent"
+        );
+        assert!(terminal_receipt_for_mission(dir.path(), job_id, attacher)
+            .await
+            .unwrap()
+            .is_some());
+        // SQL mirror: one job row, one subscriber row.
+        let db = dir.path().join(".sandboxed-sh/projects.db");
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        let jobs: i64 = connection
+            .query_row("SELECT count(*) FROM remote_jobs", [], |r| r.get(0))
+            .unwrap();
+        let subs: (i64, String) = connection
+            .query_row(
+                "SELECT count(*), COALESCE(MAX(wake_state), '') FROM remote_job_subscribers WHERE job_id = ?1",
+                rusqlite::params![job_id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(jobs, 1);
+        assert_eq!(subs, (1, "delivered".to_string()));
     }
 }

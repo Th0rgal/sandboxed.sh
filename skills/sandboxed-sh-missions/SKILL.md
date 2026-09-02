@@ -724,3 +724,13 @@ If a mission stalls on an env issue and the prompt is good, **don't keep retryin
 ## Remote build fleet (2026-07-12)
 
 For offloading `lake build` of a pushed SHA to the 4-node fleet (ashur/babylon/nippur/dgx-spark), use `GET /api/remote-nodes` for fleet status and `GET /api/health/fleet` for disk preflight. Capacity-aware auto placement is the default build-offload path.
+
+## Remote builds: attach, never poll
+
+- Re-running the same `remote-lean-build` command while an identical build is live
+  returns `202` with `"attached": true` and the canonical `job_id`. There is never a
+  second execution and never a 409 to route around. Your mission is woken when the
+  job ends.
+- `start_mission` for a helper on the same project/track while you are parked on a
+  build answers `409 BUILD_IN_PROGRESS {job_id}`. Do not spawn pollers; wait for the
+  wake or read the job status with the `job_id`.
