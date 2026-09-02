@@ -403,6 +403,15 @@ async def choose_model(page, requested: str) -> str:
     raise RuntimeError("requested model is not visibly available in the model picker")
 
 
+async def composer_locator(page):
+    """Return the current composer textbox after the shell has hydrated."""
+    composer = page.locator("#prompt-textarea").first
+    if not await composer.count():
+        composer = page.get_by_role("textbox").last
+    await composer.wait_for(state="visible", timeout=30_000)
+    return composer
+
+
 def safe_download_name(value: str, index: int) -> str:
     basename = Path(value).name.strip()
     if not basename:
@@ -911,8 +920,14 @@ async def run(args, request) -> None:
             if probe_only:
                 stage = "recovery_probe"
                 await establish_fresh_chat(page)
+                # The current ChatGPT shell does not render its intelligence
+                # picker until the composer contains a draft. Hydrate it with
+                # an unsent marker, select the requested model, then clear it.
+                composer = await composer_locator(page)
+                await composer.fill(".")
                 stage = "model_selection"
                 await choose_model(page, requested_model)
+                await composer.fill("")
                 await raise_if_rate_limited(page)
                 await assert_blank_chat(page)
                 emit("probe_ready")
@@ -928,28 +943,24 @@ async def run(args, request) -> None:
             elif continuation_path is not None:
                 stage = "continuation"
                 baseline = await establish_continued_chat(page, continuation_path)
+                stage = "composer"
+                composer = await composer_locator(page)
+                await composer.fill(message)
                 stage = "model_selection"
                 model_used = await choose_model(page, requested_model)
-                stage = "composer"
-                composer = page.locator("#prompt-textarea").first
-                if not await composer.count():
-                    composer = page.get_by_role("textbox").last
-                await composer.fill(message)
                 stage = "send"
                 if await click_send_control(page):
                     emit("diagnostic", message="stage=send_button_fallback")
             else:
                 stage = "fresh_chat"
                 baseline = await establish_fresh_chat(page)
+                stage = "composer"
+                composer = await composer_locator(page)
+                await composer.fill(message)
                 stage = "model_selection"
                 model_used = await choose_model(page, requested_model)
                 stage = "blank_chat_check"
                 await assert_blank_chat(page)
-                stage = "composer"
-                composer = page.locator("#prompt-textarea").first
-                if not await composer.count():
-                    composer = page.get_by_role("textbox").last
-                await composer.fill(message)
                 stage = "send"
                 if await click_send_control(page):
                     emit("diagnostic", message="stage=send_button_fallback")
