@@ -606,3 +606,24 @@ into `projects.db` (`remote_jobs`, `remote_job_subscribers`, `receipts`
 kind=`build`) on every mutation; boot reconciliation backfills and logs a
 parity report. The JSON files stay authoritative until one production
 restart shows zero drift (plan step 9 retires them).
+
+### Attach, durable subscribers, lineage (plan step 7)
+
+- **One live job per identity, no 409.** A submission whose identity matches a
+  job that is still `accepted`/`running` no longer fails with
+  `REMOTE_VALIDATION_ALREADY_ACTIVE`. Core records the caller as a *subscriber*
+  of the canonical job (`remote_job_subscribers`, JSON handle with the same
+  `job_id`) and answers `202` with the canonical `job_id` and `"attached": true`.
+  The canonical job runs once; every subscribed mission gets its own terminal
+  receipt and its own wake, delivered exactly once per `(job_id, mission_id)`.
+  `GET /api/remote-build/{job_id}?mission_id=…` accepts any subscribed mission.
+- **Lineage guard.** `create_mission` refuses a child whose `parent_mission_id`
+  is on the same project/track and is parked on a remote build:
+  `409 {"error":"BUILD_IN_PROGRESS","job_id":…,"parent_mission_id":…}`. The
+  parent is woken when the job ends; spawning a helper to poll it is never the
+  answer. Lineage is the explicit parent id, never the origin session.
+- **Passive harness.** `REMOTE_BUILD_PASSIVE=1` makes `remote-lean-build` exit
+  `75` right after a durable submission instead of polling; re-running the exact
+  command after the wake collects the receipt (or attaches if still running).
+  The default poll interval for the non-passive path is now 15 s
+  (`REMOTE_BUILD_POLL_SECS`).

@@ -81,3 +81,4 @@ ios_dashboard/SandboxedDashboard.xcodeproj/*
 
 # Android simulator run artifacts
 android_dashboard/test-artifacts/
+.sandboxed-sh/
