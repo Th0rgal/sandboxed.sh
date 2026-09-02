@@ -3141,9 +3141,20 @@ impl ProjectsStore {
         let idempotency_key = {
             use sha2::Digest;
             let mut hasher = sha2::Sha256::new();
+            // The reopen generation is part of the key: a plain retry of
+            // the same evidence replays its receipt (the revision moves on
+            // every accept, so it cannot be the key), while after a reopen —
+            // which invalidated the old receipt — the same reference records
+            // a fresh accept for the new contract.
+            let reopen_generation = self
+                .receipts_for_track(slug, track)
+                .map_err(AcceptError::Store)?
+                .iter()
+                .filter(|r| r.kind == "reconcile" && r.subject_id.starts_with("reopen:"))
+                .count();
             hasher.update(
                 format!(
-                    "{slug}\0{}\0{}\0{evidence_ref}\0{artifact_version}",
+                    "{slug}\0{}\0{reopen_generation}\0{}\0{evidence_ref}\0{artifact_version}",
                     current.track,
                     criterion_id.as_deref().unwrap_or("")
                 )
@@ -3495,8 +3506,6 @@ impl ProjectsStore {
         }
         Ok(created)
     }
-
-    #[allow(clippy::too_many_arguments)]
 
     pub fn get_grant(&self, slug: &str) -> Result<Option<ProjectGrant>, String> {
         let connection = self.lock()?;
@@ -6770,6 +6779,26 @@ mod tests {
             store.reopen_track("lido", "s3", "again", None, "u"),
             Err(AcceptError::Invalid(ref m)) if m.contains("not terminal")
         ));
+        // The same reference re-satisfies the reopened revision (fresh
+        // receipts, not a replay of the invalidated ones).
+        for criterion in ["proved", "merged"] {
+            store
+                .accept_track_criterion_evidence(
+                    "lido",
+                    "s3",
+                    Some(criterion),
+                    "operator",
+                    "https://github.com/o/r/pull/1",
+                    "def456",
+                    None,
+                    "user:prod",
+                )
+                .expect("re-accept after reopen");
+        }
+        assert!(store.track_contract_satisfied("lido", "s3").unwrap());
+        store
+            .reopen_track("lido", "s3", "cancel it", None, "u")
+            .expect("reopen again");
         store
             .set_track("lido", "s3", None, Some("cancelled"))
             .expect("cancel");
