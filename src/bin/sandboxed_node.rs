@@ -781,6 +781,7 @@ mod tests {
                 lease_token: create_lease_token(&claims, &state.shared_token).expect("lease token"),
                 payload: sandboxed_sh::remote_node::JobPayload::LeanBuild {
                     source: Box::new(sandboxed_sh::remote_node::JobSource {
+                        base_tree_sha: None,
                         repo: "/node/local/repo".to_string(),
                         commit: "a".repeat(40),
                         archive: None,

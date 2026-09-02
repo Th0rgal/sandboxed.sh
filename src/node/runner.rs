@@ -786,6 +786,7 @@ mod tests {
                     data_base64: "private-source-data".to_string(),
                 })),
                 bundle: None,
+                base_tree_sha: None,
             }),
             cwd_rel: None,
             command: vec!["lake".to_string(), "build".to_string()],

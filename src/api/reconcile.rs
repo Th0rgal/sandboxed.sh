@@ -408,6 +408,13 @@ pub struct ReconcileReport {
 pub async fn run(state: &Arc<AppState>) -> ReconcileReport {
     let mut report = ReconcileReport::default();
 
+    // Remote job ledger: mirror JSON handles/receipts into SQL and report
+    // drift (dual-write window, plan step 6). Never deletes.
+    match crate::remote_node::job_ledger::sql_parity_backfill(&state.config.working_dir).await {
+        Ok(parity) => tracing::info!(?parity, "reconcile: remote job ledger parity"),
+        Err(error) => tracing::warn!(%error, "reconcile: remote job ledger parity failed"),
+    }
+
     // Track leases: release those whose mission is terminal or gone, renew
     // the live ones. Repairs the create-mission crash windows at boot.
     match super::track_leases::sweep(state).await {

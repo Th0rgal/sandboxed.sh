@@ -74,6 +74,27 @@ if toolchain_path.is_file():
 expected_head = os.environ.get("REMOTE_BUILD_EXPECTED_HEAD", "").strip()
 if expected_head:
     req["expected_head"] = expected_head
+# Content identity: the root tree, not the commit. Same tree under a
+# different commit message is the same build and reuses its receipt.
+req["base_tree_sha"] = subprocess.check_output(
+    ["git", "-C", str(repo_root), "rev-parse", f"{commit}^{{tree}}"], text=True
+).strip().lower()
+req["build_protocol_version"] = "1"
+# Behaviour-affecting, non-secret environment only (allowlist), hashed so a
+# changed Lean/Lake setting cannot reuse a stale receipt. Anything that looks
+# like a credential is excluded even when it matches the prefixes.
+_env_prefixes = ("LEAN_", "LAKE_", "ELAN_", "SANDBOXED_COMPUTE_POLICY")
+_secretish = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+_behavior_env = sorted(
+    (k, v)
+    for k, v in os.environ.items()
+    if k.startswith(_env_prefixes) and not any(marker in k.upper() for marker in _secretish)
+)
+if _behavior_env:
+    _digest = hashlib.sha256()
+    for k, v in _behavior_env:
+        _digest.update(f"{k}={v}\0".encode("utf-8", "surrogateescape"))
+    req["behavior_env_digest"] = _digest.hexdigest()
 if os.environ.get("REMOTE_BUILD_FORCE_NEW", "0") == "1":
     req["force_new"] = True
 

@@ -35,8 +35,17 @@ pub enum JobHandleKind {
 /// exactly what was validated without persisting clone credentials.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteJobIdentity {
+    /// Identity schema version. `0` = legacy (commit-keyed, no tree); such
+    /// receipts are never replayed as success for a newer identity.
+    #[serde(default)]
+    pub version: u32,
     pub repository: String,
     pub commit: String,
+    /// Root tree of `commit`. When present it, not the commit, is the content
+    /// identity: the same tree under a different commit message is the same
+    /// build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_tree_sha: Option<String>,
     /// `false` means this identity predates cwd persistence. Such receipts are
     /// intentionally not equal to new root-cwd requests because their actual
     /// execution directory is unknowable after upgrade.
@@ -54,6 +63,77 @@ pub struct RemoteJobIdentity {
     pub toolchain: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_bundle_digest: Option<String>,
+    /// Builder image / toolchain container digest, when the node runs one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_image_digest: Option<String>,
+    /// Wire/build protocol revision of the submitting wrapper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_protocol_version: Option<String>,
+    /// Digest of the allowlisted, behaviour-affecting, non-secret environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior_env_digest: Option<String>,
+}
+
+/// Current identity schema version written by core.
+pub const IDENTITY_VERSION: u32 = 1;
+
+impl RemoteJobIdentity {
+    /// Canonical, byte-stable hash of the identity. `base_tree_sha` replaces
+    /// the commit when present; artifacts are sorted and de-duplicated; the
+    /// version is part of the hash so a schema change can never alias.
+    pub fn identity_hash(&self) -> String {
+        use sha2::Digest;
+        let mut artifacts = self.artifacts.clone();
+        artifacts.sort();
+        artifacts.dedup();
+        let content = match self.base_tree_sha.as_deref().map(str::trim) {
+            Some(tree) if !tree.is_empty() => format!("tree:{}", tree.to_ascii_lowercase()),
+            _ => format!("commit:{}", self.commit.to_ascii_lowercase()),
+        };
+        let canonical = serde_json::json!({
+            "v": self.version,
+            "repository": self.repository,
+            "content": content,
+            "cwd_rel": self.cwd_rel,
+            "cwd_rel_known": self.cwd_rel_known,
+            "argv": self.command,
+            "artifacts": artifacts,
+            "toolchain": self.toolchain,
+            "bundle": self.source_bundle_digest,
+            "image": self.builder_image_digest,
+            "protocol": self.build_protocol_version,
+            "env": self.behavior_env_digest,
+        });
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"sandboxed-remote-job-identity\0");
+        hasher.update(canonical.to_string().as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    /// Same build for exclusion purposes. Two identities of the same version
+    /// compare by hash. A legacy (v0) identity on either side falls back to
+    /// the legacy field equality so an in-flight pre-upgrade job still
+    /// blocks a duplicate — conservatively, never the other way round.
+    pub fn excludes(&self, other: &RemoteJobIdentity) -> bool {
+        if self.version == other.version {
+            return self.identity_hash() == other.identity_hash();
+        }
+        self.repository == other.repository
+            && self.commit.eq_ignore_ascii_case(&other.commit)
+            && self.cwd_rel == other.cwd_rel
+            && self.command == other.command
+            && self.artifacts == other.artifacts
+            && self.toolchain == other.toolchain
+            && self.source_bundle_digest == other.source_bundle_digest
+    }
+
+    /// Whether a successful receipt with this identity may be replayed for a
+    /// request with `other`: same version (never v0) and same hash.
+    pub fn reusable_for(&self, other: &RemoteJobIdentity) -> bool {
+        self.version >= 1
+            && self.version == other.version
+            && self.identity_hash() == other.identity_hash()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,7 +422,7 @@ pub async fn equivalent_remote_validation(
     if let Some(receipt) = receipts
         .into_iter()
         .filter(|receipt| {
-            receipt.identity == *identity
+            receipt.identity.reusable_for(identity)
                 && (identity.artifacts.is_empty() || !receipt.artifacts.is_empty())
                 && receipt.state == "succeeded"
                 && receipt.exit_status == Some(0)
@@ -355,7 +435,10 @@ pub async fn equivalent_remote_validation(
         .await?
         .into_iter()
         .filter(|handle| {
-            handle.identity.as_ref() == Some(identity)
+            handle
+                .identity
+                .as_ref()
+                .is_some_and(|existing| existing.excludes(identity))
                 && matches!(
                     handle.kind,
                     JobHandleKind::RemoteBuild | JobHandleKind::Tentative
@@ -379,7 +462,10 @@ pub async fn active_equivalent_remote_validation(
         .await?
         .into_iter()
         .filter(|handle| {
-            handle.identity.as_ref() == Some(identity)
+            handle
+                .identity
+                .as_ref()
+                .is_some_and(|existing| existing.excludes(identity))
                 && matches!(
                     handle.kind,
                     JobHandleKind::RemoteBuild | JobHandleKind::Tentative
@@ -522,6 +608,7 @@ pub async fn mark_terminal_wake_suppressed(
     if receipt.wake_delivered_at.is_none() {
         receipt.wake_delivered_at = Some(chrono::Utc::now());
         receipt.wake_suppressed_by = Some(superseding_job_id);
+        sql::mirror_wake(working_dir, job_id, "suppressed", Some(superseding_job_id));
         store_receipts(working_dir, &receipts).await?;
     }
     Ok(true)
@@ -538,6 +625,7 @@ pub async fn mark_terminal_wake_delivered(
     };
     if receipt.wake_delivered_at.is_none() {
         receipt.wake_delivered_at = Some(chrono::Utc::now());
+        sql::mirror_wake(working_dir, job_id, "delivered", None);
         store_receipts(working_dir, &receipts).await?;
     }
     Ok(true)
@@ -570,9 +658,13 @@ pub async fn finalize_with_artifacts(
         return Ok(false);
     };
     let handle = handles.remove(index);
+    if handle.kind != JobHandleKind::RemoteBuild {
+        sql::mirror_terminal_without_receipt(working_dir, job_id, state);
+    }
     if handle.kind == JobHandleKind::RemoteBuild {
         let continuation_expected = handle.expects_mission_continuation();
         let Some(identity) = handle.identity else {
+            sql::mirror_terminal_without_receipt(working_dir, job_id, state);
             store(working_dir, &handles).await?;
             return Ok(true);
         };
@@ -598,6 +690,9 @@ pub async fn finalize_with_artifacts(
             wake_delivered_at: previous_wake_delivered_at,
             wake_suppressed_by: None,
         });
+        if let Some(receipt) = receipts.last() {
+            sql::mirror_receipt(working_dir, receipt);
+        }
         if receipts.len() > MAX_RECEIPTS {
             receipts.sort_by_key(|receipt| receipt.finished_at);
             let mut excess = receipts.len() - MAX_RECEIPTS;
@@ -647,6 +742,7 @@ pub async fn record(working_dir: &Path, handle: JobHandle) -> anyhow::Result<()>
         };
     }
     handles.retain(|existing| existing.job_id != handle.job_id);
+    sql::mirror_handle(working_dir, &handle);
     handles.push(handle);
     store(working_dir, &handles).await
 }
@@ -664,6 +760,7 @@ pub async fn remove(working_dir: &Path, job_id: Uuid) {
     let before = handles.len();
     handles.retain(|h| h.job_id != job_id);
     if handles.len() != before {
+        sql::mirror_remove(working_dir, job_id);
         if let Err(err) = store(working_dir, &handles).await {
             tracing::warn!(?err, "remote job ledger removal failed");
         }
@@ -685,6 +782,7 @@ pub async fn heartbeat(working_dir: &Path, job_id: Uuid) -> anyhow::Result<bool>
         return Ok(true);
     }
     handle.heartbeat_at = Some(now);
+    sql::mirror_handle(working_dir, handle);
     store(working_dir, &handles).await?;
     Ok(true)
 }
@@ -700,6 +798,397 @@ pub async fn require_terminal_wake(working_dir: &Path, job_id: Uuid) -> anyhow::
         store(working_dir, &handles).await?;
     }
     Ok(true)
+}
+
+/// SQL mirror of the JSON ledger (`projects.db`: `remote_jobs`,
+/// `remote_job_subscribers`, `receipts` kind=`build`).
+///
+/// Dual-write window (plan step 6): the JSON files stay authoritative and
+/// every mutation is mirrored here best-effort; startup runs
+/// [`sql_parity_backfill`] so a mirror that fell behind converges. Reads move
+/// to SQL in step 7, once a production restart has shown zero drift.
+pub mod sql {
+    use std::path::{Path, PathBuf};
+
+    use rusqlite::{params, Connection, OptionalExtension};
+    use serde::Serialize;
+    use uuid::Uuid;
+
+    use super::{JobHandle, JobHandleKind, RemoteJobReceipt};
+
+    fn db_path(working_dir: &Path) -> PathBuf {
+        working_dir.join(".sandboxed-sh").join("projects.db")
+    }
+
+    fn open(working_dir: &Path) -> Option<Connection> {
+        let path = db_path(working_dir);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let connection = Connection::open(&path)
+            .map_err(|error| tracing::warn!(%error, "remote job SQL mirror: open failed"))
+            .ok()?;
+        let _ = connection.busy_timeout(std::time::Duration::from_secs(5));
+        let _ = connection.pragma_update(None, "journal_mode", "WAL");
+        // Idempotent: the store normally created these already; a fresh
+        // working dir (tests, first boot before the store opened) gets them
+        // here so a mirror write can never race the store's initialize.
+        for schema in [
+            crate::api::projects_store::SCHEMA,
+            crate::api::projects_store::REMOTE_JOBS_SCHEMA,
+        ] {
+            if let Err(error) = connection.execute_batch(schema) {
+                tracing::warn!(%error, "remote job SQL mirror: schema failed");
+                return None;
+            }
+        }
+        Some(connection)
+    }
+
+    fn kind_label(kind: JobHandleKind) -> &'static str {
+        match kind {
+            JobHandleKind::Mission => "mission",
+            JobHandleKind::RemoteBuild => "remote_build",
+            JobHandleKind::Tentative => "tentative",
+        }
+    }
+
+    fn handle_state(handle: &JobHandle) -> &'static str {
+        if handle.kind == JobHandleKind::Tentative || handle.accepted_at.is_none() {
+            "submitting"
+        } else if handle.heartbeat_at.is_some() {
+            "running"
+        } else {
+            "accepted"
+        }
+    }
+
+    fn upsert_handle(connection: &Connection, handle: &JobHandle) -> rusqlite::Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let identity_json = handle
+            .identity
+            .as_ref()
+            .and_then(|identity| serde_json::to_string(identity).ok());
+        let identity_hash = handle
+            .identity
+            .as_ref()
+            .map(|identity| identity.identity_hash());
+        let identity_version = handle
+            .identity
+            .as_ref()
+            .map(|identity| identity.version)
+            .unwrap_or(0);
+        connection.execute(
+            "INSERT INTO remote_jobs \
+               (job_id, mission_id, node_id, kind, state, identity_version, identity_hash, identity_json, \
+                submission_sequence, started_at, accepted_at, heartbeat_at, wake_required, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+             ON CONFLICT(job_id) DO UPDATE SET \
+               node_id = excluded.node_id, kind = excluded.kind, \
+               state = CASE WHEN remote_jobs.state IN ('succeeded','failed','cancelled','lost') \
+                            THEN remote_jobs.state ELSE excluded.state END, \
+               identity_version = excluded.identity_version, identity_hash = excluded.identity_hash, \
+               identity_json = excluded.identity_json, \
+               submission_sequence = CASE WHEN excluded.submission_sequence > 0 \
+                                          THEN excluded.submission_sequence ELSE remote_jobs.submission_sequence END, \
+               accepted_at = COALESCE(excluded.accepted_at, remote_jobs.accepted_at), \
+               heartbeat_at = COALESCE(excluded.heartbeat_at, remote_jobs.heartbeat_at), \
+               wake_required = MAX(remote_jobs.wake_required, excluded.wake_required), \
+               updated_at = excluded.updated_at",
+            params![
+                handle.job_id.to_string(),
+                handle.mission_id.to_string(),
+                handle.node_id,
+                kind_label(handle.kind),
+                handle_state(handle),
+                identity_version,
+                identity_hash,
+                identity_json,
+                handle.submission_sequence as i64,
+                handle.started_at.to_rfc3339(),
+                handle.accepted_at.map(|at| at.to_rfc3339()),
+                handle.heartbeat_at.map(|at| at.to_rfc3339()),
+                handle.wake_on_terminal as i64,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Mirror a live handle. A unique-index violation means a second live
+    /// job for the same identity slipped past the JSON check: logged loudly
+    /// (the JSON path is still the authority in the dual-write window).
+    pub fn mirror_handle(working_dir: &Path, handle: &JobHandle) {
+        let Some(connection) = open(working_dir) else {
+            return;
+        };
+        if let Err(error) = upsert_handle(&connection, handle) {
+            tracing::warn!(
+                job_id = %handle.job_id,
+                mission_id = %handle.mission_id,
+                %error,
+                "remote job SQL mirror: handle upsert failed (duplicate live identity?)"
+            );
+        }
+    }
+
+    fn upsert_receipt(connection: &Connection, receipt: &RemoteJobReceipt) -> rusqlite::Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let state = match receipt.state.as_str() {
+            "succeeded" | "failed" | "cancelled" | "lost" => receipt.state.as_str(),
+            _ => "failed",
+        };
+        let artifacts = serde_json::to_string(&receipt.artifacts).unwrap_or_else(|_| "[]".into());
+        let identity_json = serde_json::to_string(&receipt.identity).ok();
+        connection.execute(
+            "INSERT INTO remote_jobs \
+               (job_id, mission_id, node_id, kind, state, identity_version, identity_hash, identity_json, \
+                submission_sequence, started_at, finished_at, exit_status, artifacts_json, wake_required, \
+                wake_delivered_at, wake_suppressed_by, updated_at) \
+             VALUES (?1, ?2, ?3, 'remote_build', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+             ON CONFLICT(job_id) DO UPDATE SET \
+               state = excluded.state, finished_at = excluded.finished_at, exit_status = excluded.exit_status, \
+               artifacts_json = excluded.artifacts_json, identity_version = excluded.identity_version, \
+               identity_hash = excluded.identity_hash, identity_json = excluded.identity_json, \
+               wake_required = excluded.wake_required, wake_delivered_at = excluded.wake_delivered_at, \
+               wake_suppressed_by = excluded.wake_suppressed_by, updated_at = excluded.updated_at",
+            params![
+                receipt.job_id.to_string(),
+                receipt.mission_id.to_string(),
+                receipt.node_id,
+                state,
+                receipt.identity.version,
+                receipt.identity.identity_hash(),
+                identity_json,
+                receipt.submission_sequence as i64,
+                receipt.started_at.to_rfc3339(),
+                receipt.finished_at.to_rfc3339(),
+                receipt.exit_status,
+                artifacts,
+                receipt.wake_required as i64,
+                receipt.wake_delivered_at.map(|at| at.to_rfc3339()),
+                receipt.wake_suppressed_by.map(|id| id.to_string()),
+                now,
+            ],
+        )?;
+        // Immutable evidence: one build receipt per job (idempotent).
+        let outcome = match state {
+            "succeeded" => "succeeded",
+            "cancelled" => "cancelled",
+            _ => "failed",
+        };
+        let payload = serde_json::json!({
+            "identity": receipt.identity,
+            "identity_hash": receipt.identity.identity_hash(),
+            "node_id": receipt.node_id,
+            "mission_id": receipt.mission_id,
+            "exit_status": receipt.exit_status,
+            "artifacts": receipt.artifacts,
+            "started_at": receipt.started_at,
+            "finished_at": receipt.finished_at,
+        });
+        let request_hash = {
+            use sha2::Digest;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(payload.to_string().as_bytes());
+            hex::encode(hasher.finalize())
+        };
+        connection.execute(
+            "INSERT OR IGNORE INTO receipts \
+               (id, idempotency_key, request_hash, kind, project_slug, track_id, criterion_id, subject_type, \
+                subject_id, outcome, actor_type, actor_id, verifier, supersedes_receipt_id, observed_at, \
+                payload, created_at) \
+             VALUES (?1, ?2, ?3, 'build', NULL, NULL, NULL, 'build', ?4, ?5, 'system', ?6, ?7, NULL, ?8, ?9, ?10)",
+            params![
+                Uuid::new_v4().to_string(),
+                format!("build:{}", receipt.job_id),
+                request_hash,
+                receipt.job_id.to_string(),
+                outcome,
+                format!("node:{}", receipt.node_id),
+                receipt.identity.toolchain,
+                receipt.finished_at.to_rfc3339(),
+                payload.to_string(),
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mirror_receipt(working_dir: &Path, receipt: &RemoteJobReceipt) {
+        let Some(connection) = open(working_dir) else {
+            return;
+        };
+        if let Err(error) = upsert_receipt(&connection, receipt) {
+            tracing::warn!(job_id = %receipt.job_id, %error, "remote job SQL mirror: receipt upsert failed");
+        }
+    }
+
+    /// A mission / tentative handle finalized without a receipt.
+    pub fn mirror_terminal_without_receipt(working_dir: &Path, job_id: Uuid, state: &str) {
+        let Some(connection) = open(working_dir) else {
+            return;
+        };
+        let state = match state {
+            "succeeded" | "failed" | "cancelled" | "lost" => state,
+            _ => "failed",
+        };
+        if let Err(error) = connection.execute(
+            "UPDATE remote_jobs SET state = ?2, finished_at = ?3, updated_at = ?3 WHERE job_id = ?1",
+            params![job_id.to_string(), state, chrono::Utc::now().to_rfc3339()],
+        ) {
+            tracing::warn!(%job_id, %error, "remote job SQL mirror: terminal update failed");
+        }
+    }
+
+    pub fn mirror_remove(working_dir: &Path, job_id: Uuid) {
+        let Some(connection) = open(working_dir) else {
+            return;
+        };
+        // Only a still-live row is removed; terminal rows are history.
+        if let Err(error) = connection.execute(
+            "DELETE FROM remote_jobs WHERE job_id = ?1 AND state IN ('submitting','accepted','running')",
+            params![job_id.to_string()],
+        ) {
+            tracing::warn!(%job_id, %error, "remote job SQL mirror: remove failed");
+        }
+    }
+
+    pub fn mirror_wake(
+        working_dir: &Path,
+        job_id: Uuid,
+        disposition: &str,
+        suppressed_by: Option<Uuid>,
+    ) {
+        let Some(connection) = open(working_dir) else {
+            return;
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = match disposition {
+            "delivered" => connection.execute(
+                "UPDATE remote_jobs SET wake_delivered_at = ?2, updated_at = ?2 WHERE job_id = ?1",
+                params![job_id.to_string(), now],
+            ),
+            _ => connection.execute(
+                "UPDATE remote_jobs SET wake_suppressed_by = ?2, updated_at = ?3 WHERE job_id = ?1",
+                params![
+                    job_id.to_string(),
+                    suppressed_by.map(|id| id.to_string()),
+                    now
+                ],
+            ),
+        };
+        if let Err(error) = result {
+            tracing::warn!(%job_id, %error, "remote job SQL mirror: wake update failed");
+        }
+    }
+
+    #[derive(Debug, Default, Clone, Serialize)]
+    pub struct ParityReport {
+        pub json_handles: usize,
+        pub json_receipts: usize,
+        pub sql_live: usize,
+        pub sql_terminal: usize,
+        pub backfilled_handles: usize,
+        pub backfilled_receipts: usize,
+        pub sql_live_not_in_json: usize,
+    }
+
+    /// Compare the JSON ledger with the mirror and backfill what the mirror
+    /// lacks. Live SQL rows with no JSON handle are reported, not deleted:
+    /// in the dual-write window the JSON file is the authority and a
+    /// disagreement is the signal the removal gate waits on.
+    pub fn parity_backfill(
+        working_dir: &Path,
+        handles: &[JobHandle],
+        receipts: &[RemoteJobReceipt],
+    ) -> ParityReport {
+        let mut report = ParityReport {
+            json_handles: handles.len(),
+            json_receipts: receipts.len(),
+            ..ParityReport::default()
+        };
+        let Some(connection) = open(working_dir) else {
+            return report;
+        };
+        let exists = |job_id: &Uuid| -> bool {
+            connection
+                .query_row(
+                    "SELECT 1 FROM remote_jobs WHERE job_id = ?1",
+                    params![job_id.to_string()],
+                    |_| Ok(()),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .is_some()
+        };
+        for handle in handles {
+            if !exists(&handle.job_id) && upsert_handle(&connection, handle).is_ok() {
+                report.backfilled_handles += 1;
+            }
+        }
+        for receipt in receipts {
+            let terminal: Option<String> = connection
+                .query_row(
+                    "SELECT state FROM remote_jobs WHERE job_id = ?1",
+                    params![receipt.job_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            let needs = !matches!(
+                terminal.as_deref(),
+                Some("succeeded" | "failed" | "cancelled" | "lost")
+            );
+            if needs && upsert_receipt(&connection, receipt).is_ok() {
+                report.backfilled_receipts += 1;
+            }
+        }
+        report.sql_live = connection
+            .query_row(
+                "SELECT count(*) FROM remote_jobs WHERE state IN ('submitting','accepted','running')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as usize;
+        report.sql_terminal = connection
+            .query_row(
+                "SELECT count(*) FROM remote_jobs WHERE state IN ('succeeded','failed','cancelled','lost')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as usize;
+        let live_ids: Vec<String> = connection
+            .prepare(
+                "SELECT job_id FROM remote_jobs WHERE state IN ('submitting','accepted','running')",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map(|rows| rows.filter_map(Result::ok).collect())
+            })
+            .unwrap_or_default();
+        report.sql_live_not_in_json = live_ids
+            .iter()
+            .filter(|id| {
+                !handles
+                    .iter()
+                    .any(|handle| handle.job_id.to_string() == **id)
+            })
+            .count();
+        report
+    }
+}
+
+/// Boot-time parity pass: mirror anything the JSON ledger has that SQL lacks
+/// and report drift. Never deletes.
+pub async fn sql_parity_backfill(working_dir: &Path) -> anyhow::Result<sql::ParityReport> {
+    let _guard = lock().lock().await;
+    let handles = load_result(working_dir).await?;
+    let receipts = load_receipts_result(working_dir).await?;
+    Ok(sql::parity_backfill(working_dir, &handles, &receipts))
 }
 
 #[cfg(test)]
@@ -888,6 +1377,11 @@ mod tests {
             disk_reservation_bytes: 0,
             kind: JobHandleKind::RemoteBuild,
             identity: Some(RemoteJobIdentity {
+                version: 0,
+                base_tree_sha: None,
+                builder_image_digest: None,
+                build_protocol_version: None,
+                behavior_env_digest: None,
                 repository: "https://example.invalid/repo.git".to_string(),
                 commit: "a".repeat(40),
                 cwd_rel_known: true,
@@ -915,6 +1409,11 @@ mod tests {
         let job_id = Uuid::new_v4();
         let mission_id = Uuid::new_v4();
         let identity = RemoteJobIdentity {
+            version: 0,
+            base_tree_sha: None,
+            builder_image_digest: None,
+            build_protocol_version: None,
+            behavior_env_digest: None,
             repository: "https://example.invalid/repo.git".to_string(),
             commit: "a".repeat(40),
             cwd_rel_known: true,
@@ -977,6 +1476,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let job_id = Uuid::new_v4();
         let identity = RemoteJobIdentity {
+            version: IDENTITY_VERSION,
+            base_tree_sha: None,
+            builder_image_digest: None,
+            build_protocol_version: None,
+            behavior_env_digest: None,
             repository: "https://example.invalid/repo.git".to_string(),
             commit: "a".repeat(40),
             cwd_rel_known: true,
@@ -1132,6 +1636,11 @@ mod tests {
         let old_started_at = chrono::Utc::now() - chrono::Duration::minutes(2);
         let new_started_at = chrono::Utc::now() - chrono::Duration::minutes(1);
         let identity = |commit: char| RemoteJobIdentity {
+            version: 0,
+            base_tree_sha: None,
+            builder_image_digest: None,
+            build_protocol_version: None,
+            behavior_env_digest: None,
             repository: "https://example.invalid/verity.git".to_string(),
             commit: commit.to_string().repeat(40),
             cwd_rel_known: true,
@@ -1228,6 +1737,11 @@ mod tests {
             disk_reservation_bytes: 0,
             kind: JobHandleKind::RemoteBuild,
             identity: Some(RemoteJobIdentity {
+                version: 0,
+                base_tree_sha: None,
+                builder_image_digest: None,
+                build_protocol_version: None,
+                behavior_env_digest: None,
                 repository: "https://example.invalid/verity.git".to_string(),
                 commit: job_id.to_string(),
                 cwd_rel_known: true,
@@ -1274,6 +1788,11 @@ mod tests {
         let continuation_job_id = Uuid::new_v4();
         let detached_job_id = Uuid::new_v4();
         let identity = |commit: char| RemoteJobIdentity {
+            version: 0,
+            base_tree_sha: None,
+            builder_image_digest: None,
+            build_protocol_version: None,
+            behavior_env_digest: None,
             repository: "https://example.invalid/verity.git".to_string(),
             commit: commit.to_string().repeat(40),
             cwd_rel_known: true,
@@ -1409,6 +1928,11 @@ mod tests {
         let active_started_at = chrono::Utc::now() - chrono::Duration::minutes(2);
         let receipt_started_at = chrono::Utc::now() - chrono::Duration::minutes(1);
         let identity = RemoteJobIdentity {
+            version: 0,
+            base_tree_sha: None,
+            builder_image_digest: None,
+            build_protocol_version: None,
+            behavior_env_digest: None,
             repository: "https://example.invalid/verity.git".to_string(),
             commit: "a".repeat(40),
             cwd_rel_known: true,
@@ -1467,6 +1991,11 @@ mod tests {
         let old_started_at = chrono::Utc::now() - chrono::Duration::minutes(2);
         let new_started_at = chrono::Utc::now() - chrono::Duration::minutes(1);
         let identity = RemoteJobIdentity {
+            version: 0,
+            base_tree_sha: None,
+            builder_image_digest: None,
+            build_protocol_version: None,
+            behavior_env_digest: None,
             repository: "https://example.invalid/verity.git".to_string(),
             commit: "a".repeat(40),
             cwd_rel_known: true,
@@ -1551,6 +2080,11 @@ mod tests {
                 disk_reservation_bytes: 0,
                 kind: JobHandleKind::Tentative,
                 identity: Some(RemoteJobIdentity {
+                    version: 0,
+                    base_tree_sha: None,
+                    builder_image_digest: None,
+                    build_protocol_version: None,
+                    behavior_env_digest: None,
                     repository: "https://example.invalid/verity.git".to_string(),
                     commit: "a".repeat(40),
                     cwd_rel_known: true,
@@ -1577,5 +2111,182 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    fn identity_v1(commit: &str, tree: Option<&str>) -> RemoteJobIdentity {
+        RemoteJobIdentity {
+            version: IDENTITY_VERSION,
+            repository: "github.com/lfglabs-dev/verity".to_string(),
+            commit: commit.to_string(),
+            base_tree_sha: tree.map(str::to_string),
+            cwd_rel_known: true,
+            cwd_rel: Some("verity".to_string()),
+            command: vec!["lake".to_string(), "build".to_string()],
+            artifacts: vec!["b.olean".to_string(), "a.olean".to_string()],
+            toolchain: Some("leanprover/lean4:v4.19.0".to_string()),
+            source_bundle_digest: None,
+            builder_image_digest: None,
+            build_protocol_version: Some("1".to_string()),
+            behavior_env_digest: None,
+        }
+    }
+
+    #[test]
+    fn identity_hash_is_content_not_commit_and_every_input_matters() {
+        let tree = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let a = identity_v1("a".repeat(40).as_str(), Some(tree));
+        let b = identity_v1("b".repeat(40).as_str(), Some(tree));
+        assert_eq!(
+            a.identity_hash(),
+            b.identity_hash(),
+            "same tree, different commit: same build"
+        );
+        assert!(a.reusable_for(&b));
+        assert!(a.excludes(&b));
+
+        let other_tree = identity_v1("a".repeat(40).as_str(), Some(&"f".repeat(64)));
+        assert_ne!(a.identity_hash(), other_tree.identity_hash());
+
+        let mut env = a.clone();
+        env.behavior_env_digest = Some("abc".into());
+        assert_ne!(a.identity_hash(), env.identity_hash());
+        let mut image = a.clone();
+        image.builder_image_digest = Some("sha256:1".into());
+        assert_ne!(a.identity_hash(), image.identity_hash());
+        let mut argv = a.clone();
+        argv.command = vec!["lake".into(), "build".into(), "-K".into()];
+        assert_ne!(a.identity_hash(), argv.identity_hash());
+        let mut sorted = a.clone();
+        sorted.artifacts = vec!["a.olean".into(), "b.olean".into()];
+        assert_eq!(
+            a.identity_hash(),
+            sorted.identity_hash(),
+            "artifact order is not identity"
+        );
+
+        // No tree: the commit is the content.
+        let c1 = identity_v1("c".repeat(40).as_str(), None);
+        let c2 = identity_v1("d".repeat(40).as_str(), None);
+        assert_ne!(c1.identity_hash(), c2.identity_hash());
+    }
+
+    #[test]
+    fn legacy_v0_receipts_never_replay_but_still_exclude() {
+        let mut legacy = identity_v1("a".repeat(40).as_str(), None);
+        legacy.version = 0;
+        legacy.base_tree_sha = None;
+        legacy.build_protocol_version = None;
+        let current = identity_v1("a".repeat(40).as_str(), Some(&"e".repeat(64)));
+        assert!(
+            !legacy.reusable_for(&current),
+            "a pre-upgrade success is not evidence for v1"
+        );
+        assert!(
+            !legacy.reusable_for(&legacy),
+            "v0 never replays, even against itself"
+        );
+        let mut current_same_fields = current.clone();
+        current_same_fields.build_protocol_version = None;
+        assert!(
+            legacy.excludes(&current_same_fields),
+            "an in-flight v0 job still blocks a v1 duplicate"
+        );
+        let mut other_cwd = current_same_fields.clone();
+        other_cwd.cwd_rel = Some("elsewhere".into());
+        assert!(!legacy.excludes(&other_cwd));
+    }
+
+    #[tokio::test]
+    async fn sql_mirror_tracks_handles_receipts_and_backfills() {
+        let dir = tempfile::tempdir().unwrap();
+        let job_id = Uuid::new_v4();
+        let mission_id = Uuid::new_v4();
+        let identity = identity_v1("a".repeat(40).as_str(), Some(&"e".repeat(64)));
+        record(
+            dir.path(),
+            JobHandle {
+                mission_id,
+                node_id: "spark".to_string(),
+                job_id,
+                started_at: chrono::Utc::now(),
+                submission_sequence: 0,
+                accepted_at: Some(chrono::Utc::now()),
+                heartbeat_at: None,
+                disk_reservation_bytes: 0,
+                kind: JobHandleKind::RemoteBuild,
+                identity: Some(identity.clone()),
+                wait_for_completion: Some(true),
+                wake_on_terminal: true,
+            },
+        )
+        .await
+        .unwrap();
+        let db = dir.path().join(".sandboxed-sh/projects.db");
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        let (state, hash): (String, String) = connection
+            .query_row(
+                "SELECT state, identity_hash FROM remote_jobs WHERE job_id = ?1",
+                rusqlite::params![job_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "accepted");
+        assert_eq!(hash, identity.identity_hash());
+
+        // A second live job with the same identity trips the unique index in
+        // SQL (logged, not fatal in the dual-write window).
+        let duplicate = Uuid::new_v4();
+        sql::mirror_handle(
+            dir.path(),
+            &JobHandle {
+                mission_id: Uuid::new_v4(),
+                node_id: "spark".to_string(),
+                job_id: duplicate,
+                started_at: chrono::Utc::now(),
+                submission_sequence: 0,
+                accepted_at: Some(chrono::Utc::now()),
+                heartbeat_at: None,
+                disk_reservation_bytes: 0,
+                kind: JobHandleKind::RemoteBuild,
+                identity: Some(identity.clone()),
+                wait_for_completion: None,
+                wake_on_terminal: false,
+            },
+        );
+        let live: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM remote_jobs WHERE state IN ('submitting','accepted','running')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 1, "the unique index keeps one live job per identity");
+
+        finalize(dir.path(), job_id, "succeeded", Some(0))
+            .await
+            .unwrap();
+        let (state, outcome): (String, String) = connection
+            .query_row(
+                "SELECT j.state, r.outcome FROM remote_jobs j \
+                 JOIN receipts r ON r.subject_type = 'build' AND r.subject_id = j.job_id \
+                 WHERE j.job_id = ?1",
+                rusqlite::params![job_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), outcome.as_str()),
+            ("succeeded", "succeeded")
+        );
+
+        // Wipe the mirror; the boot parity pass rebuilds it from JSON.
+        connection.execute("DELETE FROM remote_jobs", []).unwrap();
+        let report = sql_parity_backfill(dir.path()).await.unwrap();
+        assert_eq!(report.json_receipts, 1);
+        assert_eq!(report.backfilled_receipts, 1);
+        assert_eq!(report.sql_terminal, 1);
+        assert_eq!(report.sql_live_not_in_json, 0);
+        let again = sql_parity_backfill(dir.path()).await.unwrap();
+        assert_eq!(again.backfilled_receipts, 0, "parity is idempotent");
     }
 }

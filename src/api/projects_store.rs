@@ -29,12 +29,58 @@ pub const SCHEMA_VERSION: i64 = 2;
 /// Tracker parser revision recorded on every import row.
 pub const TRACKER_PARSER_VERSION: i64 = 1;
 
+/// Remote build job mirror tables. Shared with `remote_node::job_ledger::sql`,
+/// which opens the same database from the ledger's working dir.
+pub const REMOTE_JOBS_SCHEMA: &str = r#"
+-- Remote build jobs and their subscribers (mirror of the JSON ledger during
+-- the dual-write window; see remote_node::job_ledger). Terminal outcomes are
+-- also written to `receipts` as kind='build'.
+CREATE TABLE IF NOT EXISTS remote_jobs (
+    job_id              TEXT PRIMARY KEY,
+    mission_id          TEXT NOT NULL,
+    node_id             TEXT NOT NULL,
+    kind                TEXT NOT NULL,                     -- mission|remote_build|tentative
+    state               TEXT NOT NULL CHECK (state IN
+                          ('submitting','accepted','running','succeeded','failed','cancelled','lost')),
+    identity_version    INTEGER NOT NULL DEFAULT 0,
+    identity_hash       TEXT,
+    identity_json       TEXT,
+    submission_sequence INTEGER NOT NULL DEFAULT 0,
+    started_at          TEXT NOT NULL,
+    accepted_at         TEXT,
+    heartbeat_at        TEXT,
+    finished_at         TEXT,
+    exit_status         INTEGER,
+    artifacts_json      TEXT NOT NULL DEFAULT '[]',
+    wake_required       INTEGER NOT NULL DEFAULT 0,
+    wake_delivered_at   TEXT,
+    wake_suppressed_by  TEXT,
+    updated_at          TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_live_job_per_identity
+    ON remote_jobs(identity_hash)
+    WHERE state IN ('submitting','accepted','running') AND identity_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS remote_jobs_mission ON remote_jobs(mission_id, state);
+
+CREATE TABLE IF NOT EXISTS remote_job_subscribers (
+    job_id          TEXT NOT NULL REFERENCES remote_jobs(job_id) ON DELETE CASCADE,
+    mission_id      TEXT NOT NULL,
+    wake_required   INTEGER NOT NULL DEFAULT 0,
+    wake_state      TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (wake_state IN ('pending','delivered','suppressed')),
+    attached_at     TEXT NOT NULL,
+    delivered_at    TEXT,
+    PRIMARY KEY (job_id, mission_id)
+);
+
+"#;
+
 pub type SharedProjectsStore = Arc<ProjectsStore>;
 
 pub const TRACK_VERIFIER_CLASSES: [&str; 5] =
     ["external_state", "command", "review", "operator", "manual"];
 
-const SCHEMA: &str = r#"
+pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS project_bindings (
     slug               TEXT PRIMARY KEY NOT NULL,
     control_session_id TEXT NOT NULL,
@@ -375,6 +421,7 @@ impl ProjectsStore {
     /// column must be reconciled explicitly.
     fn initialize(connection: &Connection) -> rusqlite::Result<()> {
         connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(REMOTE_JOBS_SCHEMA)?;
         // project_state_events.session_id (2026-08: the overview builds
         // latest_update from the store, so the delivery's session rides along).
         Self::ensure_column(
