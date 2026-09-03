@@ -450,6 +450,54 @@ fn slug_is_archived(
         .is_some_and(|record| record.status == "archived")
 }
 
+/// Diff this read's attention items against the previous read and write a
+/// `resolution` entry into the decision ledger for every reason that went
+/// away — so the drawer's "Recent activity" says *why* a card left the
+/// attention column, and the desktop can toast/reply on the same key. The
+/// first read after boot only seeds the snapshot.
+async fn record_attention_resolutions(state: &AppState, projects: &[ProjectRow]) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut snapshot = state.attention_snapshot.write().await;
+    for row in projects {
+        let current: HashSet<String> = row.attention.iter().map(AttentionItem::key).collect();
+        if let Some(previous) = snapshot.get(&row.slug) {
+            for key in resolved_keys(previous, &current) {
+                let (kind, mission_id) = key.split_once('|').unwrap_or((key.as_str(), ""));
+                let question = match mission_id {
+                    "" => format!("resolved: {}", kind.replace('_', " ")),
+                    id => format!(
+                        "resolved: {} for mission {}",
+                        kind.replace('_', " "),
+                        &id[..8.min(id.len())]
+                    ),
+                };
+                if let Err(error) = state.projects.record_decision(
+                    &row.slug,
+                    &super::projects_store::NewDecision {
+                        question,
+                        rationale: None,
+                        kind: Some("resolution".to_string()),
+                        authority: "granted".to_string(),
+                        status: "decided".to_string(),
+                        evidence: Some(serde_json::json!({
+                            "attention_key": key,
+                            "kind": kind,
+                            "mission_id": (!mission_id.is_empty()).then_some(mission_id),
+                            "resolved_at": now,
+                        })),
+                    },
+                ) {
+                    tracing::warn!(project = %row.slug, %error, "attention resolution not recorded");
+                }
+            }
+        }
+        snapshot.insert(row.slug.clone(), current);
+    }
+    // Rows that vanished from the roster (deleted) drop out silently.
+    let live: HashSet<&str> = projects.iter().map(|row| row.slug.as_str()).collect();
+    snapshot.retain(|slug, _| live.contains(slug.as_str()));
+}
+
 fn record_unrouted(
     projects: &super::projects_store::ProjectsStore,
     delivery: &DeliveryUpdate,
@@ -2003,6 +2051,53 @@ fn live_mission_title(status: MissionStatus, title: Option<&str>, id: &str) -> O
     )
 }
 
+/// The one HTTP call that clears an attention item.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AttentionAction {
+    pub label: &'static str,
+    pub method: &'static str,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<serde_json::Value>,
+}
+
+/// One reason a project needs the operator, with what produced it.
+///
+/// `kind` is stable (the desktop maps it to a button): `blocker_reported`,
+/// `state_stalled`, `mission_awaiting_user`, `decision_pending`,
+/// `mission_failed`, `tracker_stale`, `no_controller`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AttentionItem {
+    pub kind: &'static str,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<String>,
+    /// When the underlying signal started (status change, delivery time).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// The headline that carried the signal (blocker, callback, failure).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_headline: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<AttentionAction>,
+}
+
+impl AttentionItem {
+    /// Identity across overview snapshots: the same reason for the same
+    /// subject is the same item even when its message text changes.
+    pub fn key(&self) -> String {
+        format!("{}|{}", self.kind, self.mission_id.as_deref().unwrap_or(""))
+    }
+}
+
+/// Keys present in `previous` and gone from `current`: the reasons that
+/// resolved between two overview reads.
+pub fn resolved_keys(previous: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
+    let mut gone: Vec<String> = previous.difference(current).cloned().collect();
+    gone.sort();
+    gone
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct MissionChip {
     id: String,
@@ -2188,6 +2283,10 @@ struct ProjectRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     progress_state: Option<&'static str>,
     tracker: Option<TrackerInfo>,
+    /// Structured attention: one item per reason, with the evidence that
+    /// produced it and the one call that clears it. `attention_reasons` is
+    /// the same list as plain text.
+    attention: Vec<AttentionItem>,
     missions: Vec<MissionChip>,
     latest_update: Option<DeliveryUpdate>,
     updates_count: usize,
@@ -2575,6 +2674,7 @@ pub async fn projects_overview(
             .cmp(&bucket_rank(b.bucket))
             .then_with(|| a.slug.cmp(&b.slug))
     });
+    record_attention_resolutions(&state, &projects).await;
 
     Ok(Json(serde_json::json!({
         "projects": projects,
@@ -2840,6 +2940,13 @@ impl ProjectRowBuilder {
         self.missions.truncate(8);
 
         let mut attention: Vec<String> = Vec::new();
+        let mut items: Vec<AttentionItem> = Vec::new();
+        let evidence_headline = self
+            .latest_update
+            .as_ref()
+            .map(|update| update.headline.clone())
+            .filter(|headline| !headline.trim().is_empty());
+        let latest_at = self.latest_update.as_ref().map(|update| update.at.clone());
 
         if let Some(latest) = &self.latest_update {
             if let Some(blocker) = latest.blocker.as_deref() {
@@ -2857,6 +2964,14 @@ impl ProjectRowBuilder {
                     });
                 if !stale_mode {
                     attention.push(format!("blocker reported: {blocker}"));
+                    items.push(AttentionItem {
+                        kind: "blocker_reported",
+                        message: format!("blocker reported: {blocker}"),
+                        mission_id: None,
+                        since: Some(signal_at.to_string()),
+                        evidence_headline: evidence_headline.clone(),
+                        action: None,
+                    });
                 }
             }
             // Same non-silent state three ticks in a row: the controller
@@ -2867,6 +2982,14 @@ impl ProjectRowBuilder {
             // running" is exactly `observations >= 3` on the latest event.
             if stall_descriptor(latest.state.as_deref()) && self.latest_observations >= 3 {
                 attention.push("same state on 3 consecutive updates".to_string());
+                items.push(AttentionItem {
+                    kind: "state_stalled",
+                    message: "same state on 3 consecutive updates".to_string(),
+                    mission_id: None,
+                    since: latest_at.clone(),
+                    evidence_headline: evidence_headline.clone(),
+                    action: None,
+                });
             }
         }
         // Only qualified operator pages count as "awaiting user". Ack and
@@ -2899,13 +3022,49 @@ impl ProjectRowBuilder {
                 1 => "1 mission awaiting user input".to_string(),
                 count => format!("{count} missions awaiting user input"),
             });
+            for chip in self.missions.iter().filter(|chip| chip.needs_operator) {
+                items.push(AttentionItem {
+                    kind: "mission_awaiting_user",
+                    message: format!(
+                        "mission {} is waiting for you{}",
+                        &chip.id[..8.min(chip.id.len())],
+                        chip.title
+                            .as_deref()
+                            .map(|title| format!(": {title}"))
+                            .unwrap_or_default()
+                    ),
+                    mission_id: Some(chip.id.clone()),
+                    since: chip.last_status_change_at.clone(),
+                    evidence_headline: chip.title.clone(),
+                    action: Some(AttentionAction {
+                        label: "Acknowledge",
+                        method: "POST",
+                        path: format!("/api/control/missions/{}/status", chip.id),
+                        body: Some(serde_json::json!({ "status": "acknowledged" })),
+                    }),
+                });
+            }
         }
         // Same rule for ledger escalations: a pending_user decision is a
         // question only the owner can answer, so freshness never silences it.
         if self.pending_decisions > 0 {
-            attention.push(match self.pending_decisions {
+            let message = match self.pending_decisions {
                 1 => "1 decision awaiting you".to_string(),
                 count => format!("{count} decisions awaiting you"),
+            };
+            attention.push(message.clone());
+            items.push(AttentionItem {
+                kind: "decision_pending",
+                message,
+                mission_id: None,
+                since: latest_at.clone(),
+                evidence_headline: evidence_headline.clone(),
+                action: Some(AttentionAction {
+                    label: "Answer",
+                    method: "POST",
+                    path: format!("/api/projects/{}/decision/answer", self.slug),
+                    body: None,
+                }),
             });
         }
 
@@ -2970,6 +3129,29 @@ impl ProjectRowBuilder {
                 attention.push(format!("{count} missions failed or interrupted"));
             }
         }
+        for chip in &problem_missions {
+            items.push(AttentionItem {
+                kind: "mission_failed",
+                message: format!(
+                    "mission {} is {:?}{}",
+                    &chip.id[..8.min(chip.id.len())],
+                    chip.status,
+                    chip.title
+                        .as_deref()
+                        .map(|title| format!(": {title}"))
+                        .unwrap_or_default()
+                ),
+                mission_id: Some(chip.id.clone()),
+                since: chip.last_status_change_at.clone(),
+                evidence_headline: chip.title.clone(),
+                action: Some(AttentionAction {
+                    label: "Acknowledge",
+                    method: "POST",
+                    path: format!("/api/control/missions/{}/status", chip.id),
+                    body: Some(serde_json::json!({ "status": "acknowledged" })),
+                }),
+            });
+        }
         let tracker_active = self
             .tracker
             .as_ref()
@@ -2992,7 +3174,8 @@ impl ProjectRowBuilder {
                 .map(|u| u.at.clone())
                 .or_else(|| self.tracker.as_ref().and_then(|t| t.updated_at.clone()));
             let stale = last_signal
-                .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+                .as_deref()
+                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
                 .map(|at| {
                     chrono::Utc::now().signed_duration_since(at.with_timezone(&chrono::Utc))
                         > chrono::Duration::hours(STALE_ACTIVE_HOURS)
@@ -3000,6 +3183,19 @@ impl ProjectRowBuilder {
                 .unwrap_or(false);
             if stale {
                 attention.push("active tracker with no live mission or recent update".to_string());
+                items.push(AttentionItem {
+                    kind: "tracker_stale",
+                    message: "active tracker with no live mission or recent update".to_string(),
+                    mission_id: None,
+                    since: last_signal.clone(),
+                    evidence_headline: evidence_headline.clone(),
+                    action: Some(AttentionAction {
+                        label: "Pause project",
+                        method: "POST",
+                        path: format!("/api/projects/{}/action", self.slug),
+                        body: Some(serde_json::json!({ "action": "pause" })),
+                    }),
+                });
             }
         }
 
@@ -3063,6 +3259,19 @@ impl ProjectRowBuilder {
         // above; the field alone carries it without forcing attention.)
         if controller_health == Some("missing") {
             attention.push("active project has no controller".to_string());
+            items.push(AttentionItem {
+                kind: "no_controller",
+                message: "active project has no controller".to_string(),
+                mission_id: None,
+                since: latest_at.clone(),
+                evidence_headline: evidence_headline.clone(),
+                action: Some(AttentionAction {
+                    label: "Pause project",
+                    method: "POST",
+                    path: format!("/api/projects/{}/action", self.slug),
+                    body: Some(serde_json::json!({ "action": "pause" })),
+                }),
+            });
         }
         let effective_mode = self
             .mode
@@ -3163,6 +3372,7 @@ impl ProjectRowBuilder {
             autonomy_level: self.autonomy_level,
             pending_decisions: self.pending_decisions,
             attention_reasons: attention,
+            attention: items,
             health,
             summary,
             conversation,
@@ -6605,5 +6815,70 @@ mod tests {
             .expect("read")
             .is_none());
         assert!(store.unrouted(10).expect("unrouted").is_empty());
+    }
+
+    #[test]
+    fn attention_items_carry_the_subject_and_the_clearing_call() {
+        let mut builder = ProjectRowBuilder::new("eip-8282".into());
+        builder
+            .missions
+            .push(failed_chip("1971a723-8f02-4179-bbe9-54e5585fe5b3"));
+        builder.pending_decisions = 1;
+        let row = builder.finish(&[], None, None, "2026-08-02T01:00:00Z");
+        assert_eq!(row.attention_reasons.len(), 2);
+        assert_eq!(row.attention.len(), 2);
+        let failed = row
+            .attention
+            .iter()
+            .find(|item| item.kind == "mission_failed")
+            .expect("failed item");
+        assert_eq!(
+            failed.mission_id.as_deref(),
+            Some("1971a723-8f02-4179-bbe9-54e5585fe5b3")
+        );
+        let action = failed.action.as_ref().expect("action");
+        assert_eq!(
+            action.path,
+            "/api/control/missions/1971a723-8f02-4179-bbe9-54e5585fe5b3/status"
+        );
+        assert_eq!(
+            action.body,
+            Some(serde_json::json!({ "status": "acknowledged" }))
+        );
+        assert_eq!(
+            failed.key(),
+            "mission_failed|1971a723-8f02-4179-bbe9-54e5585fe5b3"
+        );
+        let decision = row
+            .attention
+            .iter()
+            .find(|item| item.kind == "decision_pending")
+            .expect("decision item");
+        assert_eq!(
+            decision.action.as_ref().map(|a| a.path.as_str()),
+            Some("/api/projects/eip-8282/decision/answer")
+        );
+        // The plain-text list stays byte-identical to what cards rendered before.
+        assert!(row
+            .attention_reasons
+            .iter()
+            .any(|reason| reason == "mission 1971a723 is Failed"));
+    }
+
+    #[test]
+    fn resolved_keys_are_the_reasons_that_went_away() {
+        let previous: HashSet<String> = ["mission_failed|a", "no_controller|", "decision_pending|"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let current: HashSet<String> = ["decision_pending|", "mission_failed|b"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            resolved_keys(&previous, &current),
+            vec!["mission_failed|a".to_string(), "no_controller|".to_string()]
+        );
+        assert!(resolved_keys(&current, &current).is_empty());
     }
 }

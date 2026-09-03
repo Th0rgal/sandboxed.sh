@@ -161,6 +161,9 @@ pub struct AppState {
     pub validation: super::validation::SharedValidationStore,
     /// Explicitly-declared project facts (control conversation binding).
     pub projects: super::projects_store::SharedProjectsStore,
+    /// Attention items per project slug as of the last `/api/projects/overview`
+    /// read; the next read diffs against it to record resolutions.
+    pub attention_snapshot: RwLock<HashMap<String, std::collections::HashSet<String>>>,
 }
 
 /// Start the HTTP server.
@@ -556,6 +559,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         fleet: Arc::new(crate::remote_node::FleetMonitor::new()),
         validation,
         projects,
+        attention_snapshot: RwLock::new(HashMap::new()),
     });
 
     // Persisted node state (operator cordons) survives restarts.
