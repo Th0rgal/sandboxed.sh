@@ -1,23 +1,17 @@
 diff --git a/cron/scheduler.py b/cron/scheduler.py
-index c595707..9e25672 100644
+index 79e75120cb..e5bf660ea1 100644
 --- a/cron/scheduler.py
 +++ b/cron/scheduler.py
-@@ -1523,6 +1523 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
--    try:
--        config = load_gateway_config()
--    except Exception as e:
--        msg = f"failed to load gateway config: {e}"
--        logger.error("Job '%s': %s", job["id"], msg)
--        return msg
-+    config = None
-@@ -1536,0 +1532,45 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
-+        # API-server sessions (WebUI/Desktop) do not have a live messaging
-+        # adapter once the originating HTTP turn has ended.  Their durable
-+        # delivery surface is the persisted session transcript itself.  The
-+        # API adapter binds chat_id to the concrete session_id, so an
-+        # origin-scoped cron can safely append its result to that exact
-+        # conversation without falling back to a configured home platform
-+        # such as Telegram.
+@@ -3579,6 +3579,43 @@ def _deliver_result(
+                 delivery_errors.append(bot_chat_error)
+             continue
+ 
++        # [fork-delta] API-server sessions (WebUI/Desktop) have no live
++        # messaging adapter once the originating HTTP turn has ended. Their
++        # durable delivery surface is the persisted session transcript itself.
++        # The API adapter binds chat_id to the concrete session_id, so an
++        # origin-scoped cron appends its result to that exact conversation
++        # instead of falling back to a configured home platform (Telegram).
 +        if str(platform_name).lower() == "api_server":
 +            db = None
 +            try:
@@ -49,19 +43,17 @@ index c595707..9e25672 100644
 +                    db.close()
 +            continue
 +
-+        if config is None:
-+            try:
-+                config = load_gateway_config()
-+            except Exception as e:
-+                msg = f"failed to load gateway config: {e}"
-+                logger.error("Job '%s': %s", job["id"], msg)
-+                return msg
-+
+         # Diagnostic: log thread_id for topic-aware delivery debugging
+         origin = _resolve_origin(job) or {}
+         origin_thread = origin.get("thread_id")
 diff --git a/tests/cron/test_scheduler.py b/tests/cron/test_scheduler.py
-index f5317bf..2554de3 100644
+index e7f99c2594..ccb3b219ed 100644
 --- a/tests/cron/test_scheduler.py
 +++ b/tests/cron/test_scheduler.py
-@@ -4041,0 +4042,58 @@ class TestDeliverResultLiveAdapterUnconfirmed:
+@@ -2854,3 +2854,61 @@ class TestFailureStreakNudge:
+         from cron.scheduler import _failure_streak_nudge
+         with patch("cron.scheduler.load_config", side_effect=RuntimeError("boom")):
+             assert "failed 3 runs" in _failure_streak_nudge(self._job(2))
 +class TestDeliverApiServerOrigin:
 +    def test_appends_result_to_origin_session(self, tmp_path, monkeypatch):
 +        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
