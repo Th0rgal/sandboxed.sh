@@ -210,7 +210,7 @@ fn ingest_deliveries_with_live(
         // STATE_SIGNATURE, as Lido does) still routes. Without a key the
         // delivery goes to the unrouted triage inbox instead of vanishing.
         let Some(raw_key) = delivery.signature.as_deref() else {
-            record_unrouted(projects, &delivery);
+            record_unrouted(projects, &delivery, "no_routing_key");
             continue;
         };
         let canonical = resolve_alias(aliases, raw_key);
@@ -220,15 +220,26 @@ fn ingest_deliveries_with_live(
         // which is what prompts the operator to fix routes.json. The file is
         // never rewritten here.
         if aliases.contains_key(raw_key) && slug_is_archived(projects, overrides, &canonical) {
-            record_unrouted(projects, &delivery);
+            record_unrouted(projects, &delivery, "alias_to_archived");
             continue;
         }
         let slug = canonical.as_str();
-        // Auto-upsert the roster from routed deliveries: a slug that
-        // reports is a real project. This is how projects.db becomes the
-        // complete authoritative list without a manual seed of every
-        // project — in the background ingestor, not on a GET. Cheap when
-        // the row already exists (COALESCE upsert).
+        // A delivery may only report *into* a known project; it never creates
+        // one. A slug is known when the roster has it, or when routes.json
+        // names it (as an alias key or target). Anything else — a typo, a test
+        // wake, a controller inventing a second signature — lands in the
+        // unrouted inbox with a reason, where the operator registers or
+        // aliases it. Before this gate a single synthetic wake created a
+        // permanent "Unknown" project on the board.
+        let known = aliases.contains_key(raw_key)
+            || aliases.values().any(|target| target == slug)
+            || matches!(projects.get_project(slug), Ok(Some(_)));
+        if !known {
+            record_unrouted(projects, &delivery, "unknown_slug");
+            continue;
+        }
+        // Touch the roster row (COALESCE upsert: never overwrites fields)
+        // so `updated_at` reflects the report.
         if let Err(error) = projects.upsert_project(slug, None, None, None, None) {
             tracing::warn!("state ingest upsert: {slug}: {error}");
         }
@@ -439,7 +450,11 @@ fn slug_is_archived(
         .is_some_and(|record| record.status == "archived")
 }
 
-fn record_unrouted(projects: &super::projects_store::ProjectsStore, delivery: &DeliveryUpdate) {
+fn record_unrouted(
+    projects: &super::projects_store::ProjectsStore,
+    delivery: &DeliveryUpdate,
+    reason: &str,
+) {
     if let Err(error) = projects.record_unrouted(
         &delivery.session_id,
         &delivery.at,
@@ -447,6 +462,7 @@ fn record_unrouted(projects: &super::projects_store::ProjectsStore, delivery: &D
         delivery.signature.as_deref(),
         delivery.mode.as_deref(),
         delivery.blocker.as_deref(),
+        Some(reason),
     ) {
         tracing::warn!("state ingest unrouted: {error}");
     }
@@ -5941,6 +5957,9 @@ mod tests {
     #[test]
     fn a_ctrl_only_delivery_headline_lands_on_the_row_via_the_store() {
         let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("verity", None, None, None, None)
+            .expect("seed roster");
         let ctrl_only =
             "[Cron delivery: Verity]\nDid a thing\n[CTRL: verity | mode=active | wait=0 | next=x]";
         ingest_deliveries(
@@ -5974,6 +5993,9 @@ mod tests {
     #[test]
     fn a_silent_delivery_keeps_the_previous_headline_but_advances_freshness() {
         let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("verity", None, None, None, None)
+            .expect("seed roster");
         let real = "[Cron delivery: Verity]\nCertify #2240 merged\n\
                     [CTRL: verity | mode=active | wait=0 | next=x]";
         let quiet = "[Cron delivery: Verity]\n[SILENT]\n\
@@ -6009,6 +6031,9 @@ mod tests {
     #[test]
     fn a_silent_first_delivery_records_no_garbage_headline() {
         let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido", None, None, None, None)
+            .expect("seed roster");
         let quiet = "[Cron delivery: Lido]\n[SILENT]\n\
                      [CTRL: lido | mode=active | wait=0 | next=x]";
         ingest_deliveries(
@@ -6162,6 +6187,9 @@ mod tests {
     #[test]
     fn repeated_ctrl_only_ticks_collapse_and_project_the_mode() {
         let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido", None, None, None, None)
+            .expect("seed roster");
         for i in 0..3 {
             let tick = "[Cron delivery: Lido]\n[SILENT]\n[CTRL: lido | mode=blocked:transport-cap | wait=0 | next=x]";
             ingest_deliveries(
@@ -6273,6 +6301,9 @@ mod tests {
     #[test]
     fn newest_delivery_in_a_mixed_batch_wins_mode() {
         let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("verity", None, None, None, None)
+            .expect("seed roster");
         let older = "[Cron delivery: Verity]\nOld block\n\
                      [CTRL: verity | mode=blocked:lease | wait=0 | next=wait]\n\
                      [STATE_SIGNATURE: verity|old|head|blocked]\n";
@@ -6457,6 +6488,9 @@ mod tests {
     #[test]
     fn replaying_an_already_applied_mode_does_not_reset_wait() {
         let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido", None, None, None, None)
+            .expect("seed roster");
         for i in 0..3 {
             let tick = "[Cron delivery: Lido]\n[SILENT]\n[CTRL: lido | mode=blocked:transport-cap | wait=0 | next=x]";
             ingest_deliveries(
@@ -6483,5 +6517,61 @@ mod tests {
         assert_eq!(after.mode.as_deref(), Some("blocked"));
         assert_eq!(after.blocker.as_deref(), Some("transport-cap"));
         assert_eq!(after.wait_ticks, 2);
+    }
+
+    #[test]
+    fn an_unknown_signature_is_unrouted_with_a_reason_not_a_phantom_project() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        let wake = "[Mission callback: synthetic origin-wake]\n\
+                    [STATE_SIGNATURE: unknown|mission-callback|testwake-1111|completed|inspect]";
+        ingest_deliveries(
+            &store,
+            &HashMap::new(),
+            &HashMap::new(),
+            vec![parse_delivery("20260815_testwake", 1_754_000_000.0, wake)],
+        );
+        assert!(
+            store.get_project("unknown").expect("read").is_none(),
+            "a delivery never creates a project"
+        );
+        assert!(store
+            .latest_states()
+            .expect("latest")
+            .get("unknown")
+            .is_none());
+        let inbox = store.unrouted(10).expect("unrouted");
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].signature.as_deref(), Some("unknown"));
+        assert_eq!(inbox[0].reason.as_deref(), Some("unknown_slug"));
+    }
+
+    #[test]
+    fn a_registered_or_aliased_slug_still_routes() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("verity-core", None, None, None, None)
+            .expect("seed roster");
+        let mut aliases = HashMap::new();
+        aliases.insert("copilot-verity-core".to_string(), "verity-core".to_string());
+        let direct = "Core: PR merged.\n[STATE_SIGNATURE: verity-core|main|abc|none|next]";
+        let via_alias =
+            "Copilot: slice running.\n[STATE_SIGNATURE: copilot-verity-core|main|abc|none|next]";
+        ingest_deliveries(
+            &store,
+            &aliases,
+            &HashMap::new(),
+            vec![
+                parse_delivery("s2", 1_754_000_100.0, via_alias),
+                parse_delivery("s1", 1_754_000_000.0, direct),
+            ],
+        );
+        let latest = store.latest_states().expect("latest");
+        assert!(latest.contains_key("verity-core"));
+        assert!(!latest.contains_key("copilot-verity-core"));
+        assert!(store
+            .get_project("copilot-verity-core")
+            .expect("read")
+            .is_none());
+        assert!(store.unrouted(10).expect("unrouted").is_empty());
     }
 }
