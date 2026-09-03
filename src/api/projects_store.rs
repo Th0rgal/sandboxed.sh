@@ -117,6 +117,7 @@ CREATE TABLE IF NOT EXISTS unrouted_deliveries (
     signature  TEXT,
     mode       TEXT,
     blocker    TEXT,
+    reason     TEXT,  -- no_routing_key | alias_to_archived | unknown_slug
     PRIMARY KEY (session_id, at)
 );
 
@@ -433,6 +434,7 @@ impl ProjectsStore {
         // 2026-08: the decision ledger grew authority/status/evidence, and the
         // grant grew a normalized autonomy level.
         Self::ensure_column(connection, "project_decisions", "kind", "kind TEXT")?;
+        Self::ensure_column(connection, "unrouted_deliveries", "reason", "reason TEXT")?;
         Self::ensure_column(
             connection,
             "project_decisions",
@@ -1588,15 +1590,16 @@ impl ProjectsStore {
         signature: Option<&str>,
         mode: Option<&str>,
         blocker: Option<&str>,
+        reason: Option<&str>,
     ) -> Result<(), String> {
         let connection = self.lock()?;
         connection
             .execute(
                 "INSERT INTO unrouted_deliveries \
-                   (session_id, at, headline, signature, mode, blocker) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                   (session_id, at, headline, signature, mode, blocker, reason) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT(session_id, at) DO NOTHING",
-                params![session_id, at, headline, signature, mode, blocker],
+                params![session_id, at, headline, signature, mode, blocker, reason],
             )
             .map_err(|e| e.to_string())?;
         connection
@@ -1615,7 +1618,7 @@ impl ProjectsStore {
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
-                "SELECT session_id, at, headline, signature, mode, blocker \
+                "SELECT session_id, at, headline, signature, mode, blocker, reason \
                  FROM unrouted_deliveries ORDER BY at DESC LIMIT ?1",
             )
             .map_err(|e| e.to_string())?;
@@ -1628,6 +1631,7 @@ impl ProjectsStore {
                     signature: row.get(3)?,
                     mode: row.get(4)?,
                     blocker: row.get(5)?,
+                    reason: row.get(6)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -4087,6 +4091,9 @@ pub struct UnroutedDelivery {
     pub signature: Option<String>,
     pub mode: Option<String>,
     pub blocker: Option<String>,
+    /// Why the ingestor could not route it: `no_routing_key`,
+    /// `alias_to_archived`, `unknown_slug`.
+    pub reason: Option<String>,
 }
 
 /// Parsed RFC3339 compare so `Z` and `+00:00` (and other offsets) order by
@@ -6210,7 +6217,15 @@ mod tests {
         // Replaying the same delivery (overlapping ingest window) is one row.
         for _ in 0..3 {
             store
-                .record_unrouted("s1", "2026-08-04T10:00:00Z", "orphan", None, None, None)
+                .record_unrouted(
+                    "s1",
+                    "2026-08-04T10:00:00Z",
+                    "orphan",
+                    None,
+                    None,
+                    None,
+                    Some("no_routing_key"),
+                )
                 .expect("record");
         }
         assert_eq!(store.unrouted(100).expect("read").len(), 1);
@@ -6225,11 +6240,13 @@ mod tests {
                     Some("ghost"),
                     None,
                     None,
+                    Some("unknown_slug"),
                 )
                 .expect("record");
         }
         let rows = store.unrouted(100).expect("read");
         assert_eq!(rows.len(), ProjectsStore::UNROUTED_RETENTION);
+        assert_eq!(rows[0].reason.as_deref(), Some("unknown_slug"));
         // Newest first, and the oldest batch (including s1) was evicted.
         assert_eq!(rows[0].at, "2026-08-05T10:59:00Z");
         assert!(rows.iter().all(|row| row.session_id == "s2"));
