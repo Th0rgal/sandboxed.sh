@@ -377,8 +377,22 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
         pricing: pricing(600, 2_400, Some(375), Some(60)),
     },
     // Meta Muse (api.meta.ai). models.dev / OpenCode catalog, checked 2026-08-19.
-    // Contributor must sit above the 1.2 family alias so "-contributor" does not
+    // Contributor must sit above the family alias so "-contributor" does not
     // inherit standard Spark rates via the `muse-spark` prefix.
+    //
+    // Spark 1.3 appeared on /models on 2026-09-03; models.dev had no rates for
+    // it yet, so it carries the 1.2 tiers (contributor = the data-sharing tier,
+    // ~12x cheaper). Re-check models.dev and correct if Meta priced it apart.
+    PricingEntry {
+        canonical: "muse-spark-1.3-contributor",
+        aliases: &["muse-spark-1.3-contributor"],
+        pricing: pricing(100, 200, None, Some(2)),
+    },
+    PricingEntry {
+        canonical: "muse-spark-1.3",
+        aliases: &["muse-spark-1.3"],
+        pricing: pricing(1_250, 4_250, None, Some(150)),
+    },
     PricingEntry {
         canonical: "muse-spark-1.2-contributor",
         aliases: &["muse-spark-1.2-contributor"],
@@ -671,6 +685,10 @@ mod tests {
             "muse-spark-1.2-contributor"
         );
         assert_eq!(normalize_model("muse-spark-1.1"), "muse-spark-1.1");
+        assert_eq!(
+            normalize_model("meta/muse-spark-1.3-contributor"),
+            "muse-spark-1.3-contributor"
+        );
     }
 
     #[test]
