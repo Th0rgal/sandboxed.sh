@@ -7492,6 +7492,12 @@ pub struct CreateMissionRequest {
     pub backend: Option<String>,
     /// Parent mission ID (for orchestrated worker missions)
     pub parent_mission_id: Option<Uuid>,
+    /// The attempt this mission replaces (a relay after a failure, a
+    /// backend handoff). The prior mission is tagged `superseded_by:<id>`
+    /// and acknowledged, so the board stops flagging it. Must be on the
+    /// same project.
+    #[serde(default)]
+    pub supersedes_mission_id: Option<Uuid>,
     /// Working directory override (for git worktrees etc.)
     pub working_directory: Option<String>,
     /// FLEET-001 scheduling hint: dispatch priority (higher = more important,
@@ -7600,6 +7606,19 @@ pub struct UpdateMissionSettingsRequest {
     /// Config profile. Omit to leave unchanged, null/empty string to clear.
     #[serde(default, deserialize_with = "deserialize_string_patch")]
     pub config_profile: Option<Option<String>>,
+    /// After a settings change on a Failed/Interrupted mission, queue a
+    /// resume on the new settings (default true). A handoff that leaves the
+    /// mission dead is the failure mode this exists to remove: the controller
+    /// changed the backend, the mission stayed `failed`, work stalled.
+    pub resume: Option<bool>,
+}
+
+/// Does a settings change on a mission in `previous` status queue a resume?
+/// Only terminal-but-resumable statuses; a live, paused or acknowledged
+/// mission is left exactly where it is.
+fn should_queue_resume(previous: MissionStatus, requested: Option<bool>) -> bool {
+    requested.unwrap_or(true)
+        && matches!(previous, MissionStatus::Failed | MissionStatus::Interrupted)
 }
 
 fn normalize_model_effort(raw: &str) -> Option<String> {
@@ -9559,6 +9578,7 @@ pub async fn create_mission(
         config_profile: None,
         backend: None,
         parent_mission_id: None,
+        supersedes_mission_id: None,
         working_directory: None,
         priority: None,
         not_before: None,
@@ -10538,6 +10558,22 @@ pub async fn create_mission(
                 mission_id = %mission.id,
                 %error,
                 "could not absorb prior attempts on the same item"
+            );
+        }
+    }
+    if let Some(prior_id) = req.supersedes_mission_id {
+        if let Err(error) = super::mission_horizon::supersede_explicit(
+            control.mission_store.as_ref(),
+            &mission,
+            prior_id,
+        )
+        .await
+        {
+            tracing::warn!(
+                mission_id = %mission.id,
+                %prior_id,
+                %error,
+                "supersedes_mission_id was not applied"
             );
         }
     }
@@ -12542,7 +12578,7 @@ pub async fn update_mission_settings(
     Extension(user): Extension<AuthUser>,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateMissionSettingsRequest>,
-) -> Result<Json<Mission>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let current = control
         .mission_store
@@ -12550,6 +12586,7 @@ pub async fn update_mission_settings(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Mission {} not found", id)))?;
+    let previous_status = current.status;
 
     let backend = req.backend.as_ref().and_then(|backend| {
         let trimmed = backend.trim();
@@ -12700,7 +12737,7 @@ pub async fn update_mission_settings(
         .await
         .map_err(session_unavailable)?;
 
-    rx.await.map_err(recv_failed)?.map(Json).map_err(|e| {
+    let mission = rx.await.map_err(recv_failed)?.map_err(|e| {
         if e.contains("not found") {
             (StatusCode::NOT_FOUND, e)
         } else if e.contains("running") {
@@ -12708,7 +12745,44 @@ pub async fn update_mission_settings(
         } else {
             internal_error(e)
         }
-    })
+    })?;
+
+    // The settings write is durable at this point. A handoff on a dead
+    // mission continues it on the new settings; the handoff user message
+    // was logged by the command handler, so the resumed turn sees it. A
+    // resume refusal is reported, never turned into an error.
+    let mut body = serde_json::to_value(&mission).map_err(internal_error)?;
+    if should_queue_resume(previous_status, req.resume) {
+        let (tx, rx) = oneshot::channel();
+        let queued = match control
+            .cmd_tx
+            .send(ControlCommand::ResumeMission {
+                mission_id: id,
+                clean_workspace: false,
+                skip_message: false,
+                respond: tx,
+            })
+            .await
+        {
+            Ok(()) => rx
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r.map(|_| ())),
+            Err(e) => Err(e.to_string()),
+        };
+        match queued {
+            Ok(()) => {
+                tracing::info!(mission_id = %id, previous = ?previous_status, "settings handoff resumed the mission");
+                body["resume_queued"] = serde_json::Value::Bool(true);
+            }
+            Err(error) => {
+                tracing::warn!(mission_id = %id, %error, "settings handoff could not resume the mission");
+                body["resume_queued"] = serde_json::Value::Bool(false);
+                body["resume_warning"] = serde_json::Value::String(error);
+            }
+        }
+    }
+    Ok(Json(body))
 }
 
 /// Load/switch to a mission.
@@ -14258,6 +14332,7 @@ pub async fn clone_mission(
         config_profile: source.config_profile.clone(),
         backend: overrides.backend.or_else(|| Some(source.backend.clone())),
         parent_mission_id,
+        supersedes_mission_id: None,
         working_directory: source.working_directory.clone(),
         priority: None,
         not_before: None,
@@ -27261,6 +27336,18 @@ pub async fn telegram_webhook_receiver(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_settings_handoff_resumes_only_dead_missions() {
+        use super::{should_queue_resume, MissionStatus};
+        assert!(should_queue_resume(MissionStatus::Failed, None));
+        assert!(should_queue_resume(MissionStatus::Interrupted, Some(true)));
+        assert!(!should_queue_resume(MissionStatus::Failed, Some(false)));
+        assert!(!should_queue_resume(MissionStatus::Active, None));
+        assert!(!should_queue_resume(MissionStatus::Paused, None));
+        assert!(!should_queue_resume(MissionStatus::Acknowledged, None));
+        assert!(!should_queue_resume(MissionStatus::Completed, None));
+    }
+
     #[test]
     fn registered_liveness_interrupt_skips_hermes_tagged_writer() {
         assert!(super::skip_idle_registered_liveness_interrupt(

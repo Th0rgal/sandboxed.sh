@@ -331,6 +331,8 @@ struct StartMissionParams {
     #[serde(default)]
     idempotency_key: Option<String>,
     #[serde(default)]
+    supersedes_mission_id: Option<String>,
+    #[serde(default)]
     intent: Option<String>,
     #[serde(default)]
     github_pr: Option<String>,
@@ -1562,6 +1564,7 @@ impl AssistantMcp {
                         "desired_state": {"type": "string", "description": "Track state, e.g. waiting_ci / waiting_review / blocked_external."},
                         "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "Outcome contract used when this dispatch declares the track. Existing satisfied tracks are never reopened implicitly."},
                         "idempotency_key": {"type": "string", "description": "Stable retry key for one logical dispatch. Reusing it returns the existing mission receipt instead of starting a duplicate."},
+                        "supersedes_mission_id": {"type": "string", "description": "The failed/interrupted attempt this mission relays (same project). It is tagged superseded_by and acknowledged, so the board stops flagging it. Use this on every handoff/relay instead of a separate acknowledge_mission call."},
                         "next_check_at": {"type": "string", "description": "When the track should next be checked (RFC3339)."},
                         "estimated_disk_gib": {"type": "integer", "minimum": 1, "maximum": 512, "description": "Expected peak local scratch use. Set this for Lean/build-heavy missions; omit for small/no-build work."},
                         "origin_session_id": {"type": "string", "description": "Hermes session id of the conversation spawning this mission. Dashboards group the mission as a worker of that session, AND the mission-status webhook carries it back so the completion is delivered into that conversation instead of an isolated webhook session — always pass it when starting a mission from a conversation. Injected automatically by the Hermes-side plugin; pass through unchanged, never another session's id."}
@@ -1618,7 +1621,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "acknowledge_mission".to_string(),
-                description: "Acknowledge a mission only after independently verifying its terminal result. This is the safe host-authenticated replacement for asking a workspace container to use the service JWT. It accepts only awaiting_user missions whose awaiting_kind is ack; decision waits and live missions are refused.".to_string(),
+                description: "Acknowledge a mission only after independently verifying its terminal result. This is the safe host-authenticated replacement for asking a workspace container to use the service JWT. It accepts awaiting_user missions whose awaiting_kind is ack, and failed/interrupted missions once you have relayed or abandoned their work (prefer start_mission with supersedes_mission_id for a relay); decision waits and live missions are refused.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -2109,7 +2112,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "update_mission_settings".to_string(),
-                description: "Change a mission's run settings for its NEXT turn: switch backend (claudecode/codex/opencode/gemini/grok/chatgpt_ui), model, reasoning effort, fast mode, or agent. Applies between turns — the mission must be idle (awaiting_user/acknowledged/interrupted), not actively running. If it is running, cancel_mission first (or wait), then update, then send_message_to_mission or resume_mission to kick the next turn. model_effort applies to claudecode/codex; fast_mode applies only to Codex GPT-5.6/5.5/5.4 and consumes ChatGPT credits faster.".to_string(),
+                description: "Change a mission's run settings for its NEXT turn: switch backend (claudecode/codex/opencode/gemini/grok/chatgpt_ui), model, reasoning effort, fast mode, or agent. On a failed or interrupted mission the server resumes it on the new settings automatically (resume_queued in the response) — a handoff is one call, no separate resume_mission. Applies between turns — the mission must be idle (awaiting_user/acknowledged/interrupted/failed), not actively running. If it is running, cancel_mission first (or wait), then update, then send_message_to_mission or resume_mission to kick the next turn. model_effort applies to claudecode/codex; fast_mode applies only to Codex GPT-5.6/5.5/5.4 and consumes ChatGPT credits faster.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -2414,6 +2417,7 @@ impl AssistantMcp {
             "project": params.project,
             "track": params.track,
             "idempotency_key": params.idempotency_key,
+            "supersedes_mission_id": params.supersedes_mission_id,
             "intent": params.intent,
             "github_pr": params.github_pr,
             "writer": writer,
@@ -4631,6 +4635,13 @@ fn mission_requires_acknowledgement(digest: &Value) -> Result<bool, String> {
     if status == "awaiting_user" && awaiting_kind == Some("ack") {
         return Ok(true);
     }
+    // A failed or interrupted attempt is terminal too: acknowledging it is
+    // how a controller that relayed the work elsewhere clears the board's
+    // "mission … is Failed" reason. Live missions and decision waits stay
+    // refused.
+    if status == "failed" || status == "interrupted" {
+        return Ok(true);
+    }
 
     Err(format!(
         "Mission cannot be ACKed from status={status}, awaiting_kind={}",
@@ -5761,6 +5772,16 @@ mod tests {
             "awaiting_kind": null
         }))
         .is_err());
+        assert!(mission_requires_acknowledgement(&json!({
+            "status": "failed",
+            "awaiting_kind": null
+        }))
+        .unwrap());
+        assert!(mission_requires_acknowledgement(&json!({
+            "status": "interrupted",
+            "awaiting_kind": null
+        }))
+        .unwrap());
     }
 
     #[test]

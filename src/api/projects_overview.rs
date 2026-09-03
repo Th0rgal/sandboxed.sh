@@ -2018,6 +2018,10 @@ struct MissionChip {
     /// Qualified operator page — ack / in-grace controller waits stay false.
     #[serde(default)]
     needs_operator: bool,
+    /// The attempt that replaced this one (relay / handoff). A superseded
+    /// attempt is never a reason for attention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<String>,
 }
 
 /// Owned copy of what the health rollup reads.
@@ -2948,7 +2952,7 @@ impl ProjectRowBuilder {
                     matches!(
                         chip.status,
                         MissionStatus::Failed | MissionStatus::Interrupted
-                    )
+                    ) && chip.superseded_by.is_none()
                 })
                 .collect()
         };
@@ -3197,6 +3201,7 @@ fn mission_chip(
             wait_started_at,
             chrono::Utc::now(),
         ),
+        superseded_by: super::mission_horizon::superseded_by(mission).map(|id| id.to_string()),
     }
 }
 
@@ -5147,6 +5152,7 @@ mod tests {
             github_pr: None,
             last_status_change_at: None,
             needs_operator: false,
+            superseded_by: None,
         });
         let row = builder.finish(&[], None, None, "2026-08-14T06:05:00Z");
         assert_eq!(row.mode.as_deref(), Some("active"));
@@ -5334,6 +5340,7 @@ mod tests {
                 github_pr: None,
                 last_status_change_at: None,
                 needs_operator: false,
+                superseded_by: None,
             });
         }
         let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
@@ -5357,7 +5364,28 @@ mod tests {
             github_pr: None,
             last_status_change_at: None,
             needs_operator: false,
+            superseded_by: None,
         }
+    }
+
+    #[test]
+    fn a_superseded_failed_attempt_is_not_a_reason_for_attention() {
+        let mut builder = ProjectRowBuilder::new("eip-8282".into());
+        let mut chip = failed_chip("1971a723-0000-0000-0000-000000000000");
+        chip.superseded_by = Some("bc136872-0000-0000-0000-000000000000".into());
+        builder.missions.push(chip);
+        let row = builder.finish(&[], None, None, "2026-08-02T01:00:00Z");
+        assert!(
+            row.attention_reasons.is_empty(),
+            "relayed attempt still flagged: {:?}",
+            row.attention_reasons
+        );
+        let mut builder = ProjectRowBuilder::new("eip-8282".into());
+        builder
+            .missions
+            .push(failed_chip("1971a723-0000-0000-0000-000000000000"));
+        let row = builder.finish(&[], None, None, "2026-08-02T01:00:00Z");
+        assert_eq!(row.attention_reasons.len(), 1);
     }
 
     fn active_update(at: &str, blocker: Option<&str>) -> DeliveryUpdate {
@@ -5582,6 +5610,7 @@ mod tests {
             github_pr: None,
             last_status_change_at: None,
             needs_operator: true,
+            superseded_by: None,
         });
         builder
             .missions
@@ -5605,6 +5634,7 @@ mod tests {
             github_pr: None,
             last_status_change_at: None,
             needs_operator,
+            superseded_by: None,
         }
     }
 
@@ -5837,6 +5867,7 @@ mod tests {
             github_pr: None,
             last_status_change_at: None,
             needs_operator: false,
+            superseded_by: None,
         });
         builder.missions.push(MissionChip {
             id: "8cc8df04-b8f4-4003-b668-d17f7d3e8def".to_string(),
@@ -5846,6 +5877,7 @@ mod tests {
             github_pr: None,
             last_status_change_at: None,
             needs_operator: false,
+            superseded_by: None,
         });
         let row = builder.finish(&[], None, None, "2026-08-16T19:05:00Z");
         let next = row.next_action.expect("derived");
