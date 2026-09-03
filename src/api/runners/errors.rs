@@ -76,8 +76,17 @@ pub(crate) fn is_auth_error(message: &str) -> bool {
 }
 
 pub(crate) fn is_rate_limited_error(message: &str) -> bool {
-    const RATE_LIMIT_MARKERS: [&str; 15] = [
+    const RATE_LIMIT_MARKERS: [&str; 18] = [
         "overloaded_error",
+        // Claude Code CLI on a subscription whose credits ran out (seen on
+        // prod mission 1971a723, 2026-09-03): the CLI exits 0 with a plain
+        // assistant message "You're out of usage credits. Switch to another
+        // model to continue." — no provider-error payload, no status code.
+        // It is a quota signal: rotate accounts / hand off, never "Model
+        // error".
+        "out of usage credits",
+        "out of credits",
+        "switch to another model to continue",
         "rate limit",
         "rate_limit",
         "resource_exhausted",
@@ -209,6 +218,10 @@ pub(crate) fn is_success_path_rate_limited_error(message: &str) -> bool {
     let lower = message.trim().replace('\u{2019}', "'").to_ascii_lowercase();
     lower.starts_with("you've hit your limit")
         || lower.starts_with("you have hit your limit")
+        || lower.starts_with("you're out of usage credits")
+        || lower.starts_with("you are out of usage credits")
+        || lower.starts_with("you're out of credits")
+        || lower.starts_with("you are out of credits")
         || (looks_like_explicit_provider_error_output(message) && is_rate_limited_error(message))
 }
 
@@ -316,5 +329,18 @@ mod tests {
         assert!(starts_with_ascii_case_insensitive(b"Error: 401", b"error:"));
         assert_eq!(find_ascii_case_insensitive(b"abCDef", b"cde"), Some(2));
         assert_eq!(find_ascii_case_insensitive(b"abc", b""), None);
+    }
+
+    #[test]
+    fn out_of_usage_credits_is_a_rate_limit_signal() {
+        let msg = "You\u{2019}re out of usage credits. Switch to another model to continue.";
+        assert!(is_rate_limited_error(msg));
+        assert!(is_success_path_rate_limited_error(msg));
+        assert!(is_success_path_rate_limited_error(
+            "You're out of usage credits. Switch to another model to continue."
+        ));
+        assert!(!is_success_path_rate_limited_error(
+            "I checked the billing page; we are not out of credits."
+        ));
     }
 }
