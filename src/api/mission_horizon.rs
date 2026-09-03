@@ -40,6 +40,90 @@ pub fn writer_role(mission: &Mission) -> WriterRole {
     }
 }
 
+/// Tag prefix recording *which* attempt replaced this one, so the board can
+/// show "relayed by …" and never count the superseded attempt as a problem.
+pub const SUPERSEDED_BY_PREFIX: &str = "superseded_by:";
+
+/// The attempt that superseded this mission, if any (from its tags).
+pub fn superseded_by(mission: &Mission) -> Option<Uuid> {
+    mission
+        .project
+        .tags
+        .iter()
+        .filter_map(|tag| tag.strip_prefix(SUPERSEDED_BY_PREFIX))
+        .filter_map(|id| Uuid::parse_str(id.trim()).ok())
+        .next_back()
+}
+
+/// Mark `prior` as replaced by `successor`: tag it (`superseded` +
+/// `superseded_by:<id>`) and, when no run is live, acknowledge it so it leaves
+/// the attention horizon. Idempotent.
+async fn absorb(store: &dyn MissionStore, prior: &Mission, successor: Uuid) -> Result<(), String> {
+    let mut tags = prior.project.tags.clone();
+    if !tags.iter().any(|tag| tag == SUPERSEDED_TAG) {
+        tags.push(SUPERSEDED_TAG.to_string());
+    }
+    let by = format!("{SUPERSEDED_BY_PREFIX}{successor}");
+    if !tags.iter().any(|tag| tag == &by) {
+        tags.retain(|tag| !tag.starts_with(SUPERSEDED_BY_PREFIX));
+        tags.push(by);
+    }
+    store
+        .update_mission_project(
+            prior.id,
+            MissionProjectPatch {
+                tags: Some(tags),
+                ..Default::default()
+            },
+        )
+        .await?;
+    if store.get_active_mission_run(prior.id).await?.is_none() {
+        if let Err(error) = store
+            .update_mission_status(prior.id, MissionStatus::Acknowledged)
+            .await
+        {
+            tracing::warn!(
+                mission_id = %prior.id,
+                %error,
+                "could not acknowledge a superseded attempt"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// An explicit relay: the caller names the attempt it replaces
+/// (`supersedes_mission_id`). Used when a controller hands work to a new
+/// mission on another backend after a failure, whatever the track tagging.
+/// Refused across projects; a mission may not absorb itself.
+pub async fn supersede_explicit(
+    store: &dyn MissionStore,
+    new_mission: &Mission,
+    prior_id: Uuid,
+) -> Result<(), String> {
+    if prior_id == new_mission.id {
+        return Err("a mission cannot supersede itself".to_string());
+    }
+    let Some(prior) = store.get_mission(prior_id).await? else {
+        return Err(format!("mission {prior_id} not found"));
+    };
+    let same_project = match (
+        prior.project.project.as_deref().map(str::trim),
+        new_mission.project.project.as_deref().map(str::trim),
+    ) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        (None, _) => true,
+        (Some(_), None) => false,
+    };
+    if !same_project {
+        return Err(format!(
+            "mission {prior_id} belongs to project {:?}, not {:?}",
+            prior.project.project, new_mission.project.project
+        ));
+    }
+    absorb(store, &prior, new_mission.id).await
+}
+
 fn role_label(role: WriterRole) -> Option<&'static str> {
     match role {
         WriterRole::Writer => Some("pr-writer"),
@@ -91,31 +175,7 @@ pub async fn supersede_prior_attempts(
         if prior.id == new_mission.id || writer_role(&prior) != role {
             continue;
         }
-        let mut tags = prior.project.tags.clone();
-        if !tags.iter().any(|tag| tag == SUPERSEDED_TAG) {
-            tags.push(SUPERSEDED_TAG.to_string());
-        }
-        store
-            .update_mission_project(
-                prior.id,
-                MissionProjectPatch {
-                    tags: Some(tags),
-                    ..Default::default()
-                },
-            )
-            .await?;
-        if store.get_active_mission_run(prior.id).await?.is_none() {
-            if let Err(error) = store
-                .update_mission_status(prior.id, MissionStatus::Acknowledged)
-                .await
-            {
-                tracing::warn!(
-                    mission_id = %prior.id,
-                    %error,
-                    "could not acknowledge a superseded attempt"
-                );
-            }
-        }
+        absorb(store, &prior, new_mission.id).await?;
         absorbed.push(prior.id);
     }
     Ok(absorbed)
@@ -531,6 +591,67 @@ mod tests {
             .expect("exists");
         assert_eq!(prior.status, MissionStatus::Acknowledged);
         assert!(prior.project.tags.iter().any(|tag| tag == SUPERSEDED_TAG));
+        assert_eq!(superseded_by(&prior), Some(second.id));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_relay_absorbs_a_failed_attempt_without_a_track() {
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let failed = seed(
+            &store,
+            "fable-attempt",
+            "eip-8282",
+            "entry-reach",
+            MissionStatus::Failed,
+            &[],
+        )
+        .await;
+        // The relay carries the project but a different (or no) track.
+        let relay = seed(
+            &store,
+            "codex-relay",
+            "eip-8282",
+            "entry-reach-relay",
+            MissionStatus::Pending,
+            &[],
+        )
+        .await;
+        assert!(
+            supersede_prior_attempts(store.as_ref(), &relay)
+                .await
+                .expect("supersede")
+                .is_empty(),
+            "a different track never absorbs implicitly"
+        );
+        supersede_explicit(store.as_ref(), &relay, failed.id)
+            .await
+            .expect("explicit relay");
+        let prior = store
+            .get_mission(failed.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(prior.status, MissionStatus::Acknowledged);
+        assert_eq!(superseded_by(&prior), Some(relay.id));
+        // Idempotent and refuses nonsense.
+        supersede_explicit(store.as_ref(), &relay, failed.id)
+            .await
+            .expect("replay");
+        assert!(supersede_explicit(store.as_ref(), &relay, relay.id)
+            .await
+            .is_err());
+        let other = seed(
+            &store,
+            "elsewhere",
+            "verity-core",
+            "x",
+            MissionStatus::Failed,
+            &[],
+        )
+        .await;
+        assert!(supersede_explicit(store.as_ref(), &relay, other.id)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

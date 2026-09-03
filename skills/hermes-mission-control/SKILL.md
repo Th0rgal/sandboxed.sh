@@ -67,8 +67,12 @@ For each mission you're babysitting, every check-in:
 Match the signal to the fix. The health `recommendation` usually tells you which.
 
 - **`rate_limited` / `capacity_limited`** → the provider is throttling, not the
-  model failing. `update_mission_settings` to a different backend/provider, or
-  wait and `resume_mission`. (This is the class of "Cloudflare/routing dropped
+  model failing. Credit/quota exhaustion ("out of usage credits") is this class:
+  the runner already rotates through every configured Anthropic account inside
+  the turn; if all are dry the mission fails `rate_limited`. Then
+  `update_mission_settings` to a different backend/provider — on a failed or
+  interrupted mission the server resumes it by itself (`resume_queued: true`),
+  so a handoff is one call. Or wait and `resume_mission`. (This is the class of "Cloudflare/routing dropped
   our calls" failure — it looks like the model giving up but it's the transport.)
 - **`auth_error`** → backend credentials are bad. Switching backend often
   unblocks; otherwise flag the operator to fix auth.
