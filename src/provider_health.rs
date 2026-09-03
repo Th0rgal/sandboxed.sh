@@ -700,6 +700,31 @@ pub struct ChainEntry {
 }
 
 /// A named model chain (fallback sequence).
+/// The Meta Muse model every chain should ride: the current Spark on the
+/// contributor tier. See `migrate_muse_entries`.
+pub const MUSE_DEFAULT_MODEL: &str = "muse-spark-1.3-contributor";
+
+/// Rewrite superseded / full-price Muse entries to [`MUSE_DEFAULT_MODEL`].
+/// Returns whether anything changed.
+pub fn migrate_muse_entries(chain: &mut ModelChain) -> bool {
+    let mut migrated = false;
+    for entry in &mut chain.entries {
+        if entry.provider_id == "muse"
+            && matches!(
+                entry.model_id.as_str(),
+                "muse-spark-1.1"
+                    | "muse-spark-1.2"
+                    | "muse-spark-1.2-contributor"
+                    | "muse-spark-1.3"
+            )
+        {
+            entry.model_id = MUSE_DEFAULT_MODEL.to_string();
+            migrated = true;
+        }
+    }
+    migrated
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelChain {
     /// Unique chain ID (e.g., "builtin/smart", "user/fast").
@@ -919,7 +944,7 @@ impl ModelChainStore {
                     },
                     ChainEntry {
                         provider_id: "muse".to_string(),
-                        model_id: "muse-spark-1.2".to_string(),
+                        model_id: MUSE_DEFAULT_MODEL.to_string(),
                     },
                 ],
                 is_default: true,
@@ -929,6 +954,17 @@ impl ModelChainStore {
             });
             changed = true;
         } else {
+            // Meta Muse tier policy (owner decision 2026-09-03): every chain
+            // rides the current Spark on the contributor (data-sharing) tier,
+            // ~12x cheaper than the no-training tier. Older Spark ids and the
+            // full-price id are rewritten in place, order preserved.
+            for chain in chains.iter_mut() {
+                if migrate_muse_entries(chain) {
+                    chain.updated_at = now;
+                    changed = true;
+                    tracing::info!(chain = %chain.id, "Migrated Meta Muse entries to {MUSE_DEFAULT_MODEL}");
+                }
+            }
             // Built-in chains are managed defaults. Preserve configured order
             // and extra fallbacks, but keep their stock model IDs current.
             if let Some(chain) = chains.iter_mut().find(|c| c.id == "builtin/smart") {
@@ -971,10 +1007,10 @@ impl ModelChainStore {
                 {
                     chain.entries.push(ChainEntry {
                         provider_id: "muse".to_string(),
-                        model_id: "muse-spark-1.2".to_string(),
+                        model_id: MUSE_DEFAULT_MODEL.to_string(),
                     });
                     migrated = true;
-                    tracing::info!("Appended muse/muse-spark-1.2 to builtin/smart");
+                    tracing::info!("Appended muse/{MUSE_DEFAULT_MODEL} to builtin/smart");
                 }
                 if migrated {
                     chain.updated_at = now;
@@ -1862,7 +1898,7 @@ mod tests {
                 ("cerebras".to_string(), "zai-glm-4.7".to_string()),
                 // The 2026-08-06 migration appends Meta Muse as a tail
                 // fallback to persisted chains, never reordering them.
-                ("muse".to_string(), "muse-spark-1.2".to_string()),
+                ("muse".to_string(), MUSE_DEFAULT_MODEL.to_string()),
             ]
         );
 

@@ -1244,6 +1244,18 @@ fn default_providers_config() -> ProvidersConfig {
                 // is present.
                 models: vec![
                     ProviderModel {
+                        id: "muse-spark-1.3-contributor".to_string(),
+                        name: "Muse Spark 1.3 Contributor".to_string(),
+                        description: Some(
+                            "Spark 1.3, data-sharing tier (~12x cheaper). Default.".to_string(),
+                        ),
+                    },
+                    ProviderModel {
+                        id: "muse-spark-1.3".to_string(),
+                        name: "Muse Spark 1.3".to_string(),
+                        description: Some("Spark 1.3, no-training tier".to_string()),
+                    },
+                    ProviderModel {
                         id: "muse-spark-1.2".to_string(),
                         name: "Muse Spark 1.2".to_string(),
                         description: Some("Coding-focused Spark 1.2".to_string()),
