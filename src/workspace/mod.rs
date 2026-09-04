@@ -4965,6 +4965,19 @@ if [ "@INSTALL_CODEX@" = "true" ] && [ -n "$NATIVE_PKG_MGR" ] && needs_install c
     echo "[sandboxed] Codex install failed"
   fi
 fi
+# Codex >= 0.150 spawns a sidecar, codex-code-mode-host, that it expects next to
+# the `codex` launcher (/usr/local/bin). The npm/bun package ships it under the
+# platform vendor directory but does not link it, so every tool call died with
+# "failed to spawn code-mode host" (2026-09-04). Expose it whenever it exists.
+if [ "@INSTALL_CODEX@" = "true" ] && command -v codex >/dev/null 2>&1 && [ ! -x /usr/local/bin/codex-code-mode-host ]; then
+  host_bin=$(find /usr/local/lib /usr/lib /root/.bun /root/.npm-global /root/.local -xdev -type f -name codex-code-mode-host 2>/dev/null | head -1)
+  if [ -n "$host_bin" ]; then
+    ln -sfn "$host_bin" /usr/local/bin/codex-code-mode-host
+    echo "[sandboxed] Linked codex-code-mode-host -> $host_bin"
+  else
+    echo "[sandboxed] WARNING: codex-code-mode-host not found in the Codex package; Codex tool calls will fail"
+  fi
+fi
 
 if [ "@INSTALL_GEMINI@" = "true" ] && [ -n "$PKG_MGR" ] && needs_install gemini "$GEMINI_VERSION"; then
   echo "[sandboxed] Installing Gemini CLI ${GEMINI_VERSION:-latest} via $PKG_MGR..."
@@ -5768,6 +5781,10 @@ mod tests {
         // Unpinned harnesses get an empty pin (= install latest when missing).
         assert!(script.contains("GEMINI_VERSION=\"\""));
         assert!(script.contains("@openai/codex@"));
+        assert!(
+            script.contains("codex-code-mode-host"),
+            "the Codex sidecar must be linked after install"
+        );
         assert!(script.contains("@google/gemini-cli@"));
         assert!(script.contains("[ \"$ni_installed\" != \"$ni_expected\" ]"));
         assert!(!script.contains("GROK_VERSION="));
