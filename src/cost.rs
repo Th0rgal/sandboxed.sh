@@ -166,6 +166,13 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
         aliases: &["gpt-5-mini"],
         pricing: pricing(250, 2_000, None, Some(25)),
     },
+    // GPT-6 Astra (Codex, ChatGPT catalog 2026-09-05). No public rate yet:
+    // carries the GPT-5.6 Sol rates until models.dev lists it.
+    PricingEntry {
+        canonical: "gpt-6-astra",
+        aliases: &["gpt-6-astra", "gpt-6"],
+        pricing: pricing(5_000, 30_000, Some(6_250), Some(500)),
+    },
     PricingEntry {
         canonical: "gpt-5.6-sol",
         aliases: &["gpt-5.6", "gpt-5-6", "gpt-5.6-sol", "gpt-5-6-sol"],
@@ -645,6 +652,8 @@ mod tests {
         assert_eq!(normalize_model("gpt-4o-2024-08-06"), "gpt-4o");
         assert_eq!(normalize_model("gpt-5.3-codex"), "gpt-5.3");
         assert_eq!(normalize_model("openai/gpt-5.6"), "gpt-5.6-sol");
+        assert_eq!(normalize_model("openai/gpt-6-astra"), "gpt-6-astra");
+        assert_eq!(normalize_model("gpt-6"), "gpt-6-astra");
         assert_eq!(normalize_model("gpt-5.6-2026-07-09"), "gpt-5.6-sol");
         assert_eq!(normalize_model("openai/gpt-5.6-sol"), "gpt-5.6-sol");
         assert_eq!(normalize_model("openai/gpt-5.6-terra"), "gpt-5.6-terra");

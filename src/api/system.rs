@@ -5387,7 +5387,10 @@ fn is_env_name_char(ch: char) -> bool {
 fn hermes_uses_native_codex(model: Option<&str>, base_url: Option<&str>) -> bool {
     let model_is_codex = model.is_some_and(|m| {
         let value = m.to_ascii_lowercase();
-        value.contains("openai-codex") || value.contains("gpt-5.6") || value.contains("gpt-5.5")
+        value.contains("openai-codex")
+            || value.contains("gpt-6")
+            || value.contains("gpt-5.6")
+            || value.contains("gpt-5.5")
     });
     let base_url_is_codex = base_url.is_some_and(|url| {
         url.to_ascii_lowercase()

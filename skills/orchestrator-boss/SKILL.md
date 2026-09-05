@@ -66,7 +66,7 @@ re-prescription of the work.
 ## Backend Guide
 
 - `codex` + `gpt-5.6-terra`: default for bounded code changes
-- `codex` + `gpt-5.6-sol`: hard blockers, formal proofs, and adversarial certification
+- `codex` + `gpt-6-astra` (default; `gpt-5.6-sol` as fallback): hard blockers, formal proofs, and adversarial certification
 - `gemini` + `gemini-3.1-pro-preview` or `gemini-2.5-pro`: good for proofs and parallel analysis
 - `opencode`: cheap redundancy
 

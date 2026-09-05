@@ -60,8 +60,8 @@ fn role_default_model(task: &BoardTask) -> Option<&'static str> {
         return None;
     }
     Some(match task.role {
-        BoardTaskRole::Planner | BoardTaskRole::Reviewer => "gpt-5.6-sol",
-        BoardTaskRole::Reconciler if task.risk_class == "high" => "gpt-5.6-sol",
+        BoardTaskRole::Planner | BoardTaskRole::Reviewer => "gpt-6-astra",
+        BoardTaskRole::Reconciler if task.risk_class == "high" => "gpt-6-astra",
         BoardTaskRole::Worker | BoardTaskRole::Reconciler => "gpt-5.6-terra",
     })
 }
