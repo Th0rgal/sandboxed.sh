@@ -3376,9 +3376,16 @@ pub(crate) async fn resolve_claudecode_default_model(
 
 /// Return the default model for Codex CLI when no override is specified.
 pub(crate) fn resolve_codex_default_model() -> String {
-    // Keep aligned with Codex upstream:
-    // https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json
-    "gpt-5.6-sol".to_string()
+    // Keep aligned with the live ChatGPT Codex catalog (`codex debug models`):
+    // gpt-6-astra listed on both prod accounts 2026-09-05 (efforts low..ultra,
+    // default medium). Owner decision: Astra is the Codex default.
+    if let Ok(model) = std::env::var("CODEX_DEFAULT_MODEL") {
+        let trimmed = model.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "gpt-6-astra".to_string()
 }
 
 /// Return the default model for Gemini CLI when no override is specified.
@@ -7628,6 +7635,9 @@ fn normalize_model_effort(raw: &str) -> Option<String> {
         "high" => Some("high".to_string()),
         "xhigh" => Some("xhigh".to_string()),
         "max" => Some("max".to_string()),
+        // Codex-only (gpt-6-astra, gpt-5.6-sol/terra): maximum reasoning with
+        // automatic task delegation.
+        "ultra" => Some("ultra".to_string()),
         _ => None,
     }
 }
@@ -7646,7 +7656,7 @@ fn normalize_model_effort_for_backend(backend: Option<&str>, raw: &str) -> Optio
 fn supported_model_efforts_for_backend(backend: Option<&str>) -> &'static str {
     match backend {
         Some("claudecode") => "low, medium, high, xhigh, max",
-        Some("codex") => "low, medium, high, xhigh, max",
+        Some("codex") => "low, medium, high, xhigh, max, ultra",
         _ => "none",
     }
 }
@@ -7656,7 +7666,7 @@ fn codex_fast_mode_model_supported(model: Option<&str>) -> bool {
         return false;
     };
     let model = model.rsplit('/').next().unwrap_or(model);
-    ["gpt-5.6", "gpt-5.5", "gpt-5.4"]
+    ["gpt-6", "gpt-5.6", "gpt-5.5", "gpt-5.4"]
         .iter()
         .any(|prefix| model == *prefix || model.starts_with(&format!("{prefix}-")))
 }
@@ -7703,10 +7713,16 @@ fn normalize_model_override_for_backend(backend: Option<&str>, raw_model: &str) 
     if backend == Some("codex") && trimmed == "gpt-5.6" {
         return Some("gpt-5.6-sol".to_string());
     }
+    if backend == Some("codex") && trimmed == "gpt-6" {
+        return Some("gpt-6-astra".to_string());
+    }
     if backend != Some("opencode") {
         if let Some((_, model_id)) = trimmed.split_once('/') {
             if backend == Some("codex") && model_id == "gpt-5.6" {
                 return Some("gpt-5.6-sol".to_string());
+            }
+            if backend == Some("codex") && model_id == "gpt-6" {
+                return Some("gpt-6-astra".to_string());
             }
             return Some(model_id.to_string());
         }
@@ -31915,6 +31931,15 @@ And the report:
             normalize_model_override_for_backend(Some("codex"), "openai/gpt-5.6"),
             Some("gpt-5.6-sol".to_string())
         );
+        assert_eq!(
+            normalize_model_override_for_backend(Some("codex"), "gpt-6"),
+            Some("gpt-6-astra".to_string())
+        );
+        assert_eq!(
+            normalize_model_override_for_backend(Some("codex"), "openai/gpt-6"),
+            Some("gpt-6-astra".to_string())
+        );
+        assert_eq!(resolve_codex_default_model(), "gpt-6-astra");
         assert_eq!(
             normalize_model_override_for_backend(Some("opencode"), "openai/gpt-5.6"),
             Some("openai/gpt-5.6".to_string())

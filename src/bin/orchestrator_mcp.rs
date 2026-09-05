@@ -369,7 +369,7 @@ struct MergeBranchParams {
     /// Backend for the auto-registered conflict-resolver task (default codex)
     #[serde(default)]
     resolver_backend: Option<String>,
-    /// Model for the resolver task (default gpt-5.6-sol)
+    /// Model for the resolver task (default gpt-6-astra)
     #[serde(default)]
     resolver_model: Option<String>,
 }
@@ -718,7 +718,7 @@ impl OrchestratorMcp {
                         "push": { "type": "boolean", "description": "Push target to origin after a clean merge" },
                         "delete_source": { "type": "boolean", "description": "Delete the source branch after a clean merge" },
                         "resolver_backend": { "type": "string", "description": "Backend for the auto conflict-resolver task (default codex)" },
-                        "resolver_model": { "type": "string", "description": "Model for the resolver task (default gpt-5.6-sol)" }
+                        "resolver_model": { "type": "string", "description": "Model for the resolver task (default gpt-6-astra)" }
                     }
                 }),
             },
@@ -2330,7 +2330,7 @@ impl OrchestratorMcp {
                     model_override: Some(
                         params
                             .resolver_model
-                            .unwrap_or_else(|| "gpt-5.6-sol".to_string()),
+                            .unwrap_or_else(|| "gpt-6-astra".to_string()),
                     ),
                     model_effort: Some("high".to_string()),
                     working_directory: Some(repo_dir.clone()),

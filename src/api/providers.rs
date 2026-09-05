@@ -83,6 +83,7 @@ const OPENROUTER_SEED_MODEL_IDS: &[&str] = &[
     "anthropic/claude-opus-5",
     "anthropic/claude-sonnet-4.6",
     "google/gemini-3.1-pro-preview",
+    "openai/gpt-6-astra",
     "openai/gpt-5.6",
     "openai/gpt-5.6-sol",
     "openai/gpt-5.5",
@@ -879,6 +880,14 @@ fn default_providers_config() -> ProvidersConfig {
                     // removed — gpt-5.3-codex now 404s ("model not supported when
                     // using Codex with a ChatGPT account"), and everything older
                     // than it is dead too. Newest first.
+                    ProviderModel {
+                        id: "gpt-6-astra".to_string(),
+                        name: "GPT-6 Astra".to_string(),
+                        description: Some(
+                            "OpenAI's GPT-6 flagship in Codex (efforts low..ultra). Default."
+                                .to_string(),
+                        ),
+                    },
                     ProviderModel {
                         id: "gpt-5.6".to_string(),
                         name: "GPT-5.6".to_string(),
@@ -2940,6 +2949,8 @@ fn is_codex_backend_model_id(model_id: &str) -> bool {
         || matches!(
             model_id,
             "gpt-daybreak-blue-latest"
+                | "gpt-6-astra"
+                | "gpt-6"
                 | "gpt-5.5"
                 | "gpt-5.6"
                 | "gpt-5.6-sol"
@@ -3230,6 +3241,7 @@ mod tests {
 
         for id in [
             "gpt-daybreak-blue-latest",
+            "gpt-6-astra",
             "gpt-5.6",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
