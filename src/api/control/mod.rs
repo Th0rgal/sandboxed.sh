@@ -939,6 +939,105 @@ mod campaign_guard_tests {
     }
 
     #[tokio::test]
+    async fn goal_digest_reads_durable_goal_independently_of_mission_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "goal-digest-test")
+                .await
+                .unwrap();
+        let mission = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let objective = "🦀".repeat(1500);
+        store
+            .update_mission_goal(mission.id, true, Some(&objective))
+            .await
+            .unwrap();
+        drop(store);
+        let reopened =
+            mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "goal-digest-test")
+                .await
+                .unwrap();
+        let loaded = reopened.get_mission(mission.id).await.unwrap().unwrap();
+        let digest = mission_goal_digest(&loaded);
+        assert_eq!(digest["mission_mode"], "task");
+        assert_eq!(digest["goal_mode"], true);
+        assert_eq!(
+            digest["goal_objective"].as_str().unwrap().chars().count(),
+            1001
+        );
+        assert!(digest["goal_objective"].as_str().unwrap().ends_with('…'));
+        let listed = reopened.list_missions(10, 0).await.unwrap();
+        assert_eq!(mission_goal_digest(&listed[0]), digest);
+        reopened
+            .update_mission_goal(mission.id, false, None)
+            .await
+            .unwrap();
+        let cleared = reopened.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(
+            mission_goal_digest(&cleared),
+            serde_json::json!({
+                "mission_mode": "task", "goal_mode": false, "goal_objective": null,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn control_continuation_validates_against_stored_identity_without_mutation() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("RESERVE-1"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .update_mission_project(
+                mission.id,
+                mission_store::MissionProjectPatch {
+                    track: Some(Some("trio-reserve1".into())),
+                    tags: Some(vec!["pr-readonly".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let loaded = store.get_mission(mission.id).await.unwrap().unwrap();
+        let request: ControlMessageRequest = serde_json::from_value(serde_json::json!({
+            "mission_id": mission.id, "content": "Continue RESERVE-1 on PR 244; exclude PR #230.",
+            "continue_identity": {"project": null, "track": "trio-reserve1", "github_pr": null}
+        }))
+        .unwrap();
+        assert!(request.extra.is_empty());
+        let patch = dispatch_identity_patch(
+            request.github_pr,
+            request.track,
+            request.title,
+            Some(request.content),
+            request.continue_identity,
+        );
+        let next = writer_reuse_or_conflict(&loaded, &patch).unwrap();
+        assert_eq!(next.track, loaded.project.track);
+        assert_eq!(next.github_pr, None);
+        let unchanged = store.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.project.tags, vec!["pr-readonly"]);
+        let resume: ResumeMissionRequest = serde_json::from_value(serde_json::json!({
+            "content": "Different work PR #90", "continue_identity": {"project": null, "track": "different", "github_pr": null}
+        })).unwrap();
+        let err = writer_reuse_or_conflict(
+            &loaded,
+            &dispatch_identity_patch(
+                resume.github_pr,
+                resume.track,
+                resume.title,
+                resume.content,
+                resume.continue_identity,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
     async fn silent_recycle_of_pr88_writer_as_reserve_is_rejected() {
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
@@ -965,35 +1064,33 @@ mod campaign_guard_tests {
             .await
             .expect("tag");
         let loaded = store.get_mission(mission.id).await.unwrap().unwrap();
-        let err = apply_writer_reuse_or_conflict(
-            &store,
+        let err = writer_reuse_or_conflict(
             &loaded,
-            None,
-            None,
-            None,
-            Some("Implement P-RESERVE-RELATIONAL first slice".into()),
+            &dispatch_identity_patch(
+                None,
+                None,
+                None,
+                Some("Implement P-RESERVE-RELATIONAL first slice".into()),
+                None,
+            ),
         )
-        .await
         .expect_err("silent recycle");
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert!(err.1.contains("writer_identity_stale"));
 
-        apply_writer_reuse_or_conflict(
-            &store,
+        let updated = writer_reuse_or_conflict(
             &loaded,
-            Some(String::new()),
-            Some("p-reserve-relational".into()),
-            Some("P-RESERVE-RELATIONAL first slice".into()),
-            Some("Implement P-RESERVE-RELATIONAL first slice".into()),
+            &dispatch_identity_patch(
+                Some(String::new()),
+                Some("p-reserve-relational".into()),
+                Some("P-RESERVE-RELATIONAL first slice".into()),
+                Some("Implement P-RESERVE-RELATIONAL first slice".into()),
+                None,
+            ),
         )
-        .await
         .expect("explicit retag");
-        let updated = store.get_mission(mission.id).await.unwrap().unwrap();
-        assert_eq!(updated.project.github_pr.as_deref(), None);
-        assert_eq!(
-            updated.project.track.as_deref(),
-            Some("p-reserve-relational")
-        );
+        assert_eq!(updated.github_pr.as_deref(), None);
+        assert_eq!(updated.track.as_deref(), Some("p-reserve-relational"));
     }
 
     #[tokio::test]
@@ -1023,15 +1120,10 @@ mod campaign_guard_tests {
             .await
             .expect("tag");
         let loaded = store.get_mission(mission.id).await.unwrap().unwrap();
-        apply_writer_reuse_or_conflict(
-            &store,
+        writer_reuse_or_conflict(
             &loaded,
-            None,
-            None,
-            None,
-            Some("fix the failing test".into()),
+            &dispatch_identity_patch(None, None, None, Some("fix the failing test".into()), None),
         )
-        .await
         .expect("same-work chat must not 409");
         let updated = store.get_mission(mission.id).await.unwrap().unwrap();
         assert_eq!(
@@ -1050,15 +1142,16 @@ mod campaign_guard_tests {
             .await
             .expect("create");
         let loaded = store.get_mission(mission.id).await.unwrap().unwrap();
-        apply_writer_reuse_or_conflict(
-            &store,
+        writer_reuse_or_conflict(
             &loaded,
-            None,
-            None,
-            None,
-            Some("Continue from PR #105. Launch P-TOPUP-2 and P-ALLOC-1.".into()),
+            &dispatch_identity_patch(
+                None,
+                None,
+                None,
+                Some("Continue from PR #105. Launch P-TOPUP-2 and P-ALLOC-1.".into()),
+                None,
+            ),
         )
-        .await
         .expect("blank writer first message must not 409");
     }
 
@@ -3468,6 +3561,10 @@ async fn close_mission_desktop_sessions(
 /// Message posted by a user to the control session.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ControlMessageRequest {
+    /// Explicit same-work assertion, checked against stored identity before dispatch.
+    #[serde(default)]
+    pub continue_identity: Option<crate::api::writer_recycle::WriterContinuation>,
+
     pub content: String,
     /// Client-generated idempotency key for the send action. When present,
     /// the backend uses it as the message id and ignores duplicate commands
@@ -4780,6 +4877,12 @@ pub async fn post_message(
         );
         warnings.push(format!("unrecognized fields ignored: {joined}"));
     }
+    if req.continue_identity.is_some() && target_mission_id.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "continue_identity requires an explicit mission_id".into(),
+        ));
+    }
     // A real user message means the operator is steering this mission — reset
     // its stall-guard budget so future genuine stalls get the full allowance.
     if let Some(mid) = target_mission_id {
@@ -4787,19 +4890,29 @@ pub async fn post_message(
     }
     let control = control_for_user(&state, &user).await;
     if let Some(mission_id) = target_mission_id {
-        if let Some(mission) = control
-            .mission_store
-            .get_mission(mission_id)
-            .await
-            .map_err(internal_error)?
         {
-            apply_writer_reuse_or_conflict(
-                &control.mission_store,
+            let mission = control
+                .mission_store
+                .get_mission(mission_id)
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!("Mission {mission_id} not found"),
+                    )
+                })?;
+            let mission = apply_writer_reuse_or_conflict(
+                &state,
+                &user,
                 &mission,
-                req.github_pr.clone(),
-                req.track.clone(),
-                req.title.clone(),
-                Some(content.clone()),
+                dispatch_identity_patch(
+                    req.github_pr.clone(),
+                    req.track.clone(),
+                    req.title.clone(),
+                    Some(content.clone()),
+                    req.continue_identity.clone(),
+                ),
             )
             .await?;
             if mission_is_pr_writer_in_store(&control.mission_store, &mission)
@@ -7271,6 +7384,21 @@ fn load_mission_projection_from_sqlite(
     )))
 }
 
+fn mission_goal_digest(mission: &Mission) -> serde_json::Value {
+    let objective = mission.goal_objective.as_deref().map(|text| {
+        let mut snippet: String = text.chars().take(1000).collect();
+        if text.chars().count() > 1000 {
+            snippet.push('…');
+        }
+        snippet
+    });
+    serde_json::json!({
+        "mission_mode": mission.mission_mode,
+        "goal_mode": mission.goal_mode,
+        "goal_objective": objective,
+    })
+}
+
 /// Compact, orchestrator-friendly view of a mission: status, last exchange,
 /// and PR links — without the full transcript. Recap/orchestration sessions
 /// previously pulled entire mission histories (multi-KB each) just to answer
@@ -7358,6 +7486,7 @@ pub async fn get_mission_digest(
         .as_ref()
         .map(|run| mission_execution_projection(run, mission.status));
 
+    let goal = mission_goal_digest(&mission);
     Ok(Json(serde_json::json!({
         "id": mission.id,
         "title": mission.title,
@@ -7383,6 +7512,9 @@ pub async fn get_mission_digest(
         "updated_at": mission.updated_at,
         "acknowledged_at": (mission.status == MissionStatus::Acknowledged).then_some(mission.updated_at.clone()),
         "execution": execution,
+        "mission_mode": goal["mission_mode"],
+        "goal_mode": goal["goal_mode"],
+        "goal_objective": goal["goal_objective"],
         "history_len": mission.history.len(),
         "last_user_message": last_user,
         "last_assistant_message": last_assistant,
@@ -8711,16 +8843,13 @@ struct PrWriterLease {
     status: MissionStatus,
 }
 
-async fn apply_writer_reuse_or_conflict(
-    store: &Arc<dyn crate::api::mission_store::MissionStore>,
-    mission: &Mission,
+fn dispatch_identity_patch(
     github_pr: Option<String>,
     track: Option<String>,
     title: Option<String>,
     work_hint: Option<String>,
-) -> Result<(), (StatusCode, String)> {
-    use crate::api::writer_recycle::{apply_writer_reuse, WriterIdentity, WriterIdentityPatch};
-
+    continue_identity: Option<crate::api::writer_recycle::WriterContinuation>,
+) -> crate::api::writer_recycle::WriterIdentityPatch {
     let to_patch = |value: Option<String>| -> Option<Option<String>> {
         value.map(|raw| {
             let trimmed = raw.trim();
@@ -8731,62 +8860,83 @@ async fn apply_writer_reuse_or_conflict(
             }
         })
     };
-    let stored = WriterIdentity {
-        title: mission.title.clone(),
-        github_pr: mission.project.github_pr.clone(),
-        track: mission.project.track.clone(),
-    };
-    let next = apply_writer_reuse(
-        &stored,
-        &WriterIdentityPatch {
-            title: to_patch(title),
-            github_pr: to_patch(github_pr),
-            track: to_patch(track),
-            work_hint,
+    crate::api::writer_recycle::WriterIdentityPatch {
+        title: to_patch(title),
+        github_pr: to_patch(github_pr),
+        track: to_patch(track),
+        work_hint,
+        continue_identity,
+    }
+}
+
+fn writer_reuse_or_conflict(
+    mission: &Mission,
+    patch: &crate::api::writer_recycle::WriterIdentityPatch,
+) -> Result<crate::api::writer_recycle::WriterIdentity, (StatusCode, String)> {
+    use crate::api::writer_recycle::{apply_writer_reuse, WriterIdentity};
+    apply_writer_reuse(
+        &WriterIdentity {
+            project: mission.project.project.clone(),
+            title: mission.title.clone(),
+            github_pr: mission.project.github_pr.clone(),
+            track: mission.project.track.clone(),
         },
+        patch,
     )
     .map_err(|err| {
         (
             StatusCode::CONFLICT,
-            serde_json::json!({
-                "error": err.error,
-                "message": err.message,
-            })
-            .to_string(),
+            serde_json::json!({"error": err.error, "message": err.message}).to_string(),
         )
-    })?;
-    if next.github_pr == stored.github_pr
-        && next.track == stored.track
-        && next.title == stored.title
-    {
-        return Ok(());
-    }
-    store
-        .update_mission_project(
-            mission.id,
-            crate::api::mission_store::MissionProjectPatch {
-                github_pr: Some(next.github_pr.clone()),
-                track: Some(next.track.clone()),
-                ..Default::default()
-            },
+    })
+}
+
+async fn apply_writer_reuse_or_conflict(
+    state: &Arc<AppState>,
+    user: &AuthUser,
+    mission: &Mission,
+    patch: crate::api::writer_recycle::WriterIdentityPatch,
+) -> Result<Mission, (StatusCode, String)> {
+    let next = writer_reuse_or_conflict(mission, &patch)?;
+    let mut updated = mission.clone();
+    if next.github_pr != mission.project.github_pr || next.track != mission.project.track {
+        // Identity changes must use the same PR and track lease arbitration as
+        // a structured project edit. Never write tags directly during dispatch.
+        updated = update_mission_project(
+            State(state.clone()),
+            Extension(user.clone()),
+            Path(mission.id),
+            Json(UpdateMissionProjectRequest {
+                github_pr: patch.github_pr,
+                track: patch.track,
+                project: None,
+                intent: None,
+                writer: None,
+                tags: None,
+                desired_state: None,
+                next_check_at: None,
+            }),
         )
-        .await
-        .map_err(internal_error)?;
-    if next.title != stored.title {
-        if let Some(title) = next.title {
-            let _ = store
-                .update_mission_metadata(
-                    mission.id,
-                    Some(Some(title.as_str())),
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await;
-        }
+        .await?
+        .0;
     }
-    Ok(())
+    if next.title != mission.title {
+        let control = control_for_user(state, user).await;
+        control
+            .mission_store
+            .update_mission_metadata(
+                mission.id,
+                Some(next.title.as_deref()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map_err(internal_error)?;
+        updated.title = next.title;
+    }
+    Ok(updated)
 }
 
 fn pr_writer_lease(mission: &Mission) -> PrWriterLease {
@@ -14412,6 +14562,10 @@ pub async fn clone_mission(
 /// Request body for resuming a mission
 #[derive(Debug, Deserialize, Default)]
 pub struct ResumeMissionRequest {
+    /// Explicit same-work assertion, checked against stored identity before dispatch.
+    #[serde(default)]
+    pub continue_identity: Option<crate::api::writer_recycle::WriterContinuation>,
+
     /// If true, clean the mission's work directory before resuming
     #[serde(default)]
     pub clean_workspace: bool,
@@ -14448,14 +14602,29 @@ pub async fn resume_mission(
     let actor = resolve_actor(request.actor.clone(), &user);
 
     let control = control_for_user(&state, &user).await;
-    if let Ok(Some(mission)) = control.mission_store.get_mission(mission_id).await {
+    {
+        let mission = control
+            .mission_store
+            .get_mission(mission_id)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Mission {mission_id} not found"),
+                )
+            })?;
         apply_writer_reuse_or_conflict(
-            &control.mission_store,
+            &state,
+            &user,
             &mission,
-            request.github_pr.clone(),
-            request.track.clone(),
-            request.title.clone(),
-            request.content.clone(),
+            dispatch_identity_patch(
+                request.github_pr.clone(),
+                request.track.clone(),
+                request.title.clone(),
+                request.content.clone(),
+                request.continue_identity.clone(),
+            ),
         )
         .await?;
     }

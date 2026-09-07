@@ -9,7 +9,7 @@ description: >
 metadata:
   policy: chatgpt-ui-pool
   policy_version: 1.4.0
-version: 1.12.0
+version: 1.13.0
 ---
 
 # Hermes Mission Control
@@ -45,6 +45,49 @@ or touch the host directly.
   directly — you manage the top-level mission. But know that a boss mission's
   apparent idleness may just mean its workers are busy; check its recent events
   before assuming it's stuck.
+
+## Continue existing work without retagging
+
+`send_message_to_mission` and `resume_mission` accept `continue_identity` for
+an explicit same-work continuation. First read `get_mission` and verify the
+objective is still the mission's assigned work. Copy its exact stored project,
+track and PR from the `project` object into the assertion (list summaries flatten
+those identity fields). All assertion fields are required; use JSON `null`
+when `project` or `github_pr` is unset:
+
+```json
+{
+  "mission_id": "<existing mission id>",
+  "content": "Continue RESERVE-1 on existing PR 244. Do not modify PRs #230 or #231.",
+  "continue_identity": {"project": "<stored project slug>", "track": "trio-reserve1", "github_pr": null}
+}
+```
+
+The assertion identifies the assigned work; PR/campaign references in the
+message can be scope exclusions or collaborator context. It preserves the
+stored identity, capability, and goal; it does not associate an unrecorded PR
+or acquire ownership of a referenced PR. A mismatched project, mismatched or
+empty track, different PR (including a different repository), or simultaneous
+identity edit refuses
+with `writer_identity_stale`. Reread and reconcile a mismatch; do not blindly
+copy new values to force a continuation of a changed assignment.
+
+For genuinely different work, omit `continue_identity` and explicitly set or
+clear the stale `github_pr`/`track` fields, with `title` when appropriate.
+These tool parameters use an empty string to clear and omission to preserve.
+Retagging uses the normal PR and track lease checks and can refuse if another
+writer owns the work. Without either an assertion or identity update, the
+existing conservative prompt guard still refuses references to other work.
+Resume validates its content and identity before waking; if its later message
+delivery fails, inspect `steer_warning` and retry the message on the same id.
+
+Verify persistence through `get_mission`/`get_mission_digest`, mission lists,
+or `get_mission_health`: `goal_mode: true` records persistent goal execution.
+`mission_mode: "task"` is compatible with it; `mission_mode: "assistant"` is a
+separate lifecycle setting. `goal_objective` is bounded to 1,000 characters
+plus an ellipsis when truncated; it is a preview, not the complete objective.
+A missing/null `goal_mode` from an older server is unknown, not false. Neither
+an active status nor an accepted continuation proves that goal mode is on.
 
 ## The monitoring loop
 

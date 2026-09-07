@@ -669,12 +669,32 @@ When dispatching 3+ missions in one turn (parallel batch), it's easy to typo or 
 
 > **Pitfall — the MCP server has a consecutive-failure circuit breaker.** The `mcp_sandboxed_assistant_*` server trips a breaker after **3 consecutive failed calls** and enters a ~45–60 s cooldown during which *every* call returns `MCP server 'sandboxed_assistant' is unreachable after 3 consecutive failures. Auto-retry available in ~Ns.` — even calls to healthy missions. The trap: **"not found" counts as a failure.** If you fire a parallel batch of 20 `cancel_mission` calls and 3 of those missions are already cleaned up (→ `Mission … not found`), the breaker trips and the remaining 17 never execute. Same for a parallel batch of `get_mission_events`/`send_message_to_mission` where a few target stale IDs. **Rule of thumb: never put >5–8 `mcp_sandboxed_assistant_*` calls in a single parallel block.** For batch cancel/survey of a large fleet, serialize in small groups (2–3 at a time) or loop with a short `sleep` between. If you do trip the breaker, `sleep 60` then resume — do not retry into the cooldown, it extends it.
 
-### Large mission histories — don't `get_mission` a long orchestrator raw
+### Large mission histories — use compact reads and bounded events
 
-`get_mission` returns the **entire** `history` array inline. For a long-running `goal_mode` boss orchestrator (hundreds of turns over days), this easily hits 100–200 KB and gets redirected to a persisted-output file — useless for a quick status read. Prefer these for large/old missions:
+Assistant MCP `get_mission` and `get_mission_digest` return a compact digest;
+the raw HTTP mission endpoint still returns the full history. Use the bounded
+read tools for large/old missions. Digests, list summaries, and health expose
+`goal_mode` separately from `mission_mode`, plus a `goal_objective` preview
+capped at 1,000 characters and a truncation ellipsis. `mission_mode=task` does
+not mean goal mode is off.
 
-1. `get_mission_events(mission_id=…, view='transcript', limit=3)` — just the first user_message (the original goal) and the last assistant self-report. This is the right tool for "what is this mission doing now" 90% of the time.
-2. If you genuinely need the full history (e.g. diagnosing *why* an orchestrator died), `get_mission` → then `read_file` the persisted `/tmp/hermes-results/…txt` with `offset`/`limit`, or `tail -c 6000` it via terminal to read only the most recent events. Reading the whole file back into context defeats the purpose.
+For same-work send/resume messages that mention excluded or collaborating
+PRs, use `continue_identity: {"project": "<exact stored project>", "track": "<exact stored track>", "github_pr":
+"<exact stored PR>"}` (explicit JSON null for an unset project or PR). Read the
+mission first and assert only its existing assignment. The assertion cannot
+be combined with identity edits and never grants PR ownership. For different
+work, omit it and explicitly update/clear stale `github_pr` and `track`
+(empty string clears in these MCP tools); normal writer leases still apply.
+See the full continuation contract in
+[Hermes Mission Control](../hermes-mission-control/SKILL.md#continue-existing-work-without-retagging).
+
+
+Use `get_mission_events(mission_id=…, view='transcript', limit=3)` for the
+newest bounded messages. To investigate earlier history, page backwards with
+`before_seq` or follow new events with `since_seq`; the initial objective is
+not necessarily in the newest page. Neither compact mission alias returns
+the full transcript.
+
 
 The four most common env-related failures and how to handle each:
 
