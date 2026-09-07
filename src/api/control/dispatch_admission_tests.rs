@@ -1224,3 +1224,355 @@ async fn http_real_reader_promotion_without_pr_checks_owner_and_persists_writer_
     assert_eq!(leases.len(), 1);
     assert_eq!(leases[0].mode, "writer");
 }
+
+// A provider-launch-only seam: tests keep the real HTTP actor, durable queue,
+// JSON-RPC child/driver, event consumer and mission finalization. No API keys.
+type NativeFixture = (std::path::PathBuf, String);
+static NATIVE_FIXTURES: std::sync::LazyLock<std::sync::Mutex<HashMap<Uuid, NativeFixture>>> =
+    std::sync::LazyLock::new(Default::default);
+
+pub(crate) async fn native_goal_fixture(
+    id: Uuid,
+    message: &str,
+    events: broadcast::Sender<AgentEvent>,
+    cancel: CancellationToken,
+) -> Option<crate::agents::AgentResult> {
+    use crate::backend::{Backend, SessionConfig};
+    let (dir, order) = NATIVE_FIXTURES.lock().unwrap().get(&id).cloned()?;
+    let backend = crate::backend::codex::CodexBackend::with_config(
+        crate::backend::codex::client::CodexConfig {
+            cli_path: dir.join("app-server").to_string_lossy().into_owned(),
+            cancel_token: Some(cancel.clone()),
+            extra_env: HashMap::from([
+                (
+                    "GOAL_FIXTURE_DIR".into(),
+                    dir.to_string_lossy().into_owned(),
+                ),
+                ("GOAL_FIXTURE_ORDER".into(), order),
+            ]),
+            ..Default::default()
+        },
+    );
+    let session = backend
+        .create_session(SessionConfig {
+            directory: dir.to_string_lossy().into_owned(),
+            title: None,
+            model: None,
+            agent: None,
+        })
+        .await
+        .unwrap();
+    let (rx, handle) = backend
+        .send_message_streaming(&session, message)
+        .await
+        .unwrap();
+    let result =
+        crate::api::runners::codex::consume_codex_events(rx, events, cancel, id, message, None)
+            .await;
+    handle.await.unwrap();
+    if result.terminal_reason == Some(TerminalReason::NativeGoalStopped) {
+        assert!(!result.success);
+        let evidence = completion_evidence_for_agent_result(&result);
+        assert!(evidence.native_terminal_seen);
+        assert_eq!(
+            evidence.completion_signal,
+            crate::agents::CompletionSignal::NativeTerminal
+        );
+        assert_eq!(
+            result.data.as_ref().unwrap()["turn_outcome"]["outcome"],
+            "interrupted"
+        );
+    }
+    Some(result)
+}
+
+async fn install_native_fixture(h: &Harness, id: Uuid, order: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = h._dir.path().join(id.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let cli = dir.join("app-server");
+    std::fs::write(
+        &cli,
+        include_str!("../../../tests/fixtures/native_goal_app_server.py"),
+    )
+    .unwrap();
+    std::fs::set_permissions(cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+    NATIVE_FIXTURES
+        .lock()
+        .unwrap()
+        .insert(id, (dir.clone(), order.into()));
+    let db = rusqlite::Connection::open(h._dir.path().join("missions/missions-admission-test.db"))
+        .unwrap();
+    db.execute(
+        "UPDATE missions SET backend='codex' WHERE id=?1",
+        [id.to_string()],
+    )
+    .unwrap();
+    dir
+}
+
+async fn wait_native_file(path: &std::path::Path) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fixture reached expected wire boundary");
+}
+
+async fn wait_native_status(h: &Harness, id: Uuid, expected: MissionStatus) -> Mission {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let m = h
+                .control
+                .mission_store
+                .get_mission(id)
+                .await
+                .unwrap()
+                .unwrap();
+            if m.status == expected
+                && h.control
+                    .mission_store
+                    .get_active_mission_run(id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            {
+                return m;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("driver released its durable run and parked mission")
+}
+
+#[tokio::test]
+async fn native_goal_http_actor_blocked_parks_and_default_resume_recovers_same_goal() {
+    for order in ["before", "after", "before_started"] {
+        let h = Harness::new().await;
+        let m = h.writer(MissionStatus::Failed, None).await;
+        let dir = install_native_fixture(&h, m.id, order).await;
+        let mut events = h.control.events_tx.subscribe();
+        let objective = "RESERVE-1 objective; preserve evidence and exclusions";
+        let response = h.request(true, m.id, json!({"content":format!("/goal {objective}"), "continue_identity":Harness::assertion(&m)})).await;
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+        wait_native_file(&dir.join("started")).await;
+        // No tool is in flight. Release is an explicit native blocked update,
+        // never an observation timeout or a controller cancel.
+        std::fs::write(dir.join("release"), "").unwrap();
+        let parked = wait_native_status(&h, m.id, MissionStatus::Blocked).await;
+        assert_eq!(
+            parked.terminal_reason.as_deref(),
+            Some("native_goal_stopped")
+        );
+        assert!(parked
+            .terminal_evidence
+            .as_deref()
+            .unwrap()
+            .contains("status=blocked"));
+        assert!(parked.goal_mode);
+        assert_eq!(parked.goal_objective.as_deref(), Some(objective));
+        assert_eq!(parked.project, m.project);
+        assert!(!dir.join("unexpected-clear").exists());
+        crate::api::track_leases::sweep(&h.state).await.unwrap();
+        assert_eq!(h.state.projects.live_leases(None).unwrap().len(), 1);
+        let finals: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|e| match e {
+                AgentEvent::AssistantMessage {
+                    content,
+                    success,
+                    resumable,
+                    ..
+                } => Some((content, success, resumable)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            finals,
+            vec![(
+                "Blocked: external node unavailable; evidence retained".into(),
+                false,
+                true
+            )]
+        );
+        std::fs::write(dir.join("external-fixed"), "").unwrap();
+        let response = h
+            .request(
+                true,
+                m.id,
+                json!({"continue_identity":Harness::assertion(&m)}),
+            )
+            .await;
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+        let recovered = wait_native_status(&h, m.id, MissionStatus::AwaitingUser).await;
+        assert!(recovered.goal_mode);
+        assert_eq!(recovered.goal_objective.as_deref(), Some(objective));
+        assert_eq!(recovered.project, m.project);
+        let requests: Vec<Value> = std::fs::read_to_string(dir.join("requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|r| r["method"] == "thread/goal/set"
+            && r["params"]["objective"] == objective
+            && r["params"]["status"] == "active"));
+        NATIVE_FIXTURES.lock().unwrap().remove(&m.id);
+    }
+}
+
+#[tokio::test]
+async fn native_goal_http_actor_queued_steering_drains_once_with_blocked_evidence() {
+    for parallel in [false, true] {
+        let h = Harness::new().await;
+        let blocker = if parallel {
+            let b = h
+                .control
+                .mission_store
+                .create_mission(Some("other"), None, None, None, None, Some("codex"), None)
+                .await
+                .unwrap();
+            let dir = install_native_fixture(&h, b.id, "before").await;
+            let response = h
+                .request(false, b.id, json!({"content":"/goal unrelated live work"}))
+                .await;
+            assert!(response.status().is_success());
+            wait_native_file(&dir.join("started")).await;
+            Some((b.id, dir))
+        } else {
+            None
+        };
+        let m = h.writer(MissionStatus::Failed, Some("repo#244")).await;
+        let dir = install_native_fixture(&h, m.id, "after").await;
+        let response = h
+            .request(
+                true,
+                m.id,
+                json!({"content":"/goal RESERVE-1", "continue_identity":Harness::assertion(&m)}),
+            )
+            .await;
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+        wait_native_file(&dir.join("started")).await;
+        for content in ["first external steering", "second external steering"] {
+            let response = h
+                .request(
+                    false,
+                    m.id,
+                    json!({"content":content, "continue_identity":Harness::assertion(&m)}),
+                )
+                .await;
+            assert!(
+                response.status().is_success(),
+                "{}",
+                response.text().await.unwrap()
+            );
+        }
+        std::fs::write(dir.join("release"), "").unwrap();
+        let parked = wait_native_status(&h, m.id, MissionStatus::AwaitingUser).await;
+        let requests: Vec<Value> = std::fs::read_to_string(dir.join("requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[1]["params"]["input"][0]["text"],
+            "first external steering"
+        );
+        assert_eq!(
+            requests[2]["params"]["input"][0]["text"],
+            "second external steering"
+        );
+        assert_eq!(parked.project, m.project);
+        assert!(parked.goal_mode);
+        assert_eq!(parked.goal_objective.as_deref(), Some("RESERVE-1"));
+        assert_eq!(
+            parked
+                .history
+                .iter()
+                .filter(|e| e.role == "assistant" && e.content.contains("Blocked: external node"))
+                .count(),
+            1
+        );
+        for content in ["first external steering", "second external steering"] {
+            assert_eq!(
+                parked
+                    .history
+                    .iter()
+                    .filter(|e| e.role == "user" && e.content == content)
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(h.state.projects.live_leases(None).unwrap().len(), 1);
+        assert!(!dir.join("unexpected-clear").exists());
+        NATIVE_FIXTURES.lock().unwrap().remove(&m.id);
+        if let Some((id, dir)) = blocker {
+            std::fs::write(dir.join("release"), "").unwrap();
+            wait_native_status(&h, id, MissionStatus::Blocked).await;
+            NATIVE_FIXTURES.lock().unwrap().remove(&id);
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_goal_parked_writer_survives_sweep_and_cross_store_pr_arbitration() {
+    let h = Harness::new().await;
+    let m = h.writer(MissionStatus::Active, Some("repo#244")).await;
+    h.control
+        .mission_store
+        .update_mission_status_with_reason(
+            m.id,
+            MissionStatus::Blocked,
+            Some("native_goal_stopped"),
+        )
+        .await
+        .unwrap();
+    crate::api::track_leases::sweep(&h.state).await.unwrap();
+    assert_eq!(h.state.projects.live_leases(None).unwrap().len(), 1);
+    assert_eq!(
+        find_existing_pr_writer(&h.control.mission_store, "repo#244", None)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        m.id
+    );
+    assert_eq!(
+        find_existing_pr_writer_in_sqlite(
+            &h._dir.path().join("missions/missions-admission-test.db"),
+            "repo#244",
+            None
+        )
+        .unwrap()
+        .unwrap()
+        .id,
+        m.id
+    );
+    let replacement = Uuid::new_v4();
+    assert!(h
+        .state
+        .projects
+        .acquire_track_lease(&crate::api::track_leases::lease_request(
+            "lido",
+            "trio-reserve1",
+            &replacement.to_string(),
+            "writer",
+            None
+        ))
+        .is_err());
+}

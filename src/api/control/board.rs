@@ -110,6 +110,9 @@ fn automatic_retry(
     terminal_reason: Option<TerminalReason>,
     output: &str,
 ) -> AutomaticRetry {
+    if terminal_reason == Some(TerminalReason::NativeGoalStopped) {
+        return AutomaticRetry::Suppressed;
+    }
     if task.backend != "chatgpt_ui" {
         return AutomaticRetry::Allowed;
     }
@@ -125,6 +128,7 @@ fn persisted_terminal_reason(reason: Option<&str>) -> Option<TerminalReason> {
     match reason {
         Some("turn_complete") => Some(TerminalReason::TurnComplete),
         Some("completed") => Some(TerminalReason::Completed),
+        Some("native_goal_stopped") => Some(TerminalReason::NativeGoalStopped),
         Some("cancelled") => Some(TerminalReason::Cancelled),
         Some("server_shutdown") => Some(TerminalReason::ServerShutdown),
         Some("llm_error") => Some(TerminalReason::LlmError),

@@ -756,3 +756,26 @@ For offloading `lake build` of a pushed SHA to the 4-node fleet (ashur/babylon/n
 - `start_mission` for a helper on the same project/track while you are parked on a
   build answers `409 BUILD_IN_PROGRESS {job_id}`. Do not spawn pollers; wait for the
   wake or read the job status with the `job_id`.
+
+
+### Native Codex goal stops
+
+A native `blocked`, `paused`, `usageLimited`, or `budgetLimited` notification
+stops the driver after its associated turn and in-flight tools drain. With no
+queued steering the mission parks as `blocked`, reason `native_goal_stopped`;
+this is resumable work, never goal completion. The final response and native
+status evidence remain available. `goal_mode=true` and the stored objective
+survive; this flag does not prove a native loop is currently running.
+
+Resolve the reported external blocker or limit, then use `resume_mission`
+with the existing identity assertion. Without custom `content`, a persisted
+Codex goal mission uses the **full stored** `/goal` objective (not the bounded
+MCP preview). Explicit content and queued steering retain their exact text
+and order; a plain steer runs one turn, while `/goal <full objective>` re-arms
+the native loop. The driver uses the existing fresh-native-thread-per-turn
+behavior; same-mission recovery does not promise reuse of a native thread or
+its native token counters. Mission history and original native goal records
+are retained. Do not clear goals, queues, or ownership to release this stop.
+Do not infer a native stop from silence, elapsed observation time, or a live
+build with no recent output. Finished-turn automations do not retry a native
+stop; accepted external steering can run through normal ownership admission.

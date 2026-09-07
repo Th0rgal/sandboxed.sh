@@ -14,8 +14,10 @@
 //!   `"thread/goal/set requires experimentalApi capability"`.
 //! - After `thread/goal/set`, codex auto-starts a turn — clients only need to
 //!   send `turn/start` for non-goal sessions or follow-up user input.
-//! - Goal terminal status arrives as `thread/goal/updated` with
-//!   `goal.status ∈ {"complete", "budgetLimited"}`. The model's
+//! - Codex 0.153.0 emits `thread/goal/updated {threadId, turnId, goal}`.
+//!   Statuses are active, paused, blocked, usageLimited, budgetLimited, complete.
+//!   Only complete means the objective is achieved; the other inactive states
+//!   park resumable work after the associated turn and tools drain. The model's
 //!   `update_goal` tool call also surfaces as a normal `item/started` +
 //!   `item/completed`, but the notification is the canonical signal.
 //!
@@ -172,6 +174,8 @@ pub struct GoalSetParams {
     #[serde(rename = "threadId")]
     pub thread_id: String,
     pub objective: String,
+    /// Explicitly re-arm stopped goals, including blocked goals.
+    pub status: &'static str,
     /// Optional token budget — `null` clears, omitted leaves unchanged.
     #[serde(rename = "tokenBudget", skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<i64>,
@@ -726,6 +730,7 @@ mod tests {
         let p = GoalSetParams {
             thread_id: "abc".to_string(),
             objective: "do the thing".to_string(),
+            status: "active",
             token_budget: None,
         };
         let s = serde_json::to_string(&p).unwrap();

@@ -9,7 +9,7 @@
 
 pub(crate) mod dispatch_admission;
 #[cfg(test)]
-mod dispatch_admission_tests;
+pub(crate) mod dispatch_admission_tests;
 use dispatch_admission::admit_dispatch;
 pub use dispatch_admission::DispatchAdmission;
 pub(super) use dispatch_admission::DISPATCH_ADMISSION;
@@ -8689,7 +8689,14 @@ fn normalize_mission_tags(tags: Option<&[String]>) -> Option<Vec<String>> {
     })
 }
 
-fn status_holds_pr_writer_lease(status: MissionStatus) -> bool {
+pub(crate) fn native_goal_holds_ownership(status: MissionStatus, reason: Option<&str>) -> bool {
+    status == MissionStatus::Blocked && reason == Some("native_goal_stopped")
+}
+
+fn status_holds_pr_writer_lease(status: MissionStatus, reason: Option<&str>) -> bool {
+    if native_goal_holds_ownership(status, reason) {
+        return true;
+    }
     matches!(
         status,
         MissionStatus::Pending
@@ -8880,7 +8887,7 @@ async fn find_existing_pr_writer(
         let page_len = page.len();
         for mission in page {
             if Some(mission.id) == exclude_id
-                || !status_holds_pr_writer_lease(mission.status)
+                || !status_holds_pr_writer_lease(mission.status, mission.terminal_reason.as_deref())
                 || mission
                     .project
                     .github_pr
@@ -8988,7 +8995,7 @@ fn find_existing_pr_writer_in_sqlite(
         "NULL".to_string()
     };
     let query = format!(
-        "SELECT m.id, m.status, m.github_pr, {}, {}, {}, {}, {}, {} \
+        "SELECT m.id, m.status, m.github_pr, {}, {}, {}, {}, {}, {}, {} \
          FROM missions m WHERE m.github_pr IS NOT NULL",
         optional_mission_column("intent"),
         optional_mission_column("tags"),
@@ -8996,6 +9003,7 @@ fn find_existing_pr_writer_in_sqlite(
         first_prompt,
         first_prompt_file,
         optional_mission_column("updated_at"),
+        optional_mission_column("terminal_reason"),
     );
     let mut statement = connection
         .prepare(&query)
@@ -9012,6 +9020,7 @@ fn find_existing_pr_writer_in_sqlite(
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })
         .map_err(|error| error.to_string())?;
@@ -9027,6 +9036,7 @@ fn find_existing_pr_writer_in_sqlite(
             first_prompt,
             prompt_file,
             updated_at,
+            terminal_reason,
         ) = row.map_err(|error| error.to_string())?;
         let Ok(id) = Uuid::parse_str(&id) else {
             continue;
@@ -9036,7 +9046,7 @@ fn find_existing_pr_writer_in_sqlite(
         }
         let status = serde_json::from_value::<MissionStatus>(serde_json::Value::String(status))
             .unwrap_or(MissionStatus::Active);
-        if !status_holds_pr_writer_lease(status) {
+        if !status_holds_pr_writer_lease(status, terminal_reason.as_deref()) {
             continue;
         }
         // Offline stores are opened read-only, so a lapsed AwaitingUser writer
@@ -15834,6 +15844,7 @@ async fn paloma_webhook_forwarder_loop(
                 .and_then(|mission| mission.terminal_reason.as_deref());
             let recommended_action = match terminal_reason {
                 Some("server_shutdown" | "orphan_no_runner") => "resume_once",
+                Some("native_goal_stopped") => "resolve_stop_then_resume",
                 Some("auth_error") => "disable_provider_and_reroute",
                 Some("rate_limited" | "capacity_limited") => "reroute_or_queue",
                 Some("watchdog_stalled" | "cancelled") => "inspect_artifacts",
@@ -17486,6 +17497,7 @@ fn mission_status_for_terminal_reason(
         }
         TerminalReason::TurnComplete => None,
         TerminalReason::Completed => Some((MissionStatus::Completed, "completed")),
+        TerminalReason::NativeGoalStopped => Some((MissionStatus::Blocked, "native_goal_stopped")),
         TerminalReason::Cancelled => Some((MissionStatus::Interrupted, "cancelled")),
         TerminalReason::ServerShutdown => Some((MissionStatus::Interrupted, "server_shutdown")),
         TerminalReason::MaxIterations => Some((MissionStatus::Blocked, "max_iterations")),
@@ -17562,6 +17574,9 @@ fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<
     match reason {
         TerminalReason::TurnComplete | TerminalReason::Completed => None,
         TerminalReason::MaxIterations => Some("Reached iteration limit".to_string()),
+        TerminalReason::NativeGoalStopped => {
+            Some("Native goal stopped — resume after external steering".to_string())
+        }
         TerminalReason::Cancelled => Some("Cancelled by user".to_string()),
         TerminalReason::ServerShutdown => {
             Some("Paused for server restart — click Resume to continue".to_string())
@@ -18925,7 +18940,16 @@ async fn control_actor_loop(
             let _ = std::fs::remove_file(runtime_file);
         }
 
-        Ok((mission, INTERRUPTED_RESUME_PROMPT.to_string()))
+        let prompt = if mission.backend == "codex" && mission.goal_mode {
+            mission
+                .goal_objective
+                .as_ref()
+                .map(|objective| format!("/goal {objective}"))
+        } else {
+            None
+        }
+        .unwrap_or_else(|| INTERRUPTED_RESUME_PROMPT.to_string());
+        Ok((mission, prompt))
     }
 
     loop {
@@ -22196,6 +22220,7 @@ async fn control_actor_loop(
                     // Runner cleared itself; cancel the force-clear watchdog.
                     runner_force_clear_deadline = None;
                     let mut completed_terminal_reason = None;
+                    let mut completed_terminal_evidence = None;
                     let mut completed_completion_confidence = None;
                     let mut completed_transport_failure = false;
                     let mut completed_waiting_remote_job = false;
@@ -22210,6 +22235,7 @@ async fn control_actor_loop(
                             let completion_evidence =
                                 completion_evidence_for_agent_result(&agent_result);
                             completed_terminal_reason = agent_result.terminal_reason;
+                            completed_terminal_evidence = agent_result.terminal_evidence.clone();
                             completed_completion_confidence =
                                 Some(completion_evidence.completion_confidence);
                             completed_transport_failure =
@@ -22566,9 +22592,10 @@ async fn control_actor_loop(
                                 }
                             }
                         }
-                        let is_transient_infra_failure = matches!(
+                        let suppress_finished_automation = matches!(
                             completed_terminal_reason,
-                            Some(TerminalReason::AuthError)
+                            Some(TerminalReason::NativeGoalStopped)
+                                | Some(TerminalReason::AuthError)
                                 | Some(TerminalReason::RateLimited)
                                 | Some(TerminalReason::CapacityLimited)
                         ) || completed_transport_failure;
@@ -22586,7 +22613,7 @@ async fn control_actor_loop(
                         // otherwise the existing hook would still fire the
                         // continuation. Skipped on transient infra failures
                         // for the same reason regular automations are.
-                        if !is_transient_infra_failure {
+                        if !suppress_finished_automation {
                             post_turn_handle_grok_goal(
                                 &mission_store,
                                 &events_tx,
@@ -22596,7 +22623,7 @@ async fn control_actor_loop(
                             )
                             .await;
                         }
-                        if !already_queued_for_mission && !is_transient_infra_failure {
+                        if !already_queued_for_mission && !suppress_finished_automation {
                             // Small delay so the UI can display the completion before restarting.
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             let messages = agent_finished_automation_messages(
@@ -22620,7 +22647,7 @@ async fn control_actor_loop(
                                     .get(&mission_id)
                                     .map_or(0, std::collections::HashMap::len),
                                 completed_terminal_reason,
-                                None,
+                                completed_terminal_evidence.as_deref(),
                                 completed_completion_confidence,
                                 true,
                                 Some(completed_agent_output.as_str()),
@@ -23109,15 +23136,16 @@ async fn control_actor_loop(
                             // Check if we should enqueue agent_finished automations.
                             // Skip for transient infrastructure failures (auth, rate limit,
                             // capacity) to avoid noisy retry loops.
-                            let is_transient_infra_failure = matches!(
+                            let suppress_finished_automation = matches!(
                                 result.terminal_reason,
-                                Some(TerminalReason::AuthError)
+                                Some(TerminalReason::NativeGoalStopped)
+                                    | Some(TerminalReason::AuthError)
                                     | Some(TerminalReason::RateLimited)
                                     | Some(TerminalReason::CapacityLimited)
                             ) || is_transport_failure_evidence(&completion_evidence);
                             let cancellation_requested = runner.cancellation_requested();
                             let was_queue_empty = runner.queue.is_empty();
-                            if is_transient_infra_failure
+                            if suppress_finished_automation
                                 && is_transport_failure_evidence(&completion_evidence)
                                 && !cancellation_requested
                                 && was_queue_empty
@@ -23153,7 +23181,7 @@ async fn control_actor_loop(
                             // so a terminal sentinel disables the loop on this
                             // turn rather than after one extra continuation
                             // fire. (See `post_turn_handle_grok_goal`.)
-                            if !is_transient_infra_failure {
+                            if !suppress_finished_automation {
                                 post_turn_handle_grok_goal(
                                     &mission_store,
                                     &events_tx,
@@ -23164,7 +23192,7 @@ async fn control_actor_loop(
                                 .await;
                             }
                             if was_queue_empty
-                                && !is_transient_infra_failure
+                                && !suppress_finished_automation
                                 && !cancellation_requested
                             {
                                 // Small delay so the UI can display the completion before restarting.
@@ -24279,6 +24307,19 @@ async fn run_single_control_turn(
     boss_user_id: Option<String>,
     pr_readonly: bool,
 ) -> crate::agents::AgentResult {
+    #[cfg(test)]
+    if let Some(mid) = mission_id {
+        if let Some(result) = dispatch_admission_tests::native_goal_fixture(
+            mid,
+            &user_message,
+            events_tx.clone(),
+            cancel.clone(),
+        )
+        .await
+        {
+            return result;
+        }
+    }
     let is_claudecode = backend_id.as_deref() == Some("claudecode");
     let is_codex = backend_id.as_deref() == Some("codex");
     // Get config profile: mission's config_profile takes priority over workspace's

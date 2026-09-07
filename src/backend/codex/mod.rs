@@ -189,8 +189,8 @@ fn fold_delta_into(buffer: &mut String, delta: &str) {
 /// - Message starts with `/goal ` → strip the prefix and call
 ///   `thread/goal/set` instead of `turn/start`. Codex auto-starts a turn and
 ///   keeps looping until the model invokes `update_goal { status: "complete" }`
-///   (or the optional token budget is hit). We finish the mission when we see
-///   a `thread/goal/updated` notification with terminal status.
+///   or stops with blocked/paused/usageLimited/budgetLimited. A stopped goal
+///   releases the driver after its turn drains; it does not complete the goal.
 /// - Otherwise → `turn/start` with a single text input item. We finish the
 ///   mission on the first `turn/completed` notification.
 async fn send_message_streaming_app_server(
@@ -337,6 +337,7 @@ async fn send_message_streaming_app_server(
                 .goal_set(GoalSetParams {
                     thread_id: thread_id.clone(),
                     objective: user_payload.clone(),
+                    status: "active",
                     token_budget: None,
                 })
                 .await;
@@ -391,6 +392,7 @@ async fn send_message_streaming_app_server(
         // goal mission (no iteration counters fire then anyway).
         let mut translator = AppServerEventTranslator {
             goal_objective: initial_objective,
+            native_thread_id: Some(thread_id.clone()),
             ..Default::default()
         };
         let mut terminal = false;
@@ -697,12 +699,6 @@ async fn send_message_streaming_app_server(
                 .await;
         }
 
-        let _ = tx
-            .send(ExecutionEvent::MessageComplete {
-                session_id: session_id.clone(),
-            })
-            .await;
-
         // This driver will never resume its local session/thread after the
         // handle exits. Clear the journal after clean completion,
         // cancellation, and terminalized transport failure alike so command
@@ -712,6 +708,12 @@ async fn send_message_streaming_app_server(
         }
 
         let _ = session_arc.shutdown().await;
+
+        let _ = tx
+            .send(ExecutionEvent::MessageComplete {
+                session_id: session_id.clone(),
+            })
+            .await;
     });
 
     Ok((rx, handle))
@@ -738,6 +740,8 @@ fn elicitation_auto_approve(method: &str) -> serde_json::Value {
 /// terminal state for the mission.
 #[derive(Default)]
 struct AppServerEventTranslator {
+    /// Ignore sibling/subagent thread notifications on the same transport.
+    native_thread_id: Option<String>,
     /// Keep track of which item ids we've already emitted text for, so
     /// repeated `item/agentMessage/delta` events don't duplicate text into
     /// the mission stream beyond what each delta carries.
@@ -758,11 +762,13 @@ struct AppServerEventTranslator {
     /// `turn/started` for the same turn (codex re-emits on resume) doesn't
     /// double-count.
     counted_turn_ids: std::collections::HashSet<String>,
-    /// True while a goal-mode turn is still active. A goal can transition to
+    /// Active goal turns, keyed by native ID. A goal can transition to
     /// `complete` before the current turn emits its final assistant message;
     /// ending immediately on the goal update drops that closing response.
-    goal_turn_active: bool,
-    /// Set after a terminal goal update (`complete` / `budgetLimited`). The
+    goal_active_turns: std::collections::HashSet<String>,
+    goal_completed_turns: std::collections::HashSet<String>,
+    goal_terminal_turn_id: Option<String>,
+    /// Set after a stopped goal update (including `blocked`). The
     /// stream becomes terminal once the active turn completes.
     goal_terminal_seen: bool,
     /// Tool calls emitted to consumers but not yet paired with a terminal
@@ -884,6 +890,17 @@ impl AppServerEventTranslator {
         params: &serde_json::Value,
         is_goal_mission: bool,
     ) -> TranslateOutcome {
+        if self
+            .native_thread_id
+            .as_deref()
+            .zip(params.get("threadId").and_then(|v| v.as_str()))
+            .is_some_and(|(expected, actual)| expected != actual)
+        {
+            return TranslateOutcome {
+                events: Vec::new(),
+                terminal: false,
+            };
+        }
         let mut events = Vec::new();
         let mut terminal = false;
 
@@ -1109,7 +1126,7 @@ impl AppServerEventTranslator {
                                 output_tokens,
                             });
                         }
-                        self.emitted_usage_for_turn.insert(turn_id);
+                        self.emitted_usage_for_turn.insert(turn_id.clone());
                     }
 
                     let status = turn.get("status").and_then(|v| v.as_str()).unwrap_or("");
@@ -1141,10 +1158,8 @@ impl AppServerEventTranslator {
                             terminal = true;
                         }
                         "interrupted" | "completed" if is_goal_mission => {
-                            self.goal_turn_active = false;
-                            if self.goal_terminal_seen {
-                                terminal = true;
-                            }
+                            self.goal_active_turns.remove(&turn_id);
+                            self.goal_completed_turns.insert(turn_id);
                         }
                         _ => {}
                     }
@@ -1158,13 +1173,15 @@ impl AppServerEventTranslator {
             // automatically. For non-goal missions there's only ever one
             // turn, so a counter would be noise.
             "turn/started" if is_goal_mission => {
-                self.goal_turn_active = true;
                 let turn_id = params
                     .get("turn")
                     .and_then(|t| t.get("id"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                if !self.goal_completed_turns.contains(&turn_id) {
+                    self.goal_active_turns.insert(turn_id.clone());
+                }
                 // Codex can re-emit `turn/started` for the same turn after
                 // a thread/resume; dedupe by id.
                 if !turn_id.is_empty() && self.counted_turn_ids.insert(turn_id) {
@@ -1195,11 +1212,20 @@ impl AppServerEventTranslator {
                             objective: self.goal_objective.clone(),
                         });
                     }
-                    if status == "complete" || status == "budgetLimited" {
-                        self.goal_terminal_seen = true;
-                        if !self.goal_turn_active {
-                            terminal = true;
-                        }
+                    if is_goal_mission {
+                        self.goal_terminal_seen = matches!(
+                            status.as_str(),
+                            "complete" | "blocked" | "paused" | "usageLimited" | "budgetLimited"
+                        );
+                        self.goal_terminal_turn_id = self
+                            .goal_terminal_seen
+                            .then(|| {
+                                params
+                                    .get("turnId")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_owned)
+                            })
+                            .flatten();
                     }
                 }
             }
@@ -1243,6 +1269,18 @@ impl AppServerEventTranslator {
             _ => {}
         }
 
+        // A stopped goal ends this driver, not the objective. The native
+        // notification can precede turn/started or follow turn/completed;
+        // correlate its turnId and drain all active turns/tools in either order.
+        // No silence/observation timeout is evidence of a stopped goal.
+        terminal |= is_goal_mission
+            && self.goal_terminal_seen
+            && self.goal_active_turns.is_empty()
+            && self.pending_tool_calls.is_empty()
+            && self
+                .goal_terminal_turn_id
+                .as_ref()
+                .is_none_or(|id| self.goal_completed_turns.contains(id));
         TranslateOutcome { events, terminal }
     }
 }
@@ -1405,7 +1443,7 @@ mod tests {
             counted_turn_ids: HashSet::new(),
             goal_iteration: 0,
             goal_objective: String::new(),
-            goal_turn_active: false,
+            goal_active_turns: HashSet::new(),
             goal_terminal_seen: false,
             ..Default::default()
         };
@@ -1490,7 +1528,7 @@ mod tests {
             counted_turn_ids: HashSet::new(),
             goal_iteration: 0,
             goal_objective: String::new(),
-            goal_turn_active: false,
+            goal_active_turns: HashSet::new(),
             goal_terminal_seen: false,
             ..Default::default()
         };
@@ -1517,6 +1555,145 @@ mod tests {
                 output_tokens: 56
             }
         )));
+    }
+
+    #[test]
+    fn native_goal_stop_from_another_thread_is_ignored() {
+        let mut t = AppServerEventTranslator {
+            native_thread_id: Some("root".into()),
+            ..Default::default()
+        };
+        let out = t.handle_notification("thread/goal/updated", &json!({"threadId":"child", "turnId":null, "goal":{"status":"blocked", "objective":"other"}}), true);
+        assert!(!out.terminal);
+        assert!(out.events.is_empty());
+        assert!(t.goal_objective.is_empty());
+    }
+
+    #[test]
+    fn native_goal_stop_orders_drain_final_response() {
+        for status in [
+            "blocked",
+            "paused",
+            "usageLimited",
+            "budgetLimited",
+            "complete",
+        ] {
+            for order in 0..3 {
+                let mut t = AppServerEventTranslator::default();
+                let stop = json!({"threadId":"thread-1", "turnId":"turn-1", "goal":{"status":status,"objective":"keep objective"}});
+                if order == 2 {
+                    assert!(
+                        !t.handle_notification("thread/goal/updated", &stop, true)
+                            .terminal
+                    );
+                }
+                assert!(
+                    !t.handle_notification("turn/started", &json!({"turn":{"id":"turn-1"}}), true)
+                        .terminal
+                );
+                if order == 0 {
+                    assert!(
+                        !t.handle_notification("thread/goal/updated", &stop, true)
+                            .terminal
+                    );
+                }
+                // Completion of another/replayed turn cannot drop the live response.
+                assert!(
+                    !t.handle_notification(
+                        "turn/completed",
+                        &json!({"turn":{"id":"old","status":"completed"}}),
+                        true
+                    )
+                    .terminal
+                );
+                let text = t.handle_notification(
+                    "item/agentMessage/delta",
+                    &json!({"itemId":"final", "delta":"blocked evidence"}),
+                    true,
+                );
+                assert!(!text.terminal);
+                assert!(
+                    matches!(text.events.as_slice(), [ExecutionEvent::TextDelta {content}] if content == "blocked evidence")
+                );
+                let end = t.handle_notification(
+                    "turn/completed",
+                    &json!({"turn":{"id":"turn-1","status":"completed"}}),
+                    true,
+                );
+                assert_eq!(end.terminal, order != 1);
+                if order == 1 {
+                    assert!(
+                        t.handle_notification("thread/goal/updated", &stop, true)
+                            .terminal
+                    );
+                }
+                assert_eq!(t.goal_objective, "keep objective");
+            }
+        }
+    }
+
+    #[test]
+    fn native_goal_stop_requires_explicit_state_and_drained_tools() {
+        let mut t = AppServerEventTranslator::default();
+        let tool = json!({"item":{"id":"build", "type":"toolCall", "name":"bash", "arguments":{}}});
+        assert!(!t.handle_notification("item/started", &tool, true).terminal);
+        // Arbitrarily many observations of silence/progress do not stop a build.
+        for _ in 0..100 {
+            assert!(
+                !t.handle_notification(
+                    "thread/status/changed",
+                    &json!({"status":{"type":"idle"}}),
+                    true
+                )
+                .terminal
+            );
+        }
+        let stop = json!({"threadId":"thread-1", "turnId":null, "goal":{"status":"blocked", "objective":"build"}});
+        assert!(
+            !t.handle_notification("thread/goal/updated", &stop, true)
+                .terminal
+        );
+        assert!(
+            t.handle_notification("item/completed", &tool, true)
+                .terminal
+        );
+        let mut idle = AppServerEventTranslator::default();
+        assert!(
+            idle.handle_notification("thread/goal/updated", &stop, true)
+                .terminal
+        );
+        assert!(
+            !AppServerEventTranslator::default()
+                .handle_notification("thread/goal/updated", &stop, false)
+                .terminal
+        );
+    }
+
+    #[test]
+    fn native_goal_reactivation_revokes_pending_stop() {
+        let mut t = AppServerEventTranslator::default();
+        t.handle_notification("turn/started", &json!({"turn":{"id":"t"}}), true);
+        t.handle_notification(
+            "thread/goal/updated",
+            &json!({"turnId":"t", "goal":{"status":"blocked", "objective":"same"}}),
+            true,
+        );
+        assert!(
+            !t.handle_notification(
+                "thread/goal/updated",
+                &json!({"turnId":"t", "goal":{"status":"active", "objective":"same"}}),
+                true
+            )
+            .terminal
+        );
+        assert!(
+            !t.handle_notification(
+                "turn/completed",
+                &json!({"turn":{"id":"t","status":"completed"}}),
+                true
+            )
+            .terminal
+        );
     }
 
     #[test]

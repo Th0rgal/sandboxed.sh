@@ -44,7 +44,7 @@ pub enum ExecutionEvent {
     /// within a single mission. Backends that don't run goal loops just
     /// don't emit this event.
     GoalIteration { iteration: u32, objective: String },
-    /// Goal status transitioned (active/paused/budgetLimited/complete).
+    /// Goal status transitioned (active/paused/blocked/usageLimited/budgetLimited/complete).
     /// Carries the canonical status string from codex's `thread/goal/updated`
     /// notification. UI renders this as a goal-state pill.
     GoalStatus { status: String, objective: String },

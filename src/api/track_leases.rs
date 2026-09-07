@@ -189,7 +189,12 @@ pub async fn sweep(state: &Arc<AppState>) -> Result<LeaseSweepReport, String> {
         };
         match state.control.find_mission_any_store(mission_id).await {
             Ok(Some(mission)) => {
-                if mission.status.is_terminal() || mission.status == MissionStatus::Acknowledged {
+                if (mission.status.is_terminal() || mission.status == MissionStatus::Acknowledged)
+                    && !super::control::native_goal_holds_ownership(
+                        mission.status,
+                        mission.terminal_reason.as_deref(),
+                    )
+                {
                     state
                         .projects
                         .release_leases_for_attempt(&lease.attempt_id)?;

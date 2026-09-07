@@ -902,7 +902,6 @@ pub async fn run_codex_turn(
     override_credential: Option<&crate::api::ai_providers::CodexCredentialOverride<'_>>,
 ) -> AgentResult {
     use crate::backend::codex::CodexBackend;
-    use crate::backend::events::ExecutionEvent;
     use crate::backend::{Backend, SessionConfig};
 
     let model = model.map(str::trim).filter(|m| !m.is_empty());
@@ -1090,8 +1089,7 @@ pub async fn run_codex_turn(
     // driver ends the mission on the first `turn/completed`, so an injected
     // `turn/start` would be abandoned. Steers fall back to the authoritative
     // next-turn path (see effective_mid_turn_kind).
-    let (mut event_rx, _handle) = match backend.send_message_streaming(&session, user_message).await
-    {
+    let (event_rx, _handle) = match backend.send_message_streaming(&session, user_message).await {
         Ok(result) => result,
         Err(e) => {
             let message = format!("Codex execution failed: {}", e);
@@ -1118,6 +1116,21 @@ pub async fn run_codex_turn(
         }
     };
 
+    consume_codex_events(event_rx, events_tx, cancel, mission_id, user_message, model).await
+}
+
+/// Drain the native driver before classifying its result. Shared with transcript
+/// regressions so stopped-goal tests exercise the production final-response path.
+pub(crate) async fn consume_codex_events(
+    mut event_rx: tokio::sync::mpsc::Receiver<crate::backend::events::ExecutionEvent>,
+    events_tx: broadcast::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    mission_id: Uuid,
+    user_message: &str,
+    model: Option<&str>,
+) -> AgentResult {
+    use crate::backend::events::ExecutionEvent;
+    let resolved_model = model.map(str::to_owned);
     // Process events until completion or cancellation
     let mut assistant_message = String::new();
     let mut raw_error_message: Option<String> = None;
@@ -1148,6 +1161,7 @@ pub async fn run_codex_turn(
     // loop and let the post-loop finalization recover whatever it can.
     let mut cancelled = false;
     let mut codex_goal_cancel_deferred = false;
+    let mut native_goal_stop = None;
     let is_goal_request = codex_is_goal_request(user_message);
 
     loop {
@@ -1289,6 +1303,9 @@ pub async fn run_codex_turn(
                         });
                     }
                     ExecutionEvent::GoalStatus { status, objective } => {
+                        native_goal_stop = if is_goal_request && matches!(status.as_str(), "blocked" | "paused" | "usageLimited" | "budgetLimited") {
+                            Some(format!("Native Codex goal status={status}; objective: {objective}"))
+                        } else { None };
                         let _ = events_tx.send(AgentEvent::GoalStatus {
                             status,
                             objective,
@@ -1413,7 +1430,7 @@ pub async fn run_codex_turn(
     let no_output = assistant_message.trim().is_empty()
         && last_summary.is_none()
         && thinking_for_fallback.is_none();
-    if no_output && error_message.is_none() && !cancelled {
+    if no_output && error_message.is_none() && !cancelled && native_goal_stop.is_none() {
         success = false;
         error_message = Some(
             "Codex produced no output. This usually means the Codex CLI failed before emitting JSON (often authentication). Check that the host has a valid `~/.codex/auth.json` and that the backend can access it."
@@ -1438,7 +1455,11 @@ pub async fn run_codex_turn(
     } else if let Some(summary) = last_summary {
         summary
     } else if let Some(thinking_text) = thinking_for_fallback {
-        if success && codex_is_goal_request(user_message) && !cancelled {
+        if success
+            && codex_is_goal_request(user_message)
+            && !cancelled
+            && native_goal_stop.is_none()
+        {
             codex_missing_goal_final_response_message()
         } else {
             // Surface the model's reasoning as the assistant message so the
@@ -1446,6 +1467,8 @@ pub async fn run_codex_turn(
             // the thinking panel.
             thinking_text
         }
+    } else if let Some(evidence) = native_goal_stop.as_ref() {
+        evidence.clone()
     } else if let Some(marker) = cancel_marker.as_ref() {
         // Mid-turn cancellation with nothing accumulated — preserve the
         // historical "Mission cancelled" / shutdown text for the UI.
@@ -1454,7 +1477,8 @@ pub async fn run_codex_turn(
         "No response from Codex".to_string()
     };
 
-    let tool_activity_required = codex_turn_requires_tool_activity(user_message, &final_message);
+    let tool_activity_required = native_goal_stop.is_none()
+        && codex_turn_requires_tool_activity(user_message, &final_message);
     let stopped_before_required_tools = success && tool_events_seen == 0 && tool_activity_required;
     let stopped_on_progress_update = success
         && tool_activity_required
@@ -1514,6 +1538,10 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
         // text/reason pair consistent if shutdown fires mid-finalize.
         let cancel_reason = marker.terminal_reason.unwrap_or(TerminalReason::Cancelled);
         AgentResult::failure(final_message, cost_cents).with_terminal_reason(cancel_reason)
+    } else if let Some(evidence) = native_goal_stop.filter(|_| success) {
+        AgentResult::failure(final_message, cost_cents)
+            .with_terminal_reason(TerminalReason::NativeGoalStopped)
+            .with_terminal_evidence(evidence)
     } else if success {
         AgentResult::success(final_message, cost_cents)
             .with_terminal_reason(TerminalReason::TurnComplete)
@@ -1598,6 +1626,46 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
 mod tests {
     use super::{codex_transport_failure_stage, codex_transport_reason_is_retryable};
     use crate::agents::TerminalReason;
+
+    #[tokio::test]
+    async fn native_goal_stop_without_chat_output_is_resumable_not_auth_failure() {
+        use crate::backend::events::ExecutionEvent;
+        for status in ["blocked", "paused", "usageLimited", "budgetLimited"] {
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            tx.send(ExecutionEvent::GoalStatus {
+                status: status.into(),
+                objective: "keep objective".into(),
+            })
+            .await
+            .unwrap();
+            tx.send(ExecutionEvent::MessageComplete {
+                session_id: "native".into(),
+            })
+            .await
+            .unwrap();
+            drop(tx);
+            let (events, _) = tokio::sync::broadcast::channel(16);
+            let result = super::consume_codex_events(
+                rx,
+                events,
+                tokio_util::sync::CancellationToken::new(),
+                uuid::Uuid::new_v4(),
+                "/goal keep objective",
+                None,
+            )
+            .await;
+            assert!(!result.success);
+            assert_eq!(
+                result.terminal_reason,
+                Some(TerminalReason::NativeGoalStopped)
+            );
+            assert!(result.output.contains(&format!("status={status}")));
+            assert_eq!(
+                result.terminal_evidence.as_deref(),
+                Some(result.output.as_str())
+            );
+        }
+    }
 
     #[test]
     fn classifies_codex_stream_disconnect_before_tools() {

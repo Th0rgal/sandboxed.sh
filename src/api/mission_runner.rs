@@ -121,7 +121,9 @@ fn failure_class_for_terminal_reason(reason: TerminalReason) -> FailureClass {
         TerminalReason::Stalled | TerminalReason::InfiniteLoop | TerminalReason::MaxIterations => {
             FailureClass::AgentError
         }
-        TerminalReason::Cancelled | TerminalReason::ServerShutdown => FailureClass::AgentError,
+        TerminalReason::Cancelled
+        | TerminalReason::ServerShutdown
+        | TerminalReason::NativeGoalStopped => FailureClass::AgentError,
         TerminalReason::LlmError => FailureClass::ProviderError,
         TerminalReason::TurnComplete | TerminalReason::Completed => FailureClass::Unknown,
     }
@@ -164,7 +166,9 @@ pub(crate) fn turn_outcome_for_result(
         let reason = result.terminal_reason.unwrap_or(TerminalReason::LlmError);
         if matches!(
             reason,
-            TerminalReason::Cancelled | TerminalReason::ServerShutdown
+            TerminalReason::Cancelled
+                | TerminalReason::ServerShutdown
+                | TerminalReason::NativeGoalStopped
         ) {
             interrupted_turn_outcome(reason)
         } else {
@@ -3155,7 +3159,10 @@ impl MissionRunner {
                     // produced no output", "OpenCode CLI exited with status: ...")
                     // would contaminate context for future turns.
                     self.history.push(("user".to_string(), result.1.clone()));
-                    if result.2.success && !result.2.output.trim().is_empty() {
+                    if (result.2.success
+                        || result.2.terminal_reason == Some(TerminalReason::NativeGoalStopped))
+                        && !result.2.output.trim().is_empty()
+                    {
                         self.history
                             .push(("assistant".to_string(), result.2.output.clone()));
                     }
@@ -3496,6 +3503,17 @@ async fn run_mission_turn(
     boss_user_id: Option<String>,
     pr_readonly: bool,
 ) -> AgentResult {
+    #[cfg(test)]
+    if let Some(result) = super::control::dispatch_admission_tests::native_goal_fixture(
+        mission_id,
+        &user_message,
+        events_tx.clone(),
+        cancel.clone(),
+    )
+    .await
+    {
+        return result;
+    }
     let mut config = config;
     // Operator-note bridge: flush any pending Ask-assistant writes into this
     // turn's message so the working agent learns about out-of-band edits it
