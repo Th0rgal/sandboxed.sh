@@ -1126,3 +1126,101 @@ async fn http_actor_response_loss_quarantines_unknown_outcome_without_releasing_
         }
     }
 }
+
+#[tokio::test]
+async fn http_real_reader_promotion_without_pr_checks_owner_and_persists_writer_capability() {
+    let h = Harness::new().await;
+    let m = h.writer(MissionStatus::Paused, None).await;
+    h.control
+        .mission_store
+        .update_mission_project(
+            m.id,
+            crate::api::mission_store::MissionProjectPatch {
+                tags: Some(vec!["pr-readonly".into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    h.state
+        .projects
+        .release_leases_for_attempt(&m.id.to_string())
+        .unwrap();
+    h.state
+        .projects
+        .acquire_track_lease(&crate::api::track_leases::lease_request(
+            "lido",
+            "trio-reserve1",
+            &m.id.to_string(),
+            "reader",
+            None,
+        ))
+        .unwrap();
+    let replacement = h
+        .state
+        .projects
+        .acquire_track_lease(&crate::api::track_leases::lease_request(
+            "lido",
+            "trio-reserve1",
+            "replacement",
+            "writer",
+            None,
+        ))
+        .unwrap();
+    let before = h
+        .control
+        .mission_store
+        .get_mission(m.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let response = h
+        .state
+        .http_client
+        .patch(format!("{}/missions/{}/project", h.url, m.id))
+        .json(&json!({"writer":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    h.unchanged(&before).await;
+    h.state.projects.expire_lease(&replacement.id).unwrap();
+    let response = h
+        .state
+        .http_client
+        .patch(format!("{}/missions/{}/project", h.url, m.id))
+        .json(&json!({"writer":true}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let promoted = h
+        .control
+        .mission_store
+        .get_mission(m.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(promoted.project.tags.iter().any(|t| t == "pr-writer"));
+    assert!(!promoted.project.tags.iter().any(|t| t == "pr-readonly"));
+    assert_eq!(promoted.project.github_pr, None);
+    let response = h
+        .request(
+            true,
+            m.id,
+            json!({"skip_message":true, "continue_identity":Harness::assertion(&promoted)}),
+        )
+        .await;
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let leases = h.state.projects.live_leases(None).unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].mode, "writer");
+}

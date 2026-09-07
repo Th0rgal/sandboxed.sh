@@ -12576,13 +12576,14 @@ async fn update_mission_project_locked(
             Some(goal),
         )
     });
-    let becomes_writer = effective_github_pr.is_some()
-        && (initial_prompt_requests_writer || deferred_goal_requests_writer);
+    // Writer capability governs tracks even when PR metadata is absent.
+    // Explicit promotion must replace a read-only tag before lease_mode sees it.
+    let becomes_writer = initial_prompt_requests_writer || deferred_goal_requests_writer;
     if becomes_writer {
         effective_tags.retain(|tag| tag != "pr-readonly" && tag != "pr-writer");
         effective_tags.push("pr-writer".to_string());
         tags = Some(effective_tags.clone());
-    } else if effective_github_pr.is_some() && req.writer == Some(false) {
+    } else if req.writer == Some(false) {
         effective_tags.retain(|tag| tag != "pr-readonly" && tag != "pr-writer");
         effective_tags.push("pr-readonly".to_string());
         tags = Some(effective_tags.clone());
