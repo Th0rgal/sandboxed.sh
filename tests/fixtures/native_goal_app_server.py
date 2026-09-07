@@ -49,7 +49,8 @@ for line in sys.stdin:
         if is_goal and order == 'before':
             notify('thread/goal/updated', goal)
         text = ('Recovered same objective' if recovered else 'Blocked: external node unavailable; evidence retained') if is_goal else 'ACK: ' + content
-        notify('item/agentMessage/delta', {'threadId': 'fixture-thread', 'turnId': 'turn-1', 'itemId': 'final', 'delta': text})
+        if order != 'before_started':
+            notify('item/agentMessage/delta', {'threadId': 'fixture-thread', 'turnId': 'turn-1', 'itemId': 'final', 'delta': text})
         notify('item/completed', {'threadId': 'fixture-thread', 'turnId': 'turn-1', 'item': {'id': 'final', 'type': 'agentMessage', 'text': text}})
         notify('turn/completed', {'threadId': 'fixture-thread', 'turn': turn})
         if is_goal and order == 'after':

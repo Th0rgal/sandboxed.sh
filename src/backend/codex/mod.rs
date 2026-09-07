@@ -833,6 +833,23 @@ fn codex_usage_from_turn_params(params: &serde_json::Value) -> Option<(u64, u64)
 }
 
 impl AppServerEventTranslator {
+    /// Completed items are authoritative snapshots, including streams where
+    /// the final delta was absent. Replays of the same snapshot emit no duplicate.
+    fn completed_agent_message(&mut self, item: &serde_json::Value) -> Option<ExecutionEvent> {
+        if item.get("type").and_then(|v| v.as_str()) != Some("agentMessage") {
+            return None;
+        }
+        let id = item.get("id")?.as_str()?;
+        let text = item.get("text")?.as_str()?;
+        if text.is_empty() || self.delta_buffers.get(id).is_some_and(|old| old == text) {
+            return None;
+        }
+        self.delta_buffers.insert(id.to_string(), text.to_string());
+        Some(ExecutionEvent::TextDelta {
+            content: text.to_string(),
+        })
+    }
+
     fn pending_tool_ids(&self) -> std::collections::HashSet<String> {
         self.pending_tool_calls.keys().cloned().collect()
     }
@@ -966,6 +983,9 @@ impl AppServerEventTranslator {
                         .unwrap_or("")
                         .to_string();
                     match kind {
+                        "agentMessage" if method == "item/completed" => {
+                            events.extend(self.completed_agent_message(item));
+                        }
                         "toolCall" | "tool_call" | "functionCall" | "function_call" => {
                             let name = item
                                 .get("name")
@@ -1112,6 +1132,11 @@ impl AppServerEventTranslator {
             // ----- Turn lifecycle -----
             "turn/completed" => {
                 if let Some(turn) = params.get("turn") {
+                    if let Some(items) = turn.get("items").and_then(|v| v.as_array()) {
+                        for item in items {
+                            events.extend(self.completed_agent_message(item));
+                        }
+                    }
                     let turn_id = turn
                         .get("id")
                         .and_then(|v| v.as_str())
@@ -1555,6 +1580,37 @@ mod tests {
                 output_tokens: 56
             }
         )));
+    }
+
+    #[test]
+    fn native_goal_stop_drains_completed_message_snapshots_without_deltas() {
+        for item_event in [false, true] {
+            let mut t = AppServerEventTranslator::default();
+            t.handle_notification("turn/started", &json!({"turn":{"id":"t"}}), true);
+            t.handle_notification(
+                "thread/goal/updated",
+                &json!({"turnId":"t", "goal":{"status":"blocked"}}),
+                true,
+            );
+            let item =
+                json!({"type":"agentMessage", "id":"final", "text":"Final blocker evidence"});
+            let mut events = Vec::new();
+            if item_event {
+                let out = t.handle_notification("item/completed", &json!({"item":item}), true);
+                assert!(!out.terminal);
+                events.extend(out.events);
+            }
+            let end = t.handle_notification(
+                "turn/completed",
+                &json!({"turn":{"id":"t", "status":"completed", "items":[item]}}),
+                true,
+            );
+            assert!(end.terminal);
+            events.extend(end.events);
+            assert!(
+                matches!(events.as_slice(), [ExecutionEvent::TextDelta {content}] if content == "Final blocker evidence")
+            );
+        }
     }
 
     #[test]

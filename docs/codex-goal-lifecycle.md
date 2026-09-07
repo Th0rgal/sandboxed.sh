@@ -22,7 +22,9 @@ explicitly cover goal updates before turn start, during a turn, and after turn
 completion. A stop with `turnId` waits for that turn's completion, all active
 turns, and pending tool results. A stop with null `turnId` and no active work
 can exit immediately. Unrelated/replayed turn completions cannot end an active
-turn. Explicit `active` revokes a pending stop. Silence and idle observations
+turn. Completed agent-message snapshots (including turn payload items)
+recover final text when deltas are absent, without duplicating streamed text.
+Explicit `active` revokes a pending stop. Silence and idle observations
 never establish a stop; there is no new timeout or live-build cancellation.
 
 ## Outer contract
