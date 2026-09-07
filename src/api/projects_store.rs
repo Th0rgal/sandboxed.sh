@@ -1582,6 +1582,7 @@ impl ProjectsStore {
     ///
     /// Idempotent on `(session_id, at)` — the ingestor replays an overlapping
     /// window every cycle. Retention is enforced here rather than by a sweeper.
+    #[allow(clippy::too_many_arguments)] // Mirrors the seven persisted delivery columns.
     pub fn record_unrouted(
         &self,
         session_id: &str,

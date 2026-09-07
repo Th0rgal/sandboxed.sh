@@ -444,13 +444,38 @@ remote-lean-build lake build Verity
 
 It derives `repo` (`git remote get-url origin`), `commit`
 (`git rev-parse HEAD`), the Lean toolchain, and `cwd_rel`
-(`git rev-parse --show-prefix`). Dirty Lean sources and build metadata are sent
-as a bounded hashed overlay; unsupported deletions/renames fail before
-submission. For a private repository, set
+(`git rev-parse --show-prefix`). Local tracked edits and allowlisted untracked
+Lean/build metadata are sent as a bounded hashed overlay; tracked deletions and
+renames use explicit delete/file operations. For a private repository, set
 `REMOTE_BUILD_SOURCE_MODE=full`: the wrapper sends a content-addressed snapshot
 of all tracked files (plus the same narrow untracked Lean/build metadata
 allowlist), and the node materializes it without any Git fetch or repository
 credential. The receipt binds both the declared commit and the snapshot digest.
+Full mode recursively includes initialized Git submodules, including non-Lean
+tracked files at every level. Each submodule's `HEAD` must match its parent's
+pinned gitlink, and every repository's indexed gitlinks must match its pinned
+tree. Initialize sources first
+with `git submodule update --init --recursive` in an authorized source checkout;
+missing initialization, wrong revisions, sparse missing files, unmerged index
+entries, or uncommitted gitlink changes fail locally before submission with a
+repair instruction. The wrapper does not fetch submodules or forward their Git
+metadata or credentials.
+Full mode ignores replacement refs and disables lazy fetching of missing Git
+objects; materialize those objects in the authorized source checkout first.
+Commit intended gitlink changes before submitting them. Ordinary local file
+edits and the untracked Lean/build metadata allowlist apply recursively;
+tracked file deletions are represented by omission. Files are globally sorted
+and hashed using the existing complete-bundle and executable-operation digests.
+The existing aggregate file/byte limits and path restrictions still apply to
+the entire recursive snapshot; symlinks, including parent directories, are
+rejected. Neither `.git` metadata nor `.lake` caches are transported.
+
+This is source transport, not dependency download policy. Complete bundles
+materialize without fetching the source repositories, but Lake/Elan may still
+need permitted dependency/toolchain downloads or existing caches. This mode
+does not supply runner credentials, transport dependency caches, or change
+network policy. It uses the existing complete-bundle protocol (node v4 or newer).
+
 It submits asynchronously to
 `$REMOTE_BUILD_URL` with `$REMOTE_BUILD_TOKEN`/`$REMOTE_BUILD_MISSION_ID`,
 persists the returned job/node receipt under
