@@ -1132,10 +1132,20 @@ impl AppServerEventTranslator {
             // ----- Turn lifecycle -----
             "turn/completed" => {
                 if let Some(turn) = params.get("turn") {
-                    if let Some(items) = turn.get("items").and_then(|v| v.as_array()) {
-                        for item in items {
-                            events.extend(self.completed_agent_message(item));
-                        }
+                    // Only the last assistant item can supply the closing
+                    // response. Older partial snapshots must not replace a
+                    // final message that was already streamed.
+                    if let Some(item) =
+                        turn.get("items")
+                            .and_then(|v| v.as_array())
+                            .and_then(|items| {
+                                items.iter().rev().find(|item| {
+                                    item.get("type").and_then(|v| v.as_str())
+                                        == Some("agentMessage")
+                                })
+                            })
+                    {
+                        events.extend(self.completed_agent_message(item));
                     }
                     let turn_id = turn
                         .get("id")
@@ -1611,6 +1621,33 @@ mod tests {
                 matches!(events.as_slice(), [ExecutionEvent::TextDelta {content}] if content == "Final blocker evidence")
             );
         }
+    }
+
+    #[test]
+    fn native_goal_turn_snapshot_cannot_replace_final_with_old_commentary() {
+        let mut t = AppServerEventTranslator::default();
+        t.handle_notification(
+            "item/agentMessage/delta",
+            &json!({"itemId":"progress", "delta":"Working"}),
+            true,
+        );
+        t.handle_notification(
+            "item/agentMessage/delta",
+            &json!({"itemId":"final", "delta":"Final blocker evidence"}),
+            true,
+        );
+        let out = t.handle_notification(
+            "turn/completed",
+            &json!({"turn":{"id":"t", "status":"completed", "items":[
+                {"type":"agentMessage", "id":"progress", "text":"Working on it"},
+                {"type":"agentMessage", "id":"final", "text":"Final blocker evidence"}
+            ]}}),
+            true,
+        );
+        assert!(
+            out.events.is_empty(),
+            "old commentary must not overwrite already streamed final text"
+        );
     }
 
     #[test]
