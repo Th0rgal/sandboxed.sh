@@ -343,9 +343,9 @@ async fn http_actor_stale_assertion_is_checked_after_concurrent_project_edit() {
     for resume in [false, true] {
         let held = DISPATCH_ADMISSION.lock().await;
         // Both requests traverse actual HTTP handlers. Explicit arrival
-        // notifications establish FIFO lock order, without sleeps.
+        // notifications establish FIFO actor-command order, without sleeps.
         let edit_waiting = wait_for(m.id, "project");
-        let actor_waiting = wait_for(m.id, "actor");
+        let actor_waiting = wait_for(m.id, "enqueued");
         let client = h.state.http_client.clone();
         let url = format!("{}/missions/{}/project", h.url, m.id);
         let edit = tokio::spawn(async move {
@@ -771,11 +771,8 @@ async fn http_actor_retask_requires_edit_or_a_trusted_semantic_assertion() {
         m.project
     );
     let response = h.request(false, m.id, json!({"content":content, "github_pr":"repo#999", "track":"different-work", "title":"Different work"})).await;
-    assert!(
-        response.status().is_success(),
-        "{}",
-        response.text().await.unwrap()
-    );
+    assert!(!response.status().is_success());
+    assert!(response.text().await.unwrap().contains("assignment_busy"));
     let after = h
         .control
         .mission_store
@@ -783,8 +780,15 @@ async fn http_actor_retask_requires_edit_or_a_trusted_semantic_assertion() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(after.project.github_pr.as_deref(), Some("repo#999"));
-    assert_eq!(after.title.as_deref(), Some("Different work"));
+    assert_eq!(after.project, m.project);
+    let deferred = h
+        .control
+        .mission_store
+        .get_deferred_goal(m.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(deferred.matches(content).count(), 1);
 }
 
 #[tokio::test]
@@ -975,6 +979,52 @@ async fn http_actor_resume_dequeue_failure_keeps_accepted_prompt_and_assignment(
     let leases = h.state.projects.live_leases(None).unwrap();
     assert_eq!(leases.len(), 1);
     assert_eq!(leases[0].track, "new-track");
+    // No runner started: the accepted assignment is still bound to the
+    // durable queued prompt, even if presentation status is changed.
+    h.control
+        .mission_store
+        .update_mission_status(m.id, MissionStatus::Paused)
+        .await
+        .unwrap();
+    for track in ["second-assignment", "third-assignment"] {
+        let response = h
+            .request(
+                false,
+                m.id,
+                json!({"content":"different queued work", "track":track, "github_pr":"repo#249"}),
+            )
+            .await;
+        assert!(!response.status().is_success());
+        assert!(response.text().await.unwrap().contains("assignment_busy"));
+        let response = h
+            .state
+            .http_client
+            .patch(format!("{}/missions/{}/project", h.url, m.id))
+            .json(&json!({"track":track}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(response.text().await.unwrap().contains("assignment_busy"));
+        assert_eq!(
+            h.control
+                .mission_store
+                .get_mission(m.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .project,
+            after.project
+        );
+        assert_eq!(
+            h.control
+                .mission_store
+                .load_control_queue(&h.user.id)
+                .await
+                .unwrap(),
+            durable_queue
+        );
+    }
 }
 
 #[tokio::test]
@@ -1575,4 +1625,350 @@ async fn native_goal_parked_writer_survives_sweep_and_cross_store_pr_arbitration
             None
         ))
         .is_err());
+}
+
+#[tokio::test]
+async fn ownership_lifetime_actual_runner_refuses_retags_until_old_queue_drains() {
+    for parallel in [false, true] {
+        let h = Harness::new().await;
+        let blocker = if parallel {
+            let b = h
+                .control
+                .mission_store
+                .create_mission(
+                    Some("capacity blocker"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("codex"),
+                    None,
+                )
+                .await
+                .unwrap();
+            let dir = install_native_fixture(&h, b.id, "before").await;
+            assert!(h
+                .request(false, b.id, json!({"content":"/goal blocker"}))
+                .await
+                .status()
+                .is_success());
+            wait_native_file(&dir.join("started")).await;
+            Some((b.id, dir))
+        } else {
+            None
+        };
+        let a = h.writer(MissionStatus::Failed, Some("repo#244")).await;
+        let dir = install_native_fixture(&h, a.id, "after").await;
+        assert!(h.request(true, a.id, json!({"content":"/goal old assignment", "continue_identity":Harness::assertion(&a)})).await.status().is_success());
+        wait_native_file(&dir.join("started")).await;
+
+        let b = h
+            .control
+            .mission_store
+            .create_mission(
+                Some("competing writer"),
+                None,
+                None,
+                None,
+                None,
+                Some("codex"),
+                None,
+            )
+            .await
+            .unwrap();
+        h.control
+            .mission_store
+            .update_mission_status(b.id, MissionStatus::Failed)
+            .await
+            .unwrap();
+        h.control
+            .mission_store
+            .update_mission_project(
+                b.id,
+                crate::api::mission_store::MissionProjectPatch {
+                    project: Some(Some("lido".into())),
+                    tags: Some(vec!["pr-writer".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let bdir = install_native_fixture(&h, b.id, "after").await;
+
+        for (index, followup) in ["first old continuation", "second old continuation"]
+            .iter()
+            .enumerate()
+        {
+            // Actual actor accepts and queues same-assignment work behind the
+            // barrier-held provider. Neither a send retag nor a project patch
+            // may change the binding of either queued message.
+            let response = h
+                .request(
+                    false,
+                    a.id,
+                    json!({"content":followup, "continue_identity":Harness::assertion(&a)}),
+                )
+                .await;
+            assert!(
+                response.status().is_success(),
+                "{}",
+                response.text().await.unwrap()
+            );
+            let response = h.request(false, a.id, json!({"content":"new assignment", "track":format!("new-{index}"), "github_pr":format!("repo#{}", 245+index)})).await;
+            assert!(!response.status().is_success());
+            assert!(response.text().await.unwrap().contains("assignment_busy"));
+            let response = h.state.http_client.patch(format!("{}/missions/{}/project", h.url, a.id))
+                .json(&json!({"track":format!("new-{index}"), "github_pr":format!("repo#{}", 245+index)})).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert!(response.text().await.unwrap().contains("assignment_busy"));
+            assert_eq!(
+                h.control
+                    .mission_store
+                    .get_mission(a.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .project,
+                a.project
+            );
+            let response = h.request(true, b.id, json!({"content":"competing mutation", "track":"trio-reserve1", "github_pr":"repo#244"})).await;
+            assert!(!response.status().is_success());
+            assert!(!bdir.join("requests.jsonl").exists());
+            assert_eq!(
+                h.state
+                    .projects
+                    .live_leases(None)
+                    .unwrap()
+                    .iter()
+                    .filter(|l| l.track == "trio-reserve1")
+                    .count(),
+                1
+            );
+        }
+        std::fs::write(dir.join("release"), "").unwrap();
+        wait_native_status(&h, a.id, MissionStatus::AwaitingUser).await;
+        let requests: Vec<Value> = std::fs::read_to_string(dir.join("requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[1]["params"]["input"][0]["text"],
+            "first old continuation"
+        );
+        assert_eq!(
+            requests[2]["params"]["input"][0]["text"],
+            "second old continuation"
+        );
+        // Transfer only after the last old queued turn has finished.
+        let response = h
+            .state
+            .http_client
+            .patch(format!("{}/missions/{}/project", h.url, a.id))
+            .json(&json!({"track":"new-final", "github_pr":"repo#246"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+        let response = h.request(true, b.id, json!({"content":"competing mutation", "track":"trio-reserve1", "github_pr":"repo#244"})).await;
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+        wait_native_status(&h, b.id, MissionStatus::AwaitingUser).await;
+        assert!(std::fs::read_to_string(bdir.join("requests.jsonl"))
+            .unwrap()
+            .contains("competing mutation"));
+        NATIVE_FIXTURES.lock().unwrap().remove(&a.id);
+        NATIVE_FIXTURES.lock().unwrap().remove(&b.id);
+        if let Some((id, dir)) = blocker {
+            std::fs::write(dir.join("release"), "").unwrap();
+            wait_native_status(&h, id, MissionStatus::Blocked).await;
+            NATIVE_FIXTURES.lock().unwrap().remove(&id);
+        }
+    }
+}
+
+#[tokio::test]
+async fn pending_deferred_assignment_refuses_multiple_retags_without_concatenating_work() {
+    let h = Harness::new().await;
+    let m = h.writer(MissionStatus::Pending, Some("repo#244")).await;
+    h.control
+        .mission_store
+        .set_mission_scheduling(
+            m.id,
+            &crate::api::mission_store::MissionScheduling {
+                not_before: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    h.control
+        .mission_store
+        .set_deferred_goal(m.id, Some("Implement old RESERVE-1 objective".into()))
+        .await
+        .unwrap();
+    for pr in ["repo#245", "repo#246"] {
+        let response = h.request(false, m.id, json!({"content":"Implement unrelated new objective", "track":"new-work", "github_pr":pr})).await;
+        assert!(!response.status().is_success());
+        assert!(response.text().await.unwrap().contains("assignment_busy"));
+        let response = h
+            .state
+            .http_client
+            .patch(format!("{}/missions/{}/project", h.url, m.id))
+            .json(&json!({"track":"new-work", "github_pr":pr}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(response.text().await.unwrap().contains("assignment_busy"));
+        h.unchanged(&m).await;
+        assert_eq!(
+            h.control
+                .mission_store
+                .get_deferred_goal(m.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Implement old RESERVE-1 objective")
+        );
+        assert_eq!(h.state.projects.live_leases(None).unwrap().len(), 1);
+    }
+    let response = h.request(false, m.id, json!({"content":"Continue old RESERVE-1 with extra evidence", "continue_identity":Harness::assertion(&m)})).await;
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let deferred = h
+        .control
+        .mission_store
+        .get_deferred_goal(m.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(deferred.contains("Implement old RESERVE-1 objective"));
+    assert!(deferred.contains("Continue old RESERVE-1 with extra evidence"));
+    assert!(!deferred.contains("unrelated new objective"));
+}
+
+#[tokio::test]
+async fn dequeue_revalidates_track_before_starting_actual_queued_runner() {
+    for parallel in [false, true] {
+        let h = Harness::new().await;
+        let blocker = if parallel {
+            let b = h
+                .control
+                .mission_store
+                .create_mission(Some("other"), None, None, None, None, Some("codex"), None)
+                .await
+                .unwrap();
+            let dir = install_native_fixture(&h, b.id, "before").await;
+            assert!(h
+                .request(false, b.id, json!({"content":"/goal blocker"}))
+                .await
+                .status()
+                .is_success());
+            wait_native_file(&dir.join("started")).await;
+            Some((b.id, dir))
+        } else {
+            None
+        };
+        let m = h.writer(MissionStatus::Failed, Some("repo#244")).await;
+        let dir = install_native_fixture(&h, m.id, "after").await;
+        assert!(h.request(true, m.id, json!({"content":"/goal old assignment", "continue_identity":Harness::assertion(&m)})).await.status().is_success());
+        wait_native_file(&dir.join("started")).await;
+        assert!(h.request(false, m.id, json!({"content":"retained old queued work", "continue_identity":Harness::assertion(&m)})).await.status().is_success());
+        let db = rusqlite::Connection::open(h._dir.path().join("projects.db")).unwrap();
+        // Fail only the transactional claim revalidation after acceptance,
+        // while the provider is still held at the old-runner barrier.
+        db.execute_batch("CREATE TRIGGER refuse_revalidation BEFORE UPDATE OF lease_until ON track_leases BEGIN SELECT RAISE(FAIL, 'dequeue barrier reject'); END;").unwrap();
+        let mut events = h.control.events_tx.subscribe();
+        std::fs::write(dir.join("release"), "").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if let Ok(AgentEvent::Error {
+                    message,
+                    mission_id,
+                    ..
+                }) = events.recv().await
+                {
+                    if mission_id == Some(m.id) && message.contains("dequeue barrier reject") {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("queued activation revalidated the original track claim");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("requests.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(h
+            .control
+            .mission_store
+            .load_control_queue(&h.user.id)
+            .await
+            .unwrap()
+            .contains("retained old queued work"));
+        assert_eq!(
+            h.control
+                .mission_store
+                .get_mission(m.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .project,
+            m.project
+        );
+        // The still-queued assignment must remain protected even after its
+        // first runner became quiescent and dequeue was refused.
+        let response = h
+            .request(
+                false,
+                m.id,
+                json!({"content":"unrelated work", "track":"unrelated", "github_pr":"repo#245"}),
+            )
+            .await;
+        assert!(!response.status().is_success());
+        assert!(response.text().await.unwrap().contains("assignment_busy"));
+        db.execute_batch("DROP TRIGGER refuse_revalidation")
+            .unwrap();
+        let response = h
+            .request(
+                false,
+                m.id,
+                json!({
+                    "content":"Continue old assignment after storage recovery",
+                    "continue_identity":Harness::assertion(&m)
+                }),
+            )
+            .await;
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+        wait_native_status(&h, m.id, MissionStatus::AwaitingUser).await;
+        let requests = std::fs::read_to_string(dir.join("requests.jsonl")).unwrap();
+        assert_eq!(requests.lines().count(), 3);
+        assert_eq!(requests.matches("retained old queued work").count(), 1);
+        if let Some((id, dir)) = blocker {
+            std::fs::write(dir.join("release"), "").unwrap();
+            wait_native_status(&h, id, MissionStatus::Blocked).await;
+            NATIVE_FIXTURES.lock().unwrap().remove(&id);
+        }
+        NATIVE_FIXTURES.lock().unwrap().remove(&m.id);
+    }
 }

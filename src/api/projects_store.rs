@@ -3042,6 +3042,39 @@ impl ProjectsStore {
         }
     }
 
+    /// Revalidate a queued assignment without creating a new binding or
+    /// releasing any claim. Renew the existing lease under the same SQLite
+    /// write transaction used by acquisition, including a fresh writer check.
+    pub fn revalidate_track_lease(&self, request: &LeaseRequest) -> Result<(), String> {
+        let mut connection = self.lock()?;
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let track_id = Self::resolve_track_id_on(&tx, &request.slug, &request.track)?
+            .ok_or_else(|| "queued_assignment_unowned: track is missing".to_string())?;
+        if request.mode == "writer" {
+            let conflicting: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM track_leases l WHERE l.track_id=?1 AND l.mutation_domain=?2 AND l.mode='writer' AND l.state IN ('reserved','active') AND (l.lease_until>?3 OR EXISTS(SELECT 1 FROM mission_dispatch_admissions a WHERE a.attempt_id=l.attempt_id)) AND l.attempt_id!=?4)",
+                params![track_id, request.mutation_domain, now_text, request.attempt_id],
+                |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if conflicting {
+                return Err("queued_assignment_unowned: another writer holds the track".into());
+            }
+        }
+        let updated = tx.execute(
+            "UPDATE track_leases SET lease_until=?5, updated_at=?6 WHERE track_id=?1 AND mutation_domain=?2 AND attempt_id=?3 AND mode=?4 AND state IN ('reserved','active')",
+            params![track_id, request.mutation_domain, request.attempt_id, request.mode,
+                (now + chrono::Duration::seconds(request.ttl_secs as i64)).to_rfc3339(), now_text],
+        ).map_err(|e| e.to_string())?;
+        if updated == 0 {
+            return Err("queued_assignment_unowned: original track claim is no longer held".into());
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     /// Unresolved admissions retain both PR claims as well as track leases.
     pub fn dispatch_admissions(&self) -> Result<Vec<(String, serde_json::Value)>, String> {
         let connection = self.lock()?;

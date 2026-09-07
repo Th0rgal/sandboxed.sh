@@ -73,6 +73,7 @@ impl AdmissionReceipt {
     fn journal(&self, phase: &str) -> serde_json::Value {
         serde_json::json!({
             "phase": phase,
+            "assignment_lifetime": "quiescent-retag-v1",
             "before": { "title": self.before.title, "project": self.before.project, "status": self.before.status },
             "after": { "title": self.after.title, "project": self.after.project },
             "acquired": self.acquired,
@@ -142,6 +143,11 @@ pub(super) async fn recover_dispatch(
             for lease in journal["acquired"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) { state.projects.expire_lease(lease)?; }
         }
         Some("accepted") => {
+            if journal["assignment_lifetime"].as_str() != Some("quiescent-retag-v1")
+                && journal["before"]["project"] != journal["after"]["project"]
+            {
+                return Err("dispatch_recovery_required: legacy accepted retag has no execution-quiescence proof; both assignments remain fenced".into());
+            }
             let keep = journal["acquired"].as_array().and_then(|leases| leases.last()).and_then(|id| id.as_str());
             state.projects.retain_attempt_lease(&key, keep)?;
         }
@@ -151,10 +157,42 @@ pub(super) async fn recover_dispatch(
     state.projects.clear_dispatch_admission(&key)
 }
 
+/// Presentation status alone cannot prove that old work has stopped. The actor
+/// supplies its runner/queue state while holding the admission mutex; durable
+/// runs also fence execution owned by another cooperating process. Pending
+/// objectives are deliberately refused, never concatenated across assignments.
+pub(super) async fn require_quiescent(
+    state: &Arc<AppState>,
+    store: &Arc<dyn MissionStore>,
+    mission: &Mission,
+    actor_busy: bool,
+) -> Result<(), String> {
+    if actor_busy
+        || matches!(
+            mission.status,
+            MissionStatus::Active | MissionStatus::Pending
+        )
+        || store.get_active_mission_run(mission.id).await?.is_some()
+        || store
+            .get_deferred_goal(mission.id)
+            .await?
+            .is_some_and(|goal| !goal.trim().is_empty())
+        || crate::remote_node::job_ledger::load(&state.config.working_dir)
+            .await
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|handle| handle.mission_id == mission.id)
+    {
+        return Err("assignment_busy: stop and drain old running, queued, or Pending work before changing assignment".into());
+    }
+    Ok(())
+}
+
 async fn prepare(
     admission: DispatchAdmission,
     id: Uuid,
     resume: bool,
+    actor_busy: bool,
 ) -> Result<AdmissionReceipt, String> {
     let file_guard = durable_lock(&admission.state.config).await?;
     let store = admission.store.clone();
@@ -183,6 +221,11 @@ async fn prepare(
     after.title = next.title;
     after.project.github_pr = next.github_pr;
     after.project.track = next.track;
+    if before.project.github_pr != after.project.github_pr
+        || before.project.track != after.project.track
+    {
+        require_quiescent(&admission.state, &store, &before, actor_busy).await?;
+    }
     let wants_writer = mission_is_pr_writer_in_store(&store, &after).await?
         || admission
             .patch
@@ -288,10 +331,20 @@ async fn prepare(
 /// Replace the response sender so rollback/ownership cleanup precedes the HTTP
 /// acknowledgement. The admission lock survives client cancellation and every
 /// actor `continue`/early rejection. Lost responses keep a pending recovery fence.
+#[cfg(test)]
 pub(super) async fn admit_dispatch(
+    admission: DispatchAdmission,
+    command: ControlCommand,
+    guard: tokio::sync::MutexGuard<'static, ()>,
+) -> Option<ControlCommand> {
+    admit_dispatch_with_lifetime(admission, command, guard, false).await
+}
+
+pub(super) async fn admit_dispatch_with_lifetime(
     admission: DispatchAdmission,
     mut command: ControlCommand,
     guard: tokio::sync::MutexGuard<'static, ()>,
+    actor_busy: bool,
 ) -> Option<ControlCommand> {
     let (id, resume) = match &command {
         ControlCommand::UserMessage {
@@ -320,7 +373,7 @@ pub(super) async fn admit_dispatch(
             *skip_message = false;
         }
     }
-    let receipt = prepare(admission, id, resume).await;
+    let receipt = prepare(admission, id, resume, actor_busy).await;
     match command {
         ControlCommand::UserMessage {
             id,

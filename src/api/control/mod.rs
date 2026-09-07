@@ -10,6 +10,7 @@
 pub(crate) mod dispatch_admission;
 #[cfg(test)]
 pub(crate) mod dispatch_admission_tests;
+#[cfg(test)]
 use dispatch_admission::admit_dispatch;
 pub use dispatch_admission::DispatchAdmission;
 pub(super) use dispatch_admission::DISPATCH_ADMISSION;
@@ -4939,6 +4940,10 @@ pub async fn post_message(
         })
         .await
         .map_err(session_unavailable)?;
+    #[cfg(test)]
+    if let Some(mission_id) = target_mission_id {
+        dispatch_admission_tests::notify_wait(mission_id, "enqueued");
+    }
     let queued = match queued_rx.await {
         // The wire response keeps its historical bool shape: `queued` is true
         // only when the message is waiting for the next turn boundary.
@@ -9203,6 +9208,32 @@ async fn activate_mission_for_message(
     mission: &Mission,
     content: &str,
 ) -> Result<(), String> {
+    // Both sequential dequeue and parallel follow-up activation pass here.
+    // Retags are refused for the lifetime of the queue, so its mission identity
+    // remains the binding; validate that this binding still owns its track.
+    if let (Some(state), Some(slug), Some(track)) = (
+        control_hub
+            .admission_state
+            .get()
+            .and_then(std::sync::Weak::upgrade),
+        mission.project.project.as_deref(),
+        mission.project.track.as_deref(),
+    ) {
+        let writer = mission_is_pr_writer_in_store(store, mission).await?
+            || message_requests_pr_writer(mission, content);
+        let request = super::track_leases::lease_request(
+            slug,
+            track,
+            &mission.id.to_string(),
+            super::track_leases::lease_mode(
+                writer.then_some(true),
+                &mission.project.tags,
+                mission.project.intent.as_deref(),
+            ),
+            None,
+        );
+        state.projects.revalidate_track_lease(&request)?;
+    }
     // Keep the writer mutex until Active is persisted so a replacement writer
     // cannot race a terminal mission's message-based reactivation.
     let _pr_writer_guard =
@@ -12462,16 +12493,25 @@ pub async fn update_mission_project(
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateMissionProjectRequest>,
 ) -> Result<Json<Mission>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let (respond, result) = oneshot::channel();
+    control
+        .cmd_tx
+        .send(ControlCommand::UpdateProject {
+            mission_id: id,
+            user,
+            request: req,
+            respond,
+        })
+        .await
+        .map_err(session_unavailable)?;
     #[cfg(test)]
     dispatch_admission_tests::notify_wait(id, "project");
-    let _guard = DISPATCH_ADMISSION.lock().await;
-    let _file_guard = dispatch_admission::durable_lock(&state.config)
-        .await
-        .map_err(internal_error)?;
-    update_mission_project_locked(State(state), Extension(user), Path(id), Json(req)).await
+    result.await.map_err(recv_failed)?.map(Json)
 }
 
 async fn update_mission_project_locked(
+    actor_busy: bool,
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Path(id): Path<Uuid>,
@@ -12631,6 +12671,16 @@ async fn update_mission_project_locked(
     // old ones. A held writer lease is a 409 and the patch is not applied.
     let effective_project = effective_string(&project, &current.project.project);
     let effective_track = effective_string(&track, &current.project.track);
+    if effective_project != current.project.project
+        || effective_track != current.project.track
+        || effective_github_pr != current.project.github_pr
+        || effective_tags != current.project.tags
+        || effective_intent != current.project.intent
+    {
+        dispatch_admission::require_quiescent(&state, &control.mission_store, &current, actor_busy)
+            .await
+            .map_err(|error| (StatusCode::CONFLICT, error))?;
+    }
     let track_changed = track.is_some() || project.is_some() || could_change_writer_status;
     let mut acquired_lease = None;
     let track = if let (true, Some(slug), Some(key)) = (
@@ -14623,6 +14673,8 @@ pub async fn resume_mission(
             })
             .await
             .map_err(session_unavailable)?;
+        #[cfg(test)]
+        dispatch_admission_tests::notify_wait(mission_id, "enqueued");
         rx.await
             .map_err(recv_failed)?
             .map_err(|e| (StatusCode::BAD_REQUEST, e))
@@ -18655,6 +18707,7 @@ async fn control_actor_loop(
     // and `Stop` becomes a no-op. After this deadline we force-abort
     // the JoinHandle and clean up the in-memory state.
     let mut runner_force_clear_deadline: Option<tokio::time::Instant> = None;
+    let mut runner_force_abort_requested = false;
     const RUNNER_FORCE_CLEAR_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
     // Correlate Bash `tool_call_id` -> command string so that when the matching
@@ -19174,7 +19227,19 @@ async fn control_actor_loop(
                                 continue;
                             }
                         }
-                        match admit_dispatch(*admission, *command, admission_guard).await {
+                        let target = match command.as_ref() {
+                            ControlCommand::UserMessage { target_mission_id, .. } => *target_mission_id,
+                            ControlCommand::ResumeMission { mission_id, .. } => Some(*mission_id),
+                            _ => None,
+                        };
+                        let busy = target.is_some_and(|id| running_mission_id == Some(id)
+                            || parallel_runners.contains_key(&id)
+                            || queue_has_pending_target_mission(&queue, id)
+                            || queue.iter().any(|entry| entry.3.is_none()));
+                        let busy = busy || if let Some(id) = target {
+                            background_tasks.read().await.get(&id).is_some_and(|tasks| !tasks.is_empty())
+                        } else { false };
+                        match dispatch_admission::admit_dispatch_with_lifetime(*admission, *command, admission_guard, busy).await {
                             Some(cmd) => (cmd, None),
                             None => continue,
                         }
@@ -19182,6 +19247,22 @@ async fn control_actor_loop(
                     cmd => (cmd, Some(admission_guard)),
                 };
                 match cmd {
+                    ControlCommand::UpdateProject { mission_id, user, request, respond } => {
+                        let busy = running_mission_id == Some(mission_id)
+                            || parallel_runners.contains_key(&mission_id)
+                            || queue_has_pending_target_mission(&queue, mission_id)
+                            || queue.iter().any(|entry| entry.3.is_none())
+                            || background_tasks.read().await.get(&mission_id).is_some_and(|tasks| !tasks.is_empty());
+                        let result = if let Some(state) = control_hub.admission_state.get().and_then(std::sync::Weak::upgrade) {
+                            match dispatch_admission::durable_lock(&state.config).await {
+                                Ok(_file_guard) => update_mission_project_locked(busy, State(state), Extension(user), Path(mission_id), Json(request)).await.map(|Json(m)| m),
+                                Err(error) => Err(internal_error(error)),
+                            }
+                        } else {
+                            Err((StatusCode::SERVICE_UNAVAILABLE, "Admission state unavailable".into()))
+                        };
+                        let _ = respond.send(result);
+                    }
                     ControlCommand::AdmitDispatch { .. } => unreachable!("nested admission"),
                     ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, strict, source, respond } => {
                         if recovered_consumed_user_messages.contains_key(&id) {
@@ -22201,7 +22282,7 @@ async fn control_actor_loop(
                     Some(handle) => Some(handle.await),
                     None => None
                 }
-            }, if running.is_some() => {
+            }, if running.is_some() && !runner_force_abort_requested => {
                 if let Some(res) = finished {
                     // Save the running mission ID before clearing it - we need it for persist and auto-complete
                     // (current_mission can change if user clicks "New Mission" while task was running)
@@ -23263,7 +23344,6 @@ async fn control_actor_loop(
                                             mission_id: Some(*mission_id),
                                             resumable: true,
                                         });
-                                        completed_missions.push(*mission_id);
                                         continue;
                                     }
                                 }
@@ -23536,11 +23616,11 @@ async fn control_actor_loop(
                 }
             }, if runner_force_clear_deadline.is_some() && running.is_some() => {
                 let stuck_mid = running_mission_id;
-                let still_progressing = main_runner_active_tool_calls
+                let still_progressing = !runner_force_abort_requested && (main_runner_active_tool_calls
                     .load(std::sync::atomic::Ordering::Relaxed)
                     > 0
                     || main_runner_last_activity.elapsed()
-                        < super::controller_honesty::CANCEL_TIMEOUT_FRESH_PROGRESS;
+                        < super::controller_honesty::CANCEL_TIMEOUT_FRESH_PROGRESS);
                 if still_progressing {
                     tracing::info!(
                         mission_id = ?stuck_mid,
@@ -23555,9 +23635,18 @@ async fn control_actor_loop(
                     "Force-aborting stuck runner: cancel fired but JoinHandle never resolved within {}s",
                     RUNNER_FORCE_CLEAR_GRACE.as_secs()
                 );
-                if let Some(handle) = running.take() {
-                    handle.abort();
+                if let Some(handle) = running.as_ref() {
+                    if !handle.is_finished() {
+                        handle.abort();
+                        runner_force_abort_requested = true;
+                        runner_force_clear_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(100));
+                        // Preserve the runner and its durable ownership until
+                        // the abort finishes; continue servicing refusals.
+                        continue;
+                    }
                 }
+                running = None;
+                runner_force_abort_requested = false;
                 running_cancel = None;
                 running_mission_id = None;
                 running_backend_id = None;

@@ -15,6 +15,26 @@ PR writer lock, stores. The advisory file lock covers cooperating backend
 processes using the same mission directory. Internal targeted wakes use the
 same ownership admission without applying controller prose inference.
 
+Assignment changes require quiescence. Send/resume retags and structured project
+edits run in the owning actor and refuse with `assignment_busy` while that actor
+holds an old runner, queued message or background task, a durable run or remote
+job handle remains open, any deferred objective remains, or the mission is Active
+or Pending. Stale remote heartbeats do not prove that the job stopped. Cancel
+timeout keeps the runner registered until its aborted task actually finishes. Project/track/PR changes and assignment tag/intent changes
+cannot transfer claims across that boundary. Same-assignment continuation may
+still queue normally. Title-only edits do not change the assignment.
+
+Pending deferred objectives are retained under their original assignment;
+retags are refused instead of concatenating a new assignment into old deferred
+work. Stop and drain the old work before retagging, or create a separate mission.
+Multiple retag attempts behind a running/queued turn are all refused. Consequently
+dequeue cannot observe an assignment changed by these APIs while its old message
+was waiting: the actor serializes edits with dequeue and keeps the assignment
+fixed through the last queued turn. Dequeue also revalidates PR exclusivity and
+checks/renews the original track claim under a SQLite write transaction; a
+missing or replaced claim refuses execution instead of silently rebinding work. Direct database writers are outside this
+cooperating-controller protocol.
+
 Admission checks resume state, the proposed assignment, PR exclusivity and track
 ownership, including unchanged tracks, absent PR metadata, PR-only edits and
 reader-to-writer promotion. Provisional acquisitions use distinct lease keys so
@@ -29,10 +49,14 @@ identity persistence. The original leases remain held until the actor accepts
 the message/resume. A known actor rejection restores identity/title
 before the HTTP response; client disconnection does not cancel cleanup.
 
-Successful acceptance retains the new lease and releases the old leases.
+Successful acceptance retains the new lease and releases the old leases. A retag
+reaches this step only after quiescence was checked before mutation; acceptance
+alone is not evidence that the old execution stopped.
 Cleanup failure after acceptance is not reported as a rejected dispatch. Both
 leases remain fenced and an error is logged. Known `accepted`/`rejected` journal
-phases are recovered before the next admission or project edit. If an outcome
+phases are recovered before the next admission or project edit. Legacy accepted
+retags without the new lifetime marker stay fenced for operator reconciliation,
+because their original acceptance did not establish quiescence. If an outcome
 was lost with the actor response or to a crash (`pending`), the server refuses with
 `dispatch_recovery_required`: it cannot safely infer whether queued work was
 accepted. The sweep preserves and renews these leases, and writer acquisition

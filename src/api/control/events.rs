@@ -364,6 +364,12 @@ pub enum UserMessageAck {
 /// Internal control commands (queued and processed by the actor).
 #[derive(Debug)]
 pub enum ControlCommand {
+    UpdateProject {
+        mission_id: Uuid,
+        user: crate::api::auth::AuthUser,
+        request: super::UpdateMissionProjectRequest,
+        respond: oneshot::Sender<Result<Mission, (axum::http::StatusCode, String)>>,
+    },
     AdmitDispatch {
         admission: Box<super::DispatchAdmission>,
         command: Box<ControlCommand>,
