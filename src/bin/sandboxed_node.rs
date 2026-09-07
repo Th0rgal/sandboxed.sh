@@ -142,7 +142,9 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/jobs",
             post(submit_job)
-                .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
+                .layer(DefaultBodyLimit::max(
+                    sandboxed_sh::remote_node::protocol::MAX_SOURCE_REQUEST_BODY_BYTES,
+                ))
                 .get(list_jobs),
         )
         .route("/jobs/:id", get(get_job))

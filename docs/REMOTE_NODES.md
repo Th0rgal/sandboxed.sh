@@ -227,8 +227,9 @@ Node env vars for lean-build jobs:
   filesystem drops below it, checkout dirs then lake cache slots are
   LRU-deleted (by dir mtime) until the threshold is met.
 - `SANDBOXED_NODE_MAX_SOURCE_BUNDLE_BYTES` — maximum decoded size of a local
-  source bundle (default 1 MiB/256 files for overlays and 16 MiB/4096 files
-  for complete snapshots). Paths, per-file hashes and the manifest hash are
+  source bundle (default 1 MiB/256 files for overlays and 32 MiB/4096 files
+  for complete snapshots). An explicit positive byte override applies to both
+  modes; it does not raise either file-count cap or any HTTP/JSON ceiling. Paths, per-file hashes and the manifest hash are
   verified before any file is applied.
 - `SANDBOXED_NODE_GIT_SSH_KEY` — path to an SSH key used for git fetches
   (`GIT_SSH_COMMAND="ssh -i <key> -o IdentitiesOnly=yes -o
@@ -475,6 +476,39 @@ materialize without fetching the source repositories, but Lake/Elan may still
 need permitted dependency/toolchain downloads or existing caches. This mode
 does not supply runner credentials, transport dependency caches, or change
 network policy. It uses the existing complete-bundle protocol (node v4 or newer).
+
+Full snapshots default to **32 MiB decoded / 4096 files**, aggregated across
+all recursive submodules. Overlays remain **1 MiB / 256 operations**.
+`REMOTE_BUILD_MAX_SOURCE_BUNDLE_BYTES` and
+`REMOTE_BUILD_MAX_SOURCE_BUNDLE_FILES` remain explicit sender overrides;
+`SANDBOXED_NODE_MAX_SOURCE_BUNDLE_BYTES` remains the receiver byte override
+for both modes. Existing smaller operator ceilings are respected. Raising a
+sender limit alone cannot raise the receiver's fixed file-count cap or its
+configured byte ceiling. No source or receipt should be removed to fit a cap.
+
+The wrapper gzip-compresses its base64 JSON. Core ingress has a **50 MiB HTTP
+body** cap and a separate **64 MiB decompressed JSON** cap, enforced while
+reading at most cap + 1 bytes. Core forwards ordinary uncompressed
+`SubmitJobRequest` JSON to the node; `/jobs` retains its **50 MiB HTTP body**
+cap. These HTTP/JSON ceilings are fixed, independent of operator byte overrides.
+32 MiB of decoded source occupies about 42.67 MiB in base64 before metadata;
+the unchanged 50 MiB body limits leave room for the measured manifests and job
+envelope. Path-heavy metadata or larger explicit overrides must still fit
+all layers. Check the actual serialized request sizes; compression is not a
+way to bypass decoded-source validation. Reverse proxies may impose smaller
+body limits and must be verified on the intended route before rollout.
+
+Roll out the backend (including its embedded sender and 64 MiB decoder),
+refresh mission-managed wrappers through normal mission setup, and update an
+idle node to the matching 32 MiB receiver before submitting larger snapshots.
+A v4 heartbeat proves protocol support, not this new byte default; older v4
+nodes may still reject above 16 MiB. Preserve explicit operator overrides,
+active jobs and receipt/resume state. Require a >16 MiB complete-source canary
+through the intended proxy/backend/node route, with source bytes, executable
+bits, manifest/operations digests and terminal receipts checked. Existing
+submodule initialization, path, symlink, replacement-ref and privacy checks
+remain mandatory. This development change does not install, restart or deploy
+production services. See [measured capacity evidence](REMOTE_SOURCE_CAPACITY.md).
 
 It submits asynchronously to
 `$REMOTE_BUILD_URL` with `$REMOTE_BUILD_TOKEN`/`$REMOTE_BUILD_MISSION_ID`,

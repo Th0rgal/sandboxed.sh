@@ -50,7 +50,9 @@ const DEFAULT_ESTIMATED_DISK_GB: u64 = 12;
 const MAX_ESTIMATED_DISK_GB: u64 = 512;
 const DEFAULT_NODE_MIN_DISK_GB: u64 = 20;
 const DEFAULT_NODE_DISK_EMERGENCY_GB: u64 = 10;
-const MAX_REMOTE_BUILD_JSON_BYTES: u64 = 32 * 1024 * 1024;
+// Independent of the 50 MiB wire ceiling: gzip can expand beyond its body size.
+// 32 MiB of complete source needs ~43 MiB after base64, plus metadata.
+const MAX_REMOTE_BUILD_JSON_BYTES: u64 = 64 * 1024 * 1024;
 
 fn parse_remote_build_request(
     headers: &HeaderMap,
@@ -2114,6 +2116,282 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         let oversized = vec![b' '; MAX_REMOTE_BUILD_JSON_BYTES as usize + 1];
         let error = parse_remote_build_request(&HeaderMap::new(), &oversized).unwrap_err();
         assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    fn validate_parsed_source(request: RemoteBuildRequest) -> Result<(), String> {
+        crate::node::lean::validate_lean_build(
+            &JobSource {
+                repo: request.repo,
+                commit: request.commit,
+                base_tree_sha: request.base_tree_sha,
+                archive: request.source_archive.map(Box::new),
+                bundle: request.source_bundle,
+            },
+            request.cwd_rel.as_deref(),
+            &request.command,
+            &HashMap::new(),
+            &[],
+        )
+    }
+
+    #[tokio::test]
+    async fn complete_32_mib_wrapper_crosses_api_decoder_and_receiver_with_strict_identity() {
+        use crate::remote_node::protocol::MAX_SOURCE_REQUEST_BODY_BYTES;
+        use base64::Engine;
+
+        let output = std::process::Command::new("python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/test_remote_lean_build_source.py"
+            ))
+            .arg("--emit-large-fixture")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let parsed = parse_remote_build_request(&headers, &output.stdout).unwrap();
+        let bundle = parsed.source_bundle.as_ref().unwrap();
+        let total: usize = bundle
+            .files
+            .iter()
+            .map(|f| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(&f.data_base64)
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        assert_eq!(total, 32 << 20);
+        assert!(bundle.files.iter().any(|f| f.path.ends_with("receipt.bin")));
+        assert!(bundle.files.iter().any(|f| f.executable == Some(true)));
+
+        // Use the same Bytes extractor and body ceiling as core ingress, and
+        // the actual gzip decoder and receiver validation. No dispatch/build.
+        async fn ingress(
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> Result<StatusCode, (StatusCode, String)> {
+            validate_parsed_source(parse_remote_build_request(&headers, &body)?)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            Ok(StatusCode::OK)
+        }
+        async fn node_ingress(
+            Json(job): Json<SubmitJobRequest>,
+        ) -> Result<StatusCode, (StatusCode, String)> {
+            let JobPayload::LeanBuild {
+                source,
+                cwd_rel,
+                command,
+                env,
+                ..
+            } = job.payload
+            else {
+                panic!("expected lean build");
+            };
+            crate::node::lean::validate_lean_build(
+                &source,
+                cwd_rel.as_deref(),
+                &command,
+                &env,
+                &[],
+            )
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            Ok(StatusCode::OK)
+        }
+        let app = Router::new()
+            .route("/", post(ingress))
+            .route("/jobs", post(node_ingress))
+            .layer(axum::extract::DefaultBodyLimit::max(
+                MAX_SOURCE_REQUEST_BODY_BYTES,
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}/");
+        let response = client
+            .post(&url)
+            .header("Content-Encoding", "gzip")
+            .body(output.stdout.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            response.text().await.unwrap()
+        );
+        let response = client
+            .post(&url)
+            .body(vec![b' '; MAX_SOURCE_REQUEST_BODY_BYTES + 1])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // The node client sends plain JSON. Its unchanged 50 MiB body ceiling
+        // includes the real SubmitJobRequest envelope, not just the bundle.
+        let job = SubmitJobRequest {
+            job_id: Uuid::new_v4(),
+            mission_id: parsed.mission_id,
+            lease_token: "test-lease".to_string(),
+            payload: JobPayload::LeanBuild {
+                source: Box::new(JobSource {
+                    repo: parsed.repo,
+                    commit: parsed.commit,
+                    base_tree_sha: parsed.base_tree_sha,
+                    archive: None,
+                    bundle: parsed.source_bundle,
+                }),
+                cwd_rel: None,
+                command: vec!["lake".to_string(), "build".to_string()],
+                timeout_secs: None,
+                estimated_disk_bytes: None,
+                cache_key: None,
+                artifacts: vec![],
+                env: HashMap::new(),
+            },
+        };
+        let json = serde_json::to_vec(&job).unwrap();
+        assert!(json.len() > 32 << 20);
+        assert!(json.len() < MAX_SOURCE_REQUEST_BODY_BYTES);
+        let roundtrip: SubmitJobRequest = serde_json::from_slice(&json).unwrap();
+        assert_eq!(roundtrip, job);
+        drop(json);
+        drop(roundtrip);
+        let response = client
+            .post(format!("{url}jobs"))
+            .json(&job)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            response.text().await.unwrap()
+        );
+        let response = client
+            .post(format!("{url}jobs"))
+            .header("Content-Type", "application/json")
+            .body(vec![b' '; MAX_SOURCE_REQUEST_BODY_BYTES + 1])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        server.abort();
+        drop(job);
+
+        // An explicit operator ceiling must still win over the new default.
+        // Isolate the environment in a child, avoiding process-global test races.
+        let fixture = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(fixture.path(), &output.stdout).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "api::remote_build::tests::measured_complete_fixture_crosses_api_decoder_and_receiver", "--ignored"])
+            .env("REMOTE_BUILD_MEASURED_FIXTURE", fixture.path())
+            .env("SANDBOXED_NODE_MAX_SOURCE_BUNDLE_BYTES", (16 << 20).to_string())
+            .output().unwrap();
+        assert!(!child.status.success());
+        assert!(String::from_utf8_lossy(&child.stdout).contains("maximum is 16777216"));
+
+        for (mutation, expected) in [
+            ("byte", "content hash mismatch"),
+            ("mode", "operations hash mismatch"),
+            ("manifest", "manifest hash mismatch"),
+            ("max+1", "maximum is 33554432"),
+        ] {
+            let mut request = parse_remote_build_request(&headers, &output.stdout).unwrap();
+            let bundle = request.source_bundle.as_mut().unwrap();
+            match mutation {
+                "byte" => {
+                    bundle.files[0].data_base64 =
+                        base64::engine::general_purpose::STANDARD.encode(b"tampered")
+                }
+                "mode" => bundle.files[0].executable = Some(!bundle.files[0].executable.unwrap()),
+                "manifest" => bundle.manifest_sha256 = "0".repeat(64),
+                "max+1" => {
+                    let file = bundle
+                        .files
+                        .iter_mut()
+                        .find(|f| f.path.ends_with("receipt.bin"))
+                        .unwrap();
+                    let mut data = base64::engine::general_purpose::STANDARD
+                        .decode(&file.data_base64)
+                        .unwrap();
+                    data.push(b'x');
+                    file.sha256 = hex::encode(sha2::Sha256::digest(&data));
+                    file.data_base64 = base64::engine::general_purpose::STANDARD.encode(data);
+                    bundle.manifest_sha256 = crate::node::lean::bundle_manifest_sha256_for_mode(
+                        &bundle
+                            .files
+                            .iter()
+                            .map(|f| (f.path.clone(), f.sha256.clone()))
+                            .collect::<Vec<_>>(),
+                        true,
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_parsed_source(request)
+                    .unwrap_err()
+                    .contains(expected),
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_build_json_boundary_and_gzip_expansion_are_bounded() {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let mut plain = serde_json::to_vec(&serde_json::json!({
+            "mission_id": Uuid::nil(), "token": "test", "repo": "https://example.invalid/repo.git",
+            "commit": "a".repeat(40), "command": ["lake", "build"],
+        }))
+        .unwrap();
+        plain.resize(MAX_REMOTE_BUILD_JSON_BYTES as usize, b' ');
+        // Whitespace makes a valid JSON request at the exact expansion cap.
+        parse_remote_build_request(&HeaderMap::new(), &plain).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        for extra in [false, true] {
+            if extra {
+                plain.push(b' ');
+            }
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(&plain).unwrap();
+            let compressed = encoder.finish().unwrap();
+            assert!(compressed.len() < 1 << 20);
+            let result = parse_remote_build_request(&headers, &compressed);
+            if extra {
+                assert_eq!(result.unwrap_err().0, StatusCode::PAYLOAD_TOO_LARGE);
+                assert_eq!(
+                    parse_remote_build_request(&HeaderMap::new(), &plain)
+                        .unwrap_err()
+                        .0,
+                    StatusCode::PAYLOAD_TOO_LARGE
+                );
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "local measured wrapper request; set REMOTE_BUILD_MEASURED_FIXTURE"]
+    fn measured_complete_fixture_crosses_api_decoder_and_receiver() {
+        let path = std::env::var("REMOTE_BUILD_MEASURED_FIXTURE").unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        validate_parsed_source(parse_remote_build_request(&headers, &bytes).unwrap()).unwrap();
     }
 
     #[test]

@@ -14,6 +14,12 @@
 #   REMOTE_BUILD_NODE_ID     explicit runner id or "auto" (default)
 #   REMOTE_BUILD_REQUIREMENTS JSON array of runner labels (default: ["lean"])
 #
+# Source limits (decoded bytes across the entire recursive snapshot):
+#   full: 32 MiB / 4096 files; overlay: 1 MiB / 256 operations.
+#   REMOTE_BUILD_MAX_SOURCE_BUNDLE_BYTES / _FILES override sender limits.
+#   Coordinate byte overrides with SANDBOXED_NODE_MAX_SOURCE_BUNDLE_BYTES;
+#   HTTP bodies remain capped at 50 MiB and core-expanded JSON at 64 MiB.
+#
 # Exit codes:
 #   remote build's exit code on success/failure of the build itself
 #   2   unsafe symlink or oversized source overlay
@@ -341,7 +347,7 @@ untracked_source = [] if source_mode == "full" else select_untracked_sources(
 paths = sorted(set(tracked + untracked_source))
 deleted = sorted(set(deleted) - set(paths))
 default_max_files = "4096" if source_mode == "full" else "256"
-default_max_bytes = str(16 << 20) if source_mode == "full" else str(1 << 20)
+default_max_bytes = str(32 << 20) if source_mode == "full" else str(1 << 20)
 max_files = int(os.environ.get("REMOTE_BUILD_MAX_SOURCE_BUNDLE_FILES", default_max_files))
 max_bytes = int(os.environ.get("REMOTE_BUILD_MAX_SOURCE_BUNDLE_BYTES", default_max_bytes))
 if max_files <= 0 or max_bytes <= 0:

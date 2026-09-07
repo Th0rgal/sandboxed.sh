@@ -19,6 +19,10 @@ pub const NODE_PROTOCOL_VERSION: u32 = 4;
 /// First protocol that reports `active_jobs` and `queued_jobs` in heartbeats.
 pub const NODE_JOB_COUNTER_PROTOCOL_VERSION: u32 = 2;
 
+/// HTTP body ceiling for source submissions: gzip on core ingress, plain JSON
+/// on node ingress. Keep independent from the decoded-source and gzip expansion caps.
+pub const MAX_SOURCE_REQUEST_BODY_BYTES: usize = 50 * 1024 * 1024;
+
 /// Lease scope for the synchronous `/execute` path.
 pub const SCOPE_MISSION_EXECUTE: &str = "mission:execute";
 

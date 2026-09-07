@@ -42,7 +42,7 @@ pub const ALLOWED_COMMANDS: [&str; 2] = ["lake", "lean"];
 /// filesystem backing the work dir (`SANDBOXED_NODE_MIN_FREE_GB` overrides).
 const DEFAULT_MIN_FREE_GB: u64 = 10;
 const DEFAULT_MAX_SOURCE_BUNDLE_BYTES: u64 = 1 << 20;
-const DEFAULT_MAX_COMPLETE_SOURCE_BUNDLE_BYTES: u64 = 16 << 20;
+const DEFAULT_MAX_COMPLETE_SOURCE_BUNDLE_BYTES: u64 = 32 << 20;
 const MAX_SOURCE_BUNDLE_FILES: usize = 256;
 const DEFAULT_MAX_SOURCE_ARCHIVE_BYTES: u64 = 32 << 20;
 const DEFAULT_MAX_SOURCE_ARCHIVE_EXPANDED_BYTES: u64 = 2 << 30;
@@ -2506,6 +2506,62 @@ mod tests {
         assert!(validate_source_bundle(&tampered)
             .unwrap_err()
             .contains("operations hash mismatch"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "local measured wrapper request; set REMOTE_BUILD_MEASURED_FIXTURE"]
+    async fn measured_complete_fixture_materializes_every_byte_and_mode() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        let input = std::fs::read(std::env::var("REMOTE_BUILD_MEASURED_FIXTURE").unwrap()).unwrap();
+        let mut json = Vec::new();
+        flate2::read::GzDecoder::new(input.as_slice())
+            .take((64 << 20) + 1)
+            .read_to_end(&mut json)
+            .unwrap();
+        assert!(json.len() <= 64 << 20);
+        let request: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let bundle: SourceBundle =
+            serde_json::from_value(request["source_bundle"].clone()).unwrap();
+        assert!(bundle.complete);
+        validate_source_bundle(&bundle).unwrap();
+        let source = JobSource {
+            repo: "https://example.invalid/no-fetch.git".to_string(),
+            commit: request["commit"].as_str().unwrap().to_string(),
+            base_tree_sha: Some(request["base_tree_sha"].as_str().unwrap().to_string()),
+            archive: None,
+            bundle: Some(bundle.clone()),
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = ensure_checkout(
+            temp.path(),
+            &source,
+            &temp.path().join("job.log"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        for file in &bundle.files {
+            let path = checkout.join(&file.path);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                base64::engine::general_purpose::STANDARD
+                    .decode(&file.data_base64)
+                    .unwrap(),
+                "{}",
+                file.path
+            );
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o111 != 0,
+                file.executable.unwrap(),
+                "{}",
+                file.path
+            );
+        }
+        assert!(!walkdir::WalkDir::new(checkout)
+            .into_iter()
+            .any(|entry| entry.unwrap().file_name() == ".git"));
     }
 
     #[tokio::test]
