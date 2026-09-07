@@ -54,7 +54,14 @@ pub enum DerivedState {
     ClaimOnly,
     Cancelled,
     Inconsistent,
+    /// An absorbed (mission-only) row whose attempts all ended more than
+    /// [`DORMANT_AFTER_DAYS`] ago. It never was a declared plan item; it is
+    /// history, not todo, so it is neither open nor on the checklist.
+    Dormant,
 }
+
+/// Days without any attempt activity after which an absorbed row is dormant.
+pub const DORMANT_AFTER_DAYS: i64 = 7;
 
 impl DerivedState {
     pub fn as_str(self) -> &'static str {
@@ -67,6 +74,7 @@ impl DerivedState {
             Self::ClaimOnly => "claim_only",
             Self::Cancelled => "cancelled",
             Self::Inconsistent => "inconsistent",
+            Self::Dormant => "dormant",
         }
     }
 
@@ -277,10 +285,44 @@ fn owner_of(item: &ProjectItem) -> Option<ItemOwner> {
         })
 }
 
+/// An absorbed row nobody declared, with no live or waiting attempt, whose
+/// newest attempt is older than [`DORMANT_AFTER_DAYS`]. Such rows are what a
+/// mission left behind; listing them as `ready` made agents read a hundred
+/// finished attempts as pending work (Lido, 2026-09-07).
+fn is_dormant(item: &ProjectItem, as_of: &str) -> bool {
+    if item.declared || origin_of(item) != Origin::Absorbed {
+        return false;
+    }
+    if item
+        .attempts
+        .iter()
+        .any(|attempt| attempt_is_live(&attempt.status) || attempt_is_waiting(&attempt.status))
+    {
+        return false;
+    }
+    let Some(now) = chrono::DateTime::parse_from_rfc3339(as_of).ok() else {
+        return false;
+    };
+    let newest = item
+        .attempts
+        .iter()
+        .filter_map(|attempt| chrono::DateTime::parse_from_rfc3339(&attempt.updated_at).ok())
+        .max();
+    match newest {
+        Some(at) => now.signed_duration_since(at) > chrono::Duration::days(DORMANT_AFTER_DAYS),
+        // No attempt at all and nobody declared it: nothing keeps it alive.
+        None => true,
+    }
+}
+
 /// Derive one state from lifecycle, claim, live attempts, and dependencies.
 /// `open_keys` is the set of keys in this project that are still open, used
 /// to resolve `depends_on`.
-fn derive_state(item: &ProjectItem, open_keys: &BTreeSet<String>) -> (DerivedState, Vec<String>) {
+fn derive_state(
+    item: &ProjectItem,
+    open_keys: &BTreeSet<String>,
+    as_of: &str,
+) -> (DerivedState, Vec<String>) {
     if lifecycle_of(item) == Lifecycle::Cancelled {
         return (DerivedState::Cancelled, Vec::new());
     }
@@ -296,6 +338,9 @@ fn derive_state(item: &ProjectItem, open_keys: &BTreeSet<String>) -> (DerivedSta
     }
     if is_legacy_claim(item) {
         return (DerivedState::ClaimOnly, Vec::new());
+    }
+    if is_dormant(item, as_of) {
+        return (DerivedState::Dormant, Vec::new());
     }
     let blocked_by: Vec<String> = item
         .depends_on
@@ -352,6 +397,7 @@ pub fn build(
             .any(|attempt| attempt_is_live(&attempt.status));
         if lifecycle_of(item) == Lifecycle::Active
             && (live || !(is_legacy_claim(item) || is_verified(item)))
+            && !is_dormant(item, as_of)
         {
             open_keys.insert(item.key.clone());
         }
@@ -359,7 +405,7 @@ pub fn build(
 
     let mut out: Vec<SituationItem> = Vec::with_capacity(items.len());
     for item in items {
-        let (derived_state, blocked_by) = derive_state(item, &open_keys);
+        let (derived_state, blocked_by) = derive_state(item, &open_keys, as_of);
         let claim = derived_state == DerivedState::ClaimOnly;
         let latest = item.attempts.first();
         let updated_at = latest.map(|attempt| attempt.updated_at.clone());
@@ -411,6 +457,7 @@ pub fn build(
                 summary.cancelled += 1;
                 continue;
             }
+            DerivedState::Dormant => continue,
             DerivedState::Satisfied => summary.verified_satisfied += 1,
             DerivedState::ClaimOnly => summary.claim_only += 1,
             DerivedState::Blocked => {
@@ -480,6 +527,7 @@ pub fn roadmap_status(item: &SituationItem) -> &'static str {
         DerivedState::Satisfied | DerivedState::ClaimOnly => "accepted",
         DerivedState::Executing => "running",
         DerivedState::Cancelled => "cancelled",
+        DerivedState::Dormant => "dormant",
         _ => {
             if item.status.as_deref() == Some("proposed") {
                 return "proposed";
@@ -500,7 +548,10 @@ pub fn roadmap_status(item: &SituationItem) -> &'static str {
 /// Which items the public checklist shows. Mission-only rows appear only
 /// while they have a live attempt; cancelled rows never appear.
 pub fn belongs_on_roadmap(item: &SituationItem) -> bool {
-    if item.derived_state == DerivedState::Cancelled {
+    if matches!(
+        item.derived_state,
+        DerivedState::Cancelled | DerivedState::Dormant
+    ) {
         return false;
     }
     if item.derived_state == DerivedState::Executing {
@@ -707,5 +758,56 @@ mod tests {
     fn humanize_keeps_short_codes_upper() {
         assert_eq!(humanize_key("ux1-pr229-cert"), "UX1 PR229 Cert");
         assert_eq!(humanize_key("repair-pr-233"), "Repair PR 233");
+    }
+
+    #[test]
+    fn absorbed_rows_go_dormant_a_week_after_their_last_attempt() {
+        let mut old = item("wave-4-pr153-certification", None, false);
+        old.origin = Some("absorbed".into());
+        old.attempts.push(attempt("failed", "2026-08-01T10:00:00Z"));
+        let mut fresh = item("pr-243-postmerge-certification", None, false);
+        fresh.origin = Some("absorbed".into());
+        fresh
+            .attempts
+            .push(attempt("failed", "2026-09-06T10:00:00Z"));
+        let mut declared = item("ux2", None, true);
+        declared
+            .attempts
+            .push(attempt("failed", "2026-08-01T10:00:00Z"));
+        let situation = build(
+            "p",
+            &[old, fresh, declared],
+            &SourceStatus::default(),
+            "2026-09-07T10:00:00Z",
+        );
+        let by_key = |key: &str| {
+            situation
+                .items
+                .iter()
+                .find(|i| i.key == key)
+                .expect(key)
+                .derived_state
+        };
+        assert_eq!(by_key("wave-4-pr153-certification"), DerivedState::Dormant);
+        assert_eq!(
+            by_key("pr-243-postmerge-certification"),
+            DerivedState::Ready
+        );
+        assert_eq!(
+            by_key("ux2"),
+            DerivedState::Ready,
+            "declared rows never go dormant"
+        );
+        let dormant = situation
+            .items
+            .iter()
+            .find(|i| i.key == "wave-4-pr153-certification")
+            .unwrap();
+        assert!(!dormant.open);
+        assert!(!belongs_on_roadmap(dormant));
+        assert_eq!(roadmap_status(dormant), "dormant");
+        // The counters only ever counted declared rows; unchanged.
+        assert_eq!(situation.summary.total, 1);
+        assert_eq!(situation.summary.open, 1);
     }
 }
