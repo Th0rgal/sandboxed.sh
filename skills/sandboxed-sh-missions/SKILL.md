@@ -779,3 +779,8 @@ are retained. Do not clear goals, queues, or ownership to release this stop.
 Do not infer a native stop from silence, elapsed observation time, or a live
 build with no recent output. Finished-turn automations do not retry a native
 stop; accepted external steering can run through normal ownership admission.
+
+Native goal non-completion is authoritative for board settlement: live settlement
+and restart recovery record a blocked outcome even when final prose looks complete
+or is absent. Dependent tasks remain gated; the board does not automatically retry
+these stops. Native completion still requires the usual delivery evidence.

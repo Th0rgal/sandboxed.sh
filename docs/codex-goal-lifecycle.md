@@ -65,3 +65,15 @@ seam avoids credentials and workspace provisioning; no live model is invoked.
 The fixture emits blocked evidence and final text in controlled orders,
 accepts two queued steers, and verifies same-objective default recovery and
 retained ownership. All databases/files in those tests are temporary.
+
+Native goal non-completion is authoritative for board settlement: live settlement
+and restart recovery record a blocked outcome even when final prose looks complete
+or is absent. Dependent tasks remain gated; the board does not automatically retry
+these stops. Native completion still requires the usual delivery evidence.
+
+Board regressions exercise the production live settlement hook and restart
+scheduler with an in-memory mission store, asserting saved outcomes, retained
+worker/digest, no automatic retry, dependent readiness and duplicate-notification
+handling. The matrix supplies the driver boundary reason and native status
+evidence; it is not another end-to-end app-server/board integration test. Existing
+translator and consumer tests cover the native-status-to-reason mapping.
