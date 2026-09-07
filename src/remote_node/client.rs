@@ -223,6 +223,7 @@ mod tests {
                 active_jobs: 0,
                 queued_jobs: 0,
                 cached_toolchains: vec![],
+                source_bundle_capacity: Some(crate::node::lean::source_bundle_capacity()),
                 lean_runtime_ready: Some(true),
             })
         }
@@ -242,6 +243,10 @@ mod tests {
         };
         let heartbeat = client.heartbeat(&node, "unused").await.unwrap();
         assert_eq!(heartbeat.capacity_available, 1);
+        assert_eq!(
+            heartbeat.source_bundle_capacity,
+            Some(crate::node::lean::source_bundle_capacity())
+        );
         assert_eq!(heartbeat.labels, vec!["lean".to_string()]);
         assert_eq!(heartbeat.lean_runtime_ready, Some(true));
     }

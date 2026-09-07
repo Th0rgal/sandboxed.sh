@@ -50,9 +50,11 @@ const DEFAULT_ESTIMATED_DISK_GB: u64 = 12;
 const MAX_ESTIMATED_DISK_GB: u64 = 512;
 const DEFAULT_NODE_MIN_DISK_GB: u64 = 20;
 const DEFAULT_NODE_DISK_EMERGENCY_GB: u64 = 10;
-const MAX_REMOTE_BUILD_JSON_BYTES: u64 = 32 * 1024 * 1024;
+// Independent of the 50 MiB wire ceiling: gzip can expand beyond its body size.
+// 32 MiB of complete source needs ~43 MiB after base64, plus metadata.
+const MAX_REMOTE_BUILD_JSON_BYTES: u64 = 64 * 1024 * 1024;
 
-fn parse_remote_build_request(
+pub(crate) fn parse_remote_build_request(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<RemoteBuildRequest, (StatusCode, String)> {
@@ -619,6 +621,7 @@ async fn resolve_node(
     requirements: &[String],
     min_disk_bytes: u64,
     min_protocol_version: u32,
+    source: Option<crate::remote_node::protocol::SourceBundleRequirement>,
 ) -> Result<RemoteNodeConfig, (StatusCode, String)> {
     let settings = &state.config.remote_nodes;
     if !settings.enabled || settings.nodes.is_empty() {
@@ -633,11 +636,12 @@ async fn resolve_node(
             .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?;
         let first = state
             .fleet
-            .place_auto_with_protocol_and_resource_reservations(
+            .place_auto_with_source_and_resource_reservations(
                 settings,
                 requirements,
                 min_disk_bytes,
                 min_protocol_version,
+                source,
                 &reservations.jobs,
                 &reservations.disk_bytes,
             );
@@ -674,11 +678,12 @@ async fn resolve_node(
                     .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?;
                 state
                     .fleet
-                    .place_auto_with_protocol_and_resource_reservations(
+                    .place_auto_with_source_and_resource_reservations(
                         settings,
                         requirements,
                         min_disk_bytes,
                         min_protocol_version,
+                        source,
                         &reservations.jobs,
                         &reservations.disk_bytes,
                     )
@@ -714,6 +719,7 @@ async fn resolve_node(
             ),
         ));
     }
+    check_node_source_capacity(&heartbeat, source)?;
     let reserved = reservations.disk_bytes.get(&node.id).copied().unwrap_or(0);
     let effective = heartbeat.disk_available_bytes.saturating_sub(reserved);
     if effective < min_disk_bytes {
@@ -729,6 +735,52 @@ async fn resolve_node(
         ));
     }
     Ok(node)
+}
+
+fn check_node_source_capacity(
+    heartbeat: &crate::remote_node::protocol::NodeHeartbeat,
+    source: Option<crate::remote_node::protocol::SourceBundleRequirement>,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(source) = source {
+        source.check(heartbeat).map_err(|reason| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("remote node '{}': {reason}", heartbeat.node_id),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The node receives compact JSON, not the gzip body accepted by core.
+/// Count the exact final envelope (including lease, metadata and JSON escaping)
+/// without allocating another payload-sized buffer. Byte capacity alone cannot
+/// guarantee transportability when an operator raises the decoded-source limit.
+fn check_node_submission_size(request: &SubmitJobRequest) -> Result<(), (StatusCode, String)> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, request)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let limit = crate::remote_node::protocol::MAX_SOURCE_REQUEST_BODY_BYTES;
+    if counter.0 > limit {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "remote job requires {} bytes of node JSON; transport capacity is {limit} bytes",
+                counter.0,
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn submit_error_status(err: &RemoteNodeError) -> StatusCode {
@@ -1211,6 +1263,15 @@ async fn submit_remote_build(
         )
             .into_response();
     }
+    let source = match req
+        .source_bundle
+        .as_ref()
+        .map(crate::remote_node::protocol::SourceBundleRequirement::from_bundle)
+        .transpose()
+    {
+        Ok(source) => source,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
     let min_disk_bytes = required_node_disk_bytes(req.estimated_disk_bytes);
     let min_protocol_version = if req.source_archive.is_some() {
         crate::remote_node::protocol::NODE_PROTOCOL_VERSION
@@ -1255,6 +1316,7 @@ async fn submit_remote_build(
         &requirements,
         min_disk_bytes,
         min_protocol_version,
+        source,
     )
     .await
     {
@@ -1305,6 +1367,11 @@ async fn submit_remote_build(
         },
     };
 
+    // Fail before recording a tentative job or issuing any submission. Every
+    // receiver uses this same HTTP limit, regardless of its source override.
+    if let Err((status, message)) = check_node_submission_size(&submit) {
+        return (status, message).into_response();
+    }
     let client = RemoteNodeClient::default();
     let started_at = chrono::Utc::now();
     if let Err(error) = crate::remote_node::job_ledger::record(
@@ -2114,6 +2181,495 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         let oversized = vec![b' '; MAX_REMOTE_BUILD_JSON_BYTES as usize + 1];
         let error = parse_remote_build_request(&HeaderMap::new(), &oversized).unwrap_err();
         assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    fn validate_parsed_source(request: RemoteBuildRequest) -> Result<(), String> {
+        crate::node::lean::validate_lean_build(
+            &JobSource {
+                repo: request.repo,
+                commit: request.commit,
+                base_tree_sha: request.base_tree_sha,
+                archive: request.source_archive.map(Box::new),
+                bundle: request.source_bundle,
+            },
+            request.cwd_rel.as_deref(),
+            &request.command,
+            &HashMap::new(),
+            &[],
+        )
+    }
+
+    #[tokio::test]
+    async fn complete_32_mib_wrapper_crosses_api_decoder_and_receiver_with_strict_identity() {
+        use crate::remote_node::protocol::MAX_SOURCE_REQUEST_BODY_BYTES;
+        use base64::Engine;
+
+        let output = std::process::Command::new("python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/test_remote_lean_build_source.py"
+            ))
+            .arg("--emit-large-fixture")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let parsed = parse_remote_build_request(&headers, &output.stdout).unwrap();
+        let bundle = parsed.source_bundle.as_ref().unwrap();
+        let total: usize = bundle
+            .files
+            .iter()
+            .map(|f| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(&f.data_base64)
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        assert_eq!(total, 32 << 20);
+        let requirement =
+            crate::remote_node::protocol::SourceBundleRequirement::from_bundle(bundle).unwrap();
+        assert_eq!(requirement.bytes, total as u64);
+
+        assert!(bundle.files.iter().any(|f| f.path.ends_with("receipt.bin")));
+        assert!(bundle.files.iter().any(|f| f.executable == Some(true)));
+
+        // Use the same Bytes extractor and body ceiling as core ingress, and
+        // the actual gzip decoder and receiver validation. No dispatch/build.
+        async fn ingress(
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> Result<StatusCode, (StatusCode, String)> {
+            validate_parsed_source(parse_remote_build_request(&headers, &body)?)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            Ok(StatusCode::OK)
+        }
+        async fn node_ingress(
+            Json(job): Json<SubmitJobRequest>,
+        ) -> Result<StatusCode, (StatusCode, String)> {
+            let JobPayload::LeanBuild {
+                source,
+                cwd_rel,
+                command,
+                env,
+                ..
+            } = job.payload
+            else {
+                panic!("expected lean build");
+            };
+            crate::node::lean::validate_lean_build(
+                &source,
+                cwd_rel.as_deref(),
+                &command,
+                &env,
+                &[],
+            )
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            Ok(StatusCode::OK)
+        }
+        use crate::remote_node::protocol::NodeHeartbeat;
+        let old: NodeHeartbeat = serde_json::from_value(serde_json::json!({
+            "node_id":"a-old", "online":true, "capacity_total":1,
+            "capacity_available":1, "active_leases":0, "version":"old", "protocol_version":4,
+            "labels":["lean"], "disk_available_bytes": 1000 * GIB,
+            "mem_available_bytes": 1000 * GIB,
+        }))
+        .unwrap();
+        let mut capable = old.clone();
+        capable.node_id = "z-capable".into();
+        capable.source_bundle_capacity = Some(crate::node::lean::source_bundle_capacity());
+        let old_posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let old_posts_route = old_posts.clone();
+        let app = Router::new()
+            .route("/", post(ingress))
+            .route("/jobs", post(node_ingress))
+            .route(
+                "/heartbeat",
+                axum::routing::get(move || async move { Json(capable) }),
+            )
+            .route(
+                "/old/heartbeat",
+                axum::routing::get(move || async move { Json(old) }),
+            )
+            .route(
+                "/old/jobs",
+                post(move || async move {
+                    old_posts_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    StatusCode::UNPROCESSABLE_ENTITY
+                }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(
+                MAX_SOURCE_REQUEST_BODY_BYTES,
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}/");
+        let old_node = RemoteNodeConfig {
+            id: "a-old".into(),
+            base_url: format!("http://{address}/old"),
+            token_env: "UNUSED_TEST_TOKEN".into(),
+            labels: None,
+        };
+        let capable_node = RemoteNodeConfig {
+            id: "z-capable".into(),
+            base_url: format!("http://{address}"),
+            token_env: "UNUSED_TEST_TOKEN".into(),
+            labels: None,
+        };
+        let fleet = crate::remote_node::FleetMonitor::new();
+        let node_client = RemoteNodeClient::default();
+        for node in [&old_node, &capable_node] {
+            let hb = node_client.heartbeat(node, "test").await.unwrap();
+            fleet.record_heartbeat(&node.id, hb);
+        }
+        let mut settings = crate::remote_node::RemoteNodeSettings {
+            enabled: true,
+            nodes: vec![old_node.clone()],
+        };
+        let pick = |settings: &crate::remote_node::RemoteNodeSettings| {
+            fleet.place_auto_with_source_and_resource_reservations(
+                settings,
+                &["lean".into()],
+                GIB,
+                minimum_node_protocol_version(Some(bundle)),
+                Some(requirement),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+        };
+        assert!(pick(&settings).is_err()); // no dispatch when fleet capacity is insufficient
+        let old_hb = fleet.get(&old_node.id).unwrap().last_heartbeat.unwrap();
+        assert_eq!(
+            check_node_source_capacity(&old_hb, Some(requirement))
+                .unwrap_err()
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        ); // explicit node has the same pre-dispatch gate
+        settings.nodes.push(capable_node.clone());
+        assert_eq!(pick(&settings).unwrap(), capable_node.id);
+        let selected_url = settings
+            .node(&pick(&settings).unwrap())
+            .unwrap()
+            .base_url
+            .clone();
+
+        let response = client
+            .post(&url)
+            .header("Content-Encoding", "gzip")
+            .body(output.stdout.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            response.text().await.unwrap()
+        );
+        let response = client
+            .post(&url)
+            .body(vec![b' '; MAX_SOURCE_REQUEST_BODY_BYTES + 1])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // The node client sends plain JSON. Its unchanged 50 MiB body ceiling
+        // includes the real SubmitJobRequest envelope, not just the bundle.
+        let job = SubmitJobRequest {
+            job_id: Uuid::new_v4(),
+            mission_id: parsed.mission_id,
+            lease_token: "test-lease".to_string(),
+            payload: JobPayload::LeanBuild {
+                source: Box::new(JobSource {
+                    repo: parsed.repo,
+                    commit: parsed.commit,
+                    base_tree_sha: parsed.base_tree_sha,
+                    archive: None,
+                    bundle: parsed.source_bundle,
+                }),
+                cwd_rel: None,
+                command: vec!["lake".to_string(), "build".to_string()],
+                timeout_secs: None,
+                estimated_disk_bytes: None,
+                cache_key: None,
+                artifacts: vec![],
+                env: HashMap::new(),
+            },
+        };
+        check_node_submission_size(&job).unwrap();
+        let json = serde_json::to_vec(&job).unwrap();
+        assert!(json.len() > 32 << 20);
+        assert!(json.len() < MAX_SOURCE_REQUEST_BODY_BYTES);
+        let roundtrip: SubmitJobRequest = serde_json::from_slice(&json).unwrap();
+        assert_eq!(roundtrip, job);
+        drop(json);
+        drop(roundtrip);
+        let response = client
+            .post(format!("{selected_url}/jobs"))
+            .json(&job)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            response.text().await.unwrap()
+        );
+        let response = client
+            .post(format!("{selected_url}/jobs"))
+            .header("Content-Type", "application/json")
+            .body(vec![b' '; MAX_SOURCE_REQUEST_BODY_BYTES + 1])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(old_posts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+        drop(job);
+
+        // An explicit operator ceiling must still win over the new default.
+        // Isolate the environment in a child, avoiding process-global test races.
+        let fixture = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(fixture.path(), &output.stdout).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "api::remote_build::tests::measured_complete_fixture_crosses_api_decoder_and_receiver", "--ignored"])
+            .env("REMOTE_BUILD_MEASURED_FIXTURE", fixture.path())
+            .env("SANDBOXED_NODE_MAX_SOURCE_BUNDLE_BYTES", (16 << 20).to_string())
+            .output().unwrap();
+        assert!(!child.status.success());
+        assert!(String::from_utf8_lossy(&child.stdout).contains("maximum is 16777216"));
+
+        for (mutation, expected) in [
+            ("byte", "content hash mismatch"),
+            ("mode", "operations hash mismatch"),
+            ("manifest", "manifest hash mismatch"),
+            ("max+1", "maximum is 33554432"),
+        ] {
+            let mut request = parse_remote_build_request(&headers, &output.stdout).unwrap();
+            let bundle = request.source_bundle.as_mut().unwrap();
+            match mutation {
+                "byte" => {
+                    bundle.files[0].data_base64 =
+                        base64::engine::general_purpose::STANDARD.encode(b"tampered")
+                }
+                "mode" => bundle.files[0].executable = Some(!bundle.files[0].executable.unwrap()),
+                "manifest" => bundle.manifest_sha256 = "0".repeat(64),
+                "max+1" => {
+                    let file = bundle
+                        .files
+                        .iter_mut()
+                        .find(|f| f.path.ends_with("receipt.bin"))
+                        .unwrap();
+                    let mut data = base64::engine::general_purpose::STANDARD
+                        .decode(&file.data_base64)
+                        .unwrap();
+                    data.push(b'x');
+                    file.sha256 = hex::encode(sha2::Sha256::digest(&data));
+                    file.data_base64 = base64::engine::general_purpose::STANDARD.encode(data);
+                    bundle.manifest_sha256 = crate::node::lean::bundle_manifest_sha256_for_mode(
+                        &bundle
+                            .files
+                            .iter()
+                            .map(|f| (f.path.clone(), f.sha256.clone()))
+                            .collect::<Vec<_>>(),
+                        true,
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_parsed_source(request)
+                    .unwrap_err()
+                    .contains(expected),
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_submission_gate_counts_exact_wire_boundary_and_escaping() {
+        use crate::remote_node::protocol::MAX_SOURCE_REQUEST_BODY_BYTES;
+        let mut request = SubmitJobRequest {
+            job_id: Uuid::nil(),
+            mission_id: Uuid::nil(),
+            lease_token: String::new(),
+            payload: JobPayload::RawCommand {
+                command: "true".into(),
+                timeout_secs: None,
+                env: None,
+            },
+        };
+        let overhead = serde_json::to_vec(&request).unwrap().len();
+        request.lease_token = "x".repeat(MAX_SOURCE_REQUEST_BODY_BYTES - overhead);
+        assert_eq!(
+            serde_json::to_vec(&request).unwrap().len(),
+            MAX_SOURCE_REQUEST_BODY_BYTES
+        );
+        check_node_submission_size(&request).unwrap();
+        request.lease_token.push('x');
+        assert_eq!(
+            check_node_submission_size(&request).unwrap_err().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        request.lease_token.pop();
+        // Same string length, but a quote adds a JSON escape byte to the wire.
+        request.lease_token.pop();
+        request.lease_token.push('"');
+        assert_eq!(
+            check_node_submission_size(&request).unwrap_err().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn raised_decoded_capacity_cannot_bypass_node_json_transport_gate() {
+        use crate::remote_node::protocol::{NodeHeartbeat, SourceBundleRequirement};
+        use base64::Engine;
+        let raw = vec![b'x'; 38 << 20];
+        let file = crate::remote_node::SourceBundleFile {
+            path: "Main.lean".into(),
+            sha256: hex::encode(sha2::Sha256::digest(&raw)),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&raw),
+            executable: None,
+        };
+        drop(raw);
+        let bundle = SourceBundle {
+            manifest_sha256: crate::node::lean::bundle_manifest_sha256_for_mode(
+                &[(file.path.clone(), file.sha256.clone())],
+                true,
+            ),
+            files: vec![file],
+            complete: true,
+            deleted_paths: vec![],
+            operations_sha256: None,
+        };
+        let requirement = SourceBundleRequirement::from_bundle(&bundle).unwrap();
+        assert_eq!(requirement.bytes, 38 << 20);
+        let hb: NodeHeartbeat = serde_json::from_value(serde_json::json!({
+            "node_id":"raised", "online":true, "capacity_total":1, "capacity_available":1,
+            "active_leases":0, "version":"test", "protocol_version":4,
+            "source_bundle_capacity":{"complete_bytes": 64 << 20, "overlay_bytes":64 << 20},
+        }))
+        .unwrap();
+        check_node_source_capacity(&hb, Some(requirement)).unwrap();
+        let request = SubmitJobRequest {
+            job_id: Uuid::nil(),
+            mission_id: Uuid::nil(),
+            lease_token: "lease".into(),
+            payload: JobPayload::LeanBuild {
+                source: Box::new(JobSource {
+                    repo: "https://example.invalid/repo.git".into(),
+                    commit: "a".repeat(40),
+                    base_tree_sha: None,
+                    archive: None,
+                    bundle: Some(bundle),
+                }),
+                cwd_rel: None,
+                command: vec!["lake".into(), "build".into()],
+                timeout_secs: None,
+                estimated_disk_bytes: Some(GIB),
+                cache_key: None,
+                artifacts: vec![],
+                env: HashMap::new(),
+            },
+        };
+        let (status, reason) = check_node_submission_size(&request).unwrap_err();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(reason.contains("transport capacity is 52428800"));
+    }
+
+    #[test]
+    fn remote_build_json_boundary_and_gzip_expansion_are_bounded() {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let mut plain = serde_json::to_vec(&serde_json::json!({
+            "mission_id": Uuid::nil(), "token": "test", "repo": "https://example.invalid/repo.git",
+            "commit": "a".repeat(40), "command": ["lake", "build"],
+        }))
+        .unwrap();
+        plain.resize(MAX_REMOTE_BUILD_JSON_BYTES as usize, b' ');
+        // Whitespace makes a valid JSON request at the exact expansion cap.
+        parse_remote_build_request(&HeaderMap::new(), &plain).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        for extra in [false, true] {
+            if extra {
+                plain.push(b' ');
+            }
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(&plain).unwrap();
+            let compressed = encoder.finish().unwrap();
+            assert!(compressed.len() < 1 << 20);
+            let result = parse_remote_build_request(&headers, &compressed);
+            if extra {
+                assert_eq!(result.unwrap_err().0, StatusCode::PAYLOAD_TOO_LARGE);
+                assert_eq!(
+                    parse_remote_build_request(&HeaderMap::new(), &plain)
+                        .unwrap_err()
+                        .0,
+                    StatusCode::PAYLOAD_TOO_LARGE
+                );
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "local measured wrapper request; set REMOTE_BUILD_MEASURED_FIXTURE"]
+    fn measured_fixture_capacity_matches_receiver_and_explicit_placement() {
+        use crate::remote_node::protocol::{NodeHeartbeat, SourceBundleRequirement};
+        let bytes = std::fs::read(std::env::var("REMOTE_BUILD_MEASURED_FIXTURE").unwrap()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let request = parse_remote_build_request(&headers, &bytes).unwrap();
+        let requirement =
+            SourceBundleRequirement::from_bundle(request.source_bundle.as_ref().unwrap()).unwrap();
+        let mut hb: NodeHeartbeat = serde_json::from_value(serde_json::json!({
+            "node_id":"receiver", "online":true, "capacity_total":1,
+            "capacity_available":1, "active_leases":0, "version":"test", "protocol_version":4,
+            "source_bundle_capacity": crate::node::lean::source_bundle_capacity(),
+        }))
+        .unwrap();
+        let placement = check_node_source_capacity(&hb, Some(requirement));
+        let receiver = validate_parsed_source(request);
+        assert_eq!(placement.is_ok(), receiver.is_ok());
+        if let Err((status, reason)) = placement {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(reason.contains("receiver capacity"));
+            assert!(receiver.unwrap_err().contains("maximum is"));
+        }
+        // Exact explicit-node gate also preserves legacy compatibility.
+        hb.source_bundle_capacity = None;
+        assert_eq!(
+            check_node_source_capacity(&hb, Some(requirement)).is_ok(),
+            requirement.bytes <= 16 << 20
+        );
+        check_node_source_capacity(&hb, None).unwrap();
+        println!(
+            "decoded bytes: {}; effective capacity: {:?}",
+            requirement.bytes,
+            crate::node::lean::source_bundle_capacity()
+        );
+    }
+
+    #[test]
+    #[ignore = "local measured wrapper request; set REMOTE_BUILD_MEASURED_FIXTURE"]
+    fn measured_complete_fixture_crosses_api_decoder_and_receiver() {
+        let path = std::env::var("REMOTE_BUILD_MEASURED_FIXTURE").unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        validate_parsed_source(parse_remote_build_request(&headers, &bytes).unwrap()).unwrap();
     }
 
     #[test]

@@ -751,7 +751,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         // and manifest instead of Axum's 2 MiB default.
         .nest(
             "/api/remote-build",
-            super::remote_build::routes().layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
+            super::remote_build::routes().layer(DefaultBodyLimit::max(
+                crate::remote_node::protocol::MAX_SOURCE_REQUEST_BODY_BYTES,
+            )),
         );
 
     // File upload routes with increased body limit (10GB)

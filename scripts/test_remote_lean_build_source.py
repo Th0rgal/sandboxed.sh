@@ -105,7 +105,7 @@ printf '503'
     def run_wrapper(self, cwd=None, **env):
         self.capture.unlink(missing_ok=True)
         self.trace.unlink(missing_ok=True)
-        result = subprocess.run(["bash", str(WRAPPER), "true"], cwd=cwd or self.repo,
+        result = subprocess.run(["bash", str(WRAPPER), *getattr(self, "command", ["true"])], cwd=cwd or self.repo,
                                 env={**self.env, "GIT_TRACE": str(self.trace), **env},
                                 capture_output=True, timeout=20)
         trace = self.trace.read_text()
@@ -326,6 +326,29 @@ printf '503'
         self.request(REMOTE_BUILD_MAX_SOURCE_BUNDLE_BYTES=str(total))
         self.rejected(f"maximum is {total - 1}", REMOTE_BUILD_MAX_SOURCE_BUNDLE_BYTES=str(total - 1))
 
+    def add_large_receipt(self):
+        self.command = ["lake", "build"]
+        # Preserve every recursive source file; fill the remaining aggregate
+        # budget with a tracked binary receipt, including executable metadata.
+        bundle = self.request()["source_bundle"]
+        total = sum(len(base64.b64decode(f["data_base64"])) for f in bundle["files"])
+        receipt = self.nested / "receipt.bin"
+        receipt.write_bytes(bytes(range(256)) * ((32 << 20) // 256))
+        with receipt.open("r+b") as out:
+            out.truncate((32 << 20) - total)
+        self.git(self.nested, "add", "receipt.bin")
+        return receipt
+
+    def test_complete_default_byte_boundary_and_explicit_override(self):
+        receipt = self.add_large_receipt()
+        bundle = self.request()["source_bundle"]
+        self.assertEqual(sum(len(base64.b64decode(f["data_base64"])) for f in bundle["files"]), 32 << 20)
+        self.rejected("maximum is 16777216", REMOTE_BUILD_MAX_SOURCE_BUNDLE_BYTES=str(16 << 20))
+        with receipt.open("ab") as out:
+            out.write(b"x")
+        self.rejected("maximum is 33554432")
+        self.request(REMOTE_BUILD_MAX_SOURCE_BUNDLE_BYTES=str((32 << 20) + 1))
+
     def test_full_and_overlay_without_submodules(self):
         self.repo = self.new_repo("plain", {"Root.lean": b"root\n", "Gone.lean": b"gone\n"})
         self.git(self.repo, "remote", "add", "origin", "https://example.invalid/plain.git")
@@ -340,11 +363,16 @@ printf '503'
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["--emit-fixture"]:
+    if sys.argv[1:] in (["--emit-fixture"], ["--emit-large-fixture"]):
         fixture = SourceTransportTest()
         try:
             fixture.setUp()
-            print(json.dumps(fixture.request()))
+            if sys.argv[1:] == ["--emit-large-fixture"]:
+                fixture.add_large_receipt()
+                fixture.request()
+                sys.stdout.buffer.write(fixture.capture.read_bytes())
+            else:
+                print(json.dumps(fixture.request()))
         finally:
             fixture.doCleanups()
     else:
