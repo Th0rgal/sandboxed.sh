@@ -2463,7 +2463,7 @@ mod tests {
                         }
                         assert!(!checkout.join("B.new").exists());
                         assert!(!log.exists());
-                        assert_eq!(std::fs::read_dir(&checkout).unwrap().count(), 4);
+                        assert_eq!(std::fs::read_dir(&checkout).unwrap().count(), 3);
                         assert_eq!(
                             std::fs::read_dir(checkout.join("nested")).unwrap().count(),
                             1
