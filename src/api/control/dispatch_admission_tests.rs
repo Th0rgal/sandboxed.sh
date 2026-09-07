@@ -32,9 +32,15 @@ impl Drop for Harness {
 
 impl Harness {
     async fn new() -> Self {
+        Self::with_nodes(Vec::new()).await
+    }
+
+    async fn with_nodes(nodes: Vec<crate::remote_node::RemoteNodeConfig>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
-        let config = Config::new(path.to_path_buf());
+        let mut config = Config::new(path.to_path_buf());
+        config.remote_nodes.enabled = !nodes.is_empty();
+        config.remote_nodes.nodes = nodes;
         let root_agent: AgentRef = Arc::new(crate::agents::OpenCodeAgent::new(config.clone()));
         let mcp = Arc::new(McpRegistry::new(path).await);
         let workspaces = Arc::new(workspace::WorkspaceStore::new(path.to_path_buf()).await);
@@ -136,6 +142,7 @@ impl Harness {
             .upsert_project("lido", None, None, None, None)
             .unwrap();
         let app = axum::Router::new()
+            .nest("/remote-build", crate::api::remote_build::routes())
             .route("/message", axum::routing::post(post_message))
             .route("/missions/:id/resume", axum::routing::post(resume_mission))
             .route(
@@ -1661,6 +1668,35 @@ async fn ownership_lifetime_actual_runner_refuses_retags_until_old_queue_drains(
         let dir = install_native_fixture(&h, a.id, "after").await;
         assert!(h.request(true, a.id, json!({"content":"/goal old assignment", "continue_identity":Harness::assertion(&a)})).await.status().is_success());
         wait_native_file(&dir.join("started")).await;
+        // A supported terminal presentation edit must not retire the actual
+        // main/parallel runner or make its assignment available to sweep.
+        let (tx, rx) = oneshot::channel();
+        h.control
+            .cmd_tx
+            .send(ControlCommand::SetMissionStatus {
+                id: a.id,
+                status: MissionStatus::Failed,
+                respond: tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap();
+        crate::api::track_leases::sweep(&h.state).await.unwrap();
+        assert_eq!(
+            find_existing_pr_writer_global(&h.state.control, "repo#244", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            a.id
+        );
+        assert!(h
+            .state
+            .projects
+            .live_leases(None)
+            .unwrap()
+            .iter()
+            .any(|lease| lease.attempt_id == a.id.to_string()));
 
         let b = h
             .control
@@ -1971,4 +2007,970 @@ async fn dequeue_revalidates_track_before_starting_actual_queued_runner() {
         }
         NATIVE_FIXTURES.lock().unwrap().remove(&m.id);
     }
+}
+
+#[tokio::test]
+async fn remote_ownership_survives_terminal_presentation_sweep_and_recovery() {
+    use crate::remote_node::job_ledger::{self, JobHandle, JobHandleKind};
+    for status in [
+        MissionStatus::Active,
+        MissionStatus::Pending,
+        MissionStatus::Failed,
+        MissionStatus::Interrupted,
+        MissionStatus::Completed,
+        MissionStatus::Acknowledged,
+        MissionStatus::Blocked,
+    ] {
+        for pr in [Some("repo#244"), None] {
+            let h = Harness::new().await;
+            let m = h.writer(status, pr).await;
+            let job_id = Uuid::new_v4();
+            let stale = chrono::Utc::now() - chrono::Duration::days(7);
+            job_ledger::record(
+                &h.state.config.working_dir,
+                JobHandle {
+                    mission_id: m.id,
+                    node_id: "unconfigured-recovery-node".into(),
+                    job_id,
+                    started_at: stale,
+                    submission_sequence: 0,
+                    accepted_at: Some(stale),
+                    heartbeat_at: Some(stale),
+                    disk_reservation_bytes: 0,
+                    kind: JobHandleKind::Mission,
+                    identity: None,
+                    wait_for_completion: None,
+                    wake_on_terminal: false,
+                },
+            )
+            .await
+            .unwrap();
+            let mut attached = std::collections::HashSet::new();
+            reconcile_pending_handles(
+                &h.state,
+                &h.state.config.working_dir,
+                job_ledger::load(&h.state.config.working_dir).await.unwrap(),
+                &mut attached,
+            )
+            .await;
+            assert!(
+                attached.is_empty(),
+                "configuration loss must remain retryable"
+            );
+            assert_eq!(
+                job_ledger::load(&h.state.config.working_dir)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            crate::api::track_leases::sweep(&h.state).await.unwrap();
+            assert_eq!(h.state.projects.live_leases(None).unwrap().len(), 1);
+            assert_eq!(
+                find_existing_pr_writer_global(&h.state.control, "repo#244", None)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                m.id
+            );
+            assert!(
+                find_existing_pr_writer_global(&h.state.control, "repo#244", Some(m.id))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "same-owner exclusion survives"
+            );
+            let request = crate::api::track_leases::lease_request(
+                "lido",
+                "trio-reserve1",
+                &Uuid::new_v4().to_string(),
+                "writer",
+                None,
+            );
+            assert!(h.state.projects.acquire_track_lease(&request).is_err());
+            h.unchanged(&m).await;
+            // This test models the terminal wrapper's ledger cleanup. The
+            // fake-node lifecycle test must separately establish that only an
+            // authoritative node terminal response reaches this cleanup.
+            h.control
+                .mission_store
+                .update_mission_status(m.id, MissionStatus::Completed)
+                .await
+                .unwrap();
+            job_ledger::remove(&h.state.config.working_dir, job_id).await;
+            crate::api::track_leases::sweep(&h.state).await.unwrap();
+            assert!(
+                find_existing_pr_writer_global(&h.state.control, "repo#244", None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(h.state.projects.acquire_track_lease(&request).is_ok());
+        }
+    }
+}
+
+#[tokio::test]
+async fn remote_poll_loss_and_cancel_ack_retain_ownership_until_terminal_cleanup() {
+    use crate::remote_node::job_ledger::{self, JobHandle, JobHandleKind};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let h = Harness::new().await;
+    let owner = h.writer(MissionStatus::Active, Some("repo#244")).await;
+    let job_id = Uuid::new_v4();
+    let phase = Arc::new(AtomicUsize::new(0));
+    let failed_cancels = Arc::new(AtomicUsize::new(0));
+    let acknowledged_cancels = Arc::new(AtomicUsize::new(0));
+    let observed_phase = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .route(
+            "/jobs/:id",
+            axum::routing::get({
+                let phase = phase.clone();
+                let observed_phase = observed_phase.clone();
+                move || {
+                    let phase = phase.clone();
+                    let observed_phase = observed_phase.clone();
+                    async move {
+                        let current = phase.load(Ordering::SeqCst);
+                        if current == 0 {
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(json!({"error":"observation unavailable"})),
+                            );
+                        }
+                        observed_phase.store(current, Ordering::SeqCst);
+                        if current == 3 {
+                            return (StatusCode::NOT_FOUND, Json(json!({"error":"job record missing"})));
+                        }
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "job_id":job_id, "mission_id":owner.id,
+                                "state":match current {1 => "running", 2 => "lost", _ => "cancelled"},
+                                "created_at":chrono::Utc::now().to_rfc3339(),
+                            })),
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/jobs/:id/cancel",
+            axum::routing::post({
+                let phase = phase.clone();
+                let failed_cancels = failed_cancels.clone();
+                let acknowledged_cancels = acknowledged_cancels.clone();
+                move || {
+                    let phase = phase.clone();
+                    let failed_cancels = failed_cancels.clone();
+                    let acknowledged_cancels = acknowledged_cancels.clone();
+                    async move {
+                        if phase.load(Ordering::SeqCst) == 0 {
+                            failed_cancels.fetch_add(1, Ordering::SeqCst);
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(json!({"error":"cancel unavailable"})),
+                            );
+                        }
+                        if phase.load(Ordering::SeqCst) == 3 {
+                            return (StatusCode::NOT_FOUND, Json(json!({"error":"job record missing"})));
+                        }
+                        acknowledged_cancels.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            Json(
+                                json!({"job_id":job_id,"state":"running","cancel_requested":true}),
+                            ),
+                        )
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node = crate::remote_node::RemoteNodeConfig {
+        id: "lifetime-test-node".into(),
+        base_url: format!("http://{}", listener.local_addr().unwrap()),
+        token_env: "UNUSED_LIFETIME_TEST_TOKEN".into(),
+        labels: None,
+    };
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    // Model an already accepted remote job. From here the real HTTP client,
+    // poll loop, mission finalizer and durable terminal cleanup own lifecycle.
+    job_ledger::record(
+        &h.state.config.working_dir,
+        JobHandle {
+            mission_id: owner.id,
+            node_id: node.id.clone(),
+            job_id,
+            started_at: chrono::Utc::now(),
+            submission_sequence: 0,
+            accepted_at: Some(chrono::Utc::now()),
+            heartbeat_at: None,
+            disk_reservation_bytes: 0,
+            kind: JobHandleKind::Mission,
+            identity: None,
+            wait_for_completion: None,
+            wake_on_terminal: false,
+        },
+    )
+    .await
+    .unwrap();
+    let poller = tokio::spawn({
+        let ledger_dir = h.state.config.working_dir.clone();
+        let fleet = h.state.fleet.clone();
+        let poll_owner = RemoteMissionOwner::live(&h.control);
+        async move {
+            poll_remote_job(
+                &ledger_dir,
+                poll_owner,
+                fleet,
+                crate::remote_node::RemoteNodeClient::default(),
+                node,
+                "fixture-token".into(),
+                owner.id,
+                job_id,
+                chrono::Utc::now(),
+            )
+            .await;
+        }
+    });
+    let competitor = h
+        .control
+        .mission_store
+        .create_mission(
+            Some("Competitor"),
+            None,
+            None,
+            None,
+            None,
+            Some("test-no-execution"),
+            None,
+        )
+        .await
+        .unwrap();
+    h.control
+        .mission_store
+        .update_mission_project(
+            competitor.id,
+            crate::api::mission_store::MissionProjectPatch {
+                project: Some(Some("lido".into())),
+                track: Some(Some("competitor-track".into())),
+                github_pr: Some(Some("repo#245".into())),
+                tags: Some(vec!["pr-writer".into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    h.control
+        .mission_store
+        .update_mission_status(competitor.id, MissionStatus::Failed)
+        .await
+        .unwrap();
+    let competitor = h
+        .control
+        .mission_store
+        .get_mission(competitor.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(40), async {
+        while failed_cancels.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("five failed observations must lead to cancellation retry");
+    let failed = h
+        .control
+        .mission_store
+        .get_mission(owner.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.status, MissionStatus::Failed);
+    assert_eq!(failed.terminal_reason.as_deref(), Some("remote_node_lost"));
+
+    for next_phase in 0..=3 {
+        if next_phase > 0 {
+            phase.store(next_phase, Ordering::SeqCst);
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while acknowledged_cancels.load(Ordering::SeqCst) == 0
+                    || observed_phase.load(Ordering::SeqCst) != next_phase
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        assert!(!poller.is_finished());
+        assert_eq!(
+            job_ledger::load(&h.state.config.working_dir)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // An outage may exceed lease TTL. Check admission BEFORE sweep has
+        // had any chance to renew the old writer's claim.
+        rusqlite::Connection::open(h._dir.path().join("projects.db")).unwrap()
+            .execute("UPDATE track_leases SET lease_until='2000-01-01T00:00:00+00:00' WHERE attempt_id=?1", [owner.id.to_string()]).unwrap();
+        for pr in ["repo#244", ""] {
+            let response = h
+                .request(
+                    true,
+                    competitor.id,
+                    json!({
+                        "content":"Implement replacement work", "title":"Replacement",
+                        "github_pr":pr, "track":"trio-reserve1",
+                    }),
+                )
+                .await;
+            assert!(!response.status().is_success());
+            let error = response.text().await.unwrap();
+            assert!(
+                error.contains("held") || error.contains("track_owned"),
+                "{error}"
+            );
+            h.unchanged(&competitor).await;
+        }
+        crate::api::track_leases::sweep(&h.state).await.unwrap();
+        assert!(h
+            .state
+            .projects
+            .live_leases(None)
+            .unwrap()
+            .iter()
+            .any(|lease| lease.attempt_id == owner.id.to_string()));
+        assert_eq!(
+            find_existing_pr_writer_global(&h.state.control, "repo#244", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            owner.id
+        );
+    }
+    // Terminal proof must survive a transient ledger write/read failure and
+    // a subsequent loss of the node. No second terminal response is required.
+    let receipt_path = h
+        .state
+        .config
+        .working_dir
+        .join(".sandboxed-sh/remote-job-receipts.json");
+    std::fs::create_dir(&receipt_path).unwrap();
+    let cleanup_failed = wait_for(job_id, "remote_cleanup_failed");
+    phase.store(4, Ordering::SeqCst);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while observed_phase.load(Ordering::SeqCst) != 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), cleanup_failed)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!poller.is_finished());
+    assert_eq!(
+        job_ledger::load(&h.state.config.working_dir)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    phase.store(3, Ordering::SeqCst);
+    std::fs::remove_dir(receipt_path).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), poller)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(job_ledger::load(&h.state.config.working_dir)
+        .await
+        .unwrap()
+        .is_empty());
+    crate::api::track_leases::sweep(&h.state).await.unwrap();
+    assert!(
+        find_existing_pr_writer_global(&h.state.control, "repo#244", None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let response = h
+        .request(
+            true,
+            competitor.id,
+            json!({
+                "content":"Implement replacement work", "title":"Replacement",
+                "github_pr":"repo#244", "track":"trio-reserve1",
+            }),
+        )
+        .await;
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn execution_ownership_retains_live_and_offline_runs_until_reconciled() {
+    for kind in ["live", "sqlite", "file"] {
+        let h = Harness::new().await;
+        let base = h.state.config.working_dir.join(".sandboxed-sh/missions");
+        let store: Arc<dyn MissionStore> = match kind {
+            "live" => h.control.mission_store.clone(),
+            "sqlite" => Arc::new(
+                SqliteMissionStore::new(base.clone(), "offline")
+                    .await
+                    .unwrap(),
+            ),
+            _ => Arc::new(
+                mission_store::FileMissionStore::new(base.clone(), "offline")
+                    .await
+                    .unwrap(),
+            ),
+        };
+        let mission = store
+            .create_mission(
+                Some("offline owner"),
+                None,
+                None,
+                None,
+                None,
+                Some("test-no-execution"),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .update_mission_project(
+                mission.id,
+                crate::api::mission_store::MissionProjectPatch {
+                    project: Some(Some("lido".into())),
+                    track: Some(Some("offline-track".into())),
+                    github_pr: Some(Some("repo#991".into())),
+                    tags: Some(vec!["pr-writer".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let run = store
+            .begin_mission_run(mission.id, "test-owner", None)
+            .await
+            .unwrap();
+        h.state
+            .projects
+            .absorb_track("lido", "offline-track", None, None)
+            .unwrap();
+        let request = crate::api::track_leases::lease_request(
+            "lido",
+            "offline-track",
+            &mission.id.to_string(),
+            "writer",
+            None,
+        );
+        h.state.projects.acquire_track_lease(&request).unwrap();
+        let competitor = crate::api::track_leases::lease_request(
+            "lido",
+            "offline-track",
+            &Uuid::new_v4().to_string(),
+            "writer",
+            None,
+        );
+        for status in [
+            MissionStatus::Failed,
+            MissionStatus::Interrupted,
+            MissionStatus::Acknowledged,
+        ] {
+            let update = store.update_mission_status(mission.id, status).await;
+            if status == MissionStatus::Acknowledged {
+                assert!(update.unwrap_err().contains("cannot be acknowledged"));
+            } else {
+                update.unwrap();
+            }
+            crate::api::track_leases::sweep(&h.state).await.unwrap();
+            assert!(
+                h.state.projects.acquire_track_lease(&competitor).is_err(),
+                "{kind} {status}"
+            );
+            assert_eq!(
+                find_existing_pr_writer_global(&h.state.control, "repo#991", None)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                mission.id
+            );
+            assert!(
+                find_existing_pr_writer_global(&h.state.control, "repo#991", Some(mission.id))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        store
+            .finish_mission_run(run.run_id, run.generation, Some("confirmed-exit"))
+            .await
+            .unwrap();
+        crate::api::track_leases::sweep(&h.state).await.unwrap();
+        assert!(
+            find_existing_pr_writer_global(&h.state.control, "repo#991", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(h.state.projects.acquire_track_lease(&competitor).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn execution_ownership_corrupt_offline_store_cannot_release_overdue_claims() {
+    let h = Harness::new().await;
+    let mission = h.writer(MissionStatus::Completed, Some("repo#244")).await;
+    let base = h.state.config.working_dir.join(".sandboxed-sh/missions");
+    std::fs::create_dir_all(&base).unwrap();
+    let path = base.join("missions-unreadable.json");
+    std::fs::write(&path, b"incomplete snapshot").unwrap();
+    rusqlite::Connection::open(h._dir.path().join("projects.db"))
+        .unwrap()
+        .execute(
+            "UPDATE track_leases SET lease_until='2000-01-01T00:00:00+00:00'",
+            [],
+        )
+        .unwrap();
+    assert!(crate::api::track_leases::sweep(&h.state).await.is_err());
+    assert!(
+        find_existing_pr_writer_global(&h.state.control, "repo#244", None)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        h.state.projects.live_leases(None).unwrap()[0].attempt_id,
+        mission.id.to_string()
+    );
+    std::fs::write(path, br#"{"missions":{},"runs":{}}"#).unwrap();
+    crate::api::track_leases::sweep(&h.state).await.unwrap();
+    assert!(h.state.projects.live_leases(None).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cancellation_recovery_retains_accepted_and_tentative_jobs_on_404_and_lost() {
+    use crate::remote_node::job_ledger::{self, JobHandle, JobHandleKind};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for kind in [JobHandleKind::Mission, JobHandleKind::Tentative] {
+        let h = Harness::new().await;
+        let owner = h.writer(MissionStatus::Interrupted, Some("repo#244")).await;
+        let job_id = Uuid::new_v4();
+        let phase = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(AtomicUsize::new(usize::MAX));
+        let app = axum::Router::new()
+            .route(
+                "/jobs/:id",
+                axum::routing::get({
+                    let phase = phase.clone();
+                    let observed = observed.clone();
+                    move || {
+                        let phase = phase.clone();
+                        let observed = observed.clone();
+                        async move {
+                            let value = phase.load(Ordering::SeqCst);
+                            observed.store(value, Ordering::SeqCst);
+                            if value == 0 {
+                                return (StatusCode::NOT_FOUND, Json(json!({"error":"missing"})));
+                            }
+                            (
+                                StatusCode::OK,
+                                Json(json!({"job_id":job_id, "mission_id":owner.id,
+                            "state": if value == 1 {"lost"} else {"cancelled"},
+                            "created_at":chrono::Utc::now().to_rfc3339()})),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/jobs/:id/cancel",
+                axum::routing::post(|| async { StatusCode::NOT_FOUND }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node = crate::remote_node::RemoteNodeConfig {
+            id: "recovery-fixture".into(),
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            token_env: "UNUSED_RECOVERY_FIXTURE_TOKEN".into(),
+            labels: None,
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        job_ledger::record(
+            &h.state.config.working_dir,
+            JobHandle {
+                mission_id: owner.id,
+                node_id: node.id.clone(),
+                job_id,
+                started_at: chrono::Utc::now(),
+                submission_sequence: 0,
+                accepted_at: (kind == JobHandleKind::Mission).then(chrono::Utc::now),
+                heartbeat_at: None,
+                disk_reservation_bytes: 0,
+                kind,
+                identity: None,
+                wait_for_completion: None,
+                wake_on_terminal: false,
+            },
+        )
+        .await
+        .unwrap();
+        let observer = tokio::spawn(observe_untracked_remote_job_cancellation(
+            h.state.fleet.clone(),
+            node,
+            "fixture".into(),
+            owner.id,
+            job_id,
+            chrono::Utc::now(),
+            h.state.config.working_dir.clone(),
+        ));
+        for value in [0, 1] {
+            phase.store(value, Ordering::SeqCst);
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while observed.load(Ordering::SeqCst) != value {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!observer.is_finished());
+            assert_eq!(
+                job_ledger::load(&h.state.config.working_dir)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            crate::api::track_leases::sweep(&h.state).await.unwrap();
+            assert_eq!(h.state.projects.live_leases(None).unwrap().len(), 1);
+            assert_eq!(
+                find_existing_pr_writer_global(&h.state.control, "repo#244", None)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                owner.id
+            );
+        }
+        phase.store(2, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(10), observer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(job_ledger::load(&h.state.config.working_dir)
+            .await
+            .unwrap()
+            .is_empty());
+        crate::api::track_leases::sweep(&h.state).await.unwrap();
+        assert!(h.state.projects.live_leases(None).unwrap().is_empty());
+        assert!(
+            find_existing_pr_writer_global(&h.state.control, "repo#244", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn http_terminal_build_response_retains_cleanup_after_request_and_node_loss() {
+    // Isolate the capability signing secret from concurrently running tests.
+    const CHILD: &str = "PR889_HTTP_TERMINAL_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "api::control::dispatch_admission_tests::http_terminal_build_response_retains_cleanup_after_request_and_node_loss", "--nocapture"])
+            .env(CHILD, "1").env("SANDBOXED_INTERNAL_ACTION_SECRET", "isolated-test-only-secret")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    use crate::remote_node::job_ledger::{self, JobHandle, JobHandleKind};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node = crate::remote_node::RemoteNodeConfig {
+        id: "http-terminal-node".into(),
+        base_url: format!("http://{}", listener.local_addr().unwrap()),
+        // A nonsecret existing variable avoids process-global env mutation.
+        token_env: "PATH".into(),
+        labels: None,
+    };
+    let h = Harness::with_nodes(vec![node.clone()]).await;
+    let owner = h.writer(MissionStatus::Failed, Some("repo#244")).await;
+    let job_id = Uuid::new_v4();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().route("/jobs/:id", axum::routing::get({
+        let calls = calls.clone();
+        move || {
+            let calls = calls.clone();
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"node observation lost"})));
+                }
+                (StatusCode::OK, Json(json!({"job_id":job_id,"mission_id":owner.id,"state":"succeeded","exit_code":0,"created_at":chrono::Utc::now().to_rfc3339()})))
+            }
+        }
+    }));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    job_ledger::record(
+        &h.state.config.working_dir,
+        JobHandle {
+            mission_id: owner.id,
+            node_id: node.id.clone(),
+            job_id,
+            started_at: chrono::Utc::now(),
+            submission_sequence: 0,
+            accepted_at: Some(chrono::Utc::now()),
+            heartbeat_at: None,
+            disk_reservation_bytes: 0,
+            kind: JobHandleKind::RemoteBuild,
+            identity: None,
+            wait_for_completion: Some(false),
+            wake_on_terminal: false,
+        },
+    )
+    .await
+    .unwrap();
+    let receipts = h
+        .state
+        .config
+        .working_dir
+        .join(".sandboxed-sh/remote-job-receipts.json");
+    std::fs::create_dir(&receipts).unwrap();
+    let token = crate::api::remote_build::build_remote_build_token(owner.id).unwrap();
+    let response = h
+        .state
+        .http_client
+        .get(format!("{}/remote-build/{}", h.url, job_id))
+        .query(&[("mission_id", owner.id.to_string()), ("node_id", node.id)])
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let response: Value = response.json().await.unwrap();
+    assert_eq!(response["state"], "succeeded");
+    assert_eq!(
+        job_ledger::load(&h.state.config.working_dir)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    crate::api::track_leases::sweep(&h.state).await.unwrap();
+    assert_eq!(
+        find_existing_pr_writer_global(&h.state.control, "repo#244", None)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        owner.id
+    );
+    // The HTTP request is over and the node will never repeat terminal proof.
+    std::fs::remove_dir(receipts).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !job_ledger::load(&h.state.config.working_dir)
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "cleanup must use the retained proof"
+    );
+    crate::api::track_leases::sweep(&h.state).await.unwrap();
+    assert!(
+        find_existing_pr_writer_global(&h.state.control, "repo#244", None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(h.state.projects.live_leases(None).unwrap().is_empty());
+    server.abort();
+}
+
+#[tokio::test]
+async fn configured_recovery_polls_offline_owner_until_confirmed_cancellation() {
+    use crate::remote_node::job_ledger::{self, JobHandle, JobHandleKind};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node = crate::remote_node::RemoteNodeConfig {
+        id: "offline-recovery-node".into(),
+        base_url: format!("http://{}", listener.local_addr().unwrap()),
+        token_env: "PATH".into(),
+        labels: None,
+    };
+    let h = Harness::with_nodes(vec![node.clone()]).await;
+    let store: Arc<dyn MissionStore> = Arc::new(
+        SqliteMissionStore::new(
+            h.state.config.working_dir.join(".sandboxed-sh/missions"),
+            "offline-recovered-owner",
+        )
+        .await
+        .unwrap(),
+    );
+    let owner = store
+        .create_mission(
+            Some("offline writer"),
+            None,
+            None,
+            None,
+            None,
+            Some("test-no-execution"),
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .update_mission_project(
+            owner.id,
+            crate::api::mission_store::MissionProjectPatch {
+                project: Some(Some("lido".into())),
+                track: Some(Some("recovery-track".into())),
+                github_pr: Some(Some("repo#882".into())),
+                tags: Some(vec!["pr-writer".into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .update_mission_status(owner.id, MissionStatus::Interrupted)
+        .await
+        .unwrap();
+    h.state
+        .projects
+        .absorb_track("lido", "recovery-track", None, None)
+        .unwrap();
+    h.state
+        .projects
+        .acquire_track_lease(&crate::api::track_leases::lease_request(
+            "lido",
+            "recovery-track",
+            &owner.id.to_string(),
+            "writer",
+            None,
+        ))
+        .unwrap();
+    let job_id = Uuid::new_v4();
+    let terminal = Arc::new(AtomicBool::new(false));
+    let cancels = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .route("/jobs/:id", axum::routing::get({
+            let terminal = terminal.clone();
+            move || { let terminal = terminal.clone(); async move {
+                Json(json!({"job_id":job_id,"mission_id":owner.id,"state":if terminal.load(Ordering::SeqCst) {"cancelled"} else {"running"},"created_at":chrono::Utc::now().to_rfc3339()}))
+            }}
+        }))
+        .route("/jobs/:id/cancel", axum::routing::post({
+            let cancels = cancels.clone();
+            move || { let cancels = cancels.clone(); async move {
+                cancels.fetch_add(1, Ordering::SeqCst);
+                Json(json!({"job_id":job_id,"state":"running","cancel_requested":true}))
+            }}
+        }));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    job_ledger::record(
+        &h.state.config.working_dir,
+        JobHandle {
+            mission_id: owner.id,
+            node_id: node.id,
+            job_id,
+            started_at: chrono::Utc::now(),
+            submission_sequence: 0,
+            accepted_at: Some(chrono::Utc::now()),
+            heartbeat_at: None,
+            disk_reservation_bytes: 0,
+            kind: JobHandleKind::Mission,
+            identity: None,
+            wait_for_completion: None,
+            wake_on_terminal: false,
+        },
+    )
+    .await
+    .unwrap();
+    let mut attached = HashSet::new();
+    reconcile_pending_handles(
+        &h.state,
+        &h.state.config.working_dir,
+        job_ledger::load(&h.state.config.working_dir).await.unwrap(),
+        &mut attached,
+    )
+    .await;
+    assert_eq!(attached, HashSet::from([job_id]));
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while cancels.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    crate::api::track_leases::sweep(&h.state).await.unwrap();
+    assert_eq!(
+        find_existing_pr_writer_global(&h.state.control, "repo#882", None)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        owner.id
+    );
+    assert_eq!(h.state.projects.live_leases(None).unwrap().len(), 1);
+    terminal.store(true, Ordering::SeqCst);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !job_ledger::load(&h.state.config.working_dir)
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        store.get_mission(owner.id).await.unwrap().unwrap().status,
+        MissionStatus::Interrupted
+    );
+    crate::api::track_leases::sweep(&h.state).await.unwrap();
+    assert!(h.state.projects.live_leases(None).unwrap().is_empty());
+    assert!(
+        find_existing_pr_writer_global(&h.state.control, "repo#882", None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    server.abort();
 }

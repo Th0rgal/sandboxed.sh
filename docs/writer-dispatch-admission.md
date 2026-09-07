@@ -24,6 +24,30 @@ timeout keeps the runner registered until its aborted task actually finishes. Pr
 cannot transfer claims across that boundary. Same-assignment continuation may
 still queue normally. Title-only edits do not change the assignment.
 
+Ownership is independent of presentation status. Sweep and global PR arbitration
+read accepted/tentative remote handles, durable nonterminal runs, pending targeted
+queues and actor-owned work across live sessions, offline SQLite and legacy file
+stores. A `Failed`, `Interrupted` or acknowledged-looking row does not retire an
+unresolved execution. Store or ledger read failures keep the claims fenced.
+Native `Blocked/native_goal_stopped` retains its existing ownership semantics.
+
+Lease timestamps request renewal/reconciliation; they do not transfer ownership.
+An overdue writer claim still excludes competing acquisition, reader promotion
+and queued revalidation until reconciliation or an explicit rollback releases it.
+Same-owner dispatch-key replay continues to use the unreleased claim.
+
+Remote polling can present `Failed/remote_node_lost` after repeated observation
+failure while still holding both claims and retrying cancellation. A cancellation
+acknowledgment, a missing job record (404), a node-restart `lost` state or a stale
+heartbeat is not termination proof. Raw-job, remote-build and recovery observers
+retire handles only for confirmed `succeeded`, `failed` or `cancelled` execution
+responses. The ledger rejects finalization with an unconfirmed state. Received
+terminal proof is retained across transient persistence failures so cleanup can
+retry even if the node subsequently becomes unreachable. Missing node
+configuration or credentials leaves recovery pending; it does not erase the
+handle. A job that remains only `lost` or missing stays fenced pending terminal
+reconciliation. Do not delete its ledger entry to admit a replacement writer.
+
 Pending deferred objectives are retained under their original assignment;
 retags are refused instead of concatenating a new assignment into old deferred
 work. Stop and drain the old work before retagging, or create a separate mission.

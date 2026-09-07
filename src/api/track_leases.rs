@@ -12,12 +12,12 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use super::control::events::MissionStatus;
 use super::projects_store::{LeaseError, LeaseRequest, TrackLease};
 use super::routes::AppState;
 
 /// How long a lease lives without renewal. Missions run for days; the sweep
-/// renews live ones every pass, so this only has to outlast a restart.
+/// renews live ones every pass. Passing this deadline requests reconciliation;
+/// it does not itself prove that the writer stopped or permit replacement.
 pub const LEASE_TTL_SECS: u64 = 6 * 60 * 60;
 
 /// Intents that never mutate the governed artifact. A mission with one of
@@ -161,10 +161,11 @@ pub struct LeaseSweepReport {
 }
 
 /// One pass: renew leases of live missions, release those whose mission is
-/// terminal or gone, expire overdue ones nobody renewed.
+/// terminal or gone. Overdue leases require the same evidence as fresh ones.
 pub async fn sweep(state: &Arc<AppState>) -> Result<LeaseSweepReport, String> {
     let _admission = super::control::DISPATCH_ADMISSION.lock().await;
     let _file_guard = super::control::dispatch_admission::durable_lock(&state.config).await?;
+    let ownership = super::control::execution_ownership::snapshot(&state.control).await?;
     let mut report = LeaseSweepReport::default();
     let leases: Vec<TrackLease> = state.projects.live_leases(None)?;
     report.live = leases.len();
@@ -187,51 +188,23 @@ pub async fn sweep(state: &Arc<AppState>) -> Result<LeaseSweepReport, String> {
             report.expired_invalid += 1;
             continue;
         };
-        match state.control.find_mission_any_store(mission_id).await {
-            Ok(Some(mission)) => {
-                if (mission.status.is_terminal() || mission.status == MissionStatus::Acknowledged)
-                    && !super::control::native_goal_holds_ownership(
-                        mission.status,
-                        mission.terminal_reason.as_deref(),
-                    )
-                {
-                    state
-                        .projects
-                        .release_leases_for_attempt(&lease.attempt_id)?;
-                    released.insert(lease.attempt_id.clone());
-                    report.released_terminal += 1;
-                } else if state.projects.renew_lease(&lease.id, LEASE_TTL_SECS)? {
+        match ownership.holds_track(mission_id) {
+            Some(true) => {
+                if state.projects.renew_lease(&lease.id, LEASE_TTL_SECS)? {
                     report.renewed += 1;
                 }
             }
-            Ok(None) => {
+            terminal_or_missing => {
                 state
                     .projects
                     .release_leases_for_attempt(&lease.attempt_id)?;
                 released.insert(lease.attempt_id.clone());
-                report.released_missing += 1;
+                if terminal_or_missing.is_some() {
+                    report.released_terminal += 1;
+                } else {
+                    report.released_missing += 1;
+                }
             }
-            Err(error) => {
-                tracing::warn!(
-                    lease = %lease.id,
-                    mission = %lease.attempt_id,
-                    %error,
-                    "lease sweep: mission store unavailable; leaving lease"
-                );
-            }
-        }
-    }
-    for lease in state.projects.overdue_leases()? {
-        if state
-            .projects
-            .dispatch_admission(&lease.attempt_id)?
-            .is_some()
-        {
-            state.projects.renew_lease(&lease.id, LEASE_TTL_SECS)?;
-            continue;
-        }
-        if state.projects.expire_lease(&lease.id)? {
-            report.expired_overdue += 1;
         }
     }
     Ok(report)

@@ -10,6 +10,7 @@
 pub(crate) mod dispatch_admission;
 #[cfg(test)]
 pub(crate) mod dispatch_admission_tests;
+pub(crate) mod execution_ownership;
 #[cfg(test)]
 use dispatch_admission::admit_dispatch;
 pub use dispatch_admission::DispatchAdmission;
@@ -4185,6 +4186,9 @@ pub struct ControlState {
     pub progress: Arc<RwLock<ExecutionProgress>>,
     /// Running missions (for parallel execution)
     pub running_missions: Arc<RwLock<Vec<super::mission_runner::RunningMissionInfo>>>,
+    /// Published by the owning actor before it processes its next command.
+    /// Admission/sweep read this without recursively querying that actor.
+    pub(crate) assignment_owners: Arc<RwLock<HashSet<Uuid>>>,
     /// Max parallel missions allowed
     pub max_parallel: usize,
     /// Mission persistence (SQLite-backed)
@@ -9099,28 +9103,17 @@ fn find_existing_pr_writer_in_sqlite(
     Ok(None)
 }
 
-impl ControlHub {
-    /// Look a mission up across every persisted per-user store. Used by
-    /// cross-cutting sweeps (track leases) that hold a mission id but no user.
-    pub(crate) async fn find_mission_any_store(
-        &self,
-        mission_id: Uuid,
-    ) -> Result<Option<Mission>, String> {
-        let inventory = self.mission_store_inventory().await?;
-        for store in inventory.live {
-            if let Some(mission) = store.get_mission(mission_id).await? {
-                return Ok(Some(mission));
-            }
-        }
-        Ok(None)
-    }
-}
-
 async fn find_existing_pr_writer_global(
     control_hub: &ControlHub,
     github_pr: &str,
     exclude_id: Option<Uuid>,
 ) -> Result<Option<PrWriterLease>, String> {
+    if let Some(owner) = execution_ownership::snapshot(control_hub)
+        .await?
+        .unresolved_pr_writer(github_pr, exclude_id)
+    {
+        return Ok(Some(owner));
+    }
     // Cross-store admission can temporarily change or clear the stored PR.
     // Until cleanup completes, neither the old nor proposed PR is available
     // to another writer, including after a crash with a terminal status.
@@ -11696,6 +11689,7 @@ async fn dispatch_remote_job(
         let started_at = chrono::Utc::now();
         tokio::spawn(async move {
             poll_remote_job(
+                &ledger_dir,
                 poll_owner,
                 fleet,
                 client,
@@ -11706,7 +11700,6 @@ async fn dispatch_remote_job(
                 started_at,
             )
             .await;
-            crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
         });
         return Err(err);
     }
@@ -11743,6 +11736,7 @@ async fn dispatch_remote_job(
         move || {
             tokio::spawn(async move {
                 poll_remote_job(
+                    &ledger_dir,
                     poll_owner,
                     fleet,
                     client,
@@ -11753,9 +11747,6 @@ async fn dispatch_remote_job(
                     started_at,
                 )
                 .await;
-                // The poll loop only returns once the mission is finalized (or the
-                // job was cancelled/lost); the handle is no longer needed.
-                crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
             });
         },
     )
@@ -11780,10 +11771,10 @@ async fn read_dispatched_mission_after_observer_start(
         .ok_or_else(|| format!("Mission {mission_id} disappeared after remote dispatch"))
 }
 
-/// Retry cancellation for a remote job that must not outlive its failed
-/// dispatch. The tentative ledger entry survives a process restart; this
-/// in-process observer removes it only after terminal state or authoritative
-/// 404, so a transient cancel failure cannot leak node capacity.
+/// Retry cancellation without treating a missing job record or node restart
+/// as terminal proof. An accepted request may outlive the observer or the
+/// node's current job database; retain its fence until execution is confirmed
+/// terminal and durable cleanup succeeds.
 fn spawn_untracked_remote_job_cancellation(
     fleet: Arc<crate::remote_node::FleetMonitor>,
     node: crate::remote_node::RemoteNodeConfig,
@@ -11793,59 +11784,75 @@ fn spawn_untracked_remote_job_cancellation(
     started_at: chrono::DateTime<chrono::Utc>,
     ledger_dir: std::path::PathBuf,
 ) {
-    tokio::spawn(async move {
-        let client = crate::remote_node::RemoteNodeClient::default();
-        loop {
+    tokio::spawn(observe_untracked_remote_job_cancellation(
+        fleet,
+        node,
+        shared_token,
+        mission_id,
+        job_id,
+        started_at,
+        ledger_dir,
+    ));
+}
+
+async fn observe_untracked_remote_job_cancellation(
+    fleet: Arc<crate::remote_node::FleetMonitor>,
+    node: crate::remote_node::RemoteNodeConfig,
+    shared_token: String,
+    mission_id: Uuid,
+    job_id: Uuid,
+    started_at: chrono::DateTime<chrono::Utc>,
+    ledger_dir: std::path::PathBuf,
+) {
+    let client = crate::remote_node::RemoteNodeClient::default();
+    let mut terminal: Option<crate::remote_node::NodeJobStatus> = None;
+    loop {
+        if terminal.is_none() {
             if let Err(error) = client.cancel_job(&node, &shared_token, job_id).await {
-                if error.is_not_found() {
-                    crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
-                    return;
-                }
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    node_id = %node.id,
-                    job_id = %job_id,
-                    ?error,
-                    "untracked remote job cancellation failed; retrying"
-                );
+                tracing::warn!(%mission_id, %job_id, node_id = %node.id, ?error,
+                    "untracked remote job cancellation failed; retaining fence and retrying");
             }
-            match client.get_job(&node, &shared_token, job_id).await {
-                Ok(status)
-                    if matches!(
-                        status.state.as_str(),
-                        "succeeded" | "failed" | "cancelled" | "lost"
-                    ) =>
-                {
+            if let Ok(status) = client.get_job(&node, &shared_token, job_id).await {
+                if crate::remote_node::job_state_confirms_termination(&status.state) {
+                    terminal = Some(status);
+                }
+            }
+        }
+        if let Some(status) = &terminal {
+            match crate::remote_node::job_ledger::finalize_with_artifacts(
+                &ledger_dir,
+                job_id,
+                &status.state,
+                status.exit_code,
+                status.artifacts.clone(),
+            )
+            .await
+            {
+                Ok(_) => {
                     fleet.record_outcome(crate::remote_node::DispatchOutcome {
                         mission_id,
-                        node_id: node.id.clone(),
+                        node_id: node.id,
                         job_id: Some(job_id),
-                        state: status.state,
+                        state: status.state.clone(),
                         exit_code: status.exit_code,
-                        error: status.error,
+                        error: status.error.clone(),
                         started_at,
                         finished_at: Some(chrono::Utc::now()),
                     });
-                    crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
                     return;
                 }
-                Err(error) if error.is_not_found() => {
-                    crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
-                    return;
+                Err(error) => {
+                    tracing::warn!(%job_id, ?error, "remote cancellation cleanup failed; retaining terminal proof and retrying")
                 }
-                Ok(_) | Err(_) => {}
             }
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
-    });
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
 }
 
-/// Startup reconciliation for async remote jobs that were in flight when the
-/// previous process exited. For each persisted handle: if its mission is
-/// still Active in some live session's store, re-attach a poll loop (the
-/// node job is durable — jobs.db — so its result is recoverable); otherwise
-/// drop the stale handle. Handles whose node is no longer configured fail
-/// their mission explicitly rather than leaving it Active forever.
+/// Reattach observation/cancellation for persisted remote jobs after restart.
+/// Missing owners, configuration, credentials and stale observations are not
+/// terminal evidence: retain the durable ownership fence and retry recovery.
 pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
     tokio::spawn(async move {
         // Let control sessions boot before touching their stores.
@@ -12067,6 +12074,7 @@ async fn reconcile_pending_handles(
                     let ledger_dir = working_dir.to_path_buf();
                     tokio::spawn(async move {
                         poll_remote_job(
+                            &ledger_dir,
                             owner,
                             fleet,
                             crate::remote_node::RemoteNodeClient::default(),
@@ -12077,38 +12085,19 @@ async fn reconcile_pending_handles(
                             handle.started_at,
                         )
                         .await;
-                        crate::remote_node::job_ledger::remove(&ledger_dir, handle.job_id).await;
                     });
                 }
                 _ => {
-                    if !should_finalize_remote_job(Some(mission_status)) {
-                        tracing::warn!(
-                            mission_id = %handle.mission_id,
-                            job_id = %handle.job_id,
-                            node = %handle.node_id,
-                            %mission_status,
-                            "inactive remote job handle retained: cancellation node unavailable"
-                        );
-                        continue;
-                    }
                     tracing::warn!(
                         mission_id = %handle.mission_id,
+                        job_id = %handle.job_id,
                         node = %handle.node_id,
-                        "remote job's node no longer configured; failing mission"
+                        %mission_status,
+                        "remote job handle retained: recovery node config/token unavailable"
                     );
-                    let _ = owner
-                        .mission_store
-                        .update_mission_status(handle.mission_id, MissionStatus::Failed)
-                        .await;
-                    owner.send(AgentEvent::MissionStatusChanged {
-                        mission_id: handle.mission_id,
-                        status: MissionStatus::Failed,
-                        summary: Some(
-                            "remote_node_lost: node unconfigured after restart".to_string(),
-                        ),
-                    });
-                    crate::remote_node::job_ledger::remove(working_dir, handle.job_id).await;
-                    settled.insert(handle.job_id);
+                    // Neither configuration loss nor the mission's presentation
+                    // status proves that the accepted node process has stopped.
+                    // Leave this job pending so recovery retries observation.
                 }
             }
         }
@@ -12130,15 +12119,16 @@ async fn poll_recovered_remote_build(
 ) {
     let working_dir = state.config.working_dir.clone();
     let client = crate::remote_node::RemoteNodeClient::default();
+    let mut terminal: Option<crate::remote_node::NodeJobStatus> = None;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        match client.get_job(&node, &shared_token, job_id).await {
-            Ok(status)
-                if matches!(
-                    status.state.as_str(),
-                    "succeeded" | "failed" | "cancelled" | "lost"
-                ) =>
-            {
+        let observation = match &terminal {
+            Some(status) => Ok(status.clone()),
+            None => client.get_job(&node, &shared_token, job_id).await,
+        };
+        match observation {
+            Ok(status) if crate::remote_node::job_state_confirms_termination(&status.state) => {
+                terminal = Some(status.clone());
                 let terminal_state = status.state.clone();
                 let terminal_exit_code = status.exit_code;
                 let terminal_artifacts = status.artifacts.clone();
@@ -12200,6 +12190,7 @@ async fn poll_recovered_remote_build(
 /// the same path as the synchronous dispatch.
 #[allow(clippy::too_many_arguments)]
 async fn poll_remote_job(
+    ledger_dir: &std::path::Path,
     owner: RemoteMissionOwner,
     fleet: Arc<crate::remote_node::FleetMonitor>,
     client: crate::remote_node::RemoteNodeClient,
@@ -12225,6 +12216,9 @@ async fn poll_remote_job(
     };
     let mut last_state = "queued".to_string();
     let mut failures = 0u32;
+    // Once received, terminal proof survives a subsequent observation outage
+    // while mission/ledger persistence is retried.
+    let mut terminal_observation: Option<crate::remote_node::NodeJobStatus> = None;
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
 
@@ -12256,7 +12250,11 @@ async fn poll_remote_job(
             }
         }
 
-        match client.get_job(&node, &shared_token, job_id).await {
+        let observation = match &terminal_observation {
+            Some(status) => Ok(status.clone()),
+            None => client.get_job(&node, &shared_token, job_id).await,
+        };
+        match observation {
             Err(err) => {
                 failures += 1;
                 if failures >= MAX_CONSECUTIVE_FAILURES {
@@ -12287,22 +12285,25 @@ async fn poll_remote_job(
                         "remote_node_lost",
                     )
                     .await;
-                    fleet.record_outcome(outcome("lost", None, Some(err.to_string()), true));
+                    fleet.record_outcome(outcome(
+                        "unreachable",
+                        None,
+                        Some(err.to_string()),
+                        false,
+                    ));
                     // Finalization moves the mission out of Active. Keep the
                     // durable handle and continue: the next iteration enters
-                    // the cancellation-aware path, and wrappers only remove
-                    // the ledger entry after a terminal node response.
+                    // the cancellation-aware path. This loop retires the ledger
+                    // entry only after confirmed termination and durable cleanup.
                     failures = 0;
                     continue;
                 }
             }
             Ok(status) => {
                 failures = 0;
-                let terminal = matches!(
-                    status.state.as_str(),
-                    "succeeded" | "failed" | "cancelled" | "lost"
-                );
+                let terminal = crate::remote_node::job_state_confirms_termination(&status.state);
                 if terminal {
+                    terminal_observation = Some(status.clone());
                     let success = status.state == "succeeded";
                     let content = format!(
                         "Remote node '{}' job {} finished with state '{}' (exit {:?}){}\n\nlog tail:\n{}",
@@ -12318,7 +12319,7 @@ async fn poll_remote_job(
                         status.log_tail.as_deref().unwrap_or("(empty)"),
                     );
                     if should_finalize_remote_job(inactive_status) {
-                        let _ = finalize_remote_mission(
+                        if let Err(error) = finalize_remote_mission(
                             &owner,
                             mission_id,
                             &node.id,
@@ -12326,7 +12327,12 @@ async fn poll_remote_job(
                             content,
                             "remote_node_job",
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::warn!(%mission_id, %job_id, %error,
+                                "remote terminal mission persistence failed; retaining ownership and retrying");
+                            continue;
+                        }
                     } else {
                         tracing::info!(
                             mission_id = %mission_id,
@@ -12335,6 +12341,21 @@ async fn poll_remote_job(
                             state = %status.state,
                             "remote job reached a terminal state after operator interruption; preserving mission status"
                         );
+                    }
+                    if let Err(error) = crate::remote_node::job_ledger::finalize_with_artifacts(
+                        ledger_dir,
+                        job_id,
+                        &status.state,
+                        status.exit_code,
+                        status.artifacts.clone(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(%mission_id, %job_id, %error,
+                            "remote terminal cleanup failed; retaining ownership and retrying");
+                        #[cfg(test)]
+                        dispatch_admission_tests::notify_wait(job_id, "remote_cleanup_failed");
+                        continue;
                     }
                     fleet.record_outcome(outcome(
                         &status.state,
@@ -16253,6 +16274,7 @@ fn spawn_control_session(
         current_tree: Arc::clone(&current_tree),
         progress: Arc::clone(&progress),
         running_missions: Arc::clone(&running_missions),
+        assignment_owners: Arc::new(RwLock::new(HashSet::new())),
         max_parallel,
         mission_store: Arc::clone(&mission_store),
         mission_search_cache,
@@ -16321,6 +16343,7 @@ fn spawn_control_session(
         secrets,
         user_id,
         Arc::clone(&background_tasks),
+        Arc::clone(&state.assignment_owners),
     ));
 
     // Recover missions stopped by the previous backend process. Graceful
@@ -18508,6 +18531,7 @@ async fn control_actor_loop(
     // Shared registry of in-flight Claude Code background shell tasks. Written
     // here from the `ToolResult` event arm; read by the auto-resume watcher.
     background_tasks: super::mission_runner::BackgroundTaskRegistry,
+    assignment_owners: Arc<RwLock<HashSet<Uuid>>>,
 ) {
     // A process-local actor cannot reattach a harness JoinHandle after restart.
     // Close any inherited execution lease before accepting new work; durable
@@ -19006,6 +19030,35 @@ async fn control_actor_loop(
     }
 
     loop {
+        let mut owners = HashSet::new();
+        if running.is_some() {
+            owners.extend(running_mission_id);
+        }
+        let current_id = *current_mission.read().await;
+        owners.extend(
+            queue
+                .iter()
+                .filter_map(|entry| entry.3.or(running_mission_id).or(current_id)),
+        );
+        owners.extend(
+            parallel_runners
+                .iter()
+                .filter(|(_, runner)| {
+                    runner.is_running()
+                        || !runner.queue.is_empty()
+                        || runner.inflight_message().is_some()
+                })
+                .map(|(id, _)| *id),
+        );
+        owners.extend(
+            background_tasks
+                .read()
+                .await
+                .iter()
+                .filter(|(_, tasks)| !tasks.is_empty())
+                .map(|(id, _)| *id),
+        );
+        *assignment_owners.write().await = owners;
         // Persist the pending queue whenever it changes so a restart doesn't
         // lose queued messages. Debounced by snapshot comparison — the DB is
         // written only when the queue actually changed (no per-iteration churn
