@@ -188,12 +188,14 @@ fn decode_source_archive(source: &JobSource, archive: &SourceArchive) -> Result<
     Ok(bytes)
 }
 
+// Bundle paths are literal manifest identities: never normalize aliases before
+// writing. Validate every entry and deletion before any filesystem mutation.
 fn bundle_path_is_safe(path: &str) -> bool {
     rel_path_is_safe(path)
         && !path.is_empty()
         && !path
             .split('/')
-            .any(|component| matches!(component, ".git" | ".lake"))
+            .any(|component| matches!(component, "." | ".git" | ".lake"))
 }
 
 pub(crate) fn bundle_manifest_sha256_for_mode(
@@ -2346,6 +2348,187 @@ mod tests {
         )
         .unwrap_err()
         .contains("unsafe source bundle path"));
+    }
+
+    // Re-sign every crafted request so rejection proves path validation, not
+    // stale content/manifest/operation hashes. Exercise the actual API decoder.
+    fn decode_path_fixture(mut bundle: SourceBundle, gzip: bool) -> JobSource {
+        use std::io::Write;
+        bundle.files.sort_by(|a, b| a.path.cmp(&b.path));
+        bundle.deleted_paths.sort();
+        bundle.manifest_sha256 = bundle_manifest_sha256_for_mode(
+            &bundle
+                .files
+                .iter()
+                .map(|f| (f.path.clone(), f.sha256.clone()))
+                .collect::<Vec<_>>(),
+            bundle.complete,
+        );
+        bundle.operations_sha256 = Some(bundle_operations_sha256(&bundle));
+        let mut body = serde_json::to_vec(&serde_json::json!({
+            "mission_id": uuid::Uuid::new_v4(),
+            "token": "fixture-capability",
+            "repo": "https://example.invalid/no-fetch.git",
+            "commit": "a".repeat(40),
+            "base_tree_sha": "b".repeat(40),
+            "command": ["lake", "build"],
+            "source_bundle": bundle,
+        }))
+        .unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        if gzip {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&body).unwrap();
+            body = encoder.finish().unwrap();
+            headers.insert(
+                axum::http::header::CONTENT_ENCODING,
+                "gzip".parse().unwrap(),
+            );
+        }
+        let request =
+            crate::api::remote_build::parse_remote_build_request(&headers, &body).unwrap();
+        JobSource {
+            repo: request.repo,
+            commit: request.commit,
+            base_tree_sha: request.base_tree_sha,
+            archive: None,
+            bundle: request.source_bundle,
+        }
+    }
+
+    #[tokio::test]
+    async fn source_bundle_path_aliases_fail_before_any_mutation() {
+        for complete in [false, true] {
+            for gzip in [false, true] {
+                for alias in [
+                    "./Root.lean",
+                    "nested/./Root.lean",
+                    "nested//Root.lean",
+                    "nested/Root.lean/.",
+                    "nested/Root.lean/",
+                    ".",
+                    "nested/../Root.lean",
+                    "/Root.lean",
+                    ".git/config",
+                    ".lake/build/Root.lean",
+                ] {
+                    // Cover aliases in entries, deletions, and between an entry
+                    // and a deletion, as well as the original two-file overwrite.
+                    for deletion in [false, true] {
+                        let temp = tempfile::tempdir().unwrap();
+                        let checkout = temp.path().join("checkout");
+                        std::fs::create_dir_all(checkout.join("nested")).unwrap();
+                        for path in ["A.keep", "Root.lean", "nested/Root.lean"] {
+                            std::fs::write(checkout.join(path), b"original\0bytes").unwrap();
+                        }
+                        let log = temp.path().join("job.log");
+                        let mut bundle = source_bundle("Root.lean", b"second\n");
+                        bundle.complete = complete;
+                        bundle.files[0].executable = Some(true);
+                        bundle.files.push(
+                            source_bundle("B.new", b"must not be created")
+                                .files
+                                .remove(0),
+                        );
+                        bundle.deleted_paths = vec!["A.keep".into()];
+                        if deletion {
+                            bundle.deleted_paths.push(alias.into());
+                        } else {
+                            bundle
+                                .files
+                                .push(source_bundle(alias, b"first\n").files.remove(0));
+                        }
+                        let source = decode_path_fixture(bundle, gzip);
+                        let error = validate_lean_build(
+                            &source,
+                            None,
+                            &["lake".into(), "build".into()],
+                            &HashMap::new(),
+                            &allowlist(),
+                        )
+                        .unwrap_err();
+                        assert!(error.contains("unsafe"), "{alias}: {error}");
+                        let error =
+                            apply_source_bundle(&checkout, source.bundle.as_ref().unwrap(), &log)
+                                .await
+                                .unwrap_err()
+                                .to_string();
+                        assert!(error.contains("unsafe"), "{alias}: {error}");
+                        for path in ["A.keep", "Root.lean", "nested/Root.lean"] {
+                            assert_eq!(
+                                std::fs::read(checkout.join(path)).unwrap(),
+                                b"original\0bytes"
+                            );
+                        }
+                        assert!(!checkout.join("B.new").exists());
+                        assert!(!log.exists());
+                        assert_eq!(std::fs::read_dir(&checkout).unwrap().count(), 4);
+                        assert_eq!(
+                            std::fs::read_dir(checkout.join("nested")).unwrap().count(),
+                            1
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_source_bundle_paths_preserve_exact_bytes_and_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        for complete in [false, true] {
+            for gzip in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let checkout = temp.path().join("checkout");
+                std::fs::create_dir_all(checkout.join("nested/deeper")).unwrap();
+                std::fs::write(checkout.join("nested/deeper/obsolete"), b"delete").unwrap();
+                let mut bundle = source_bundle("Root.lean", b"first\n");
+                bundle.complete = complete;
+                bundle.files[0].executable = Some(false);
+                for (path, bytes, executable) in [
+                    ("nested/Root.lean", b"second\0\xff\n".as_slice(), true),
+                    ("nested/deeper/.hidden-file_v2", b"third".as_slice(), false),
+                ] {
+                    let mut file = source_bundle(path, bytes).files.remove(0);
+                    file.executable = Some(executable);
+                    bundle.files.push(file);
+                }
+                bundle.deleted_paths = vec!["nested/deeper/obsolete".into()];
+                let source = decode_path_fixture(bundle, gzip);
+                validate_lean_build(
+                    &source,
+                    None,
+                    &["lake".into(), "build".into()],
+                    &HashMap::new(),
+                    &allowlist(),
+                )
+                .unwrap();
+                let bundle = source.bundle.unwrap();
+                apply_source_bundle(&checkout, &bundle, &temp.path().join("job.log"))
+                    .await
+                    .unwrap();
+                assert!(!checkout.join("nested/deeper/obsolete").exists());
+                for file in &bundle.files {
+                    let path = checkout.join(&file.path);
+                    assert_eq!(
+                        std::fs::read(&path).unwrap(),
+                        base64::engine::general_purpose::STANDARD
+                            .decode(&file.data_base64)
+                            .unwrap()
+                    );
+                    assert_eq!(
+                        std::fs::metadata(path).unwrap().permissions().mode() & 0o111,
+                        if file.executable == Some(true) {
+                            0o111
+                        } else {
+                            0
+                        }
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

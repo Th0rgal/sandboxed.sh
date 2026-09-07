@@ -54,7 +54,7 @@ const DEFAULT_NODE_DISK_EMERGENCY_GB: u64 = 10;
 // 32 MiB of complete source needs ~43 MiB after base64, plus metadata.
 const MAX_REMOTE_BUILD_JSON_BYTES: u64 = 64 * 1024 * 1024;
 
-fn parse_remote_build_request(
+pub(crate) fn parse_remote_build_request(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<RemoteBuildRequest, (StatusCode, String)> {

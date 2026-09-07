@@ -57,6 +57,14 @@ symlink and replacement-ref protections, privacy rules, receipt identity and
 resume semantics remain intact. See [operator limits and coordinated
 rollout](REMOTE_NODES.md#remote-lean-build-wrapper).
 
+Bundle entry and deletion paths must be canonical relative paths: no empty,
+`.` or `..` components, including leading/trailing slashes and repeated
+separators. The receiver rejects the entire bundle before any writes or
+deletions when a path violates this contract. Paths are never normalized;
+manifest and operation digests continue to identify literal paths. This closes
+the crafted `./Root.lean` / `Root.lean` destination alias; normal Git sender
+paths are unaffected. Build-directory path handling is unchanged.
+
 ## Reproduction and receipts
 
 From this transport checkout (Git credentials are used only for the authorized
