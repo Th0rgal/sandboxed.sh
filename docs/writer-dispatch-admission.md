@@ -48,6 +48,14 @@ configuration or credentials leaves recovery pending; it does not erase the
 handle. A job that remains only `lost` or missing stays fenced pending terminal
 reconciliation. Do not delete its ledger entry to admit a replacement writer.
 
+Node execution reports a terminal result only after its process group and any
+configured containment scope have confirmed cleanup. Failed cleanup keeps the
+job running and retries, including after command-wait errors. Zombie-only process
+groups cannot execute and do not prevent cleanup; unavailable scope-manager
+queries do. This guarantee requires the corrected node runner as well as the
+controller: an older node's premature terminal response is not independently
+verified by the controller.
+
 Pending deferred objectives are retained under their original assignment;
 retags are refused instead of concatenating a new assignment into old deferred
 work. Stop and drain the old work before retagging, or create a separate mission.
