@@ -681,7 +681,9 @@ not mean goal mode is off.
 For same-work send/resume messages that mention excluded or collaborating
 PRs, use `continue_identity: {"project": "<exact stored project>", "track": "<exact stored track>", "github_pr":
 "<exact stored PR>"}` (explicit JSON null for an unset project or PR). Read the
-mission first and assert only its existing assignment. The assertion cannot
+mission first and assert only its existing assignment. This is a trusted caller
+assertion, not semantic proof of unchanged work; blindly copying tags for an
+unrelated retask defeats the prose heuristic. The assertion cannot
 be combined with identity edits and never grants PR ownership. For different
 work, omit it and explicitly update/clear stale `github_pr` and `track`
 (empty string clears in these MCP tools); normal writer leases still apply.

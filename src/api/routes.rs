@@ -562,6 +562,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         attention_snapshot: RwLock::new(HashMap::new()),
     });
 
+    state.control.bind_admission_state(&state);
+
     // Persisted node state (operator cordons) survives restarts.
     state
         .fleet

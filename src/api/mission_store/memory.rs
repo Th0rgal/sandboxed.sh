@@ -680,6 +680,9 @@ impl MissionStore for InMemoryMissionStore {
         let mission = missions
             .get_mut(&id)
             .ok_or_else(|| format!("Mission {} not found", id))?;
+        if let Some(title) = patch.title {
+            mission.title = title;
+        }
         if let Some(project) = patch.project {
             mission.project.project = project;
         }

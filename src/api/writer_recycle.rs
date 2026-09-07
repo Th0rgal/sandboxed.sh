@@ -3,14 +3,17 @@
 //! Lido 2026-08-17: mission `ebfb1fd1` stayed tagged `github_pr=…#88` /
 //! `track=pr-88-repair` while being retasked as P-RESERVE-RELATIONAL. The
 //! inventory lied. A writer may be reused only when the caller updates the
-//! identity fields that named the previous work.
+//! identity fields that named the previous work, or explicitly asserts continuation.
+//! Continuation trusts the authenticated caller about prompt semantics; matching
+//! tags is not proof that the objective is unchanged.
 
 use super::control::canonical_github_pr;
 use serde::{Deserialize, Serialize};
 
 /// A controller's explicit assertion that this turn continues the stored work.
 /// All fields are required, including an explicit null for an unrecorded PR.
-/// This is an identity precondition, not a PR ownership grant or an identity edit.
+/// This is a trusted semantic assertion and an identity precondition, not proof
+/// of unchanged work, a PR ownership grant, or an identity edit.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WriterContinuation {

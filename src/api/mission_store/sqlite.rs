@@ -4400,6 +4400,8 @@ impl MissionStore for SqliteMissionStore {
 
         let conn = self.conn.clone();
         let now = now_string();
+        let title_set = patch.title.is_some();
+        let title = patch.title.flatten();
         let project_set = patch.project.is_some();
         let track_set = patch.track.is_some();
         let intent_set = patch.intent.is_some();
@@ -4426,7 +4428,8 @@ impl MissionStore for SqliteMissionStore {
                      tags = CASE WHEN ?9 THEN ?10 ELSE tags END,
                      desired_state = CASE WHEN ?11 THEN ?12 ELSE desired_state END,
                      next_check_at = CASE WHEN ?13 THEN ?14 ELSE next_check_at END,
-                     updated_at = ?15
+                     updated_at = ?15,
+                     title = CASE WHEN ?17 THEN ?18 ELSE title END
                  WHERE id = ?16",
                 params![
                     project_set,
@@ -4445,6 +4448,8 @@ impl MissionStore for SqliteMissionStore {
                     next_check_at,
                     now,
                     id.to_string(),
+                    title_set,
+                    title,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -13372,6 +13377,7 @@ mod tests {
             .update_mission_project(
                 mission.id,
                 MissionProjectPatch {
+                    title: None,
                     project: Some(Some("verity-core".to_string())),
                     track: Some(Some("C3-bridge-collapse".to_string())),
                     intent: Some(Some("review_merge_pr".to_string())),
@@ -16314,6 +16320,7 @@ mod tests {
             .expect("store");
 
         let tag = |project: &str| MissionProjectPatch {
+            title: None,
             project: Some(Some(project.to_string())),
             track: None,
             intent: None,

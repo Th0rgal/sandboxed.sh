@@ -622,6 +622,7 @@ pub async fn run(state: &Arc<AppState>) -> ReconcileReport {
             let sent = session
                 .cmd_tx
                 .send(ControlCommand::ResumeMission {
+                    content: None,
                     mission_id: mission.id,
                     clean_workspace: false,
                     skip_message: false,
@@ -800,6 +801,7 @@ send a new message or re-create the mission.",
             let sent = session
                 .cmd_tx
                 .send(ControlCommand::ResumeMission {
+                    content: None,
                     mission_id: mission.id,
                     clean_workspace: false,
                     skip_message: false,

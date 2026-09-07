@@ -158,6 +158,7 @@ pub(crate) async fn recover_server_shutdown_missions(
         let (tx, rx) = oneshot::channel();
         if let Err(e) = cmd_tx
             .send(ControlCommand::ResumeMission {
+                content: None,
                 mission_id,
                 clean_workspace: false,
                 skip_message: false,
@@ -723,6 +724,7 @@ pub(crate) async fn stuck_mission_watchdog_loop(
                 let (resume_tx, resume_rx) = oneshot::channel();
                 if cmd_tx
                     .send(ControlCommand::ResumeMission {
+                        content: None,
                         mission_id: mission.id,
                         clean_workspace: false,
                         skip_message: false,

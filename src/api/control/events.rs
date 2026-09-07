@@ -364,6 +364,10 @@ pub enum UserMessageAck {
 /// Internal control commands (queued and processed by the actor).
 #[derive(Debug)]
 pub enum ControlCommand {
+    AdmitDispatch {
+        admission: Box<super::DispatchAdmission>,
+        command: Box<ControlCommand>,
+    },
     UserMessage {
         id: Uuid,
         content: String,
@@ -502,6 +506,7 @@ pub enum ControlCommand {
     },
     /// Resume an interrupted mission
     ResumeMission {
+        content: Option<String>,
         mission_id: Uuid,
         /// If true, clean the mission's work directory before resuming
         clean_workspace: bool,

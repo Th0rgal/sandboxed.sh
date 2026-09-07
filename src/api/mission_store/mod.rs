@@ -189,6 +189,8 @@ impl MissionProject {
 /// `Some(vec)` to replace the whole list.
 #[derive(Debug, Clone, Default)]
 pub struct MissionProjectPatch {
+    /// Updated atomically with assignment fields during dispatch admission.
+    pub title: Option<Option<String>>,
     pub project: Option<Option<String>>,
     pub track: Option<Option<String>>,
     pub intent: Option<Option<String>>,
@@ -201,7 +203,8 @@ pub struct MissionProjectPatch {
 impl MissionProjectPatch {
     /// True when the patch would change nothing.
     pub fn is_empty(&self) -> bool {
-        self.project.is_none()
+        self.title.is_none()
+            && self.project.is_none()
             && self.track.is_none()
             && self.intent.is_none()
             && self.github_pr.is_none()

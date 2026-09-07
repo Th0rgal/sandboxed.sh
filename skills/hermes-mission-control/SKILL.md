@@ -9,7 +9,7 @@ description: >
 metadata:
   policy: chatgpt-ui-pool
   policy_version: 1.4.0
-version: 1.13.0
+version: 1.14.0
 ---
 
 # Hermes Mission Control
@@ -63,7 +63,10 @@ when `project` or `github_pr` is unset:
 }
 ```
 
-The assertion identifies the assigned work; PR/campaign references in the
+This is a trusted caller assertion, not proof that the objective is unchanged.
+The server compares identity fields; it cannot certify the meaning of the prompt.
+Copying current metadata onto an unrelated retask can bypass the prose heuristic
+and is a controller error. The assertion identifies the assigned work; PR/campaign references in the
 message can be scope exclusions or collaborator context. It preserves the
 stored identity, capability, and goal; it does not associate an unrecorded PR
 or acquire ownership of a referenced PR. A mismatched project, mismatched or
@@ -78,8 +81,19 @@ These tool parameters use an empty string to clear and omission to preserve.
 Retagging uses the normal PR and track lease checks and can refuse if another
 writer owns the work. Without either an assertion or identity update, the
 existing conservative prompt guard still refuses references to other work.
-Resume validates its content and identity before waking; if its later message
-delivery fails, inspect `steer_warning` and retry the message on the same id.
+Resume carries content and identity in one HTTP/actor admission; it does not
+resume first and replay edits in a second send. Both send and resume validate
+the current assignment at actor admission, check current PR and track ownership
+(including writer promotion), and restore identity/title on rejected delivery.
+A closed command channel makes no edits. Old leases remain held until acceptance.
+Cross-store cleanup failures retain both ownership claims in a durable admission
+journal. Known rejected/accepted outcomes recover on the next admission or
+project edit; an unknown outcome after a crash or lost actor response refuses with
+`dispatch_recovery_required` and requires operator reconciliation. Do not retag
+around that refusal. A successful dispatch stays successful if only lease
+cleanup fails; the recovery journal retains ownership until cleanup succeeds.
+`steer_warning` is retained as null for response compatibility. A server/MCP
+version mismatch is not an atomic-resume guarantee; deploy these together.
 
 Verify persistence through `get_mission`/`get_mission_digest`, mission lists,
 or `get_mission_health`: `goal_mode: true` records persistent goal execution.

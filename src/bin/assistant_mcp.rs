@@ -583,7 +583,7 @@ fn dispatch_identity_schema() -> Value {
             "track": {"type": "string", "minLength": 1},
             "github_pr": {"type": ["string", "null"]}
         },
-        "description": "Assert this turn continues the mission's existing work. Copy the exact stored project, track and github_pr (explicit null if unset) from get_mission. Prose may mention excluded or collaborating PRs. Cannot accompany title/track/github_pr updates; never use for different work. Does not grant PR ownership."
+        "description": "Trusted caller assertion, not proof of unchanged objective. Assert this turn continues the mission's existing work. Copy the exact stored project, track and github_pr (explicit null if unset) from get_mission. Prose may mention excluded or collaborating PRs. Cannot accompany title/track/github_pr updates; never use for different work. Does not grant PR ownership."
     })
 }
 
@@ -3421,12 +3421,11 @@ impl AssistantMcp {
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
         let has_hint = hint.is_some();
-        // With a steering hint we suppress the default resume prompt and deliver
-        // our own message as the next turn instead.
-        // Validate the hint and identity before the server changes run state.
+        // The backend admits the custom prompt and identity in the same actor
+        // command. Never replay identity edits in a second HTTP send.
         let mut body = json!({
             "clean_workspace": params.clean_workspace,
-            "skip_message": has_hint,
+            "skip_message": false,
             "content": hint,
         });
         params.identity.add_to(&mut body);
@@ -3445,33 +3444,10 @@ impl AssistantMcp {
             .json()
             .await
             .map_err(|error| format!("Failed to parse resumed mission: {error}"))?;
-        // If we have a steering hint, deliver it as the next turn. If the post
-        // fails, the mission is already active — surface that as a soft warning
-        // (not an error) so the caller knows resume succeeded but the hint did
-        // not land. They can retry the hint without re-resuming.
-        let steer_warning = if let Some(content) = hint {
-            match self
-                .send_message(SendMessageParams {
-                    mission_id: id.to_string(),
-                    content,
-                    identity: params.identity,
-                })
-                .await
-            {
-                Ok(_) => None,
-                Err(error) => Some(format!(
-                    "Mission resumed, but steering hint could not be delivered: {error}. \
-                     The mission is already active; retry send_message_to_mission to land \
-                     the hint."
-                )),
-            }
-        } else {
-            None
-        };
         let response_body = json!({
             "mission": compact_mission_summary(mission),
-            "steered": has_hint && steer_warning.is_none(),
-            "steer_warning": steer_warning,
+            "steered": has_hint,
+            "steer_warning": Value::Null,
         });
         Ok(response_body)
     }
@@ -4787,7 +4763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continuation_and_retag_identity_reach_both_resume_stages() {
+    async fn continuation_and_retag_identity_use_one_atomic_resume_request() {
         let id = Uuid::new_v4().to_string();
         let (mcp, state, task) = mock_assistant(json!({"id": id}), false).await;
         for identity in [
@@ -4806,15 +4782,15 @@ mod tests {
                 .unwrap();
             assert_eq!(result["steered"], true);
             let requests = state.requests.lock().unwrap();
-            let pair = &requests[requests.len() - 2..];
-            assert!(pair[0].0.ends_with("/resume"));
-            assert_eq!(pair[0].1["skip_message"], true);
-            assert_eq!(pair[1].0, "/api/control/message");
-            for (_, body) in pair {
-                assert!(body["content"].as_str().unwrap().contains("PR 244"));
-                for (key, expected) in identity.as_object().unwrap() {
-                    assert_eq!(&body[key], expected);
-                }
+            let (path, body) = requests.last().unwrap();
+            assert!(path.ends_with("/resume"));
+            assert_eq!(body["skip_message"], false);
+            assert!(body["content"].as_str().unwrap().contains("PR 244"));
+            assert!(!requests
+                .iter()
+                .any(|(path, _)| path == "/api/control/message"));
+            for (key, expected) in identity.as_object().unwrap() {
+                assert_eq!(&body[key], expected);
             }
         }
         task.abort();

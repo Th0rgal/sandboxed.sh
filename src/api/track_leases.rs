@@ -163,6 +163,8 @@ pub struct LeaseSweepReport {
 /// One pass: renew leases of live missions, release those whose mission is
 /// terminal or gone, expire overdue ones nobody renewed.
 pub async fn sweep(state: &Arc<AppState>) -> Result<LeaseSweepReport, String> {
+    let _admission = super::control::DISPATCH_ADMISSION.lock().await;
+    let _file_guard = super::control::dispatch_admission::durable_lock(&state.config).await?;
     let mut report = LeaseSweepReport::default();
     let leases: Vec<TrackLease> = state.projects.live_leases(None)?;
     report.live = leases.len();
@@ -170,6 +172,14 @@ pub async fn sweep(state: &Arc<AppState>) -> Result<LeaseSweepReport, String> {
     let mut released: std::collections::HashSet<String> = std::collections::HashSet::new();
     for lease in &leases {
         if released.contains(&lease.attempt_id) {
+            continue;
+        }
+        if state
+            .projects
+            .dispatch_admission(&lease.attempt_id)?
+            .is_some()
+        {
+            state.projects.renew_lease(&lease.id, LEASE_TTL_SECS)?;
             continue;
         }
         let Ok(mission_id) = uuid::Uuid::parse_str(&lease.attempt_id) else {
@@ -207,6 +217,14 @@ pub async fn sweep(state: &Arc<AppState>) -> Result<LeaseSweepReport, String> {
         }
     }
     for lease in state.projects.overdue_leases()? {
+        if state
+            .projects
+            .dispatch_admission(&lease.attempt_id)?
+            .is_some()
+        {
+            state.projects.renew_lease(&lease.id, LEASE_TTL_SECS)?;
+            continue;
+        }
         if state.projects.expire_lease(&lease.id)? {
             report.expired_overdue += 1;
         }

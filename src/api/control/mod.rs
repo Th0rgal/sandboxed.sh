@@ -7,6 +7,13 @@
 //! - supports frontend/interactive tools by accepting tool results
 //! - supports persistent missions (goal-oriented sessions)
 
+pub(crate) mod dispatch_admission;
+#[cfg(test)]
+mod dispatch_admission_tests;
+use dispatch_admission::admit_dispatch;
+pub use dispatch_admission::DispatchAdmission;
+pub(super) use dispatch_admission::DISPATCH_ADMISSION;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
@@ -4188,6 +4195,7 @@ pub struct ControlState {
 /// Control session manager for per-user sessions.
 #[derive(Clone)]
 pub struct ControlHub {
+    admission_state: Arc<std::sync::OnceLock<std::sync::Weak<AppState>>>,
     sessions: Arc<RwLock<HashMap<String, ControlState>>>,
     config: Config,
     root_agent: AgentRef,
@@ -4215,6 +4223,7 @@ impl ControlHub {
         secrets: Option<Arc<SecretsStore>>,
     ) -> Self {
         Self {
+            admission_state: Arc::new(std::sync::OnceLock::new()),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             config,
             root_agent,
@@ -4224,6 +4233,10 @@ impl ControlHub {
             secrets,
             telegram_bridge: None,
         }
+    }
+
+    pub(crate) fn bind_admission_state(&self, state: &Arc<AppState>) {
+        let _ = self.admission_state.set(Arc::downgrade(state));
     }
 
     /// Set the Telegram bridge reference (called after AppState is created).
@@ -4889,61 +4902,6 @@ pub async fn post_message(
         reset_stall_guard(mid);
     }
     let control = control_for_user(&state, &user).await;
-    if let Some(mission_id) = target_mission_id {
-        {
-            let mission = control
-                .mission_store
-                .get_mission(mission_id)
-                .await
-                .map_err(internal_error)?
-                .ok_or_else(|| {
-                    (
-                        StatusCode::NOT_FOUND,
-                        format!("Mission {mission_id} not found"),
-                    )
-                })?;
-            let mission = apply_writer_reuse_or_conflict(
-                &state,
-                &user,
-                &mission,
-                dispatch_identity_patch(
-                    req.github_pr.clone(),
-                    req.track.clone(),
-                    req.title.clone(),
-                    Some(content.clone()),
-                    req.continue_identity.clone(),
-                ),
-            )
-            .await?;
-            if mission_is_pr_writer_in_store(&control.mission_store, &mission)
-                .await
-                .map_err(internal_error)?
-                || message_requests_pr_writer(&mission, &content)
-            {
-                let _guard = acquire_durable_pr_writer_lock(&state.control)
-                    .await
-                    .map_err(internal_error)?;
-                if let Some(github_pr) = mission.project.github_pr.as_deref() {
-                    if let Some(existing) =
-                        find_existing_pr_writer_global(&state.control, github_pr, Some(mission.id))
-                            .await
-                            .map_err(internal_error)?
-                    {
-                        return Err((
-                            StatusCode::CONFLICT,
-                            format!(
-                                "PR writer lease is already held by mission {} (status={}); cannot send a writer message to mission {} for {}",
-                                existing.id,
-                                existing.status,
-                                mission.id,
-                                canonical_github_pr(github_pr)
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-    }
     let (queued_tx, queued_rx) = oneshot::channel();
     tracing::info!(
         user_id = %user.id,
@@ -4956,14 +4914,28 @@ pub async fn post_message(
     );
     control
         .cmd_tx
-        .send(ControlCommand::UserMessage {
-            id,
-            content,
-            agent,
-            target_mission_id,
-            strict: false,
-            source: Some(format!("api:{}", user.id)),
-            respond: queued_tx,
+        .send(ControlCommand::AdmitDispatch {
+            admission: Box::new(DispatchAdmission {
+                internal_work_hint: None,
+                state: state.clone(),
+                store: control.mission_store.clone(),
+                patch: dispatch_identity_patch(
+                    req.github_pr,
+                    req.track,
+                    req.title,
+                    Some(content.clone()),
+                    req.continue_identity,
+                ),
+            }),
+            command: Box::new(ControlCommand::UserMessage {
+                id,
+                content,
+                agent,
+                target_mission_id,
+                strict: false,
+                source: Some(format!("api:{}", user.id)),
+                respond: queued_tx,
+            }),
         })
         .await
         .map_err(session_unavailable)?;
@@ -4977,10 +4949,7 @@ pub async fn post_message(
         Ok(UserMessageAck::Rejected(reason)) => {
             return Err((StatusCode::CONFLICT, reason));
         }
-        Err(_) => {
-            let status = control.status.read().await;
-            status.state != ControlRunState::Idle
-        }
+        Err(error) => return Err(recv_failed(error)),
     };
     Ok(Json(ControlMessageResponse {
         id,
@@ -8891,54 +8860,6 @@ fn writer_reuse_or_conflict(
     })
 }
 
-async fn apply_writer_reuse_or_conflict(
-    state: &Arc<AppState>,
-    user: &AuthUser,
-    mission: &Mission,
-    patch: crate::api::writer_recycle::WriterIdentityPatch,
-) -> Result<Mission, (StatusCode, String)> {
-    let next = writer_reuse_or_conflict(mission, &patch)?;
-    let mut updated = mission.clone();
-    if next.github_pr != mission.project.github_pr || next.track != mission.project.track {
-        // Identity changes must use the same PR and track lease arbitration as
-        // a structured project edit. Never write tags directly during dispatch.
-        updated = update_mission_project(
-            State(state.clone()),
-            Extension(user.clone()),
-            Path(mission.id),
-            Json(UpdateMissionProjectRequest {
-                github_pr: patch.github_pr,
-                track: patch.track,
-                project: None,
-                intent: None,
-                writer: None,
-                tags: None,
-                desired_state: None,
-                next_check_at: None,
-            }),
-        )
-        .await?
-        .0;
-    }
-    if next.title != mission.title {
-        let control = control_for_user(state, user).await;
-        control
-            .mission_store
-            .update_mission_metadata(
-                mission.id,
-                Some(next.title.as_deref()),
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .map_err(internal_error)?;
-        updated.title = next.title;
-    }
-    Ok(updated)
-}
-
 fn pr_writer_lease(mission: &Mission) -> PrWriterLease {
     PrWriterLease {
         id: mission.id,
@@ -9185,6 +9106,31 @@ async fn find_existing_pr_writer_global(
     github_pr: &str,
     exclude_id: Option<Uuid>,
 ) -> Result<Option<PrWriterLease>, String> {
+    // Cross-store admission can temporarily change or clear the stored PR.
+    // Until cleanup completes, neither the old nor proposed PR is available
+    // to another writer, including after a crash with a terminal status.
+    if let Some(state) = control_hub
+        .admission_state
+        .get()
+        .and_then(std::sync::Weak::upgrade)
+    {
+        let target = canonical_github_pr(github_pr);
+        for (id, receipt) in state.projects.dispatch_admissions()? {
+            let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+            if Some(id) != exclude_id
+                && ["before", "after"].iter().any(|phase| {
+                    receipt[*phase]["project"]["github_pr"]
+                        .as_str()
+                        .is_some_and(|pr| canonical_github_pr(pr) == target)
+                })
+            {
+                return Ok(Some(PrWriterLease {
+                    id,
+                    status: MissionStatus::Active,
+                }));
+            }
+        }
+    }
     // Fail closed if any persisted store cannot be enumerated or read. A
     // partial cross-user scan cannot prove that a branch is writer-free.
     let inventory = control_hub.mission_store_inventory().await?;
@@ -10693,6 +10639,7 @@ pub async fn create_mission(
             .update_mission_project(
                 mission.id,
                 crate::api::mission_store::MissionProjectPatch {
+                    title: None,
                     project: project.clone().map(Some),
                     track: track.clone().map(Some),
                     intent: intent.clone().map(Some),
@@ -12505,7 +12452,25 @@ pub async fn update_mission_project(
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateMissionProjectRequest>,
 ) -> Result<Json<Mission>, (StatusCode, String)> {
+    #[cfg(test)]
+    dispatch_admission_tests::notify_wait(id, "project");
+    let _guard = DISPATCH_ADMISSION.lock().await;
+    let _file_guard = dispatch_admission::durable_lock(&state.config)
+        .await
+        .map_err(internal_error)?;
+    update_mission_project_locked(State(state), Extension(user), Path(id), Json(req)).await
+}
+
+async fn update_mission_project_locked(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateMissionProjectRequest>,
+) -> Result<Json<Mission>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
+    dispatch_admission::recover_dispatch(&state, &control.mission_store, id)
+        .await
+        .map_err(internal_error)?;
     let current = control
         .mission_store
         .get_mission(id)
@@ -12655,7 +12620,8 @@ pub async fn update_mission_project(
     // old ones. A held writer lease is a 409 and the patch is not applied.
     let effective_project = effective_string(&project, &current.project.project);
     let effective_track = effective_string(&track, &current.project.track);
-    let track_changed = track.is_some() || project.is_some();
+    let track_changed = track.is_some() || project.is_some() || could_change_writer_status;
+    let mut acquired_lease = None;
     let track = if let (true, Some(slug), Some(key)) = (
         track_changed,
         effective_project.as_deref(),
@@ -12675,10 +12641,17 @@ pub async fn update_mission_project(
                 effective_intent.as_deref(),
             )
         };
-        let request =
-            super::track_leases::lease_request(slug, &outcome.key, &id.to_string(), mode, None);
+        let request = super::track_leases::lease_request(
+            slug,
+            &outcome.key,
+            &id.to_string(),
+            mode,
+            Some(&format!("project-edit:{}", Uuid::new_v4())),
+        );
         match state.projects.acquire_track_lease(&request) {
-            Ok(_) => {}
+            Ok(lease) => {
+                acquired_lease = Some(lease.id);
+            }
             Err(super::projects_store::LeaseError::Store(error)) => {
                 return Err(internal_error(error))
             }
@@ -12695,28 +12668,17 @@ pub async fn update_mission_project(
                 ));
             }
         }
-        state
-            .projects
-            .release_leases_except(&id.to_string(), slug, &outcome.key)
-            .map_err(internal_error)?;
         Some(Some(outcome.key))
     } else {
-        if track_changed {
-            // The mission left its project or cleared its track: whatever it
-            // held no longer governs anything.
-            state
-                .projects
-                .release_leases_for_attempt(&id.to_string())
-                .map_err(internal_error)?;
-        }
         track
     };
 
-    control
+    let persisted = control
         .mission_store
         .update_mission_project(
             id,
             crate::api::mission_store::MissionProjectPatch {
+                title: None,
                 project,
                 track,
                 intent,
@@ -12726,8 +12688,26 @@ pub async fn update_mission_project(
                 next_check_at,
             },
         )
-        .await
-        .map_err(internal_error)?;
+        .await;
+    if let Err(error) = persisted {
+        if let Some(lease) = acquired_lease {
+            state
+                .projects
+                .expire_lease(&lease)
+                .map_err(internal_error)?;
+        }
+        return Err(internal_error(error));
+    }
+    if track_changed {
+        // The metadata commit succeeded. Cleanup failure retains extra leases
+        // and must not report that the assignment edit was rejected.
+        if let Err(error) = state
+            .projects
+            .retain_attempt_lease(&id.to_string(), acquired_lease.as_deref())
+        {
+            tracing::error!(mission_id = %id, %error, "Committed project edit retains old leases pending sweep");
+        }
+    }
 
     let updated = control
         .mission_store
@@ -12923,6 +12903,7 @@ pub async fn update_mission_settings(
         let queued = match control
             .cmd_tx
             .send(ControlCommand::ResumeMission {
+                content: None,
                 mission_id: id,
                 clean_workspace: false,
                 skip_message: false,
@@ -14602,43 +14583,32 @@ pub async fn resume_mission(
     let actor = resolve_actor(request.actor.clone(), &user);
 
     let control = control_for_user(&state, &user).await;
-    {
-        let mission = control
-            .mission_store
-            .get_mission(mission_id)
-            .await
-            .map_err(internal_error)?
-            .ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    format!("Mission {mission_id} not found"),
-                )
-            })?;
-        apply_writer_reuse_or_conflict(
-            &state,
-            &user,
-            &mission,
-            dispatch_identity_patch(
-                request.github_pr.clone(),
-                request.track.clone(),
-                request.title.clone(),
-                request.content.clone(),
-                request.continue_identity.clone(),
-            ),
-        )
-        .await?;
-    }
     tracing::info!(mission_id = %mission_id, actor = %actor, "FLEET-004 mission resume requested");
 
     let outcome: Result<Mission, (StatusCode, String)> = async {
         let (tx, rx) = oneshot::channel();
         control
             .cmd_tx
-            .send(ControlCommand::ResumeMission {
-                mission_id,
-                clean_workspace,
-                skip_message,
-                respond: tx,
+            .send(ControlCommand::AdmitDispatch {
+                admission: Box::new(DispatchAdmission {
+                    internal_work_hint: None,
+                    state: state.clone(),
+                    store: control.mission_store.clone(),
+                    patch: dispatch_identity_patch(
+                        request.github_pr,
+                        request.track,
+                        request.title,
+                        request.content,
+                        request.continue_identity,
+                    ),
+                }),
+                command: Box::new(ControlCommand::ResumeMission {
+                    content: None,
+                    mission_id,
+                    clean_workspace,
+                    skip_message,
+                    respond: tx,
+                }),
             })
             .await
             .map_err(session_unavailable)?;
@@ -19138,7 +19108,56 @@ async fn control_actor_loop(
             }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
+                // Internal wakes also need current track ownership. They carry
+                // no controller assertion or retag, but use the same admission
+                // and rollback boundary as HTTP dispatch.
+                let cmd = if matches!(&cmd, ControlCommand::UserMessage { target_mission_id: Some(_), .. } | ControlCommand::ResumeMission { .. }) {
+                    if let Some(state) = control_hub.admission_state.get().and_then(std::sync::Weak::upgrade) {
+                        let work_hint = match &cmd { ControlCommand::UserMessage { content, .. } => Some(content.clone()), _ => None };
+                        ControlCommand::AdmitDispatch {
+                            admission: Box::new(DispatchAdmission {
+                                state,
+                                store: mission_store.clone(),
+                                // Internal control messages are not retasks;
+                                // do not run prose recycle inference on them.
+                                patch: Default::default(),
+                                internal_work_hint: work_hint,
+                            }),
+                            command: Box::new(cmd),
+                        }
+                    } else { cmd }
+                } else { cmd };
+                #[cfg(test)]
+                if let ControlCommand::AdmitDispatch { command, .. } = &cmd {
+                    let id = match command.as_ref() {
+                        ControlCommand::UserMessage { target_mission_id, .. } => *target_mission_id,
+                        ControlCommand::ResumeMission { mission_id, .. } => Some(*mission_id),
+                        _ => None,
+                    };
+                    if let Some(id) = id { dispatch_admission_tests::notify_wait(id, "actor"); }
+                }
+                let admission_guard = DISPATCH_ADMISSION.lock().await;
+                let (cmd, _admission_guard) = match cmd {
+                    ControlCommand::AdmitDispatch { admission, command } => {
+                        // Deduplication is an admission decision too: a retry
+                        // cannot smuggle a new assignment into an accepted id.
+                        if let ControlCommand::UserMessage { id, .. } = command.as_ref() {
+                            if recovered_consumed_user_messages.contains_key(id) || accepted_user_message_ids.contains(id) {
+                                if let ControlCommand::UserMessage { respond, .. } = *command {
+                                    let _ = respond.send(UserMessageAck::Delivered);
+                                }
+                                continue;
+                            }
+                        }
+                        match admit_dispatch(*admission, *command, admission_guard).await {
+                            Some(cmd) => (cmd, None),
+                            None => continue,
+                        }
+                    }
+                    cmd => (cmd, Some(admission_guard)),
+                };
                 match cmd {
+                    ControlCommand::AdmitDispatch { .. } => unreachable!("nested admission"),
                     ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, strict, source, respond } => {
                         if recovered_consumed_user_messages.contains_key(&id) {
                             // The previous actor had already started this exact
@@ -20656,7 +20675,13 @@ async fn control_actor_loop(
                         let _ = respond.send(result);
                     }
                     ControlCommand::SetMissionTitle { id, title, respond } => {
-                        let result = mission_store.update_mission_title(id, &title).await;
+                        let result = async {
+                            let _file_guard = dispatch_admission::durable_lock(&config).await?;
+                            if let Some(state) = control_hub.admission_state.get().and_then(std::sync::Weak::upgrade) {
+                                dispatch_admission::recover_dispatch(&state, &mission_store, id).await?;
+                            }
+                            mission_store.update_mission_title(id, &title).await
+                        }.await;
                         if result.is_ok() {
                             let _ = events_tx.send(AgentEvent::MissionTitleChanged {
                                 mission_id: id,
@@ -21350,7 +21375,7 @@ async fn control_actor_loop(
                         );
                         let _ = respond.send(actor_run);
                     }
-                    ControlCommand::ResumeMission { mission_id, clean_workspace, skip_message, respond } => {
+                    ControlCommand::ResumeMission { mission_id, clean_workspace, skip_message, content, respond } => {
                         // Resumable terminal writers do not hold a lease, so a replacement
                         // writer may have been created since this mission stopped. Serialize
                         // the availability check with create/project updates and keep the
@@ -21373,7 +21398,8 @@ async fn control_actor_loop(
                             clean_workspace,
                         )
                         .await {
-                            Ok((mission, resume_prompt)) => {
+                            Ok((mission, default_resume_prompt)) => {
+                                let resume_prompt = content.unwrap_or(default_resume_prompt);
                                 if let Err(error) = ensure_pr_writer_resume_is_exclusive(
                                     &control_hub,
                                     &mission_store,
@@ -21582,7 +21608,8 @@ async fn control_actor_loop(
                                     .update_mission_status(mission_id, MissionStatus::Active)
                                     .await
                                 {
-                                    tracing::warn!("Failed to resume mission {}: {}", mission_id, e);
+                                    let _ = respond.send(Err(format!("Failed to resume mission {mission_id}: {e}")));
+                                    continue;
                                 } else {
                                     if mission.status == MissionStatus::Paused {
                                         let _ = mission_store
@@ -21605,8 +21632,9 @@ async fn control_actor_loop(
 
                                 // Queue the resume prompt as a message (no per-message agent override)
                                 // Skip if the caller just wants to update the status (e.g., before sending a custom message)
+                                let resume_message_id = Uuid::new_v4();
                                 if !skip_message {
-                                    let msg_id = Uuid::new_v4();
+                                    let msg_id = resume_message_id;
                                     queue.push_back((
                                         msg_id,
                                         resume_prompt,
@@ -21614,6 +21642,19 @@ async fn control_actor_loop(
                                         Some(mission_id),
                                         Some("system:resume".to_string()),
                                     ));
+                                }
+
+                                // Persist acceptance before a dequeue can erase
+                                // the only durable copy of the custom prompt.
+                                if !skip_message {
+                                    if let Err(error) = persist_control_queue_if_changed(
+                                        &mission_store, &session_user_id, &queue, &parallel_runners,
+                                        &recovered_consumed_user_messages, &mut last_persisted_queue,
+                                    ).await {
+                                        queue.retain(|(queued_id, ..)| *queued_id != resume_message_id);
+                                        let _ = respond.send(Err(format!("Failed to persist resumed mission queue: {error}")));
+                                        continue;
+                                    }
                                 }
 
                                 // Start execution if not already running
@@ -21639,9 +21680,13 @@ async fn control_actor_loop(
                                                 msg_target_mid,
                                                 msg_source,
                                             ));
-                                            let _ = respond.send(Err(format!(
-                                                "Failed to persist resumed mission queue: {error}"
-                                            )));
+                                            // Enqueue already committed. Keep the
+                                            // accepted prompt and its new identity;
+                                            // this is queued work, not a rejection.
+                                            tracing::warn!(%error, "Resumed prompt remains durably queued after dequeue failure");
+                                            let mut accepted = mission.clone();
+                                            accepted.status = MissionStatus::Active;
+                                            let _ = respond.send(Ok(accepted));
                                             continue;
                                         }
                                         let target_mid = msg_target_mid.unwrap_or(mission_id);
@@ -29636,6 +29681,7 @@ mod tests {
             .update_mission_project(
                 mission.id,
                 mission_store::MissionProjectPatch {
+                    title: None,
                     project: None,
                     track: None,
                     intent: None,

@@ -269,6 +269,13 @@ CREATE INDEX IF NOT EXISTS track_leases_domain
 CREATE INDEX IF NOT EXISTS track_leases_attempt
     ON track_leases(attempt_id, state);
 
+-- Cross-store dispatch recovery. An unresolved row fences its attempt's
+-- leases even past TTL; admission and edits refuse until recovery succeeds.
+CREATE TABLE IF NOT EXISTS mission_dispatch_admissions (
+    attempt_id TEXT PRIMARY KEY,
+    receipt TEXT NOT NULL
+);
+
 -- One row per (source, content hash, parser): the importer is idempotent.
 CREATE TABLE IF NOT EXISTS project_imports (
     slug            TEXT NOT NULL,
@@ -2927,7 +2934,7 @@ impl ProjectsStore {
             // held by another attempt means the dispatch key was reused by a
             // retry that created a second mission — exactly the duplicate the
             // lease exists to refuse.
-            if let Some(existing) = connection
+            let replay = connection
                 .query_row(
                     &format!(
                         "{LEASE_SELECT} WHERE l.idempotency_key = ?1 \
@@ -2937,16 +2944,18 @@ impl ProjectsStore {
                     lease_from_row,
                 )
                 .optional()
-                .map_err(|e| LeaseError::Store(e.to_string()))?
-            {
-                if existing.attempt_id == request.attempt_id {
-                    return Ok(existing);
+                .map_err(|e| LeaseError::Store(e.to_string()))?;
+            if let Some(existing) = &replay {
+                if existing.attempt_id != request.attempt_id {
+                    return Err(LeaseError::Owned {
+                        holder_attempt_id: existing.attempt_id.clone(),
+                        lease_until: existing.lease_until.clone(),
+                        lease_id: existing.id.clone(),
+                    });
                 }
-                return Err(LeaseError::Owned {
-                    holder_attempt_id: existing.attempt_id,
-                    lease_until: existing.lease_until,
-                    lease_id: existing.id,
-                });
+                if existing.mode == request.mode {
+                    return Ok(existing.clone());
+                }
             }
             let Some(track_id) =
                 Self::resolve_track_id_on(&connection, &request.slug, &request.track)
@@ -2960,7 +2969,7 @@ impl ProjectsStore {
                         &format!(
                             "{LEASE_SELECT} WHERE l.track_id = ?1 AND l.mutation_domain = ?2 \
                                AND l.mode = 'writer' AND l.state IN ('reserved','active') \
-                               AND l.lease_until > ?3 AND l.attempt_id != ?4 \
+                               AND (l.lease_until > ?3 OR EXISTS (SELECT 1 FROM mission_dispatch_admissions a WHERE a.attempt_id = l.attempt_id)) AND l.attempt_id != ?4 \
                              ORDER BY l.created_at LIMIT 1"
                         ),
                         params![
@@ -2980,6 +2989,16 @@ impl ProjectsStore {
                         lease_id: holder.id,
                     });
                 }
+            }
+            if let Some(existing) = replay {
+                connection.execute("UPDATE track_leases SET mode = ?2, lease_until = ?3, updated_at = ?4 WHERE id = ?1", params![existing.id, request.mode, until, now_text]).map_err(|e| LeaseError::Store(e.to_string()))?;
+                return connection
+                    .query_row(
+                        &format!("{LEASE_SELECT} WHERE l.id = ?1"),
+                        params![existing.id],
+                        lease_from_row,
+                    )
+                    .map_err(|e| LeaseError::Store(e.to_string()));
             }
             let id = Uuid::new_v4().to_string();
             connection
@@ -3021,6 +3040,68 @@ impl ProjectsStore {
                 Err(error)
             }
         }
+    }
+
+    /// Unresolved admissions retain both PR claims as well as track leases.
+    pub fn dispatch_admissions(&self) -> Result<Vec<(String, serde_json::Value)>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare("SELECT attempt_id, receipt FROM mission_dispatch_admissions")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.map(|row| {
+            let (id, receipt) = row.map_err(|e| e.to_string())?;
+            Ok((
+                id,
+                serde_json::from_str(&receipt).map_err(|e| e.to_string())?,
+            ))
+        })
+        .collect()
+    }
+
+    pub fn dispatch_admission(&self, attempt: &str) -> Result<Option<serde_json::Value>, String> {
+        let value: Option<String> = self
+            .lock()?
+            .query_row(
+                "SELECT receipt FROM mission_dispatch_admissions WHERE attempt_id = ?1",
+                params![attempt],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(|e| e.to_string()))
+            .transpose()
+    }
+
+    pub fn save_dispatch_admission(
+        &self,
+        attempt: &str,
+        receipt: &serde_json::Value,
+    ) -> Result<(), String> {
+        self.lock()?.execute("INSERT INTO mission_dispatch_admissions(attempt_id, receipt) VALUES (?1, ?2) ON CONFLICT(attempt_id) DO UPDATE SET receipt = excluded.receipt", params![attempt, receipt.to_string()]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn clear_dispatch_admission(&self, attempt: &str) -> Result<(), String> {
+        self.lock()?
+            .execute(
+                "DELETE FROM mission_dispatch_admissions WHERE attempt_id = ?1",
+                params![attempt],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Commit a provisional acquisition, retaining exactly its lease. A null
+    /// keep id commits leaving the governed assignment entirely.
+    pub fn retain_attempt_lease(&self, attempt: &str, keep: Option<&str>) -> Result<(), String> {
+        self.lock()?.execute("UPDATE track_leases SET state = 'released', updated_at = ?3 WHERE attempt_id = ?1 AND state IN ('reserved','active') AND (?2 IS NULL OR id != ?2)", params![attempt, keep, Utc::now().to_rfc3339()]).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// Release every live lease held by an attempt (mission). Returns how
@@ -7040,6 +7121,32 @@ mod tests {
         assert_eq!(track.origin, "absorbed");
         assert_eq!(track.title.as_deref(), Some("PR 230 Repair"));
         assert_eq!(store.tracks("lido").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn idempotent_reader_promotion_checks_current_writer() {
+        let store = ProjectsStore::open_in_memory().unwrap();
+        store
+            .upsert_project("lido", None, None, None, None)
+            .unwrap();
+        store.absorb_track("lido", "reserve", None, None).unwrap();
+        let reader = store
+            .acquire_track_lease(&lease("lido", "reserve", "a", "reader", "a-key"))
+            .unwrap();
+        let owner = store
+            .acquire_track_lease(&lease("lido", "reserve", "b", "writer", "b-key"))
+            .unwrap();
+        assert!(matches!(
+            store.acquire_track_lease(&lease("lido", "reserve", "a", "writer", "a-key")),
+            Err(LeaseError::Owned { .. })
+        ));
+        assert_eq!(store.lease_by_key("a-key").unwrap().unwrap().mode, "reader");
+        store.expire_lease(&owner.id).unwrap();
+        let promoted = store
+            .acquire_track_lease(&lease("lido", "reserve", "a", "writer", "a-key"))
+            .unwrap();
+        assert_eq!(promoted.id, reader.id);
+        assert_eq!(promoted.mode, "writer");
     }
 
     #[test]
