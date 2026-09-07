@@ -85,6 +85,7 @@ pub struct NodeHeartbeat {
 }
 
 /// Decoded file-byte limits enforced by the receiver for each bundle mode.
+/// Core separately gates the exact serialized job against the HTTP body limit.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceBundleCapacity {
     pub overlay_bytes: u64,

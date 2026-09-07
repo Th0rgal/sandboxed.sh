@@ -513,6 +513,12 @@ placement (including re-probe selection) by the matching complete/overlay limit.
 Explicit nodes use the same capacity check. Insufficient capacity returns 503
 before a job is submitted, allowing the wrapper's existing local fallback;
 400/422 submission failures are still caller errors and are not retried.
+Decoded-byte capability is separate from wire capacity: after minting the lease,
+core counts the exact compact JSON job envelope, including all metadata and
+escaping, before recording a tentative handle or submitting. An envelope above
+the unchanged 50 MiB node body cap returns 503 before dispatch even if an operator
+has raised decoded-byte capacity (for example, 38 MiB of source exceeds 50 MiB
+in base64 alone). This also protects metadata-heavy requests below the byte limit.
 Legacy heartbeats remain eligible up to the historical 16 MiB complete / 1 MiB
 overlay defaults, subject to the existing protocol gates. Larger payloads require
 advertised capacity. Legacy private overrides cannot be inferred: upgrade nodes

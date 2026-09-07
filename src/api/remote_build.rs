@@ -752,6 +752,37 @@ fn check_node_source_capacity(
     Ok(())
 }
 
+/// The node receives compact JSON, not the gzip body accepted by core.
+/// Count the exact final envelope (including lease, metadata and JSON escaping)
+/// without allocating another payload-sized buffer. Byte capacity alone cannot
+/// guarantee transportability when an operator raises the decoded-source limit.
+fn check_node_submission_size(request: &SubmitJobRequest) -> Result<(), (StatusCode, String)> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, request)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let limit = crate::remote_node::protocol::MAX_SOURCE_REQUEST_BODY_BYTES;
+    if counter.0 > limit {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "remote job requires {} bytes of node JSON; transport capacity is {limit} bytes",
+                counter.0,
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn submit_error_status(err: &RemoteNodeError) -> StatusCode {
     match err {
         // DNS/connect failures happen before an HTTP request reaches the node,
@@ -1336,6 +1367,11 @@ async fn submit_remote_build(
         },
     };
 
+    // Fail before recording a tentative job or issuing any submission. Every
+    // receiver uses this same HTTP limit, regardless of its source override.
+    if let Err((status, message)) = check_node_submission_size(&submit) {
+        return (status, message).into_response();
+    }
     let client = RemoteNodeClient::default();
     let started_at = chrono::Utc::now();
     if let Err(error) = crate::remote_node::job_ledger::record(
@@ -2368,6 +2404,7 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
                 env: HashMap::new(),
             },
         };
+        check_node_submission_size(&job).unwrap();
         let json = serde_json::to_vec(&job).unwrap();
         assert!(json.len() > 32 << 20);
         assert!(json.len() < MAX_SOURCE_REQUEST_BODY_BYTES);
@@ -2456,6 +2493,98 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
                 "{mutation}"
             );
         }
+    }
+
+    #[test]
+    fn node_submission_gate_counts_exact_wire_boundary_and_escaping() {
+        use crate::remote_node::protocol::MAX_SOURCE_REQUEST_BODY_BYTES;
+        let mut request = SubmitJobRequest {
+            job_id: Uuid::nil(),
+            mission_id: Uuid::nil(),
+            lease_token: String::new(),
+            payload: JobPayload::RawCommand {
+                command: "true".into(),
+                timeout_secs: None,
+                env: None,
+            },
+        };
+        let overhead = serde_json::to_vec(&request).unwrap().len();
+        request.lease_token = "x".repeat(MAX_SOURCE_REQUEST_BODY_BYTES - overhead);
+        assert_eq!(
+            serde_json::to_vec(&request).unwrap().len(),
+            MAX_SOURCE_REQUEST_BODY_BYTES
+        );
+        check_node_submission_size(&request).unwrap();
+        request.lease_token.push('x');
+        assert_eq!(
+            check_node_submission_size(&request).unwrap_err().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        request.lease_token.pop();
+        // Same string length, but a quote adds a JSON escape byte to the wire.
+        request.lease_token.pop();
+        request.lease_token.push('"');
+        assert_eq!(
+            check_node_submission_size(&request).unwrap_err().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn raised_decoded_capacity_cannot_bypass_node_json_transport_gate() {
+        use crate::remote_node::protocol::{NodeHeartbeat, SourceBundleRequirement};
+        use base64::Engine;
+        let raw = vec![b'x'; 38 << 20];
+        let file = crate::remote_node::SourceBundleFile {
+            path: "Main.lean".into(),
+            sha256: hex::encode(sha2::Sha256::digest(&raw)),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&raw),
+            executable: None,
+        };
+        drop(raw);
+        let bundle = SourceBundle {
+            manifest_sha256: crate::node::lean::bundle_manifest_sha256_for_mode(
+                &[(file.path.clone(), file.sha256.clone())],
+                true,
+            ),
+            files: vec![file],
+            complete: true,
+            deleted_paths: vec![],
+            operations_sha256: None,
+        };
+        let requirement = SourceBundleRequirement::from_bundle(&bundle).unwrap();
+        assert_eq!(requirement.bytes, 38 << 20);
+        let hb: NodeHeartbeat = serde_json::from_value(serde_json::json!({
+            "node_id":"raised", "online":true, "capacity_total":1, "capacity_available":1,
+            "active_leases":0, "version":"test", "protocol_version":4,
+            "source_bundle_capacity":{"complete_bytes": 64 << 20, "overlay_bytes":64 << 20},
+        }))
+        .unwrap();
+        check_node_source_capacity(&hb, Some(requirement)).unwrap();
+        let request = SubmitJobRequest {
+            job_id: Uuid::nil(),
+            mission_id: Uuid::nil(),
+            lease_token: "lease".into(),
+            payload: JobPayload::LeanBuild {
+                source: Box::new(JobSource {
+                    repo: "https://example.invalid/repo.git".into(),
+                    commit: "a".repeat(40),
+                    base_tree_sha: None,
+                    archive: None,
+                    bundle: Some(bundle),
+                }),
+                cwd_rel: None,
+                command: vec!["lake".into(), "build".into()],
+                timeout_secs: None,
+                estimated_disk_bytes: Some(GIB),
+                cache_key: None,
+                artifacts: vec![],
+                env: HashMap::new(),
+            },
+        };
+        let (status, reason) = check_node_submission_size(&request).unwrap_err();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(reason.contains("transport capacity is 52428800"));
     }
 
     #[test]

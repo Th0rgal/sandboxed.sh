@@ -80,7 +80,11 @@ Legacy v4 nodes without this field retain compatibility through 16 MiB complete
 Private lower overrides on legacy nodes remain unknowable and require updating
 those receivers to advertise them. Updated lower ceilings are enforced for all
 bundle sizes. Old backends ignore the new heartbeat field and must be updated
-before enabling larger bundles. The 32/64/50 MiB limits above are unchanged.
+before enabling larger bundles. The 32/64/50 MiB limits above are unchanged. Decoded-byte advertisements do not
+replace the wire bound: core counts the exact serialized node job, including
+lease and JSON escaping, before tentative admission and dispatch. Above 50 MiB
+it returns 503, including when a raised source override would otherwise admit
+a 38 MiB bundle. Counting uses a non-allocating writer, not an approximate ratio.
 
 ## Reproduction and receipts
 
