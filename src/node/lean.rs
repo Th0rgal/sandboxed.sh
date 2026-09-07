@@ -2423,6 +2423,91 @@ mod tests {
         assert_eq!(tokio::fs::read(&victim).await.unwrap(), b"keep me");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_source_bundle_from_recursive_wrapper_materializes_without_fetch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Exercise the real shell encoder and compressed request, then feed its
+        // wire bundle through the node's validation and checkout materializer.
+        let output = Command::new("python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/test_remote_lean_build_source.py"
+            ))
+            .arg("--emit-fixture")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let request: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(request.get("source_archive").is_none());
+        let bundle: SourceBundle =
+            serde_json::from_value(request["source_bundle"].clone()).unwrap();
+        assert!(bundle.complete);
+        assert_eq!(bundle.files.len(), 11);
+        validate_source_bundle(&bundle).unwrap();
+        let bundled_source = JobSource {
+            // This URL cannot supply the fixture. Successful materialization
+            // must use the complete bundle, with no source Git credentials.
+            repo: "https://example.invalid/private.git".to_string(),
+            commit: request["commit"].as_str().unwrap().to_string(),
+            base_tree_sha: Some(request["base_tree_sha"].as_str().unwrap().to_string()),
+            archive: None,
+            bundle: Some(bundle.clone()),
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("job.log");
+        let checkout = ensure_checkout(
+            temp.path(),
+            &bundled_source,
+            &log,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        for file in &bundle.files {
+            let path = checkout.join(&file.path);
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(hex::encode(Sha256::digest(&bytes)), file.sha256);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o111 != 0,
+                file.executable.unwrap()
+            );
+        }
+        for root in ["", "deps/sub", "deps/sub/vendor/nested"] {
+            assert!(!checkout.join(root).join(".git").exists());
+        }
+        assert_eq!(
+            std::fs::read(checkout.join("Root.lean")).unwrap(),
+            b"root\n"
+        );
+        assert_eq!(
+            std::fs::read(checkout.join("deps/sub/Sub.lean")).unwrap(),
+            b"sub\n"
+        );
+        assert_eq!(
+            std::fs::read(checkout.join("deps/sub/vendor/nested/assets/data.bin")).unwrap(),
+            b"\x00\xffnested\n"
+        );
+
+        // The receiver still rejects tampering with nested bytes or modes.
+        let mut tampered = bundle.clone();
+        tampered.files[6].data_base64 =
+            base64::engine::general_purpose::STANDARD.encode(b"tampered");
+        assert!(validate_source_bundle(&tampered)
+            .unwrap_err()
+            .contains("content hash mismatch"));
+        let mut tampered = bundle;
+        tampered.files[8].executable = Some(false);
+        assert!(validate_source_bundle(&tampered)
+            .unwrap_err()
+            .contains("operations hash mismatch"));
+    }
+
     #[tokio::test]
     async fn complete_source_bundle_materializes_without_git_and_rebuilds_cleanly() {
         let temp = tempfile::tempdir().unwrap();

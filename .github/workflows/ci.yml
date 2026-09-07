@@ -54,6 +54,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-target-test-harness-
 
+      - name: Test full-source transport (no Lean compilation)
+        run: python3 scripts/test_remote_lean_build_source.py -v
+
       - name: Run tests
         run: cargo test --locked --workspace
 
