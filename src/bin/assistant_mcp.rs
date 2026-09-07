@@ -3901,6 +3901,7 @@ fn compact_compute_fleet(fleet: &Value) -> Value {
                 "disk_available_bytes": node.get("disk_available_bytes").cloned().unwrap_or(Value::Null),
                 "cached_toolchains": node.get("cached_toolchains").cloned().unwrap_or_else(|| json!([])),
                 "lean_runtime_ready": node.get("lean_runtime_ready").cloned().unwrap_or(Value::Null),
+                "source_bundle_capacity": node.get("source_bundle_capacity").cloned().unwrap_or(Value::Null),
                 "error": node.get("error").cloned().unwrap_or(Value::Null),
             })
         })
@@ -5472,6 +5473,7 @@ mod tests {
                     "disk_available_bytes": 100_u64 << 30,
                     "cached_toolchains": ["leanprover--lean4---v4.24.0"],
                     "lean_runtime_ready": true,
+                    "source_bundle_capacity": {"overlay_bytes": 1048576, "complete_bytes": 8388608},
                     "base_url": "must-not-leak"
                 },
                 {
@@ -5515,6 +5517,11 @@ mod tests {
         assert_eq!(compact["summary"]["lean_slots_available"], 2);
         assert_eq!(compact["summary"]["active_remote_jobs"], 1);
         assert!(compact["nodes"][0].get("base_url").is_none());
+        assert_eq!(
+            compact["nodes"][0]["source_bundle_capacity"]["complete_bytes"],
+            8388608
+        );
+        assert!(compact["nodes"][3]["source_bundle_capacity"].is_null());
         assert_eq!(compact["nodes"][2]["error"], "probe degraded");
         assert_eq!(compact["recent_jobs"][0]["node_id"], "cpu");
     }

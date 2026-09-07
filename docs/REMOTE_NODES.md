@@ -131,6 +131,11 @@ To rotate a node token with zero downtime:
 `capacity_available`, `active_leases`, `version`) plus:
 
 - `protocol_version` (currently `4`; core treats a missing field as `1`).
+- `source_bundle_capacity`: `{ "overlay_bytes": 1048576, "complete_bytes": 33554432 }`
+  by default. These are effective decoded file-byte ceilings; positive
+  `SANDBOXED_NODE_MAX_SOURCE_BUNDLE_BYTES` overrides apply to both values.
+  The fleet API and `get_compute_fleet` expose this capability; legacy nodes
+  report it as absent/unknown.
   Version 3 is required for overlay jobs and version 4 for complete-source
   jobs, so a rolling deployment can never silently fetch a private repository
   or drop source content on an older node.
@@ -501,8 +506,21 @@ body limits and must be verified on the intended route before rollout.
 Roll out the backend (including its embedded sender and 64 MiB decoder),
 refresh mission-managed wrappers through normal mission setup, and update an
 idle node to the matching 32 MiB receiver before submitting larger snapshots.
-A v4 heartbeat proves protocol support, not this new byte default; older v4
-nodes may still reject above 16 MiB. Preserve explicit operator overrides,
+A v4 heartbeat proves payload semantics. Updated nodes additionally advertise
+`source_bundle_capacity`, computed by the same limit function as validation.
+Before dispatch, core sums the actual decoded file bytes and filters automatic
+placement (including re-probe selection) by the matching complete/overlay limit.
+Explicit nodes use the same capacity check. Insufficient capacity returns 503
+before a job is submitted, allowing the wrapper's existing local fallback;
+400/422 submission failures are still caller errors and are not retried.
+Legacy heartbeats remain eligible up to the historical 16 MiB complete / 1 MiB
+overlay defaults, subject to the existing protocol gates. Larger payloads require
+advertised capacity. Legacy private overrides cannot be inferred: upgrade nodes
+with smaller overrides to advertise them before relying on automatic placement.
+New nodes' explicit smaller ceilings are honored even below legacy defaults.
+Old backends ignore the additive heartbeat field, so install the corrected
+backend before enabling larger submissions; a node-only upgrade is insufficient.
+Preserve explicit operator overrides,
 active jobs and receipt/resume state. Require a >16 MiB complete-source canary
 through the intended proxy/backend/node route, with source bytes, executable
 bits, manifest/operations digests and terminal receipts checked. Existing

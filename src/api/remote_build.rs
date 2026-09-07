@@ -621,6 +621,7 @@ async fn resolve_node(
     requirements: &[String],
     min_disk_bytes: u64,
     min_protocol_version: u32,
+    source: Option<crate::remote_node::protocol::SourceBundleRequirement>,
 ) -> Result<RemoteNodeConfig, (StatusCode, String)> {
     let settings = &state.config.remote_nodes;
     if !settings.enabled || settings.nodes.is_empty() {
@@ -635,11 +636,12 @@ async fn resolve_node(
             .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?;
         let first = state
             .fleet
-            .place_auto_with_protocol_and_resource_reservations(
+            .place_auto_with_source_and_resource_reservations(
                 settings,
                 requirements,
                 min_disk_bytes,
                 min_protocol_version,
+                source,
                 &reservations.jobs,
                 &reservations.disk_bytes,
             );
@@ -676,11 +678,12 @@ async fn resolve_node(
                     .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?;
                 state
                     .fleet
-                    .place_auto_with_protocol_and_resource_reservations(
+                    .place_auto_with_source_and_resource_reservations(
                         settings,
                         requirements,
                         min_disk_bytes,
                         min_protocol_version,
+                        source,
                         &reservations.jobs,
                         &reservations.disk_bytes,
                     )
@@ -716,6 +719,7 @@ async fn resolve_node(
             ),
         ));
     }
+    check_node_source_capacity(&heartbeat, source)?;
     let reserved = reservations.disk_bytes.get(&node.id).copied().unwrap_or(0);
     let effective = heartbeat.disk_available_bytes.saturating_sub(reserved);
     if effective < min_disk_bytes {
@@ -731,6 +735,21 @@ async fn resolve_node(
         ));
     }
     Ok(node)
+}
+
+fn check_node_source_capacity(
+    heartbeat: &crate::remote_node::protocol::NodeHeartbeat,
+    source: Option<crate::remote_node::protocol::SourceBundleRequirement>,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(source) = source {
+        source.check(heartbeat).map_err(|reason| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("remote node '{}': {reason}", heartbeat.node_id),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn submit_error_status(err: &RemoteNodeError) -> StatusCode {
@@ -1213,6 +1232,15 @@ async fn submit_remote_build(
         )
             .into_response();
     }
+    let source = match req
+        .source_bundle
+        .as_ref()
+        .map(crate::remote_node::protocol::SourceBundleRequirement::from_bundle)
+        .transpose()
+    {
+        Ok(source) => source,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
     let min_disk_bytes = required_node_disk_bytes(req.estimated_disk_bytes);
     let min_protocol_version = if req.source_archive.is_some() {
         crate::remote_node::protocol::NODE_PROTOCOL_VERSION
@@ -1257,6 +1285,7 @@ async fn submit_remote_build(
         &requirements,
         min_disk_bytes,
         min_protocol_version,
+        source,
     )
     .await
     {
@@ -2167,6 +2196,10 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
             })
             .sum();
         assert_eq!(total, 32 << 20);
+        let requirement =
+            crate::remote_node::protocol::SourceBundleRequirement::from_bundle(bundle).unwrap();
+        assert_eq!(requirement.bytes, total as u64);
+
         assert!(bundle.files.iter().any(|f| f.path.ends_with("receipt.bin")));
         assert!(bundle.files.iter().any(|f| f.executable == Some(true)));
 
@@ -2203,9 +2236,37 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
             Ok(StatusCode::OK)
         }
+        use crate::remote_node::protocol::NodeHeartbeat;
+        let old: NodeHeartbeat = serde_json::from_value(serde_json::json!({
+            "node_id":"a-old", "online":true, "capacity_total":1,
+            "capacity_available":1, "active_leases":0, "version":"old", "protocol_version":4,
+            "labels":["lean"], "disk_available_bytes": 1000 * GIB,
+            "mem_available_bytes": 1000 * GIB,
+        }))
+        .unwrap();
+        let mut capable = old.clone();
+        capable.node_id = "z-capable".into();
+        capable.source_bundle_capacity = Some(crate::node::lean::source_bundle_capacity());
+        let old_posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let old_posts_route = old_posts.clone();
         let app = Router::new()
             .route("/", post(ingress))
             .route("/jobs", post(node_ingress))
+            .route(
+                "/heartbeat",
+                axum::routing::get(move || async move { Json(capable) }),
+            )
+            .route(
+                "/old/heartbeat",
+                axum::routing::get(move || async move { Json(old) }),
+            )
+            .route(
+                "/old/jobs",
+                post(move || async move {
+                    old_posts_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    StatusCode::UNPROCESSABLE_ENTITY
+                }),
+            )
             .layer(axum::extract::DefaultBodyLimit::max(
                 MAX_SOURCE_REQUEST_BODY_BYTES,
             ));
@@ -2214,6 +2275,55 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = reqwest::Client::new();
         let url = format!("http://{address}/");
+        let old_node = RemoteNodeConfig {
+            id: "a-old".into(),
+            base_url: format!("http://{address}/old"),
+            token_env: "UNUSED_TEST_TOKEN".into(),
+            labels: None,
+        };
+        let capable_node = RemoteNodeConfig {
+            id: "z-capable".into(),
+            base_url: format!("http://{address}"),
+            token_env: "UNUSED_TEST_TOKEN".into(),
+            labels: None,
+        };
+        let fleet = crate::remote_node::FleetMonitor::new();
+        let node_client = RemoteNodeClient::default();
+        for node in [&old_node, &capable_node] {
+            let hb = node_client.heartbeat(node, "test").await.unwrap();
+            fleet.record_heartbeat(&node.id, hb);
+        }
+        let mut settings = crate::remote_node::RemoteNodeSettings {
+            enabled: true,
+            nodes: vec![old_node.clone()],
+        };
+        let pick = |settings: &crate::remote_node::RemoteNodeSettings| {
+            fleet.place_auto_with_source_and_resource_reservations(
+                settings,
+                &["lean".into()],
+                GIB,
+                minimum_node_protocol_version(Some(bundle)),
+                Some(requirement),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+        };
+        assert!(pick(&settings).is_err()); // no dispatch when fleet capacity is insufficient
+        let old_hb = fleet.get(&old_node.id).unwrap().last_heartbeat.unwrap();
+        assert_eq!(
+            check_node_source_capacity(&old_hb, Some(requirement))
+                .unwrap_err()
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        ); // explicit node has the same pre-dispatch gate
+        settings.nodes.push(capable_node.clone());
+        assert_eq!(pick(&settings).unwrap(), capable_node.id);
+        let selected_url = settings
+            .node(&pick(&settings).unwrap())
+            .unwrap()
+            .base_url
+            .clone();
+
         let response = client
             .post(&url)
             .header("Content-Encoding", "gzip")
@@ -2266,7 +2376,7 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
         drop(json);
         drop(roundtrip);
         let response = client
-            .post(format!("{url}jobs"))
+            .post(format!("{selected_url}/jobs"))
             .json(&job)
             .send()
             .await
@@ -2278,13 +2388,14 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
             response.text().await.unwrap()
         );
         let response = client
-            .post(format!("{url}jobs"))
+            .post(format!("{selected_url}/jobs"))
             .header("Content-Type", "application/json")
             .body(vec![b' '; MAX_SOURCE_REQUEST_BODY_BYTES + 1])
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(old_posts.load(std::sync::atomic::Ordering::SeqCst), 0);
         server.abort();
         drop(job);
 
@@ -2382,6 +2493,44 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
                 result.unwrap();
             }
         }
+    }
+
+    #[test]
+    #[ignore = "local measured wrapper request; set REMOTE_BUILD_MEASURED_FIXTURE"]
+    fn measured_fixture_capacity_matches_receiver_and_explicit_placement() {
+        use crate::remote_node::protocol::{NodeHeartbeat, SourceBundleRequirement};
+        let bytes = std::fs::read(std::env::var("REMOTE_BUILD_MEASURED_FIXTURE").unwrap()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let request = parse_remote_build_request(&headers, &bytes).unwrap();
+        let requirement =
+            SourceBundleRequirement::from_bundle(request.source_bundle.as_ref().unwrap()).unwrap();
+        let mut hb: NodeHeartbeat = serde_json::from_value(serde_json::json!({
+            "node_id":"receiver", "online":true, "capacity_total":1,
+            "capacity_available":1, "active_leases":0, "version":"test", "protocol_version":4,
+            "source_bundle_capacity": crate::node::lean::source_bundle_capacity(),
+        }))
+        .unwrap();
+        let placement = check_node_source_capacity(&hb, Some(requirement));
+        let receiver = validate_parsed_source(request);
+        assert_eq!(placement.is_ok(), receiver.is_ok());
+        if let Err((status, reason)) = placement {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(reason.contains("receiver capacity"));
+            assert!(receiver.unwrap_err().contains("maximum is"));
+        }
+        // Exact explicit-node gate also preserves legacy compatibility.
+        hb.source_bundle_capacity = None;
+        assert_eq!(
+            check_node_source_capacity(&hb, Some(requirement)).is_ok(),
+            requirement.bytes <= 16 << 20
+        );
+        check_node_source_capacity(&hb, None).unwrap();
+        println!(
+            "decoded bytes: {}; effective capacity: {:?}",
+            requirement.bytes,
+            crate::node::lean::source_bundle_capacity()
+        );
     }
 
     #[test]

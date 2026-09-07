@@ -111,12 +111,31 @@ pub fn rel_path_is_safe(rel_clean: &str) -> bool {
         })
 }
 
+pub fn source_bundle_capacity() -> crate::remote_node::protocol::SourceBundleCapacity {
+    crate::remote_node::protocol::SourceBundleCapacity {
+        overlay_bytes: source_bundle_mode_max_bytes(false),
+        complete_bytes: source_bundle_mode_max_bytes(true),
+    }
+}
+
 fn source_bundle_max_bytes(bundle: &SourceBundle) -> u64 {
-    std::env::var("SANDBOXED_NODE_MAX_SOURCE_BUNDLE_BYTES")
-        .ok()
+    source_bundle_mode_max_bytes(bundle.complete)
+}
+
+fn source_bundle_mode_max_bytes(complete: bool) -> u64 {
+    configured_source_bundle_max_bytes(
+        complete,
+        std::env::var("SANDBOXED_NODE_MAX_SOURCE_BUNDLE_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn configured_source_bundle_max_bytes(complete: bool, configured: Option<&str>) -> u64 {
+    configured
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|bytes| *bytes > 0)
-        .unwrap_or(if bundle.complete {
+        .unwrap_or(if complete {
             DEFAULT_MAX_COMPLETE_SOURCE_BUNDLE_BYTES
         } else {
             DEFAULT_MAX_SOURCE_BUNDLE_BYTES
@@ -2147,6 +2166,29 @@ mod tests {
             error.contains("does not contain requested commit"),
             "{error}; original commit was {commit}"
         );
+    }
+
+    #[test]
+    fn source_capacity_preserves_operator_ceilings() {
+        for (configured, overlay, complete) in [
+            (None, 1 << 20, 32 << 20),
+            (Some("8388608"), 8 << 20, 8 << 20),
+            (Some(" 17 "), 17, 17),
+            (Some("0"), 1 << 20, 32 << 20),
+            (Some("invalid"), 1 << 20, 32 << 20),
+        ] {
+            assert_eq!(
+                configured_source_bundle_max_bytes(false, configured),
+                overlay
+            );
+            assert_eq!(
+                configured_source_bundle_max_bytes(true, configured),
+                complete
+            );
+        }
+        let capacity = source_bundle_capacity();
+        assert_eq!(capacity.overlay_bytes, source_bundle_mode_max_bytes(false));
+        assert_eq!(capacity.complete_bytes, source_bundle_mode_max_bytes(true));
     }
 
     #[test]

@@ -16,7 +16,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use super::client::RemoteNodeClient;
-use super::protocol::NodeHeartbeat;
+use super::protocol::{NodeHeartbeat, SourceBundleRequirement};
 use super::{RemoteNodeConfig, RemoteNodeSettings, RemoteNodeStatus};
 
 /// Consecutive missed probes after which a node is considered `Offline`
@@ -398,6 +398,31 @@ pub fn select_node_auto_with_protocol_and_resource_reservations(
     reservations: &HashMap<String, u32>,
     disk_reservations: &HashMap<String, u64>,
 ) -> Result<String, PlacementError> {
+    select_node_auto_with_source_and_resource_reservations(
+        nodes,
+        statuses,
+        requirements,
+        min_disk_bytes,
+        min_mem_bytes,
+        min_protocol_version,
+        None,
+        reservations,
+        disk_reservations,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Pure placement inputs stay explicit for auditability.
+pub fn select_node_auto_with_source_and_resource_reservations(
+    nodes: &[RemoteNodeConfig],
+    statuses: &HashMap<String, CachedNodeStatus>,
+    requirements: &[String],
+    min_disk_bytes: u64,
+    min_mem_bytes: u64,
+    min_protocol_version: u32,
+    source: Option<SourceBundleRequirement>,
+    reservations: &HashMap<String, u32>,
+    disk_reservations: &HashMap<String, u64>,
+) -> Result<String, PlacementError> {
     let mut reasons: Vec<(String, String)> = Vec::new();
     // (queued, specialized, load, capacity, mem_avail, id)
     //
@@ -430,6 +455,12 @@ pub fn select_node_auto_with_protocol_and_resource_reservations(
                 ),
             ));
             continue;
+        }
+        if let Some(source) = source {
+            if let Err(reason) = source.check(heartbeat) {
+                reasons.push((node.id.clone(), reason));
+                continue;
+            }
         }
         if requirements.iter().any(|requirement| requirement == "lean")
             && heartbeat.lean_runtime_ready == Some(false)
@@ -609,15 +640,38 @@ impl FleetMonitor {
         reservations: &HashMap<String, u32>,
         disk_reservations: &HashMap<String, u64>,
     ) -> Result<String, PlacementError> {
+        self.place_auto_with_source_and_resource_reservations(
+            settings,
+            requirements,
+            min_disk_bytes,
+            min_protocol_version,
+            None,
+            reservations,
+            disk_reservations,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_auto_with_source_and_resource_reservations(
+        &self,
+        settings: &RemoteNodeSettings,
+        requirements: &[String],
+        min_disk_bytes: u64,
+        min_protocol_version: u32,
+        source: Option<SourceBundleRequirement>,
+        reservations: &HashMap<String, u32>,
+        disk_reservations: &HashMap<String, u64>,
+    ) -> Result<String, PlacementError> {
         let (nodes, mut cordoned_reasons) = self.partition_cordoned(&settings.nodes);
         let statuses = self.statuses.read().unwrap_or_else(|e| e.into_inner());
-        select_node_auto_with_protocol_and_resource_reservations(
+        select_node_auto_with_source_and_resource_reservations(
             &nodes,
             &statuses,
             requirements,
             min_disk_bytes,
             env_gb_bytes("REMOTE_NODE_MIN_MEM_GB", DEFAULT_MIN_MEM_GB),
             min_protocol_version,
+            source,
             reservations,
             disk_reservations,
         )
@@ -665,6 +719,7 @@ pub struct RemoteNodeView {
     pub disk_available_bytes: Option<u64>,
     pub cached_toolchains: Vec<String>,
     pub lean_runtime_ready: Option<bool>,
+    pub source_bundle_capacity: Option<super::protocol::SourceBundleCapacity>,
     pub last_seen: Option<DateTime<Utc>>,
     pub error: Option<String>,
     /// Operator-cordoned: still probed and listed, but excluded from
@@ -706,6 +761,7 @@ impl RemoteNodeView {
                 .map(|h| h.cached_toolchains.clone())
                 .unwrap_or_default(),
             lean_runtime_ready: heartbeat.and_then(|h| h.lean_runtime_ready),
+            source_bundle_capacity: heartbeat.and_then(|h| h.source_bundle_capacity),
             last_seen: cached.and_then(|c| c.last_seen),
             error: cached.and_then(|c| c.last_error.clone()),
             cordoned: false,
@@ -1268,6 +1324,90 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.reasons[0].1.contains("85 GiB reserved"));
+    }
+
+    #[test]
+    fn source_capacity_filters_mixed_fleet_before_ranking() {
+        use super::super::protocol::SourceBundleCapacity;
+        let nodes = vec![
+            node_config("a-old"),
+            node_config("b-small"),
+            node_config("z-capable"),
+        ];
+        let mut statuses = HashMap::new();
+        for node in &nodes {
+            let mut status = cached_online(&node.id, &["lean"], 100, 32, 2, 0, 0);
+            let hb = status.last_heartbeat.as_mut().unwrap();
+            hb.protocol_version = 4;
+            hb.source_bundle_capacity = match node.id.as_str() {
+                "b-small" => Some(SourceBundleCapacity {
+                    overlay_bytes: 8 << 20,
+                    complete_bytes: 8 << 20,
+                }),
+                "z-capable" => Some(SourceBundleCapacity {
+                    overlay_bytes: 1 << 20,
+                    complete_bytes: 32 << 20,
+                }),
+                _ => None,
+            };
+            statuses.insert(node.id.clone(), status);
+        }
+        let pick = |statuses: &HashMap<String, CachedNodeStatus>, bytes, complete| {
+            select_node_auto_with_source_and_resource_reservations(
+                &nodes,
+                statuses,
+                &["lean".to_string()],
+                20 * GIB,
+                8 * GIB,
+                if complete { 4 } else { 3 },
+                Some(SourceBundleRequirement { bytes, complete }),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+        };
+        // Old v4 remains compatible at its historical complete ceiling.
+        assert_eq!(pick(&statuses, 16 << 20, true).unwrap(), "a-old");
+        assert_eq!(pick(&statuses, (16 << 20) + 1, true).unwrap(), "z-capable");
+        assert_eq!(pick(&statuses, 32 << 20, true).unwrap(), "z-capable");
+        assert_eq!(pick(&statuses, 1 << 20, false).unwrap(), "a-old");
+        assert_eq!(pick(&statuses, (1 << 20) + 1, false).unwrap(), "b-small");
+        assert!(pick(&statuses, (32 << 20) + 1, true)
+            .unwrap_err()
+            .reasons
+            .iter()
+            .all(|(_, reason)| reason.contains("receiver capacity")));
+        // Ranking and even spare slots must never rescue an undersized node.
+        statuses
+            .get_mut("z-capable")
+            .unwrap()
+            .last_heartbeat
+            .as_mut()
+            .unwrap()
+            .active_jobs = 2;
+        assert_eq!(pick(&statuses, 25 << 20, true).unwrap(), "z-capable");
+        statuses.get_mut("z-capable").unwrap().status = RemoteNodeStatus::Offline;
+        let err = pick(&statuses, 25 << 20, true).unwrap_err();
+        assert_eq!(err.reasons.len(), 3);
+        assert!(err
+            .reasons
+            .iter()
+            .any(|(id, reason)| id == "b-small" && reason.contains("8388608")));
+        // Configured ceilings below legacy defaults apply to small payloads too.
+        let hb = statuses["b-small"].last_heartbeat.as_ref().unwrap();
+        assert!(SourceBundleRequirement {
+            bytes: (8 << 20) + 1,
+            complete: true
+        }
+        .check(hb)
+        .is_err());
+        assert!(SourceBundleRequirement {
+            bytes: 8 << 20,
+            complete: true
+        }
+        .check(hb)
+        .is_ok());
+        let view = RemoteNodeView::from_cache(&nodes[1], statuses.get("b-small"));
+        assert_eq!(view.source_bundle_capacity, hb.source_bundle_capacity);
     }
 
     #[test]

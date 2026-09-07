@@ -65,6 +65,23 @@ manifest and operation digests continue to identify literal paths. This closes
 the crafted `./Root.lean` / `Root.lean` destination alias; normal Git sender
 paths are unaffected. Build-directory path handling is unchanged.
 
+## Placement capacity contract
+
+Complete bundles retain protocol v4. Receivers now advertise effective decoded
+file-byte limits in `source_bundle_capacity` (`complete_bytes`, `overlay_bytes`),
+including positive operator overrides. Core measures actual base64-decoded file
+contents before dispatch and excludes insufficient receivers in automatic and
+explicit placement. Auto re-probing retains the same constraint. With no capable
+node, placement returns 503 before submission; accepted jobs and receipt reuse
+keep their existing behavior. Fleet/tool output carries the same capability.
+
+Legacy v4 nodes without this field retain compatibility through 16 MiB complete
+(and v3 overlays through 1 MiB); larger bundles require explicit capacity.
+Private lower overrides on legacy nodes remain unknowable and require updating
+those receivers to advertise them. Updated lower ceilings are enforced for all
+bundle sizes. Old backends ignore the new heartbeat field and must be updated
+before enabling larger bundles. The 32/64/50 MiB limits above are unchanged.
+
 ## Reproduction and receipts
 
 From this transport checkout (Git credentials are used only for the authorized

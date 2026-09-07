@@ -245,6 +245,7 @@ async fn heartbeat(
         active_jobs: state.runner.active_count(),
         queued_jobs: state.runner.queued_count(),
         cached_toolchains: sandboxed_sh::node::cached_toolchains(&state.work_root),
+        source_bundle_capacity: Some(sandboxed_sh::node::lean::source_bundle_capacity()),
         lean_runtime_ready: Some(lean_runtime_ready),
     }))
 }
@@ -597,6 +598,10 @@ mod tests {
         assert_eq!(busy.capacity_total, 2);
         assert_eq!(busy.capacity_available, 1);
         assert_eq!(busy.protocol_version, NODE_PROTOCOL_VERSION);
+        assert_eq!(
+            busy.source_bundle_capacity,
+            Some(sandboxed_sh::node::lean::source_bundle_capacity())
+        );
         assert_eq!(busy.labels, vec!["test".to_string()]);
         let _response = running
             .await
