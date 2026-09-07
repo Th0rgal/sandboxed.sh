@@ -4194,8 +4194,15 @@ fn compact_situation(raw: Value) -> Value {
         .cloned()
         .unwrap_or_default();
     let items_total = items.len();
+    // Dormant absorbed rows are history, not work: hide them from the compact
+    // view so an agent never mistakes them for pending items.
+    let dormant_hidden = items
+        .iter()
+        .filter(|item| item.get("derived_state").and_then(Value::as_str) == Some("dormant"))
+        .count();
     let kept: Vec<Value> = items
         .iter()
+        .filter(|item| item.get("derived_state").and_then(Value::as_str) != Some("dormant"))
         .take(MCP_PROJECT_ITEM_CAP)
         .map(|item| {
             let mut out = json!({
@@ -4221,6 +4228,7 @@ fn compact_situation(raw: Value) -> Value {
         "items": kept,
         "items_total": items_total,
         "items_omitted": items_total.saturating_sub(kept.len()),
+        "dormant_hidden": dormant_hidden,
     })
 }
 
