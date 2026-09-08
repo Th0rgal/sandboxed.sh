@@ -42,7 +42,7 @@ pub const ALLOWED_COMMANDS: [&str; 2] = ["lake", "lean"];
 /// filesystem backing the work dir (`SANDBOXED_NODE_MIN_FREE_GB` overrides).
 const DEFAULT_MIN_FREE_GB: u64 = 10;
 const DEFAULT_MAX_SOURCE_BUNDLE_BYTES: u64 = 1 << 20;
-const DEFAULT_MAX_COMPLETE_SOURCE_BUNDLE_BYTES: u64 = 16 << 20;
+const DEFAULT_MAX_COMPLETE_SOURCE_BUNDLE_BYTES: u64 = 32 << 20;
 const MAX_SOURCE_BUNDLE_FILES: usize = 256;
 const DEFAULT_MAX_SOURCE_ARCHIVE_BYTES: u64 = 32 << 20;
 const DEFAULT_MAX_SOURCE_ARCHIVE_EXPANDED_BYTES: u64 = 2 << 30;
@@ -111,12 +111,31 @@ pub fn rel_path_is_safe(rel_clean: &str) -> bool {
         })
 }
 
+pub fn source_bundle_capacity() -> crate::remote_node::protocol::SourceBundleCapacity {
+    crate::remote_node::protocol::SourceBundleCapacity {
+        overlay_bytes: source_bundle_mode_max_bytes(false),
+        complete_bytes: source_bundle_mode_max_bytes(true),
+    }
+}
+
 fn source_bundle_max_bytes(bundle: &SourceBundle) -> u64 {
-    std::env::var("SANDBOXED_NODE_MAX_SOURCE_BUNDLE_BYTES")
-        .ok()
+    source_bundle_mode_max_bytes(bundle.complete)
+}
+
+fn source_bundle_mode_max_bytes(complete: bool) -> u64 {
+    configured_source_bundle_max_bytes(
+        complete,
+        std::env::var("SANDBOXED_NODE_MAX_SOURCE_BUNDLE_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn configured_source_bundle_max_bytes(complete: bool, configured: Option<&str>) -> u64 {
+    configured
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|bytes| *bytes > 0)
-        .unwrap_or(if bundle.complete {
+        .unwrap_or(if complete {
             DEFAULT_MAX_COMPLETE_SOURCE_BUNDLE_BYTES
         } else {
             DEFAULT_MAX_SOURCE_BUNDLE_BYTES
@@ -188,12 +207,14 @@ fn decode_source_archive(source: &JobSource, archive: &SourceArchive) -> Result<
     Ok(bytes)
 }
 
+// Bundle paths are literal manifest identities: never normalize aliases before
+// writing. Validate every entry and deletion before any filesystem mutation.
 fn bundle_path_is_safe(path: &str) -> bool {
     rel_path_is_safe(path)
         && !path.is_empty()
         && !path
             .split('/')
-            .any(|component| matches!(component, ".git" | ".lake"))
+            .any(|component| matches!(component, "." | ".git" | ".lake"))
 }
 
 pub(crate) fn bundle_manifest_sha256_for_mode(
@@ -2148,6 +2169,29 @@ mod tests {
     }
 
     #[test]
+    fn source_capacity_preserves_operator_ceilings() {
+        for (configured, overlay, complete) in [
+            (None, 1 << 20, 32 << 20),
+            (Some("8388608"), 8 << 20, 8 << 20),
+            (Some(" 17 "), 17, 17),
+            (Some("0"), 1 << 20, 32 << 20),
+            (Some("invalid"), 1 << 20, 32 << 20),
+        ] {
+            assert_eq!(
+                configured_source_bundle_max_bytes(false, configured),
+                overlay
+            );
+            assert_eq!(
+                configured_source_bundle_max_bytes(true, configured),
+                complete
+            );
+        }
+        let capacity = source_bundle_capacity();
+        assert_eq!(capacity.overlay_bytes, source_bundle_mode_max_bytes(false));
+        assert_eq!(capacity.complete_bytes, source_bundle_mode_max_bytes(true));
+    }
+
+    #[test]
     fn source_archive_tree_validation_rejects_unsafe_paths_and_special_entries() {
         assert!(validate_archive_tree_output(
             b"100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t../escape\0"
@@ -2348,6 +2392,187 @@ mod tests {
         .contains("unsafe source bundle path"));
     }
 
+    // Re-sign every crafted request so rejection proves path validation, not
+    // stale content/manifest/operation hashes. Exercise the actual API decoder.
+    fn decode_path_fixture(mut bundle: SourceBundle, gzip: bool) -> JobSource {
+        use std::io::Write;
+        bundle.files.sort_by(|a, b| a.path.cmp(&b.path));
+        bundle.deleted_paths.sort();
+        bundle.manifest_sha256 = bundle_manifest_sha256_for_mode(
+            &bundle
+                .files
+                .iter()
+                .map(|f| (f.path.clone(), f.sha256.clone()))
+                .collect::<Vec<_>>(),
+            bundle.complete,
+        );
+        bundle.operations_sha256 = Some(bundle_operations_sha256(&bundle));
+        let mut body = serde_json::to_vec(&serde_json::json!({
+            "mission_id": uuid::Uuid::new_v4(),
+            "token": "fixture-capability",
+            "repo": "https://example.invalid/no-fetch.git",
+            "commit": "a".repeat(40),
+            "base_tree_sha": "b".repeat(40),
+            "command": ["lake", "build"],
+            "source_bundle": bundle,
+        }))
+        .unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        if gzip {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&body).unwrap();
+            body = encoder.finish().unwrap();
+            headers.insert(
+                axum::http::header::CONTENT_ENCODING,
+                "gzip".parse().unwrap(),
+            );
+        }
+        let request =
+            crate::api::remote_build::parse_remote_build_request(&headers, &body).unwrap();
+        JobSource {
+            repo: request.repo,
+            commit: request.commit,
+            base_tree_sha: request.base_tree_sha,
+            archive: None,
+            bundle: request.source_bundle,
+        }
+    }
+
+    #[tokio::test]
+    async fn source_bundle_path_aliases_fail_before_any_mutation() {
+        for complete in [false, true] {
+            for gzip in [false, true] {
+                for alias in [
+                    "./Root.lean",
+                    "nested/./Root.lean",
+                    "nested//Root.lean",
+                    "nested/Root.lean/.",
+                    "nested/Root.lean/",
+                    ".",
+                    "nested/../Root.lean",
+                    "/Root.lean",
+                    ".git/config",
+                    ".lake/build/Root.lean",
+                ] {
+                    // Cover aliases in entries, deletions, and between an entry
+                    // and a deletion, as well as the original two-file overwrite.
+                    for deletion in [false, true] {
+                        let temp = tempfile::tempdir().unwrap();
+                        let checkout = temp.path().join("checkout");
+                        std::fs::create_dir_all(checkout.join("nested")).unwrap();
+                        for path in ["A.keep", "Root.lean", "nested/Root.lean"] {
+                            std::fs::write(checkout.join(path), b"original\0bytes").unwrap();
+                        }
+                        let log = temp.path().join("job.log");
+                        let mut bundle = source_bundle("Root.lean", b"second\n");
+                        bundle.complete = complete;
+                        bundle.files[0].executable = Some(true);
+                        bundle.files.push(
+                            source_bundle("B.new", b"must not be created")
+                                .files
+                                .remove(0),
+                        );
+                        bundle.deleted_paths = vec!["A.keep".into()];
+                        if deletion {
+                            bundle.deleted_paths.push(alias.into());
+                        } else {
+                            bundle
+                                .files
+                                .push(source_bundle(alias, b"first\n").files.remove(0));
+                        }
+                        let source = decode_path_fixture(bundle, gzip);
+                        let error = validate_lean_build(
+                            &source,
+                            None,
+                            &["lake".into(), "build".into()],
+                            &HashMap::new(),
+                            &allowlist(),
+                        )
+                        .unwrap_err();
+                        assert!(error.contains("unsafe"), "{alias}: {error}");
+                        let error =
+                            apply_source_bundle(&checkout, source.bundle.as_ref().unwrap(), &log)
+                                .await
+                                .unwrap_err()
+                                .to_string();
+                        assert!(error.contains("unsafe"), "{alias}: {error}");
+                        for path in ["A.keep", "Root.lean", "nested/Root.lean"] {
+                            assert_eq!(
+                                std::fs::read(checkout.join(path)).unwrap(),
+                                b"original\0bytes"
+                            );
+                        }
+                        assert!(!checkout.join("B.new").exists());
+                        assert!(!log.exists());
+                        assert_eq!(std::fs::read_dir(&checkout).unwrap().count(), 3);
+                        assert_eq!(
+                            std::fs::read_dir(checkout.join("nested")).unwrap().count(),
+                            1
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_source_bundle_paths_preserve_exact_bytes_and_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        for complete in [false, true] {
+            for gzip in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let checkout = temp.path().join("checkout");
+                std::fs::create_dir_all(checkout.join("nested/deeper")).unwrap();
+                std::fs::write(checkout.join("nested/deeper/obsolete"), b"delete").unwrap();
+                let mut bundle = source_bundle("Root.lean", b"first\n");
+                bundle.complete = complete;
+                bundle.files[0].executable = Some(false);
+                for (path, bytes, executable) in [
+                    ("nested/Root.lean", b"second\0\xff\n".as_slice(), true),
+                    ("nested/deeper/.hidden-file_v2", b"third".as_slice(), false),
+                ] {
+                    let mut file = source_bundle(path, bytes).files.remove(0);
+                    file.executable = Some(executable);
+                    bundle.files.push(file);
+                }
+                bundle.deleted_paths = vec!["nested/deeper/obsolete".into()];
+                let source = decode_path_fixture(bundle, gzip);
+                validate_lean_build(
+                    &source,
+                    None,
+                    &["lake".into(), "build".into()],
+                    &HashMap::new(),
+                    &allowlist(),
+                )
+                .unwrap();
+                let bundle = source.bundle.unwrap();
+                apply_source_bundle(&checkout, &bundle, &temp.path().join("job.log"))
+                    .await
+                    .unwrap();
+                assert!(!checkout.join("nested/deeper/obsolete").exists());
+                for file in &bundle.files {
+                    let path = checkout.join(&file.path);
+                    assert_eq!(
+                        std::fs::read(&path).unwrap(),
+                        base64::engine::general_purpose::STANDARD
+                            .decode(&file.data_base64)
+                            .unwrap()
+                    );
+                    assert_eq!(
+                        std::fs::metadata(path).unwrap().permissions().mode() & 0o111,
+                        if file.executable == Some(true) {
+                            0o111
+                        } else {
+                            0
+                        }
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn source_bundle_application_is_atomic_and_emits_a_receipt() {
         let temp = tempfile::tempdir().unwrap();
@@ -2506,6 +2731,62 @@ mod tests {
         assert!(validate_source_bundle(&tampered)
             .unwrap_err()
             .contains("operations hash mismatch"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "local measured wrapper request; set REMOTE_BUILD_MEASURED_FIXTURE"]
+    async fn measured_complete_fixture_materializes_every_byte_and_mode() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        let input = std::fs::read(std::env::var("REMOTE_BUILD_MEASURED_FIXTURE").unwrap()).unwrap();
+        let mut json = Vec::new();
+        flate2::read::GzDecoder::new(input.as_slice())
+            .take((64 << 20) + 1)
+            .read_to_end(&mut json)
+            .unwrap();
+        assert!(json.len() <= 64 << 20);
+        let request: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let bundle: SourceBundle =
+            serde_json::from_value(request["source_bundle"].clone()).unwrap();
+        assert!(bundle.complete);
+        validate_source_bundle(&bundle).unwrap();
+        let source = JobSource {
+            repo: "https://example.invalid/no-fetch.git".to_string(),
+            commit: request["commit"].as_str().unwrap().to_string(),
+            base_tree_sha: Some(request["base_tree_sha"].as_str().unwrap().to_string()),
+            archive: None,
+            bundle: Some(bundle.clone()),
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = ensure_checkout(
+            temp.path(),
+            &source,
+            &temp.path().join("job.log"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        for file in &bundle.files {
+            let path = checkout.join(&file.path);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                base64::engine::general_purpose::STANDARD
+                    .decode(&file.data_base64)
+                    .unwrap(),
+                "{}",
+                file.path
+            );
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o111 != 0,
+                file.executable.unwrap(),
+                "{}",
+                file.path
+            );
+        }
+        assert!(!walkdir::WalkDir::new(checkout)
+            .into_iter()
+            .any(|entry| entry.unwrap().file_name() == ".git"));
     }
 
     #[tokio::test]

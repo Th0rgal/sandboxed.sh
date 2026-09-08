@@ -19,6 +19,10 @@ pub const NODE_PROTOCOL_VERSION: u32 = 4;
 /// First protocol that reports `active_jobs` and `queued_jobs` in heartbeats.
 pub const NODE_JOB_COUNTER_PROTOCOL_VERSION: u32 = 2;
 
+/// HTTP body ceiling for source submissions: gzip on core ingress, plain JSON
+/// on node ingress. Keep independent from the decoded-source and gzip expansion caps.
+pub const MAX_SOURCE_REQUEST_BODY_BYTES: usize = 50 * 1024 * 1024;
+
 /// Lease scope for the synchronous `/execute` path.
 pub const SCOPE_MISSION_EXECUTE: &str = "mission:execute";
 
@@ -30,7 +34,7 @@ fn default_protocol_version() -> u32 {
     1
 }
 
-/// Node heartbeat payload (v2).
+/// Node heartbeat payload (v4 with additive capacity reporting).
 ///
 /// All fields beyond the original v1 set are `#[serde(default)]`-tolerant so
 /// core can parse heartbeats from nodes that were not yet upgraded, and old
@@ -74,6 +78,73 @@ pub struct NodeHeartbeat {
     /// older node that predates readiness reporting.
     #[serde(default)]
     pub lean_runtime_ready: Option<bool>,
+    /// Effective decoded file-byte ceilings, including positive operator overrides.
+    /// Absent on legacy receivers; additive to v4, not a new payload protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_bundle_capacity: Option<SourceBundleCapacity>,
+}
+
+/// Decoded file-byte limits enforced by the receiver for each bundle mode.
+/// Core separately gates the exact serialized job against the HTTP body limit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceBundleCapacity {
+    pub overlay_bytes: u64,
+    pub complete_bytes: u64,
+}
+
+/// Placement input derived from actual base64 contents, never a caller estimate.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceBundleRequirement {
+    pub complete: bool,
+    pub bytes: u64,
+}
+
+impl SourceBundleRequirement {
+    pub fn from_bundle(bundle: &SourceBundle) -> Result<Self, String> {
+        let mut bytes = 0u64;
+        for file in &bundle.files {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&file.data_base64)
+                .map_err(|_| format!("invalid source bundle base64 for '{}'", file.path))?;
+            bytes = bytes
+                .checked_add(decoded.len() as u64)
+                .ok_or_else(|| "source bundle size overflow".to_string())?;
+        }
+        Ok(Self {
+            complete: bundle.complete,
+            bytes,
+        })
+    }
+
+    /// Legacy compatibility assumes the historical default ceilings. A legacy
+    /// heartbeat cannot reveal private overrides; larger payloads require an
+    /// explicit advertisement. Updated nodes always advertise their overrides.
+    pub fn check(self, heartbeat: &NodeHeartbeat) -> Result<(), String> {
+        let capacity = heartbeat
+            .source_bundle_capacity
+            .unwrap_or(SourceBundleCapacity {
+                overlay_bytes: 1 << 20,
+                complete_bytes: 16 << 20,
+            });
+        let limit = if self.complete {
+            capacity.complete_bytes
+        } else {
+            capacity.overlay_bytes
+        };
+        if self.bytes > limit {
+            return Err(format!(
+                "source bundle requires {} decoded bytes; receiver capacity is {}{}",
+                self.bytes,
+                limit,
+                if heartbeat.source_bundle_capacity.is_none() {
+                    " (legacy, unadvertised)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Legacy per-node status shape (kept for API compatibility).
@@ -370,6 +441,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_capacity_wire_and_actual_payload_size() {
+        let legacy = serde_json::json!({"node_id":"old", "online":true,
+            "capacity_total":1, "capacity_available":1, "active_leases":0,
+            "version":"old", "protocol_version":4});
+        let old: NodeHeartbeat = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(old.source_bundle_capacity, None);
+        let mut updated = legacy;
+        updated["source_bundle_capacity"] =
+            serde_json::json!({"overlay_bytes":2,"complete_bytes":3});
+        let hb: NodeHeartbeat = serde_json::from_value(updated.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&hb).unwrap()["source_bundle_capacity"],
+            updated["source_bundle_capacity"]
+        );
+        let mut bundle = SourceBundle {
+            manifest_sha256: String::new(),
+            complete: true,
+            deleted_paths: vec!["deleted".into()],
+            operations_sha256: None,
+            files: vec![
+                SourceBundleFile {
+                    path: "binary".into(),
+                    sha256: String::new(),
+                    data_base64: "AP8=".into(),
+                    executable: None,
+                },
+                SourceBundleFile {
+                    path: "text".into(),
+                    sha256: String::new(),
+                    data_base64: "YQ==".into(),
+                    executable: Some(true),
+                },
+            ],
+        };
+        let source = SourceBundleRequirement::from_bundle(&bundle).unwrap();
+        assert_eq!(source.bytes, 3); // decoded bytes, not base64 length or deletion metadata
+        assert!(source.check(&hb).is_ok());
+        bundle.complete = false;
+        assert!(SourceBundleRequirement::from_bundle(&bundle)
+            .unwrap()
+            .check(&hb)
+            .is_err());
+        bundle.files[0].data_base64 = "!bad".into();
+        assert!(SourceBundleRequirement::from_bundle(&bundle).is_err());
+        let mut zero = hb;
+        zero.source_bundle_capacity.as_mut().unwrap().complete_bytes = 0;
+        assert!(source.check(&zero).is_err()); // zero is not a missing capability
+    }
+
+    #[test]
     fn validates_scoped_lease_token() {
         let mission_id = Uuid::new_v4();
         let claims = LeaseClaims {
@@ -653,6 +774,7 @@ mod tests {
             active_jobs: 1,
             queued_jobs: 2,
             cached_toolchains: vec![],
+            source_bundle_capacity: None,
             lean_runtime_ready: Some(true),
         };
         let json = serde_json::to_string(&heartbeat).unwrap();
