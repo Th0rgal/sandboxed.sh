@@ -827,7 +827,7 @@ fn node_shared_token(node: &RemoteNodeConfig) -> Result<String, (StatusCode, Str
 }
 
 fn remote_build_is_terminal(state: &str) -> bool {
-    matches!(state, "succeeded" | "failed" | "cancelled" | "lost")
+    crate::remote_node::job_state_confirms_termination(state)
 }
 
 /// Keep the fleet rollup aligned with the runner's latest state, not merely
@@ -887,6 +887,42 @@ async fn finalize_remote_build_handle(
     }
 }
 
+/// A terminal HTTP response may be the only surviving node observation. Give
+/// cleanup its own lifetime before returning to a caller that may disconnect.
+async fn reconcile_http_terminal(state: &Arc<AppState>, status: &NodeJobStatus) {
+    if finalize_remote_build_handle(
+        &state.config.working_dir,
+        status.job_id,
+        &status.state,
+        status.exit_code,
+        status.artifacts.clone(),
+    )
+    .await
+    {
+        super::control::deliver_pending_remote_build_wakes(state).await;
+        return;
+    }
+    let state = Arc::clone(state);
+    let terminal = status.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(WAIT_POLL_INTERVAL).await;
+            if finalize_remote_build_handle(
+                &state.config.working_dir,
+                terminal.job_id,
+                &terminal.state,
+                terminal.exit_code,
+                terminal.artifacts.clone(),
+            )
+            .await
+            {
+                super::control::deliver_pending_remote_build_wakes(&state).await;
+                return;
+            }
+        }
+    });
+}
+
 async fn remote_build_started_at(state: &AppState, job_id: Uuid) -> chrono::DateTime<chrono::Utc> {
     if let Some(started_at) = state
         .fleet
@@ -920,26 +956,12 @@ fn spawn_remote_build_observer(
     cancel_requested: bool,
 ) {
     tokio::spawn(async move {
+        let mut terminal: Option<NodeJobStatus> = None;
         loop {
             tokio::time::sleep(WAIT_POLL_INTERVAL).await;
             let client = RemoteNodeClient::default();
             if cancel_requested {
                 if let Err(error) = client.cancel_job(&node, &shared_token, job_id).await {
-                    if error.is_not_found() {
-                        if finalize_remote_build_handle(
-                            &state.config.working_dir,
-                            job_id,
-                            "lost",
-                            None,
-                            Vec::new(),
-                        )
-                        .await
-                        {
-                            super::control::deliver_pending_remote_build_wakes(&state).await;
-                            return;
-                        }
-                        continue;
-                    }
                     tracing::warn!(
                         mission_id = %mission_id,
                         node_id = %node.id,
@@ -949,8 +971,13 @@ fn spawn_remote_build_observer(
                     );
                 }
             }
-            match client.get_job(&node, &shared_token, job_id).await {
+            let observation = match &terminal {
+                Some(status) => Ok(status.clone()),
+                None => client.get_job(&node, &shared_token, job_id).await,
+            };
+            match observation {
                 Ok(status) if remote_build_is_terminal(&status.state) => {
+                    terminal = Some(status.clone());
                     record_remote_build_status(&state, &node.id, &status, started_at);
                     if finalize_remote_build_handle(
                         &state.config.working_dir,
@@ -958,20 +985,6 @@ fn spawn_remote_build_observer(
                         &status.state,
                         status.exit_code,
                         status.artifacts.clone(),
-                    )
-                    .await
-                    {
-                        super::control::deliver_pending_remote_build_wakes(&state).await;
-                        return;
-                    }
-                }
-                Err(error) if cancel_requested && error.is_not_found() => {
-                    if finalize_remote_build_handle(
-                        &state.config.working_dir,
-                        job_id,
-                        "lost",
-                        None,
-                        Vec::new(),
                     )
                     .await
                     {
@@ -1544,17 +1557,7 @@ async fn submit_remote_build(
         };
         record_remote_build_status(&state, &node.id, &status, started_at);
         if remote_build_is_terminal(&status.state) {
-            if !finalize_remote_build_handle(
-                &state.config.working_dir,
-                job_id,
-                &status.state,
-                status.exit_code,
-                status.artifacts.clone(),
-            )
-            .await
-            {
-                continue;
-            }
+            reconcile_http_terminal(&state, &status).await;
             let duration_secs = (chrono::Utc::now() - started_at).num_seconds().max(0) as u64;
             return Json(RemoteBuildWaitResponse {
                 exit_code: status.exit_code,
@@ -1574,10 +1577,10 @@ async fn submit_remote_build(
         }
     }
     state.fleet.record_outcome(outcome(
-        "lost",
+        "unreachable",
         None,
         Some("client-side wait cap (2h) exceeded".to_string()),
-        true,
+        false,
     ));
     spawn_remote_build_observer(
         Arc::clone(&state),
@@ -1807,17 +1810,7 @@ async fn get_remote_build(
     let started_at = remote_build_started_at(&state, job_id).await;
     record_remote_build_status(&state, &node.id, &status, started_at);
     if remote_build_is_terminal(&status.state) {
-        if finalize_remote_build_handle(
-            &state.config.working_dir,
-            job_id,
-            &status.state,
-            status.exit_code,
-            status.artifacts.clone(),
-        )
-        .await
-        {
-            super::control::deliver_pending_remote_build_wakes(&state).await;
-        }
+        reconcile_http_terminal(&state, &status).await;
     } else if let Err(error) =
         crate::remote_node::job_ledger::heartbeat(&state.config.working_dir, job_id).await
     {

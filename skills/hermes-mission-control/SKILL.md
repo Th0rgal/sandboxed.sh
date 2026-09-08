@@ -9,7 +9,7 @@ description: >
 metadata:
   policy: chatgpt-ui-pool
   policy_version: 1.4.0
-version: 1.12.0
+version: 1.14.0
 ---
 
 # Hermes Mission Control
@@ -45,6 +45,63 @@ or touch the host directly.
   directly — you manage the top-level mission. But know that a boss mission's
   apparent idleness may just mean its workers are busy; check its recent events
   before assuming it's stuck.
+
+## Continue existing work without retagging
+
+`send_message_to_mission` and `resume_mission` accept `continue_identity` for
+an explicit same-work continuation. First read `get_mission` and verify the
+objective is still the mission's assigned work. Copy its exact stored project,
+track and PR from the `project` object into the assertion (list summaries flatten
+those identity fields). All assertion fields are required; use JSON `null`
+when `project` or `github_pr` is unset:
+
+```json
+{
+  "mission_id": "<existing mission id>",
+  "content": "Continue RESERVE-1 on existing PR 244. Do not modify PRs #230 or #231.",
+  "continue_identity": {"project": "<stored project slug>", "track": "trio-reserve1", "github_pr": null}
+}
+```
+
+This is a trusted caller assertion, not proof that the objective is unchanged.
+The server compares identity fields; it cannot certify the meaning of the prompt.
+Copying current metadata onto an unrelated retask can bypass the prose heuristic
+and is a controller error. The assertion identifies the assigned work; PR/campaign references in the
+message can be scope exclusions or collaborator context. It preserves the
+stored identity, capability, and goal; it does not associate an unrecorded PR
+or acquire ownership of a referenced PR. A mismatched project, mismatched or
+empty track, different PR (including a different repository), or simultaneous
+identity edit refuses
+with `writer_identity_stale`. Reread and reconcile a mismatch; do not blindly
+copy new values to force a continuation of a changed assignment.
+
+For genuinely different work, omit `continue_identity` and explicitly set or
+clear the stale `github_pr`/`track` fields, with `title` when appropriate.
+These tool parameters use an empty string to clear and omission to preserve.
+Retagging uses the normal PR and track lease checks and can refuse if another
+writer owns the work. Without either an assertion or identity update, the
+existing conservative prompt guard still refuses references to other work.
+Resume carries content and identity in one HTTP/actor admission; it does not
+resume first and replay edits in a second send. Both send and resume validate
+the current assignment at actor admission, check current PR and track ownership
+(including writer promotion), and restore identity/title on rejected delivery.
+A closed command channel makes no edits. Old leases remain held until acceptance.
+Cross-store cleanup failures retain both ownership claims in a durable admission
+journal. Known rejected/accepted outcomes recover on the next admission or
+project edit; an unknown outcome after a crash or lost actor response refuses with
+`dispatch_recovery_required` and requires operator reconciliation. Do not retag
+around that refusal. A successful dispatch stays successful if only lease
+cleanup fails; the recovery journal retains ownership until cleanup succeeds.
+`steer_warning` is retained as null for response compatibility. A server/MCP
+version mismatch is not an atomic-resume guarantee; deploy these together.
+
+Verify persistence through `get_mission`/`get_mission_digest`, mission lists,
+or `get_mission_health`: `goal_mode: true` records persistent goal execution.
+`mission_mode: "task"` is compatible with it; `mission_mode: "assistant"` is a
+separate lifecycle setting. `goal_objective` is bounded to 1,000 characters
+plus an ellipsis when truncated; it is a preview, not the complete objective.
+A missing/null `goal_mode` from an older server is unknown, not false. Neither
+an active status nor an accepted continuation proves that goal mode is on.
 
 ## The monitoring loop
 
@@ -529,3 +586,31 @@ installing.
 - `start_mission` for a helper on the same project/track while you are parked on a
   build answers `409 BUILD_IN_PROGRESS {job_id}`. Do not spawn pollers; wait for the
   wake or read the job status with the `job_id`.
+
+
+### Native Codex goal stops
+
+A native `blocked`, `paused`, `usageLimited`, or `budgetLimited` notification
+stops the driver after its associated turn and in-flight tools drain. With no
+queued steering the mission parks as `blocked`, reason `native_goal_stopped`;
+this is resumable work, never goal completion. The final response and native
+status evidence remain available. `goal_mode=true` and the stored objective
+survive; this flag does not prove a native loop is currently running.
+
+Resolve the reported external blocker or limit, then use `resume_mission`
+with the existing identity assertion. Without custom `content`, a persisted
+Codex goal mission uses the **full stored** `/goal` objective (not the bounded
+MCP preview). Explicit content and queued steering retain their exact text
+and order; a plain steer runs one turn, while `/goal <full objective>` re-arms
+the native loop. The driver uses the existing fresh-native-thread-per-turn
+behavior; same-mission recovery does not promise reuse of a native thread or
+its native token counters. Mission history and original native goal records
+are retained. Do not clear goals, queues, or ownership to release this stop.
+Do not infer a native stop from silence, elapsed observation time, or a live
+build with no recent output. Finished-turn automations do not retry a native
+stop; accepted external steering can run through normal ownership admission.
+
+Native goal non-completion is authoritative for board settlement: live settlement
+and restart recovery record a blocked outcome even when final prose looks complete
+or is absent. Dependent tasks remain gated; the board does not automatically retry
+these stops. Native completion still requires the usual delivery evidence.

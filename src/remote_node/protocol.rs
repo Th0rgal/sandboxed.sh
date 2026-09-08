@@ -788,3 +788,10 @@ mod tests {
         assert!(parse_labels("  ").is_empty());
     }
 }
+
+/// A node-reported lost job is an observation failure (including node restart),
+/// not evidence that its old process ended. Only execution terminal responses
+/// authorize retiring an accepted/tentative ownership fence.
+pub fn job_state_confirms_termination(state: &str) -> bool {
+    matches!(state, "succeeded" | "failed" | "cancelled")
+}

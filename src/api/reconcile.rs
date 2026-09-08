@@ -622,6 +622,7 @@ pub async fn run(state: &Arc<AppState>) -> ReconcileReport {
             let sent = session
                 .cmd_tx
                 .send(ControlCommand::ResumeMission {
+                    content: None,
                     mission_id: mission.id,
                     clean_workspace: false,
                     skip_message: false,
@@ -680,13 +681,14 @@ pub async fn run(state: &Arc<AppState>) -> ReconcileReport {
             if classify_mission(&facts) != MissionVerdict::TagOrphaned {
                 continue;
             }
-            let mut tags = mission.project.tags.clone();
-            tags.push(ORPHANED_TAG.to_string());
             if let Err(err) = store
                 .update_mission_project(
                     mission.id,
                     MissionProjectPatch {
-                        tags: Some(tags),
+                        tag_patch: Some(super::mission_store::MissionTagPatch {
+                            add: vec![ORPHANED_TAG.to_string()],
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     },
                 )
@@ -800,6 +802,7 @@ send a new message or re-create the mission.",
             let sent = session
                 .cmd_tx
                 .send(ControlCommand::ResumeMission {
+                    content: None,
                     mission_id: mission.id,
                     clean_workspace: false,
                     skip_message: false,

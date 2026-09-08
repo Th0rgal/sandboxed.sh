@@ -83,7 +83,7 @@ pub mod usage_optimize;
 pub mod validation;
 pub mod webhook_markers;
 pub mod workspaces;
-pub(crate) mod writer_recycle;
+pub mod writer_recycle;
 pub(crate) mod xai_usage;
 
 pub use routes::serve;

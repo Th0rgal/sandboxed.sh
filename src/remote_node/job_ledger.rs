@@ -703,6 +703,10 @@ pub async fn finalize_with_artifacts(
 ) -> anyhow::Result<bool> {
     const MAX_RECEIPTS: usize = 2_000;
 
+    anyhow::ensure!(
+        super::job_state_confirms_termination(state),
+        "remote job {job_id} has no confirmed terminal execution: {state}"
+    );
     let _guard = lock().lock().await;
     let mut handles = load_result(working_dir).await?;
     if !handles.iter().any(|handle| handle.job_id == job_id) {
@@ -2316,7 +2320,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(finalize(dir.path(), job_id, "lost", None).await.unwrap());
+        assert!(finalize(dir.path(), job_id, "lost", None).await.is_err());
+        assert_eq!(load_result(dir.path()).await.unwrap().len(), 1);
+        assert!(finalize(dir.path(), job_id, "cancelled", None)
+            .await
+            .unwrap());
         assert!(load_result(dir.path()).await.unwrap().is_empty());
         assert!(terminal_receipt(dir.path(), job_id)
             .await

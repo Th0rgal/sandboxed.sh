@@ -7,6 +7,15 @@
 //! - supports frontend/interactive tools by accepting tool results
 //! - supports persistent missions (goal-oriented sessions)
 
+pub(crate) mod dispatch_admission;
+#[cfg(test)]
+pub(crate) mod dispatch_admission_tests;
+pub(crate) mod execution_ownership;
+#[cfg(test)]
+use dispatch_admission::admit_dispatch;
+pub use dispatch_admission::DispatchAdmission;
+pub(super) use dispatch_admission::DISPATCH_ADMISSION;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
@@ -939,6 +948,105 @@ mod campaign_guard_tests {
     }
 
     #[tokio::test]
+    async fn goal_digest_reads_durable_goal_independently_of_mission_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "goal-digest-test")
+                .await
+                .unwrap();
+        let mission = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let objective = "🦀".repeat(1500);
+        store
+            .update_mission_goal(mission.id, true, Some(&objective))
+            .await
+            .unwrap();
+        drop(store);
+        let reopened =
+            mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "goal-digest-test")
+                .await
+                .unwrap();
+        let loaded = reopened.get_mission(mission.id).await.unwrap().unwrap();
+        let digest = mission_goal_digest(&loaded);
+        assert_eq!(digest["mission_mode"], "task");
+        assert_eq!(digest["goal_mode"], true);
+        assert_eq!(
+            digest["goal_objective"].as_str().unwrap().chars().count(),
+            1001
+        );
+        assert!(digest["goal_objective"].as_str().unwrap().ends_with('…'));
+        let listed = reopened.list_missions(10, 0).await.unwrap();
+        assert_eq!(mission_goal_digest(&listed[0]), digest);
+        reopened
+            .update_mission_goal(mission.id, false, None)
+            .await
+            .unwrap();
+        let cleared = reopened.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(
+            mission_goal_digest(&cleared),
+            serde_json::json!({
+                "mission_mode": "task", "goal_mode": false, "goal_objective": null,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn control_continuation_validates_against_stored_identity_without_mutation() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("RESERVE-1"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .update_mission_project(
+                mission.id,
+                mission_store::MissionProjectPatch {
+                    track: Some(Some("trio-reserve1".into())),
+                    tags: Some(vec!["pr-readonly".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let loaded = store.get_mission(mission.id).await.unwrap().unwrap();
+        let request: ControlMessageRequest = serde_json::from_value(serde_json::json!({
+            "mission_id": mission.id, "content": "Continue RESERVE-1 on PR 244; exclude PR #230.",
+            "continue_identity": {"project": null, "track": "trio-reserve1", "github_pr": null}
+        }))
+        .unwrap();
+        assert!(request.extra.is_empty());
+        let patch = dispatch_identity_patch(
+            request.github_pr,
+            request.track,
+            request.title,
+            Some(request.content),
+            request.continue_identity,
+        );
+        let next = writer_reuse_or_conflict(&loaded, &patch).unwrap();
+        assert_eq!(next.track, loaded.project.track);
+        assert_eq!(next.github_pr, None);
+        let unchanged = store.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.project.tags, vec!["pr-readonly"]);
+        let resume: ResumeMissionRequest = serde_json::from_value(serde_json::json!({
+            "content": "Different work PR #90", "continue_identity": {"project": null, "track": "different", "github_pr": null}
+        })).unwrap();
+        let err = writer_reuse_or_conflict(
+            &loaded,
+            &dispatch_identity_patch(
+                resume.github_pr,
+                resume.track,
+                resume.title,
+                resume.content,
+                resume.continue_identity,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
     async fn silent_recycle_of_pr88_writer_as_reserve_is_rejected() {
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
@@ -965,35 +1073,33 @@ mod campaign_guard_tests {
             .await
             .expect("tag");
         let loaded = store.get_mission(mission.id).await.unwrap().unwrap();
-        let err = apply_writer_reuse_or_conflict(
-            &store,
+        let err = writer_reuse_or_conflict(
             &loaded,
-            None,
-            None,
-            None,
-            Some("Implement P-RESERVE-RELATIONAL first slice".into()),
+            &dispatch_identity_patch(
+                None,
+                None,
+                None,
+                Some("Implement P-RESERVE-RELATIONAL first slice".into()),
+                None,
+            ),
         )
-        .await
         .expect_err("silent recycle");
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert!(err.1.contains("writer_identity_stale"));
 
-        apply_writer_reuse_or_conflict(
-            &store,
+        let updated = writer_reuse_or_conflict(
             &loaded,
-            Some(String::new()),
-            Some("p-reserve-relational".into()),
-            Some("P-RESERVE-RELATIONAL first slice".into()),
-            Some("Implement P-RESERVE-RELATIONAL first slice".into()),
+            &dispatch_identity_patch(
+                Some(String::new()),
+                Some("p-reserve-relational".into()),
+                Some("P-RESERVE-RELATIONAL first slice".into()),
+                Some("Implement P-RESERVE-RELATIONAL first slice".into()),
+                None,
+            ),
         )
-        .await
         .expect("explicit retag");
-        let updated = store.get_mission(mission.id).await.unwrap().unwrap();
-        assert_eq!(updated.project.github_pr.as_deref(), None);
-        assert_eq!(
-            updated.project.track.as_deref(),
-            Some("p-reserve-relational")
-        );
+        assert_eq!(updated.github_pr.as_deref(), None);
+        assert_eq!(updated.track.as_deref(), Some("p-reserve-relational"));
     }
 
     #[tokio::test]
@@ -1023,15 +1129,10 @@ mod campaign_guard_tests {
             .await
             .expect("tag");
         let loaded = store.get_mission(mission.id).await.unwrap().unwrap();
-        apply_writer_reuse_or_conflict(
-            &store,
+        writer_reuse_or_conflict(
             &loaded,
-            None,
-            None,
-            None,
-            Some("fix the failing test".into()),
+            &dispatch_identity_patch(None, None, None, Some("fix the failing test".into()), None),
         )
-        .await
         .expect("same-work chat must not 409");
         let updated = store.get_mission(mission.id).await.unwrap().unwrap();
         assert_eq!(
@@ -1050,15 +1151,16 @@ mod campaign_guard_tests {
             .await
             .expect("create");
         let loaded = store.get_mission(mission.id).await.unwrap().unwrap();
-        apply_writer_reuse_or_conflict(
-            &store,
+        writer_reuse_or_conflict(
             &loaded,
-            None,
-            None,
-            None,
-            Some("Continue from PR #105. Launch P-TOPUP-2 and P-ALLOC-1.".into()),
+            &dispatch_identity_patch(
+                None,
+                None,
+                None,
+                Some("Continue from PR #105. Launch P-TOPUP-2 and P-ALLOC-1.".into()),
+                None,
+            ),
         )
-        .await
         .expect("blank writer first message must not 409");
     }
 
@@ -3468,6 +3570,10 @@ async fn close_mission_desktop_sessions(
 /// Message posted by a user to the control session.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ControlMessageRequest {
+    /// Explicit same-work assertion, checked against stored identity before dispatch.
+    #[serde(default)]
+    pub continue_identity: Option<crate::api::writer_recycle::WriterContinuation>,
+
     pub content: String,
     /// Client-generated idempotency key for the send action. When present,
     /// the backend uses it as the message id and ignores duplicate commands
@@ -4080,6 +4186,9 @@ pub struct ControlState {
     pub progress: Arc<RwLock<ExecutionProgress>>,
     /// Running missions (for parallel execution)
     pub running_missions: Arc<RwLock<Vec<super::mission_runner::RunningMissionInfo>>>,
+    /// Published by the owning actor before it processes its next command.
+    /// Admission/sweep read this without recursively querying that actor.
+    pub(crate) assignment_owners: Arc<RwLock<HashSet<Uuid>>>,
     /// Max parallel missions allowed
     pub max_parallel: usize,
     /// Mission persistence (SQLite-backed)
@@ -4091,6 +4200,8 @@ pub struct ControlState {
 /// Control session manager for per-user sessions.
 #[derive(Clone)]
 pub struct ControlHub {
+    admission_state: Arc<std::sync::OnceLock<std::sync::Weak<AppState>>>,
+    admission_ready: Arc<tokio::sync::Notify>,
     sessions: Arc<RwLock<HashMap<String, ControlState>>>,
     config: Config,
     root_agent: AgentRef,
@@ -4118,6 +4229,8 @@ impl ControlHub {
         secrets: Option<Arc<SecretsStore>>,
     ) -> Self {
         Self {
+            admission_state: Arc::new(std::sync::OnceLock::new()),
+            admission_ready: Arc::new(tokio::sync::Notify::new()),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             config,
             root_agent,
@@ -4126,6 +4239,21 @@ impl ControlHub {
             library,
             secrets,
             telegram_bridge: None,
+        }
+    }
+
+    pub(crate) fn bind_admission_state(&self, state: &Arc<AppState>) {
+        let _ = self.admission_state.set(Arc::downgrade(state));
+        self.admission_ready.notify_waiters();
+    }
+
+    pub(crate) async fn wait_for_admission_state(&self) -> Option<Arc<AppState>> {
+        loop {
+            let ready = self.admission_ready.notified();
+            if let Some(state) = self.admission_state.get() {
+                return state.upgrade();
+            }
+            ready.await;
         }
     }
 
@@ -4780,57 +4908,18 @@ pub async fn post_message(
         );
         warnings.push(format!("unrecognized fields ignored: {joined}"));
     }
+    if req.continue_identity.is_some() && target_mission_id.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "continue_identity requires an explicit mission_id".into(),
+        ));
+    }
     // A real user message means the operator is steering this mission — reset
     // its stall-guard budget so future genuine stalls get the full allowance.
     if let Some(mid) = target_mission_id {
         reset_stall_guard(mid);
     }
     let control = control_for_user(&state, &user).await;
-    if let Some(mission_id) = target_mission_id {
-        if let Some(mission) = control
-            .mission_store
-            .get_mission(mission_id)
-            .await
-            .map_err(internal_error)?
-        {
-            apply_writer_reuse_or_conflict(
-                &control.mission_store,
-                &mission,
-                req.github_pr.clone(),
-                req.track.clone(),
-                req.title.clone(),
-                Some(content.clone()),
-            )
-            .await?;
-            if mission_is_pr_writer_in_store(&control.mission_store, &mission)
-                .await
-                .map_err(internal_error)?
-                || message_requests_pr_writer(&mission, &content)
-            {
-                let _guard = acquire_durable_pr_writer_lock(&state.control)
-                    .await
-                    .map_err(internal_error)?;
-                if let Some(github_pr) = mission.project.github_pr.as_deref() {
-                    if let Some(existing) =
-                        find_existing_pr_writer_global(&state.control, github_pr, Some(mission.id))
-                            .await
-                            .map_err(internal_error)?
-                    {
-                        return Err((
-                            StatusCode::CONFLICT,
-                            format!(
-                                "PR writer lease is already held by mission {} (status={}); cannot send a writer message to mission {} for {}",
-                                existing.id,
-                                existing.status,
-                                mission.id,
-                                canonical_github_pr(github_pr)
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-    }
     let (queued_tx, queued_rx) = oneshot::channel();
     tracing::info!(
         user_id = %user.id,
@@ -4843,17 +4932,35 @@ pub async fn post_message(
     );
     control
         .cmd_tx
-        .send(ControlCommand::UserMessage {
-            id,
-            content,
-            agent,
-            target_mission_id,
-            strict: false,
-            source: Some(format!("api:{}", user.id)),
-            respond: queued_tx,
+        .send(ControlCommand::AdmitDispatch {
+            admission: Box::new(DispatchAdmission {
+                internal_work_hint: None,
+                state: state.clone(),
+                store: control.mission_store.clone(),
+                patch: dispatch_identity_patch(
+                    req.github_pr,
+                    req.track,
+                    req.title,
+                    Some(content.clone()),
+                    req.continue_identity,
+                ),
+            }),
+            command: Box::new(ControlCommand::UserMessage {
+                id,
+                content,
+                agent,
+                target_mission_id,
+                strict: false,
+                source: Some(format!("api:{}", user.id)),
+                respond: queued_tx,
+            }),
         })
         .await
         .map_err(session_unavailable)?;
+    #[cfg(test)]
+    if let Some(mission_id) = target_mission_id {
+        dispatch_admission_tests::notify_wait(mission_id, "enqueued");
+    }
     let queued = match queued_rx.await {
         // The wire response keeps its historical bool shape: `queued` is true
         // only when the message is waiting for the next turn boundary.
@@ -4864,10 +4971,7 @@ pub async fn post_message(
         Ok(UserMessageAck::Rejected(reason)) => {
             return Err((StatusCode::CONFLICT, reason));
         }
-        Err(_) => {
-            let status = control.status.read().await;
-            status.state != ControlRunState::Idle
-        }
+        Err(error) => return Err(recv_failed(error)),
     };
     Ok(Json(ControlMessageResponse {
         id,
@@ -7271,6 +7375,21 @@ fn load_mission_projection_from_sqlite(
     )))
 }
 
+fn mission_goal_digest(mission: &Mission) -> serde_json::Value {
+    let objective = mission.goal_objective.as_deref().map(|text| {
+        let mut snippet: String = text.chars().take(1000).collect();
+        if text.chars().count() > 1000 {
+            snippet.push('…');
+        }
+        snippet
+    });
+    serde_json::json!({
+        "mission_mode": mission.mission_mode,
+        "goal_mode": mission.goal_mode,
+        "goal_objective": objective,
+    })
+}
+
 /// Compact, orchestrator-friendly view of a mission: status, last exchange,
 /// and PR links — without the full transcript. Recap/orchestration sessions
 /// previously pulled entire mission histories (multi-KB each) just to answer
@@ -7358,6 +7477,7 @@ pub async fn get_mission_digest(
         .as_ref()
         .map(|run| mission_execution_projection(run, mission.status));
 
+    let goal = mission_goal_digest(&mission);
     Ok(Json(serde_json::json!({
         "id": mission.id,
         "title": mission.title,
@@ -7383,6 +7503,9 @@ pub async fn get_mission_digest(
         "updated_at": mission.updated_at,
         "acknowledged_at": (mission.status == MissionStatus::Acknowledged).then_some(mission.updated_at.clone()),
         "execution": execution,
+        "mission_mode": goal["mission_mode"],
+        "goal_mode": goal["goal_mode"],
+        "goal_objective": goal["goal_objective"],
         "history_len": mission.history.len(),
         "last_user_message": last_user,
         "last_assistant_message": last_assistant,
@@ -8588,7 +8711,14 @@ fn normalize_mission_tags(tags: Option<&[String]>) -> Option<Vec<String>> {
     })
 }
 
-fn status_holds_pr_writer_lease(status: MissionStatus) -> bool {
+pub(crate) fn native_goal_holds_ownership(status: MissionStatus, reason: Option<&str>) -> bool {
+    status == MissionStatus::Blocked && reason == Some("native_goal_stopped")
+}
+
+fn status_holds_pr_writer_lease(status: MissionStatus, reason: Option<&str>) -> bool {
+    if native_goal_holds_ownership(status, reason) {
+        return true;
+    }
     matches!(
         status,
         MissionStatus::Pending
@@ -8711,16 +8841,13 @@ struct PrWriterLease {
     status: MissionStatus,
 }
 
-async fn apply_writer_reuse_or_conflict(
-    store: &Arc<dyn crate::api::mission_store::MissionStore>,
-    mission: &Mission,
+fn dispatch_identity_patch(
     github_pr: Option<String>,
     track: Option<String>,
     title: Option<String>,
     work_hint: Option<String>,
-) -> Result<(), (StatusCode, String)> {
-    use crate::api::writer_recycle::{apply_writer_reuse, WriterIdentity, WriterIdentityPatch};
-
+    continue_identity: Option<crate::api::writer_recycle::WriterContinuation>,
+) -> crate::api::writer_recycle::WriterIdentityPatch {
     let to_patch = |value: Option<String>| -> Option<Option<String>> {
         value.map(|raw| {
             let trimmed = raw.trim();
@@ -8731,62 +8858,35 @@ async fn apply_writer_reuse_or_conflict(
             }
         })
     };
-    let stored = WriterIdentity {
-        title: mission.title.clone(),
-        github_pr: mission.project.github_pr.clone(),
-        track: mission.project.track.clone(),
-    };
-    let next = apply_writer_reuse(
-        &stored,
-        &WriterIdentityPatch {
-            title: to_patch(title),
-            github_pr: to_patch(github_pr),
-            track: to_patch(track),
-            work_hint,
+    crate::api::writer_recycle::WriterIdentityPatch {
+        title: to_patch(title),
+        github_pr: to_patch(github_pr),
+        track: to_patch(track),
+        work_hint,
+        continue_identity,
+    }
+}
+
+fn writer_reuse_or_conflict(
+    mission: &Mission,
+    patch: &crate::api::writer_recycle::WriterIdentityPatch,
+) -> Result<crate::api::writer_recycle::WriterIdentity, (StatusCode, String)> {
+    use crate::api::writer_recycle::{apply_writer_reuse, WriterIdentity};
+    apply_writer_reuse(
+        &WriterIdentity {
+            project: mission.project.project.clone(),
+            title: mission.title.clone(),
+            github_pr: mission.project.github_pr.clone(),
+            track: mission.project.track.clone(),
         },
+        patch,
     )
     .map_err(|err| {
         (
             StatusCode::CONFLICT,
-            serde_json::json!({
-                "error": err.error,
-                "message": err.message,
-            })
-            .to_string(),
+            serde_json::json!({"error": err.error, "message": err.message}).to_string(),
         )
-    })?;
-    if next.github_pr == stored.github_pr
-        && next.track == stored.track
-        && next.title == stored.title
-    {
-        return Ok(());
-    }
-    store
-        .update_mission_project(
-            mission.id,
-            crate::api::mission_store::MissionProjectPatch {
-                github_pr: Some(next.github_pr.clone()),
-                track: Some(next.track.clone()),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(internal_error)?;
-    if next.title != stored.title {
-        if let Some(title) = next.title {
-            let _ = store
-                .update_mission_metadata(
-                    mission.id,
-                    Some(Some(title.as_str())),
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await;
-        }
-    }
-    Ok(())
+    })
 }
 
 fn pr_writer_lease(mission: &Mission) -> PrWriterLease {
@@ -8801,60 +8901,56 @@ async fn find_existing_pr_writer(
     github_pr: &str,
     exclude_id: Option<Uuid>,
 ) -> Result<Option<PrWriterLease>, String> {
-    const PAGE_SIZE: usize = 200;
     let target = canonical_github_pr(github_pr);
-    let mut offset = 0;
-    loop {
-        let page = store.list_missions(PAGE_SIZE, offset).await?;
-        let page_len = page.len();
-        for mission in page {
-            if Some(mission.id) == exclude_id
-                || !status_holds_pr_writer_lease(mission.status)
-                || mission
-                    .project
-                    .github_pr
-                    .as_deref()
-                    .is_none_or(|value| canonical_github_pr(value) != target)
-            {
-                continue;
+    // Parked PR writers need the same stable inventory as execution owners.
+    // Concurrent metadata updates must not move a writer behind an OFFSET.
+    let page = store.list_missions(usize::MAX, 0).await?;
+    #[cfg(test)]
+    dispatch_admission_tests::after_ownership_page(&page);
+    for mission in page {
+        if Some(mission.id) == exclude_id
+            || !status_holds_pr_writer_lease(mission.status, mission.terminal_reason.as_deref())
+            || mission
+                .project
+                .github_pr
+                .as_deref()
+                .is_none_or(|value| canonical_github_pr(value) != target)
+        {
+            continue;
+        }
+        if mission_is_pr_writer(&mission) {
+            if let Some(lease) = resolve_writer_lease_or_release(store, &mission).await? {
+                return Ok(Some(lease));
             }
-            if mission_is_pr_writer(&mission) {
-                if let Some(lease) = resolve_writer_lease_or_release(store, &mission).await? {
+            continue;
+        }
+        // SQLite list queries intentionally omit history. Load the full
+        // mission before treating a legacy prompt-only writer as read-only.
+        if let Some(full) = store.get_mission(mission.id).await? {
+            let initial_prompt = store.get_initial_user_message(mission.id).await?;
+            if mission_is_pr_writer_with_prompt(&full, initial_prompt.as_deref()) {
+                if let Some(lease) = resolve_writer_lease_or_release(store, &full).await? {
                     return Ok(Some(lease));
                 }
                 continue;
             }
-            // SQLite list queries intentionally omit history. Load the full
-            // mission before treating a legacy prompt-only writer as read-only.
-            if let Some(full) = store.get_mission(mission.id).await? {
-                let initial_prompt = store.get_initial_user_message(mission.id).await?;
-                if mission_is_pr_writer_with_prompt(&full, initial_prompt.as_deref()) {
+            // Scheduled missions can carry their only prompt in the
+            // durable deferred goal until dispatch. Treat that prompt as
+            // capability evidence before declaring this lease read-only.
+            if let Some(goal) = store.get_deferred_goal(mission.id).await? {
+                // This is the mission's initial mandate, not a later
+                // steering message. Explicit `pr-readonly` must therefore
+                // continue to win over inferred write verbs in the goal.
+                if mission_is_pr_writer_with_prompt(&full, Some(&goal)) {
                     if let Some(lease) = resolve_writer_lease_or_release(store, &full).await? {
                         return Ok(Some(lease));
                     }
                     continue;
                 }
-                // Scheduled missions can carry their only prompt in the
-                // durable deferred goal until dispatch. Treat that prompt as
-                // capability evidence before declaring this lease read-only.
-                if let Some(goal) = store.get_deferred_goal(mission.id).await? {
-                    // This is the mission's initial mandate, not a later
-                    // steering message. Explicit `pr-readonly` must therefore
-                    // continue to win over inferred write verbs in the goal.
-                    if mission_is_pr_writer_with_prompt(&full, Some(&goal)) {
-                        if let Some(lease) = resolve_writer_lease_or_release(store, &full).await? {
-                            return Ok(Some(lease));
-                        }
-                        continue;
-                    }
-                }
             }
         }
-        if page_len < PAGE_SIZE {
-            return Ok(None);
-        }
-        offset += page_len;
     }
+    Ok(None)
 }
 
 fn find_existing_pr_writer_in_sqlite(
@@ -8917,7 +9013,7 @@ fn find_existing_pr_writer_in_sqlite(
         "NULL".to_string()
     };
     let query = format!(
-        "SELECT m.id, m.status, m.github_pr, {}, {}, {}, {}, {}, {} \
+        "SELECT m.id, m.status, m.github_pr, {}, {}, {}, {}, {}, {}, {} \
          FROM missions m WHERE m.github_pr IS NOT NULL",
         optional_mission_column("intent"),
         optional_mission_column("tags"),
@@ -8925,6 +9021,7 @@ fn find_existing_pr_writer_in_sqlite(
         first_prompt,
         first_prompt_file,
         optional_mission_column("updated_at"),
+        optional_mission_column("terminal_reason"),
     );
     let mut statement = connection
         .prepare(&query)
@@ -8941,6 +9038,7 @@ fn find_existing_pr_writer_in_sqlite(
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })
         .map_err(|error| error.to_string())?;
@@ -8956,6 +9054,7 @@ fn find_existing_pr_writer_in_sqlite(
             first_prompt,
             prompt_file,
             updated_at,
+            terminal_reason,
         ) = row.map_err(|error| error.to_string())?;
         let Ok(id) = Uuid::parse_str(&id) else {
             continue;
@@ -8965,7 +9064,7 @@ fn find_existing_pr_writer_in_sqlite(
         }
         let status = serde_json::from_value::<MissionStatus>(serde_json::Value::String(status))
             .unwrap_or(MissionStatus::Active);
-        if !status_holds_pr_writer_lease(status) {
+        if !status_holds_pr_writer_lease(status, terminal_reason.as_deref()) {
             continue;
         }
         // Offline stores are opened read-only, so a lapsed AwaitingUser writer
@@ -9013,28 +9112,42 @@ fn find_existing_pr_writer_in_sqlite(
     Ok(None)
 }
 
-impl ControlHub {
-    /// Look a mission up across every persisted per-user store. Used by
-    /// cross-cutting sweeps (track leases) that hold a mission id but no user.
-    pub(crate) async fn find_mission_any_store(
-        &self,
-        mission_id: Uuid,
-    ) -> Result<Option<Mission>, String> {
-        let inventory = self.mission_store_inventory().await?;
-        for store in inventory.live {
-            if let Some(mission) = store.get_mission(mission_id).await? {
-                return Ok(Some(mission));
-            }
-        }
-        Ok(None)
-    }
-}
-
 async fn find_existing_pr_writer_global(
     control_hub: &ControlHub,
     github_pr: &str,
     exclude_id: Option<Uuid>,
 ) -> Result<Option<PrWriterLease>, String> {
+    if let Some(owner) = execution_ownership::snapshot(control_hub)
+        .await?
+        .unresolved_pr_writer(github_pr, exclude_id)
+    {
+        return Ok(Some(owner));
+    }
+    // Cross-store admission can temporarily change or clear the stored PR.
+    // Until cleanup completes, neither the old nor proposed PR is available
+    // to another writer, including after a crash with a terminal status.
+    if let Some(state) = control_hub
+        .admission_state
+        .get()
+        .and_then(std::sync::Weak::upgrade)
+    {
+        let target = canonical_github_pr(github_pr);
+        for (id, receipt) in state.projects.dispatch_admissions()? {
+            let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+            if Some(id) != exclude_id
+                && ["before", "after"].iter().any(|phase| {
+                    receipt[*phase]["project"]["github_pr"]
+                        .as_str()
+                        .is_some_and(|pr| canonical_github_pr(pr) == target)
+                })
+            {
+                return Ok(Some(PrWriterLease {
+                    id,
+                    status: MissionStatus::Active,
+                }));
+            }
+        }
+    }
     // Fail closed if any persisted store cannot be enumerated or read. A
     // partial cross-user scan cannot prove that a branch is writer-free.
     let inventory = control_hub.mission_store_inventory().await?;
@@ -9097,6 +9210,32 @@ async fn activate_mission_for_message(
     mission: &Mission,
     content: &str,
 ) -> Result<(), String> {
+    // Both sequential dequeue and parallel follow-up activation pass here.
+    // Retags are refused for the lifetime of the queue, so its mission identity
+    // remains the binding; validate that this binding still owns its track.
+    if let (Some(state), Some(slug), Some(track)) = (
+        control_hub
+            .admission_state
+            .get()
+            .and_then(std::sync::Weak::upgrade),
+        mission.project.project.as_deref(),
+        mission.project.track.as_deref(),
+    ) {
+        let writer = mission_is_pr_writer_in_store(store, mission).await?
+            || message_requests_pr_writer(mission, content);
+        let request = super::track_leases::lease_request(
+            slug,
+            track,
+            &mission.id.to_string(),
+            super::track_leases::lease_mode(
+                writer.then_some(true),
+                &mission.project.tags,
+                mission.project.intent.as_deref(),
+            ),
+            None,
+        );
+        state.projects.revalidate_track_lease(&request)?;
+    }
     // Keep the writer mutex until Active is persisted so a replacement writer
     // cannot race a terminal mission's message-based reactivation.
     let _pr_writer_guard =
@@ -9168,10 +9307,9 @@ async fn restore_mission_after_failed_run_acquisition(
     mission: &Mission,
 ) -> Result<(), String> {
     store
-        .update_mission_status_with_reason(
+        .restore_mission_status(
             mission.id,
-            mission.status,
-            mission.terminal_reason.as_deref(),
+            &crate::api::mission_store::MissionStatusSnapshot::capture(mission),
         )
         .await?;
     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
@@ -9223,7 +9361,9 @@ async fn acquire_pr_writer_lease_for_message(
             .update_mission_project(
                 mission.id,
                 crate::api::mission_store::MissionProjectPatch {
-                    tags: Some(tags),
+                    tag_patch: Some(crate::api::mission_store::MissionTagPatch::capabilities(
+                        &tags,
+                    )),
                     ..Default::default()
                 },
             )
@@ -9246,7 +9386,9 @@ async fn rollback_message_writer_tag(
             .update_mission_project(
                 mission.id,
                 crate::api::mission_store::MissionProjectPatch {
-                    tags: Some(mission.project.tags.clone()),
+                    tag_patch: Some(crate::api::mission_store::MissionTagPatch::capabilities(
+                        &mission.project.tags,
+                    )),
                     ..Default::default()
                 },
             )
@@ -10543,11 +10685,14 @@ pub async fn create_mission(
             .update_mission_project(
                 mission.id,
                 crate::api::mission_store::MissionProjectPatch {
+                    title: None,
                     project: project.clone().map(Some),
                     track: track.clone().map(Some),
                     intent: intent.clone().map(Some),
                     github_pr: github_pr.clone().map(Some),
                     tags: tags.clone(),
+                    preserve_updated_at: false,
+                    tag_patch: None,
                     desired_state: desired_state.clone().map(Some),
                     next_check_at: next_check_at.clone().map(Some),
                 },
@@ -11558,6 +11703,7 @@ async fn dispatch_remote_job(
         let started_at = chrono::Utc::now();
         tokio::spawn(async move {
             poll_remote_job(
+                &ledger_dir,
                 poll_owner,
                 fleet,
                 client,
@@ -11568,7 +11714,6 @@ async fn dispatch_remote_job(
                 started_at,
             )
             .await;
-            crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
         });
         return Err(err);
     }
@@ -11605,6 +11750,7 @@ async fn dispatch_remote_job(
         move || {
             tokio::spawn(async move {
                 poll_remote_job(
+                    &ledger_dir,
                     poll_owner,
                     fleet,
                     client,
@@ -11615,9 +11761,6 @@ async fn dispatch_remote_job(
                     started_at,
                 )
                 .await;
-                // The poll loop only returns once the mission is finalized (or the
-                // job was cancelled/lost); the handle is no longer needed.
-                crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
             });
         },
     )
@@ -11642,10 +11785,10 @@ async fn read_dispatched_mission_after_observer_start(
         .ok_or_else(|| format!("Mission {mission_id} disappeared after remote dispatch"))
 }
 
-/// Retry cancellation for a remote job that must not outlive its failed
-/// dispatch. The tentative ledger entry survives a process restart; this
-/// in-process observer removes it only after terminal state or authoritative
-/// 404, so a transient cancel failure cannot leak node capacity.
+/// Retry cancellation without treating a missing job record or node restart
+/// as terminal proof. An accepted request may outlive the observer or the
+/// node's current job database; retain its fence until execution is confirmed
+/// terminal and durable cleanup succeeds.
 fn spawn_untracked_remote_job_cancellation(
     fleet: Arc<crate::remote_node::FleetMonitor>,
     node: crate::remote_node::RemoteNodeConfig,
@@ -11655,59 +11798,75 @@ fn spawn_untracked_remote_job_cancellation(
     started_at: chrono::DateTime<chrono::Utc>,
     ledger_dir: std::path::PathBuf,
 ) {
-    tokio::spawn(async move {
-        let client = crate::remote_node::RemoteNodeClient::default();
-        loop {
+    tokio::spawn(observe_untracked_remote_job_cancellation(
+        fleet,
+        node,
+        shared_token,
+        mission_id,
+        job_id,
+        started_at,
+        ledger_dir,
+    ));
+}
+
+async fn observe_untracked_remote_job_cancellation(
+    fleet: Arc<crate::remote_node::FleetMonitor>,
+    node: crate::remote_node::RemoteNodeConfig,
+    shared_token: String,
+    mission_id: Uuid,
+    job_id: Uuid,
+    started_at: chrono::DateTime<chrono::Utc>,
+    ledger_dir: std::path::PathBuf,
+) {
+    let client = crate::remote_node::RemoteNodeClient::default();
+    let mut terminal: Option<crate::remote_node::NodeJobStatus> = None;
+    loop {
+        if terminal.is_none() {
             if let Err(error) = client.cancel_job(&node, &shared_token, job_id).await {
-                if error.is_not_found() {
-                    crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
-                    return;
-                }
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    node_id = %node.id,
-                    job_id = %job_id,
-                    ?error,
-                    "untracked remote job cancellation failed; retrying"
-                );
+                tracing::warn!(%mission_id, %job_id, node_id = %node.id, ?error,
+                    "untracked remote job cancellation failed; retaining fence and retrying");
             }
-            match client.get_job(&node, &shared_token, job_id).await {
-                Ok(status)
-                    if matches!(
-                        status.state.as_str(),
-                        "succeeded" | "failed" | "cancelled" | "lost"
-                    ) =>
-                {
+            if let Ok(status) = client.get_job(&node, &shared_token, job_id).await {
+                if crate::remote_node::job_state_confirms_termination(&status.state) {
+                    terminal = Some(status);
+                }
+            }
+        }
+        if let Some(status) = &terminal {
+            match crate::remote_node::job_ledger::finalize_with_artifacts(
+                &ledger_dir,
+                job_id,
+                &status.state,
+                status.exit_code,
+                status.artifacts.clone(),
+            )
+            .await
+            {
+                Ok(_) => {
                     fleet.record_outcome(crate::remote_node::DispatchOutcome {
                         mission_id,
-                        node_id: node.id.clone(),
+                        node_id: node.id,
                         job_id: Some(job_id),
-                        state: status.state,
+                        state: status.state.clone(),
                         exit_code: status.exit_code,
-                        error: status.error,
+                        error: status.error.clone(),
                         started_at,
                         finished_at: Some(chrono::Utc::now()),
                     });
-                    crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
                     return;
                 }
-                Err(error) if error.is_not_found() => {
-                    crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
-                    return;
+                Err(error) => {
+                    tracing::warn!(%job_id, ?error, "remote cancellation cleanup failed; retaining terminal proof and retrying")
                 }
-                Ok(_) | Err(_) => {}
             }
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
-    });
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
 }
 
-/// Startup reconciliation for async remote jobs that were in flight when the
-/// previous process exited. For each persisted handle: if its mission is
-/// still Active in some live session's store, re-attach a poll loop (the
-/// node job is durable — jobs.db — so its result is recoverable); otherwise
-/// drop the stale handle. Handles whose node is no longer configured fail
-/// their mission explicitly rather than leaving it Active forever.
+/// Reattach observation/cancellation for persisted remote jobs after restart.
+/// Missing owners, configuration, credentials and stale observations are not
+/// terminal evidence: retain the durable ownership fence and retry recovery.
 pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
     tokio::spawn(async move {
         // Let control sessions boot before touching their stores.
@@ -11929,6 +12088,7 @@ async fn reconcile_pending_handles(
                     let ledger_dir = working_dir.to_path_buf();
                     tokio::spawn(async move {
                         poll_remote_job(
+                            &ledger_dir,
                             owner,
                             fleet,
                             crate::remote_node::RemoteNodeClient::default(),
@@ -11939,38 +12099,19 @@ async fn reconcile_pending_handles(
                             handle.started_at,
                         )
                         .await;
-                        crate::remote_node::job_ledger::remove(&ledger_dir, handle.job_id).await;
                     });
                 }
                 _ => {
-                    if !should_finalize_remote_job(Some(mission_status)) {
-                        tracing::warn!(
-                            mission_id = %handle.mission_id,
-                            job_id = %handle.job_id,
-                            node = %handle.node_id,
-                            %mission_status,
-                            "inactive remote job handle retained: cancellation node unavailable"
-                        );
-                        continue;
-                    }
                     tracing::warn!(
                         mission_id = %handle.mission_id,
+                        job_id = %handle.job_id,
                         node = %handle.node_id,
-                        "remote job's node no longer configured; failing mission"
+                        %mission_status,
+                        "remote job handle retained: recovery node config/token unavailable"
                     );
-                    let _ = owner
-                        .mission_store
-                        .update_mission_status(handle.mission_id, MissionStatus::Failed)
-                        .await;
-                    owner.send(AgentEvent::MissionStatusChanged {
-                        mission_id: handle.mission_id,
-                        status: MissionStatus::Failed,
-                        summary: Some(
-                            "remote_node_lost: node unconfigured after restart".to_string(),
-                        ),
-                    });
-                    crate::remote_node::job_ledger::remove(working_dir, handle.job_id).await;
-                    settled.insert(handle.job_id);
+                    // Neither configuration loss nor the mission's presentation
+                    // status proves that the accepted node process has stopped.
+                    // Leave this job pending so recovery retries observation.
                 }
             }
         }
@@ -11992,15 +12133,16 @@ async fn poll_recovered_remote_build(
 ) {
     let working_dir = state.config.working_dir.clone();
     let client = crate::remote_node::RemoteNodeClient::default();
+    let mut terminal: Option<crate::remote_node::NodeJobStatus> = None;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        match client.get_job(&node, &shared_token, job_id).await {
-            Ok(status)
-                if matches!(
-                    status.state.as_str(),
-                    "succeeded" | "failed" | "cancelled" | "lost"
-                ) =>
-            {
+        let observation = match &terminal {
+            Some(status) => Ok(status.clone()),
+            None => client.get_job(&node, &shared_token, job_id).await,
+        };
+        match observation {
+            Ok(status) if crate::remote_node::job_state_confirms_termination(&status.state) => {
+                terminal = Some(status.clone());
                 let terminal_state = status.state.clone();
                 let terminal_exit_code = status.exit_code;
                 let terminal_artifacts = status.artifacts.clone();
@@ -12062,6 +12204,7 @@ async fn poll_recovered_remote_build(
 /// the same path as the synchronous dispatch.
 #[allow(clippy::too_many_arguments)]
 async fn poll_remote_job(
+    ledger_dir: &std::path::Path,
     owner: RemoteMissionOwner,
     fleet: Arc<crate::remote_node::FleetMonitor>,
     client: crate::remote_node::RemoteNodeClient,
@@ -12087,6 +12230,9 @@ async fn poll_remote_job(
     };
     let mut last_state = "queued".to_string();
     let mut failures = 0u32;
+    // Once received, terminal proof survives a subsequent observation outage
+    // while mission/ledger persistence is retried.
+    let mut terminal_observation: Option<crate::remote_node::NodeJobStatus> = None;
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
 
@@ -12118,7 +12264,11 @@ async fn poll_remote_job(
             }
         }
 
-        match client.get_job(&node, &shared_token, job_id).await {
+        let observation = match &terminal_observation {
+            Some(status) => Ok(status.clone()),
+            None => client.get_job(&node, &shared_token, job_id).await,
+        };
+        match observation {
             Err(err) => {
                 failures += 1;
                 if failures >= MAX_CONSECUTIVE_FAILURES {
@@ -12149,22 +12299,25 @@ async fn poll_remote_job(
                         "remote_node_lost",
                     )
                     .await;
-                    fleet.record_outcome(outcome("lost", None, Some(err.to_string()), true));
+                    fleet.record_outcome(outcome(
+                        "unreachable",
+                        None,
+                        Some(err.to_string()),
+                        false,
+                    ));
                     // Finalization moves the mission out of Active. Keep the
                     // durable handle and continue: the next iteration enters
-                    // the cancellation-aware path, and wrappers only remove
-                    // the ledger entry after a terminal node response.
+                    // the cancellation-aware path. This loop retires the ledger
+                    // entry only after confirmed termination and durable cleanup.
                     failures = 0;
                     continue;
                 }
             }
             Ok(status) => {
                 failures = 0;
-                let terminal = matches!(
-                    status.state.as_str(),
-                    "succeeded" | "failed" | "cancelled" | "lost"
-                );
+                let terminal = crate::remote_node::job_state_confirms_termination(&status.state);
                 if terminal {
+                    terminal_observation = Some(status.clone());
                     let success = status.state == "succeeded";
                     let content = format!(
                         "Remote node '{}' job {} finished with state '{}' (exit {:?}){}\n\nlog tail:\n{}",
@@ -12180,7 +12333,7 @@ async fn poll_remote_job(
                         status.log_tail.as_deref().unwrap_or("(empty)"),
                     );
                     if should_finalize_remote_job(inactive_status) {
-                        let _ = finalize_remote_mission(
+                        if let Err(error) = finalize_remote_mission(
                             &owner,
                             mission_id,
                             &node.id,
@@ -12188,7 +12341,12 @@ async fn poll_remote_job(
                             content,
                             "remote_node_job",
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::warn!(%mission_id, %job_id, %error,
+                                "remote terminal mission persistence failed; retaining ownership and retrying");
+                            continue;
+                        }
                     } else {
                         tracing::info!(
                             mission_id = %mission_id,
@@ -12197,6 +12355,21 @@ async fn poll_remote_job(
                             state = %status.state,
                             "remote job reached a terminal state after operator interruption; preserving mission status"
                         );
+                    }
+                    if let Err(error) = crate::remote_node::job_ledger::finalize_with_artifacts(
+                        ledger_dir,
+                        job_id,
+                        &status.state,
+                        status.exit_code,
+                        status.artifacts.clone(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(%mission_id, %job_id, %error,
+                            "remote terminal cleanup failed; retaining ownership and retrying");
+                        #[cfg(test)]
+                        dispatch_admission_tests::notify_wait(job_id, "remote_cleanup_failed");
+                        continue;
                     }
                     fleet.record_outcome(outcome(
                         &status.state,
@@ -12356,6 +12529,39 @@ pub async fn update_mission_project(
     Json(req): Json<UpdateMissionProjectRequest>,
 ) -> Result<Json<Mission>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
+    let (respond, result) = oneshot::channel();
+    control
+        .cmd_tx
+        .send(ControlCommand::UpdateProject {
+            mission_id: id,
+            user,
+            request: req,
+            respond,
+        })
+        .await
+        .map_err(session_unavailable)?;
+    #[cfg(test)]
+    dispatch_admission_tests::notify_wait(id, "project");
+    result.await.map_err(recv_failed)?.map(Json)
+}
+
+async fn update_mission_project_locked(
+    actor_busy: bool,
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateMissionProjectRequest>,
+) -> Result<Json<Mission>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    dispatch_admission::recover_dispatch(&state, &control.mission_store, id)
+        .await
+        .map_err(|error| {
+            if error.contains("dispatch_recovery_required") {
+                (StatusCode::CONFLICT, error)
+            } else {
+                internal_error(error)
+            }
+        })?;
     let current = control
         .mission_store
         .get_mission(id)
@@ -12461,13 +12667,14 @@ pub async fn update_mission_project(
             Some(goal),
         )
     });
-    let becomes_writer = effective_github_pr.is_some()
-        && (initial_prompt_requests_writer || deferred_goal_requests_writer);
+    // Writer capability governs tracks even when PR metadata is absent.
+    // Explicit promotion must replace a read-only tag before lease_mode sees it.
+    let becomes_writer = initial_prompt_requests_writer || deferred_goal_requests_writer;
     if becomes_writer {
         effective_tags.retain(|tag| tag != "pr-readonly" && tag != "pr-writer");
         effective_tags.push("pr-writer".to_string());
         tags = Some(effective_tags.clone());
-    } else if effective_github_pr.is_some() && req.writer == Some(false) {
+    } else if req.writer == Some(false) {
         effective_tags.retain(|tag| tag != "pr-readonly" && tag != "pr-writer");
         effective_tags.push("pr-readonly".to_string());
         tags = Some(effective_tags.clone());
@@ -12505,7 +12712,18 @@ pub async fn update_mission_project(
     // old ones. A held writer lease is a 409 and the patch is not applied.
     let effective_project = effective_string(&project, &current.project.project);
     let effective_track = effective_string(&track, &current.project.track);
-    let track_changed = track.is_some() || project.is_some();
+    if effective_project != current.project.project
+        || effective_track != current.project.track
+        || effective_github_pr != current.project.github_pr
+        || effective_tags != current.project.tags
+        || effective_intent != current.project.intent
+    {
+        dispatch_admission::require_quiescent(&state, &control.mission_store, &current, actor_busy)
+            .await
+            .map_err(|error| (StatusCode::CONFLICT, error))?;
+    }
+    let track_changed = track.is_some() || project.is_some() || could_change_writer_status;
+    let mut lease_request = None;
     let track = if let (true, Some(slug), Some(key)) = (
         track_changed,
         effective_project.as_deref(),
@@ -12525,59 +12743,96 @@ pub async fn update_mission_project(
                 effective_intent.as_deref(),
             )
         };
-        let request =
-            super::track_leases::lease_request(slug, &outcome.key, &id.to_string(), mode, None);
-        match state.projects.acquire_track_lease(&request) {
-            Ok(_) => {}
-            Err(super::projects_store::LeaseError::Store(error)) => {
-                return Err(internal_error(error))
-            }
-            Err(super::projects_store::LeaseError::NotFound) => {
-                return Err(internal_error(format!(
-                    "track '{}' of '{slug}' vanished between absorption and lease",
-                    outcome.key
-                )))
-            }
-            Err(error @ super::projects_store::LeaseError::Owned { .. }) => {
-                return Err((
-                    StatusCode::CONFLICT,
-                    super::track_leases::owned_body(slug, &outcome.key, &error).to_string(),
-                ));
-            }
-        }
-        state
-            .projects
-            .release_leases_except(&id.to_string(), slug, &outcome.key)
-            .map_err(internal_error)?;
+        let request = super::track_leases::lease_request(
+            slug,
+            &outcome.key,
+            &id.to_string(),
+            mode,
+            Some(&format!("project-edit:{}", Uuid::new_v4())),
+        );
+        lease_request = Some(request);
         Some(Some(outcome.key))
     } else {
-        if track_changed {
-            // The mission left its project or cleared its track: whatever it
-            // held no longer governs anything.
-            state
-                .projects
-                .release_leases_for_attempt(&id.to_string())
-                .map_err(internal_error)?;
-        }
         track
     };
 
-    control
+    let patch = crate::api::mission_store::MissionProjectPatch {
+        preserve_updated_at: false,
+        title: None,
+        project,
+        track,
+        intent,
+        github_pr,
+        tags: None,
+        tag_patch: tags.as_ref().map(|tags| {
+            crate::api::mission_store::MissionTagPatch::between(&current.project.tags, tags)
+        }),
+        desired_state,
+        next_check_at,
+    };
+    let mut after = current.project.clone();
+    if let Some(value) = &patch.project {
+        after.project = value.clone();
+    }
+    if let Some(value) = &patch.track {
+        after.track = value.clone();
+    }
+    if let Some(value) = &patch.intent {
+        after.intent = value.clone();
+    }
+    if let Some(value) = &patch.github_pr {
+        after.github_pr = value.clone();
+    }
+    if let Some(value) = &patch.desired_state {
+        after.desired_state = value.clone();
+    }
+    if let Some(value) = &patch.next_check_at {
+        after.next_check_at = value.clone();
+    }
+    if let Some(delta) = &patch.tag_patch {
+        delta.apply(&mut after.tags);
+    }
+    if track_changed {
+        // Recovery compares only fields owned by this edit. The metadata write
+        // is atomic; after a crash it either committed or still names `before`.
+        // Unrelated tag additions must not prevent that decision.
+        let journal = serde_json::json!({"phase": "project-edit",
+            "before": {"project": current.project}, "after": {"project": after}});
+        state
+            .projects
+            .begin_dispatch_admission(&id.to_string(), &journal, lease_request.as_ref())
+            .map_err(|error| match (&lease_request, &error) {
+                (Some(request), super::projects_store::LeaseError::Owned { .. }) => (
+                    StatusCode::CONFLICT,
+                    super::track_leases::owned_body(&request.slug, &request.track, &error)
+                        .to_string(),
+                ),
+                _ => internal_error(error.to_string()),
+            })?;
+    }
+    let persisted = control
         .mission_store
-        .update_mission_project(
-            id,
-            crate::api::mission_store::MissionProjectPatch {
-                project,
-                track,
-                intent,
-                github_pr,
-                tags,
-                desired_state,
-                next_check_at,
-            },
-        )
-        .await
-        .map_err(internal_error)?;
+        .update_mission_project(id, patch)
+        .await;
+    if let Err(error) = persisted {
+        if track_changed {
+            // Keep the receipt when compensation itself fails, so sweep or
+            // restart retries the exact provisional claim instead of renewing it.
+            dispatch_admission::finish_project_edit(&state, &control.mission_store, id, false)
+                .await
+                .map_err(internal_error)?;
+        }
+        return Err(internal_error(error));
+    }
+    #[cfg(test)]
+    dispatch_admission_tests::crash_checkpoint("project_edit_after_metadata");
+    if track_changed {
+        if let Err(error) =
+            dispatch_admission::finish_project_edit(&state, &control.mission_store, id, true).await
+        {
+            tracing::error!(mission_id = %id, %error, "Committed project edit cleanup is journaled for retry");
+        }
+    }
 
     let updated = control
         .mission_store
@@ -12773,6 +13028,7 @@ pub async fn update_mission_settings(
         let queued = match control
             .cmd_tx
             .send(ControlCommand::ResumeMission {
+                content: None,
                 mission_id: id,
                 clean_workspace: false,
                 skip_message: false,
@@ -14412,6 +14668,10 @@ pub async fn clone_mission(
 /// Request body for resuming a mission
 #[derive(Debug, Deserialize, Default)]
 pub struct ResumeMissionRequest {
+    /// Explicit same-work assertion, checked against stored identity before dispatch.
+    #[serde(default)]
+    pub continue_identity: Option<crate::api::writer_recycle::WriterContinuation>,
+
     /// If true, clean the mission's work directory before resuming
     #[serde(default)]
     pub clean_workspace: bool,
@@ -14448,34 +14708,54 @@ pub async fn resume_mission(
     let actor = resolve_actor(request.actor.clone(), &user);
 
     let control = control_for_user(&state, &user).await;
-    if let Ok(Some(mission)) = control.mission_store.get_mission(mission_id).await {
-        apply_writer_reuse_or_conflict(
-            &control.mission_store,
-            &mission,
-            request.github_pr.clone(),
-            request.track.clone(),
-            request.title.clone(),
-            request.content.clone(),
-        )
-        .await?;
-    }
     tracing::info!(mission_id = %mission_id, actor = %actor, "FLEET-004 mission resume requested");
 
     let outcome: Result<Mission, (StatusCode, String)> = async {
         let (tx, rx) = oneshot::channel();
         control
             .cmd_tx
-            .send(ControlCommand::ResumeMission {
-                mission_id,
-                clean_workspace,
-                skip_message,
-                respond: tx,
+            .send(ControlCommand::AdmitDispatch {
+                admission: Box::new(DispatchAdmission {
+                    internal_work_hint: None,
+                    state: state.clone(),
+                    store: control.mission_store.clone(),
+                    patch: dispatch_identity_patch(
+                        request.github_pr,
+                        request.track,
+                        request.title,
+                        request.content,
+                        request.continue_identity,
+                    ),
+                }),
+                command: Box::new(ControlCommand::ResumeMission {
+                    content: None,
+                    mission_id,
+                    clean_workspace,
+                    skip_message,
+                    respond: tx,
+                }),
             })
             .await
             .map_err(session_unavailable)?;
-        rx.await
-            .map_err(recv_failed)?
-            .map_err(|e| (StatusCode::BAD_REQUEST, e))
+        #[cfg(test)]
+        dispatch_admission_tests::notify_wait(mission_id, "enqueued");
+        rx.await.map_err(recv_failed)?.map_err(|e| {
+            let conflict = e.contains("writer_identity_stale")
+                || e.contains("continue_identity")
+                || e.contains("assignment_busy")
+                || e.contains("writer lease")
+                || e.contains("track_owned")
+                || e.contains("dispatch_recovery_required")
+                || e.contains("writer_reuse_requires_retag");
+            (
+                if conflict {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                e,
+            )
+        })
     }
     .await;
 
@@ -15694,6 +15974,7 @@ async fn paloma_webhook_forwarder_loop(
                 .and_then(|mission| mission.terminal_reason.as_deref());
             let recommended_action = match terminal_reason {
                 Some("server_shutdown" | "orphan_no_runner") => "resume_once",
+                Some("native_goal_stopped") => "resolve_stop_then_resume",
                 Some("auth_error") => "disable_provider_and_reroute",
                 Some("rate_limited" | "capacity_limited") => "reroute_or_queue",
                 Some("watchdog_stalled" | "cancelled") => "inspect_artifacts",
@@ -16050,6 +16331,7 @@ fn spawn_control_session(
         current_tree: Arc::clone(&current_tree),
         progress: Arc::clone(&progress),
         running_missions: Arc::clone(&running_missions),
+        assignment_owners: Arc::new(RwLock::new(HashSet::new())),
         max_parallel,
         mission_store: Arc::clone(&mission_store),
         mission_search_cache,
@@ -16097,7 +16379,7 @@ fn spawn_control_session(
 
     // Spawn the main control actor
     tokio::spawn(control_actor_loop(
-        control_hub,
+        control_hub.clone(),
         config.clone(),
         root_agent,
         mcp,
@@ -16118,6 +16400,7 @@ fn spawn_control_session(
         secrets,
         user_id,
         Arc::clone(&background_tasks),
+        Arc::clone(&state.assignment_owners),
     ));
 
     // Recover missions stopped by the previous backend process. Graceful
@@ -16127,8 +16410,9 @@ fn spawn_control_session(
         let store = Arc::clone(&state.mission_store);
         let tx = events_tx.clone();
         let cmd = state.cmd_tx.clone();
+        let startup_at = chrono::Utc::now();
         tokio::spawn(async move {
-            recover_server_shutdown_missions(store, tx, cmd).await;
+            recover_server_shutdown_missions(store, tx, cmd, control_hub, startup_at).await;
         });
     }
 
@@ -17346,6 +17630,7 @@ fn mission_status_for_terminal_reason(
         }
         TerminalReason::TurnComplete => None,
         TerminalReason::Completed => Some((MissionStatus::Completed, "completed")),
+        TerminalReason::NativeGoalStopped => Some((MissionStatus::Blocked, "native_goal_stopped")),
         TerminalReason::Cancelled => Some((MissionStatus::Interrupted, "cancelled")),
         TerminalReason::ServerShutdown => Some((MissionStatus::Interrupted, "server_shutdown")),
         TerminalReason::MaxIterations => Some((MissionStatus::Blocked, "max_iterations")),
@@ -17422,6 +17707,9 @@ fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<
     match reason {
         TerminalReason::TurnComplete | TerminalReason::Completed => None,
         TerminalReason::MaxIterations => Some("Reached iteration limit".to_string()),
+        TerminalReason::NativeGoalStopped => {
+            Some("Native goal stopped — resume after external steering".to_string())
+        }
         TerminalReason::Cancelled => Some("Cancelled by user".to_string()),
         TerminalReason::ServerShutdown => {
             Some("Paused for server restart — click Resume to continue".to_string())
@@ -18301,6 +18589,7 @@ async fn control_actor_loop(
     // Shared registry of in-flight Claude Code background shell tasks. Written
     // here from the `ToolResult` event arm; read by the auto-resume watcher.
     background_tasks: super::mission_runner::BackgroundTaskRegistry,
+    assignment_owners: Arc<RwLock<HashSet<Uuid>>>,
 ) {
     // A process-local actor cannot reattach a harness JoinHandle after restart.
     // Close any inherited execution lease before accepting new work; durable
@@ -18500,6 +18789,7 @@ async fn control_actor_loop(
     // and `Stop` becomes a no-op. After this deadline we force-abort
     // the JoinHandle and clean up the in-memory state.
     let mut runner_force_clear_deadline: Option<tokio::time::Instant> = None;
+    let mut runner_force_abort_requested = false;
     const RUNNER_FORCE_CLEAR_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
     // Correlate Bash `tool_call_id` -> command string so that when the matching
@@ -18785,10 +19075,48 @@ async fn control_actor_loop(
             let _ = std::fs::remove_file(runtime_file);
         }
 
-        Ok((mission, INTERRUPTED_RESUME_PROMPT.to_string()))
+        let prompt = if mission.backend == "codex" && mission.goal_mode {
+            mission
+                .goal_objective
+                .as_ref()
+                .map(|objective| format!("/goal {objective}"))
+        } else {
+            None
+        }
+        .unwrap_or_else(|| INTERRUPTED_RESUME_PROMPT.to_string());
+        Ok((mission, prompt))
     }
 
     loop {
+        let mut owners = HashSet::new();
+        if running.is_some() {
+            owners.extend(running_mission_id);
+        }
+        let current_id = *current_mission.read().await;
+        owners.extend(
+            queue
+                .iter()
+                .filter_map(|entry| entry.3.or(running_mission_id).or(current_id)),
+        );
+        owners.extend(
+            parallel_runners
+                .iter()
+                .filter(|(_, runner)| {
+                    runner.is_running()
+                        || !runner.queue.is_empty()
+                        || runner.inflight_message().is_some()
+                })
+                .map(|(id, _)| *id),
+        );
+        owners.extend(
+            background_tasks
+                .read()
+                .await
+                .iter()
+                .filter(|(_, tasks)| !tasks.is_empty())
+                .map(|(id, _)| *id),
+        );
+        *assignment_owners.write().await = owners;
         // Persist the pending queue whenever it changes so a restart doesn't
         // lose queued messages. Debounced by snapshot comparison — the DB is
         // written only when the queue actually changed (no per-iteration churn
@@ -18969,7 +19297,89 @@ async fn control_actor_loop(
             }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
+                // Internal wakes also need current track ownership. They carry
+                // no controller assertion or retag, but use the same admission
+                // and rollback boundary as HTTP dispatch.
+                let cmd = if matches!(&cmd, ControlCommand::UserMessage { target_mission_id: Some(_), .. } | ControlCommand::ResumeMission { .. }) {
+                    if let Some(state) = control_hub.admission_state.get().and_then(std::sync::Weak::upgrade) {
+                        let work_hint = match &cmd { ControlCommand::UserMessage { content, .. } => Some(content.clone()), _ => None };
+                        ControlCommand::AdmitDispatch {
+                            admission: Box::new(DispatchAdmission {
+                                state,
+                                store: mission_store.clone(),
+                                // Internal control messages are not retasks;
+                                // do not run prose recycle inference on them.
+                                patch: Default::default(),
+                                internal_work_hint: work_hint,
+                            }),
+                            command: Box::new(cmd),
+                        }
+                    } else { cmd }
+                } else { cmd };
+                #[cfg(test)]
+                if let ControlCommand::AdmitDispatch { command, .. } = &cmd {
+                    let id = match command.as_ref() {
+                        ControlCommand::UserMessage { target_mission_id, .. } => *target_mission_id,
+                        ControlCommand::ResumeMission { mission_id, .. } => Some(*mission_id),
+                        _ => None,
+                    };
+                    if let Some(id) = id { dispatch_admission_tests::notify_wait(id, "actor"); }
+                }
+                let admission_guard = DISPATCH_ADMISSION.lock().await;
+                let (cmd, _admission_guard) = match cmd {
+                    ControlCommand::AdmitDispatch { admission, command } => {
+                        // Deduplication is an admission decision too: a retry
+                        // cannot smuggle a new assignment into an accepted id.
+                        if let ControlCommand::UserMessage { id, .. } = command.as_ref() {
+                            if recovered_consumed_user_messages.contains_key(id) || accepted_user_message_ids.contains(id) {
+                                if let ControlCommand::UserMessage { respond, .. } = *command {
+                                    let _ = respond.send(UserMessageAck::Delivered);
+                                }
+                                continue;
+                            }
+                        }
+                        let target = match command.as_ref() {
+                            ControlCommand::UserMessage { target_mission_id, .. } => *target_mission_id,
+                            ControlCommand::ResumeMission { mission_id, .. } => Some(*mission_id),
+                            _ => None,
+                        };
+                        let busy = target.is_some_and(|id| running_mission_id == Some(id)
+                            || parallel_runners.contains_key(&id)
+                            || queue_has_pending_target_mission(&queue, id)
+                            || queue.iter().any(|entry| entry.3.is_none()));
+                        let busy = busy || if let Some(id) = target {
+                            background_tasks.read().await.get(&id).is_some_and(|tasks| !tasks.is_empty())
+                        } else { false };
+                        let actor_before = serde_json::json!({
+                            "user_id": session_user_id,
+                            "current_mission": *current_mission.read().await,
+                            "history": history,
+                        });
+                        match dispatch_admission::admit_dispatch_with_lifetime(*admission, *command, admission_guard, busy, Some(actor_before)).await {
+                            Some(cmd) => (cmd, None),
+                            None => continue,
+                        }
+                    }
+                    cmd => (cmd, Some(admission_guard)),
+                };
                 match cmd {
+                    ControlCommand::UpdateProject { mission_id, user, request, respond } => {
+                        let busy = running_mission_id == Some(mission_id)
+                            || parallel_runners.contains_key(&mission_id)
+                            || queue_has_pending_target_mission(&queue, mission_id)
+                            || queue.iter().any(|entry| entry.3.is_none())
+                            || background_tasks.read().await.get(&mission_id).is_some_and(|tasks| !tasks.is_empty());
+                        let result = if let Some(state) = control_hub.admission_state.get().and_then(std::sync::Weak::upgrade) {
+                            match dispatch_admission::durable_lock(&state.config).await {
+                                Ok(_file_guard) => update_mission_project_locked(busy, State(state), Extension(user), Path(mission_id), Json(request)).await.map(|Json(m)| m),
+                                Err(error) => Err(internal_error(error)),
+                            }
+                        } else {
+                            Err((StatusCode::SERVICE_UNAVAILABLE, "Admission state unavailable".into()))
+                        };
+                        let _ = respond.send(result);
+                    }
+                    ControlCommand::AdmitDispatch { .. } => unreachable!("nested admission"),
                     ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, strict, source, respond } => {
                         if recovered_consumed_user_messages.contains_key(&id) {
                             // The previous actor had already started this exact
@@ -20487,7 +20897,13 @@ async fn control_actor_loop(
                         let _ = respond.send(result);
                     }
                     ControlCommand::SetMissionTitle { id, title, respond } => {
-                        let result = mission_store.update_mission_title(id, &title).await;
+                        let result = async {
+                            let _file_guard = dispatch_admission::durable_lock(&config).await?;
+                            if let Some(state) = control_hub.admission_state.get().and_then(std::sync::Weak::upgrade) {
+                                dispatch_admission::recover_dispatch(&state, &mission_store, id).await?;
+                            }
+                            mission_store.update_mission_title(id, &title).await
+                        }.await;
                         if result.is_ok() {
                             let _ = events_tx.send(AgentEvent::MissionTitleChanged {
                                 mission_id: id,
@@ -21078,6 +21494,10 @@ async fn control_actor_loop(
                             }
                         }
                     }
+                    #[cfg(test)]
+                    ControlCommand::InspectActorContext { respond } => {
+                        let _ = respond.send((*current_mission.read().await, history.clone()));
+                    }
                     ControlCommand::ListRunning { respond } => {
                         // Return info about currently running missions
                         let mut running_list = Vec::new();
@@ -21181,7 +21601,7 @@ async fn control_actor_loop(
                         );
                         let _ = respond.send(actor_run);
                     }
-                    ControlCommand::ResumeMission { mission_id, clean_workspace, skip_message, respond } => {
+                    ControlCommand::ResumeMission { mission_id, clean_workspace, skip_message, content, respond } => {
                         // Resumable terminal writers do not hold a lease, so a replacement
                         // writer may have been created since this mission stopped. Serialize
                         // the availability check with create/project updates and keep the
@@ -21204,7 +21624,8 @@ async fn control_actor_loop(
                             clean_workspace,
                         )
                         .await {
-                            Ok((mission, resume_prompt)) => {
+                            Ok((mission, default_resume_prompt)) => {
+                                let resume_prompt = content.unwrap_or(default_resume_prompt);
                                 if let Err(error) = ensure_pr_writer_resume_is_exclusive(
                                     &control_hub,
                                     &mission_store,
@@ -21402,6 +21823,9 @@ async fn control_actor_loop(
                                 )
                                 .await;
 
+                                let previous_mission = *current_mission.read().await;
+                                let previous_history = history.clone();
+
                                 // Load the mission's history into current state
                                 history = mission.history.iter()
                                     .map(|e| (e.role.clone(), e.content.clone()))
@@ -21413,7 +21837,10 @@ async fn control_actor_loop(
                                     .update_mission_status(mission_id, MissionStatus::Active)
                                     .await
                                 {
-                                    tracing::warn!("Failed to resume mission {}: {}", mission_id, e);
+                                    history = previous_history;
+                                    *current_mission.write().await = previous_mission;
+                                    let _ = respond.send(Err(format!("Failed to resume mission {mission_id}: {e}")));
+                                    continue;
                                 } else {
                                     if mission.status == MissionStatus::Paused {
                                         let _ = mission_store
@@ -21436,8 +21863,9 @@ async fn control_actor_loop(
 
                                 // Queue the resume prompt as a message (no per-message agent override)
                                 // Skip if the caller just wants to update the status (e.g., before sending a custom message)
+                                let resume_message_id = Uuid::new_v4();
                                 if !skip_message {
-                                    let msg_id = Uuid::new_v4();
+                                    let msg_id = resume_message_id;
                                     queue.push_back((
                                         msg_id,
                                         resume_prompt,
@@ -21445,6 +21873,26 @@ async fn control_actor_loop(
                                         Some(mission_id),
                                         Some("system:resume".to_string()),
                                     ));
+                                }
+
+                                // Persist acceptance before a dequeue can erase
+                                // the only durable copy of the custom prompt.
+                                if !skip_message {
+                                    if let Err(error) = persist_control_queue_if_changed(
+                                        &mission_store, &session_user_id, &queue, &parallel_runners,
+                                        &recovered_consumed_user_messages, &mut last_persisted_queue,
+                                    ).await {
+                                        queue.retain(|(queued_id, ..)| *queued_id != resume_message_id);
+                                        history = previous_history;
+                                        *current_mission.write().await = previous_mission;
+                                        let rollback = restore_mission_after_failed_run_acquisition(&mission_store, &events_tx, &mission).await;
+                                        let error = match rollback {
+                                            Ok(()) => error,
+                                            Err(rollback) => format!("{error}; status recovery required: {rollback}"),
+                                        };
+                                        let _ = respond.send(Err(format!("Failed to persist resumed mission queue: {error}")));
+                                        continue;
+                                    }
                                 }
 
                                 // Start execution if not already running
@@ -21470,9 +21918,13 @@ async fn control_actor_loop(
                                                 msg_target_mid,
                                                 msg_source,
                                             ));
-                                            let _ = respond.send(Err(format!(
-                                                "Failed to persist resumed mission queue: {error}"
-                                            )));
+                                            // Enqueue already committed. Keep the
+                                            // accepted prompt and its new identity;
+                                            // this is queued work, not a rejection.
+                                            tracing::warn!(%error, "Resumed prompt remains durably queued after dequeue failure");
+                                            let mut accepted = mission.clone();
+                                            accepted.status = MissionStatus::Active;
+                                            let _ = respond.send(Ok(accepted));
                                             continue;
                                         }
                                         let target_mid = msg_target_mid.unwrap_or(mission_id);
@@ -21533,6 +21985,23 @@ async fn control_actor_loop(
                                                 running_cancel = None;
                                                 running_mission_id = None;
                                                 running_backend_id = None;
+                                                history = previous_history;
+                                                *current_mission.write().await = previous_mission;
+                                                let error = match restore_mission_after_failed_run_acquisition(
+                                                    &mission_store, &events_tx, &mission,
+                                                ).await {
+                                                    Ok(()) => error,
+                                                    Err(rollback) => format!("{error}; status recovery required: {rollback}"),
+                                                };
+                                                // No runner was started. Compensate the shared
+                                                // Running presentation before returning rejection.
+                                                set_and_emit_status(
+                                                    &status,
+                                                    &events_tx,
+                                                    ControlRunState::Idle,
+                                                    queue.len(),
+                                                    None,
+                                                ).await;
                                                 let _ = respond.send(Err(format!(
                                                     "Failed to acquire mission run lease: {error}"
                                                 )));
@@ -21962,7 +22431,7 @@ async fn control_actor_loop(
                     Some(handle) => Some(handle.await),
                     None => None
                 }
-            }, if running.is_some() => {
+            }, if running.is_some() && !runner_force_abort_requested => {
                 if let Some(res) = finished {
                     // Save the running mission ID before clearing it - we need it for persist and auto-complete
                     // (current_mission can change if user clicks "New Mission" while task was running)
@@ -21981,6 +22450,7 @@ async fn control_actor_loop(
                     // Runner cleared itself; cancel the force-clear watchdog.
                     runner_force_clear_deadline = None;
                     let mut completed_terminal_reason = None;
+                    let mut completed_terminal_evidence = None;
                     let mut completed_completion_confidence = None;
                     let mut completed_transport_failure = false;
                     let mut completed_waiting_remote_job = false;
@@ -21995,6 +22465,7 @@ async fn control_actor_loop(
                             let completion_evidence =
                                 completion_evidence_for_agent_result(&agent_result);
                             completed_terminal_reason = agent_result.terminal_reason;
+                            completed_terminal_evidence = agent_result.terminal_evidence.clone();
                             completed_completion_confidence =
                                 Some(completion_evidence.completion_confidence);
                             completed_transport_failure =
@@ -22351,9 +22822,10 @@ async fn control_actor_loop(
                                 }
                             }
                         }
-                        let is_transient_infra_failure = matches!(
+                        let suppress_finished_automation = matches!(
                             completed_terminal_reason,
-                            Some(TerminalReason::AuthError)
+                            Some(TerminalReason::NativeGoalStopped)
+                                | Some(TerminalReason::AuthError)
                                 | Some(TerminalReason::RateLimited)
                                 | Some(TerminalReason::CapacityLimited)
                         ) || completed_transport_failure;
@@ -22371,7 +22843,7 @@ async fn control_actor_loop(
                         // otherwise the existing hook would still fire the
                         // continuation. Skipped on transient infra failures
                         // for the same reason regular automations are.
-                        if !is_transient_infra_failure {
+                        if !suppress_finished_automation {
                             post_turn_handle_grok_goal(
                                 &mission_store,
                                 &events_tx,
@@ -22381,7 +22853,7 @@ async fn control_actor_loop(
                             )
                             .await;
                         }
-                        if !already_queued_for_mission && !is_transient_infra_failure {
+                        if !already_queued_for_mission && !suppress_finished_automation {
                             // Small delay so the UI can display the completion before restarting.
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             let messages = agent_finished_automation_messages(
@@ -22405,7 +22877,7 @@ async fn control_actor_loop(
                                     .get(&mission_id)
                                     .map_or(0, std::collections::HashMap::len),
                                 completed_terminal_reason,
-                                None,
+                                completed_terminal_evidence.as_deref(),
                                 completed_completion_confidence,
                                 true,
                                 Some(completed_agent_output.as_str()),
@@ -22894,15 +23366,16 @@ async fn control_actor_loop(
                             // Check if we should enqueue agent_finished automations.
                             // Skip for transient infrastructure failures (auth, rate limit,
                             // capacity) to avoid noisy retry loops.
-                            let is_transient_infra_failure = matches!(
+                            let suppress_finished_automation = matches!(
                                 result.terminal_reason,
-                                Some(TerminalReason::AuthError)
+                                Some(TerminalReason::NativeGoalStopped)
+                                    | Some(TerminalReason::AuthError)
                                     | Some(TerminalReason::RateLimited)
                                     | Some(TerminalReason::CapacityLimited)
                             ) || is_transport_failure_evidence(&completion_evidence);
                             let cancellation_requested = runner.cancellation_requested();
                             let was_queue_empty = runner.queue.is_empty();
-                            if is_transient_infra_failure
+                            if suppress_finished_automation
                                 && is_transport_failure_evidence(&completion_evidence)
                                 && !cancellation_requested
                                 && was_queue_empty
@@ -22938,7 +23411,7 @@ async fn control_actor_loop(
                             // so a terminal sentinel disables the loop on this
                             // turn rather than after one extra continuation
                             // fire. (See `post_turn_handle_grok_goal`.)
-                            if !is_transient_infra_failure {
+                            if !suppress_finished_automation {
                                 post_turn_handle_grok_goal(
                                     &mission_store,
                                     &events_tx,
@@ -22949,7 +23422,7 @@ async fn control_actor_loop(
                                 .await;
                             }
                             if was_queue_empty
-                                && !is_transient_infra_failure
+                                && !suppress_finished_automation
                                 && !cancellation_requested
                             {
                                 // Small delay so the UI can display the completion before restarting.
@@ -23020,7 +23493,6 @@ async fn control_actor_loop(
                                             mission_id: Some(*mission_id),
                                             resumable: true,
                                         });
-                                        completed_missions.push(*mission_id);
                                         continue;
                                     }
                                 }
@@ -23293,11 +23765,11 @@ async fn control_actor_loop(
                 }
             }, if runner_force_clear_deadline.is_some() && running.is_some() => {
                 let stuck_mid = running_mission_id;
-                let still_progressing = main_runner_active_tool_calls
+                let still_progressing = !runner_force_abort_requested && (main_runner_active_tool_calls
                     .load(std::sync::atomic::Ordering::Relaxed)
                     > 0
                     || main_runner_last_activity.elapsed()
-                        < super::controller_honesty::CANCEL_TIMEOUT_FRESH_PROGRESS;
+                        < super::controller_honesty::CANCEL_TIMEOUT_FRESH_PROGRESS);
                 if still_progressing {
                     tracing::info!(
                         mission_id = ?stuck_mid,
@@ -23312,9 +23784,18 @@ async fn control_actor_loop(
                     "Force-aborting stuck runner: cancel fired but JoinHandle never resolved within {}s",
                     RUNNER_FORCE_CLEAR_GRACE.as_secs()
                 );
-                if let Some(handle) = running.take() {
-                    handle.abort();
+                if let Some(handle) = running.as_ref() {
+                    if !handle.is_finished() {
+                        handle.abort();
+                        runner_force_abort_requested = true;
+                        runner_force_clear_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(100));
+                        // Preserve the runner and its durable ownership until
+                        // the abort finishes; continue servicing refusals.
+                        continue;
+                    }
                 }
+                running = None;
+                runner_force_abort_requested = false;
                 running_cancel = None;
                 running_mission_id = None;
                 running_backend_id = None;
@@ -24064,6 +24545,19 @@ async fn run_single_control_turn(
     boss_user_id: Option<String>,
     pr_readonly: bool,
 ) -> crate::agents::AgentResult {
+    #[cfg(test)]
+    if let Some(mid) = mission_id {
+        if let Some(result) = dispatch_admission_tests::native_goal_fixture(
+            mid,
+            &user_message,
+            events_tx.clone(),
+            cancel.clone(),
+        )
+        .await
+        {
+            return result;
+        }
+    }
     let is_claudecode = backend_id.as_deref() == Some("claudecode");
     let is_codex = backend_id.as_deref() == Some("codex");
     // Get config profile: mission's config_profile takes priority over workspace's
@@ -29467,6 +29961,9 @@ mod tests {
             .update_mission_project(
                 mission.id,
                 mission_store::MissionProjectPatch {
+                    preserve_updated_at: false,
+                    tag_patch: None,
+                    title: None,
                     project: None,
                     track: None,
                     intent: None,

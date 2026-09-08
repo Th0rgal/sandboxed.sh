@@ -139,6 +139,10 @@ impl TurnOutcome {
     pub fn completion_signal(&self) -> CompletionSignal {
         match self {
             Self::Complete { signal, .. } => *signal,
+            Self::Interrupted {
+                reason: TerminalReason::NativeGoalStopped,
+                ..
+            } => CompletionSignal::NativeTerminal,
             Self::Failed { .. } | Self::Interrupted { .. } => CompletionSignal::ProcessExit,
         }
     }
@@ -318,6 +322,8 @@ pub enum TerminalReason {
     TurnComplete,
     /// Task completed successfully
     Completed,
+    /// Native goal stopped without completing its objective; external steering may resume it.
+    NativeGoalStopped,
     /// Task was cancelled by user
     Cancelled,
     /// Mission was interrupted because the server is shutting down

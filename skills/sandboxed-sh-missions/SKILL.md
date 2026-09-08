@@ -669,12 +669,34 @@ When dispatching 3+ missions in one turn (parallel batch), it's easy to typo or 
 
 > **Pitfall — the MCP server has a consecutive-failure circuit breaker.** The `mcp_sandboxed_assistant_*` server trips a breaker after **3 consecutive failed calls** and enters a ~45–60 s cooldown during which *every* call returns `MCP server 'sandboxed_assistant' is unreachable after 3 consecutive failures. Auto-retry available in ~Ns.` — even calls to healthy missions. The trap: **"not found" counts as a failure.** If you fire a parallel batch of 20 `cancel_mission` calls and 3 of those missions are already cleaned up (→ `Mission … not found`), the breaker trips and the remaining 17 never execute. Same for a parallel batch of `get_mission_events`/`send_message_to_mission` where a few target stale IDs. **Rule of thumb: never put >5–8 `mcp_sandboxed_assistant_*` calls in a single parallel block.** For batch cancel/survey of a large fleet, serialize in small groups (2–3 at a time) or loop with a short `sleep` between. If you do trip the breaker, `sleep 60` then resume — do not retry into the cooldown, it extends it.
 
-### Large mission histories — don't `get_mission` a long orchestrator raw
+### Large mission histories — use compact reads and bounded events
 
-`get_mission` returns the **entire** `history` array inline. For a long-running `goal_mode` boss orchestrator (hundreds of turns over days), this easily hits 100–200 KB and gets redirected to a persisted-output file — useless for a quick status read. Prefer these for large/old missions:
+Assistant MCP `get_mission` and `get_mission_digest` return a compact digest;
+the raw HTTP mission endpoint still returns the full history. Use the bounded
+read tools for large/old missions. Digests, list summaries, and health expose
+`goal_mode` separately from `mission_mode`, plus a `goal_objective` preview
+capped at 1,000 characters and a truncation ellipsis. `mission_mode=task` does
+not mean goal mode is off.
 
-1. `get_mission_events(mission_id=…, view='transcript', limit=3)` — just the first user_message (the original goal) and the last assistant self-report. This is the right tool for "what is this mission doing now" 90% of the time.
-2. If you genuinely need the full history (e.g. diagnosing *why* an orchestrator died), `get_mission` → then `read_file` the persisted `/tmp/hermes-results/…txt` with `offset`/`limit`, or `tail -c 6000` it via terminal to read only the most recent events. Reading the whole file back into context defeats the purpose.
+For same-work send/resume messages that mention excluded or collaborating
+PRs, use `continue_identity: {"project": "<exact stored project>", "track": "<exact stored track>", "github_pr":
+"<exact stored PR>"}` (explicit JSON null for an unset project or PR). Read the
+mission first and assert only its existing assignment. This is a trusted caller
+assertion, not semantic proof of unchanged work; blindly copying tags for an
+unrelated retask defeats the prose heuristic. The assertion cannot
+be combined with identity edits and never grants PR ownership. For different
+work, omit it and explicitly update/clear stale `github_pr` and `track`
+(empty string clears in these MCP tools); normal writer leases still apply.
+See the full continuation contract in
+[Hermes Mission Control](../hermes-mission-control/SKILL.md#continue-existing-work-without-retagging).
+
+
+Use `get_mission_events(mission_id=…, view='transcript', limit=3)` for the
+newest bounded messages. To investigate earlier history, page backwards with
+`before_seq` or follow new events with `since_seq`; the initial objective is
+not necessarily in the newest page. Neither compact mission alias returns
+the full transcript.
+
 
 The four most common env-related failures and how to handle each:
 
@@ -734,3 +756,31 @@ For offloading `lake build` of a pushed SHA to the 4-node fleet (ashur/babylon/n
 - `start_mission` for a helper on the same project/track while you are parked on a
   build answers `409 BUILD_IN_PROGRESS {job_id}`. Do not spawn pollers; wait for the
   wake or read the job status with the `job_id`.
+
+
+### Native Codex goal stops
+
+A native `blocked`, `paused`, `usageLimited`, or `budgetLimited` notification
+stops the driver after its associated turn and in-flight tools drain. With no
+queued steering the mission parks as `blocked`, reason `native_goal_stopped`;
+this is resumable work, never goal completion. The final response and native
+status evidence remain available. `goal_mode=true` and the stored objective
+survive; this flag does not prove a native loop is currently running.
+
+Resolve the reported external blocker or limit, then use `resume_mission`
+with the existing identity assertion. Without custom `content`, a persisted
+Codex goal mission uses the **full stored** `/goal` objective (not the bounded
+MCP preview). Explicit content and queued steering retain their exact text
+and order; a plain steer runs one turn, while `/goal <full objective>` re-arms
+the native loop. The driver uses the existing fresh-native-thread-per-turn
+behavior; same-mission recovery does not promise reuse of a native thread or
+its native token counters. Mission history and original native goal records
+are retained. Do not clear goals, queues, or ownership to release this stop.
+Do not infer a native stop from silence, elapsed observation time, or a live
+build with no recent output. Finished-turn automations do not retry a native
+stop; accepted external steering can run through normal ownership admission.
+
+Native goal non-completion is authoritative for board settlement: live settlement
+and restart recovery record a blocked outcome even when final prose looks complete
+or is absent. Dependent tasks remain gated; the board does not automatically retry
+these stops. Native completion still requires the usual delivery evidence.
