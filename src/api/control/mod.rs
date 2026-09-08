@@ -10691,6 +10691,7 @@ pub async fn create_mission(
                     intent: intent.clone().map(Some),
                     github_pr: github_pr.clone().map(Some),
                     tags: tags.clone(),
+                    preserve_updated_at: false,
                     tag_patch: None,
                     desired_state: desired_state.clone().map(Some),
                     next_check_at: next_check_at.clone().map(Some),
@@ -12756,6 +12757,7 @@ async fn update_mission_project_locked(
     };
 
     let patch = crate::api::mission_store::MissionProjectPatch {
+        preserve_updated_at: false,
         title: None,
         project,
         track,
@@ -29950,6 +29952,7 @@ mod tests {
             .update_mission_project(
                 mission.id,
                 mission_store::MissionProjectPatch {
+                    preserve_updated_at: false,
                     tag_patch: None,
                     title: None,
                     project: None,

@@ -3201,6 +3201,15 @@ async fn adversarial_project_recovery_conflict_is_409() {
 
 #[tokio::test]
 async fn adversarial_startup_recovery_does_not_skip_its_own_identity_restore() {
+    assert_startup_identity_recovery(false).await;
+}
+
+#[tokio::test]
+async fn adversarial_startup_recovery_survives_preceding_global_sweep() {
+    assert_startup_identity_recovery(true).await;
+}
+
+async fn assert_startup_identity_recovery(preceding_sweep: bool) {
     let admission = DISPATCH_ADMISSION.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteMissionStore::new(dir.path().join("missions"), "admission-test")
@@ -3249,6 +3258,15 @@ async fn adversarial_startup_recovery_does_not_skip_its_own_identity_restore() {
     )
     .await;
     let mut events = h.control.events_tx.subscribe();
+    if preceding_sweep {
+        // A periodic sweep or another session's startup can own this lock
+        // before this session captures its candidates. Reconcile globally
+        // while this session is waiting, preserving that exact ordering.
+        let _file = dispatch_admission::durable_lock(&h.state.config)
+            .await
+            .unwrap();
+        dispatch_admission::recover_sweep(&h.state).await.unwrap();
+    }
     drop(admission);
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {

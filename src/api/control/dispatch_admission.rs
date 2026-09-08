@@ -48,8 +48,12 @@ impl std::fmt::Debug for DispatchAdmission {
     }
 }
 
-fn identity_patch(mission: &Mission) -> crate::api::mission_store::MissionProjectPatch {
+fn identity_patch(
+    mission: &Mission,
+    preserve_updated_at: bool,
+) -> crate::api::mission_store::MissionProjectPatch {
     crate::api::mission_store::MissionProjectPatch {
+        preserve_updated_at,
         title: Some(mission.title.clone()),
         project: Some(mission.project.project.clone()),
         track: Some(mission.project.track.clone()),
@@ -107,7 +111,7 @@ impl AdmissionReceipt {
         } else {
             if self.changed {
                 self.store
-                    .update_mission_project(self.before.id, identity_patch(&self.before))
+                    .update_mission_project(self.before.id, identity_patch(&self.before, true))
                     .await?;
             }
             if self.actor_may_have_started {
@@ -260,7 +264,7 @@ pub(crate) async fn recover_dispatch(
             let title: Option<String> = serde_json::from_value(journal["before"]["title"].clone()).map_err(|e| e.to_string())?;
             if journal["identity_changed"] != false {
             store.update_mission_project(id, crate::api::mission_store::MissionProjectPatch {
-                title: Some(title), project: Some(project.project), track: Some(project.track), github_pr: Some(project.github_pr), tag_patch: Some(crate::api::mission_store::MissionTagPatch::capabilities(&project.tags)), ..Default::default()
+                preserve_updated_at: true, title: Some(title), project: Some(project.project), track: Some(project.track), github_pr: Some(project.github_pr), tag_patch: Some(crate::api::mission_store::MissionTagPatch::capabilities(&project.tags)), ..Default::default()
             }).await?;
             }
             if journal["phase"] != "preparing" && journal["actor_may_have_started"] != false {
@@ -514,7 +518,7 @@ async fn prepare(
     if changed {
         if let Err(error) = receipt
             .store
-            .update_mission_project(id, identity_patch(&receipt.after))
+            .update_mission_project(id, identity_patch(&receipt.after, false))
             .await
         {
             // The store's identity write is atomic. It failed without changing

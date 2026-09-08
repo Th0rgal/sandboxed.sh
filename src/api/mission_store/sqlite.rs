@@ -4520,7 +4520,7 @@ impl MissionStore for SqliteMissionStore {
                      tags = CASE WHEN ?9 THEN ?10 ELSE tags END,
                      desired_state = CASE WHEN ?11 THEN ?12 ELSE desired_state END,
                      next_check_at = CASE WHEN ?13 THEN ?14 ELSE next_check_at END,
-                     updated_at = ?15,
+                     updated_at = CASE WHEN ?19 THEN updated_at ELSE ?15 END,
                      title = CASE WHEN ?17 THEN ?18 ELSE title END
                  WHERE id = ?16",
                 params![
@@ -4542,6 +4542,7 @@ impl MissionStore for SqliteMissionStore {
                     id.to_string(),
                     title_set,
                     title,
+                    patch.preserve_updated_at,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -13469,6 +13470,7 @@ mod tests {
             .update_mission_project(
                 mission.id,
                 MissionProjectPatch {
+                    preserve_updated_at: false,
                     tag_patch: None,
                     title: None,
                     project: Some(Some("verity-core".to_string())),
@@ -16413,6 +16415,7 @@ mod tests {
             .expect("store");
 
         let tag = |project: &str| MissionProjectPatch {
+            preserve_updated_at: false,
             tag_patch: None,
             title: None,
             project: Some(Some(project.to_string())),

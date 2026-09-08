@@ -273,6 +273,9 @@ impl MissionStatusSnapshot {
 /// `Some(vec)` to replace the whole list.
 #[derive(Debug, Clone, Default)]
 pub struct MissionProjectPatch {
+    /// Compensation is not new activity. Keep the current timestamp rather
+    /// than restoring a stale snapshot or hiding startup recovery candidates.
+    pub preserve_updated_at: bool,
     /// Updated atomically with assignment fields during dispatch admission.
     pub title: Option<Option<String>>,
     pub project: Option<Option<String>>,
@@ -4496,6 +4499,22 @@ mod admission_restore_tests {
                 serde_json::to_value(&saved).unwrap()
             );
             assert_eq!(after.project.tags, vec!["orphaned"]);
+            store
+                .update_mission_project(
+                    mission.id,
+                    MissionProjectPatch {
+                        preserve_updated_at: true,
+                        title: Some(Some("restored identity".into())),
+                        tag_patch: Some(MissionTagPatch::capabilities(&["pr-writer".into()])),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let restored = store.get_mission(mission.id).await.unwrap().unwrap();
+            assert_eq!(restored.updated_at, after.updated_at);
+            assert_eq!(restored.title.as_deref(), Some("restored identity"));
+            assert_eq!(restored.project.tags, vec!["orphaned", "pr-writer"]);
         }
         let reopened = FileMissionStore::new(dir.path().to_path_buf(), "file")
             .await
