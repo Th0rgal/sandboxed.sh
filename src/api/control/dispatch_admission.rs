@@ -627,7 +627,7 @@ pub(super) async fn admit_dispatch_with_lifetime(
                         ack
                     }
                     Err(error) => UserMessageAck::Rejected(format!(
-                        "Dispatch recovery required; ownership retained: {error}"
+                        "dispatch_recovery_required: ownership retained: {error}"
                     )),
                 };
                 let _ = respond.send(ack);
@@ -677,7 +677,7 @@ pub(super) async fn admit_dispatch_with_lifetime(
                         result
                     }
                     Err(error) => Err(format!(
-                        "Dispatch recovery required; ownership retained: {error}"
+                        "dispatch_recovery_required: ownership retained: {error}"
                     )),
                 };
                 let _ = respond.send(result);

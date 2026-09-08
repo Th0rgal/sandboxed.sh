@@ -57,6 +57,23 @@ pub(crate) async fn recover_server_shutdown_missions(
             return;
         }
     };
+    // Snapshot startup candidates before receipt rollback writes updated_at.
+    // The admission guards exclude new activations during this inventory and
+    // reconciliation; recovery's own writes must not look like fresh work.
+    let startup_candidates: HashSet<Uuid> = match mission_store.get_all_active_missions().await {
+        Ok(missions) => missions
+            .into_iter()
+            .filter(|mission| {
+                chrono::DateTime::parse_from_rfc3339(&mission.updated_at)
+                    .is_ok_and(|updated| updated <= startup_at)
+            })
+            .map(|mission| mission.id)
+            .collect(),
+        Err(error) => {
+            tracing::warn!(%error, "Startup admission candidates unavailable");
+            return;
+        }
+    };
     if let Err(error) = super::control::dispatch_admission::recover_sweep(&state).await {
         tracing::warn!(%error, "Startup admission recovery unavailable");
         return;
@@ -84,9 +101,7 @@ pub(crate) async fn recover_server_shutdown_missions(
                 }
                 // Waiting for admission recovery must not turn newly created
                 // or freshly updated live work into a crash-recovery candidate.
-                if chrono::DateTime::parse_from_rfc3339(&mission.updated_at)
-                    .map_or(true, |updated| updated > startup_at)
-                {
+                if !startup_candidates.contains(&mission.id) {
                     continue;
                 }
                 if mission.mission_mode == super::mission_store::MissionMode::Assistant {

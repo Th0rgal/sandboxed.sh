@@ -8901,60 +8901,56 @@ async fn find_existing_pr_writer(
     github_pr: &str,
     exclude_id: Option<Uuid>,
 ) -> Result<Option<PrWriterLease>, String> {
-    const PAGE_SIZE: usize = 200;
     let target = canonical_github_pr(github_pr);
-    let mut offset = 0;
-    loop {
-        let page = store.list_missions(PAGE_SIZE, offset).await?;
-        let page_len = page.len();
-        for mission in page {
-            if Some(mission.id) == exclude_id
-                || !status_holds_pr_writer_lease(mission.status, mission.terminal_reason.as_deref())
-                || mission
-                    .project
-                    .github_pr
-                    .as_deref()
-                    .is_none_or(|value| canonical_github_pr(value) != target)
-            {
-                continue;
+    // Parked PR writers need the same stable inventory as execution owners.
+    // Concurrent metadata updates must not move a writer behind an OFFSET.
+    let page = store.list_missions(usize::MAX, 0).await?;
+    #[cfg(test)]
+    dispatch_admission_tests::after_ownership_page(&page);
+    for mission in page {
+        if Some(mission.id) == exclude_id
+            || !status_holds_pr_writer_lease(mission.status, mission.terminal_reason.as_deref())
+            || mission
+                .project
+                .github_pr
+                .as_deref()
+                .is_none_or(|value| canonical_github_pr(value) != target)
+        {
+            continue;
+        }
+        if mission_is_pr_writer(&mission) {
+            if let Some(lease) = resolve_writer_lease_or_release(store, &mission).await? {
+                return Ok(Some(lease));
             }
-            if mission_is_pr_writer(&mission) {
-                if let Some(lease) = resolve_writer_lease_or_release(store, &mission).await? {
+            continue;
+        }
+        // SQLite list queries intentionally omit history. Load the full
+        // mission before treating a legacy prompt-only writer as read-only.
+        if let Some(full) = store.get_mission(mission.id).await? {
+            let initial_prompt = store.get_initial_user_message(mission.id).await?;
+            if mission_is_pr_writer_with_prompt(&full, initial_prompt.as_deref()) {
+                if let Some(lease) = resolve_writer_lease_or_release(store, &full).await? {
                     return Ok(Some(lease));
                 }
                 continue;
             }
-            // SQLite list queries intentionally omit history. Load the full
-            // mission before treating a legacy prompt-only writer as read-only.
-            if let Some(full) = store.get_mission(mission.id).await? {
-                let initial_prompt = store.get_initial_user_message(mission.id).await?;
-                if mission_is_pr_writer_with_prompt(&full, initial_prompt.as_deref()) {
+            // Scheduled missions can carry their only prompt in the
+            // durable deferred goal until dispatch. Treat that prompt as
+            // capability evidence before declaring this lease read-only.
+            if let Some(goal) = store.get_deferred_goal(mission.id).await? {
+                // This is the mission's initial mandate, not a later
+                // steering message. Explicit `pr-readonly` must therefore
+                // continue to win over inferred write verbs in the goal.
+                if mission_is_pr_writer_with_prompt(&full, Some(&goal)) {
                     if let Some(lease) = resolve_writer_lease_or_release(store, &full).await? {
                         return Ok(Some(lease));
                     }
                     continue;
                 }
-                // Scheduled missions can carry their only prompt in the
-                // durable deferred goal until dispatch. Treat that prompt as
-                // capability evidence before declaring this lease read-only.
-                if let Some(goal) = store.get_deferred_goal(mission.id).await? {
-                    // This is the mission's initial mandate, not a later
-                    // steering message. Explicit `pr-readonly` must therefore
-                    // continue to win over inferred write verbs in the goal.
-                    if mission_is_pr_writer_with_prompt(&full, Some(&goal)) {
-                        if let Some(lease) = resolve_writer_lease_or_release(store, &full).await? {
-                            return Ok(Some(lease));
-                        }
-                        continue;
-                    }
-                }
             }
         }
-        if page_len < PAGE_SIZE {
-            return Ok(None);
-        }
-        offset += page_len;
     }
+    Ok(None)
 }
 
 fn find_existing_pr_writer_in_sqlite(
@@ -12558,7 +12554,13 @@ async fn update_mission_project_locked(
     let control = control_for_user(&state, &user).await;
     dispatch_admission::recover_dispatch(&state, &control.mission_store, id)
         .await
-        .map_err(internal_error)?;
+        .map_err(|error| {
+            if error.contains("dispatch_recovery_required") {
+                (StatusCode::CONFLICT, error)
+            } else {
+                internal_error(error)
+            }
+        })?;
     let current = control
         .mission_store
         .get_mission(id)
@@ -21981,6 +21983,14 @@ async fn control_actor_loop(
                                                 running_cancel = None;
                                                 running_mission_id = None;
                                                 running_backend_id = None;
+                                                history = previous_history;
+                                                *current_mission.write().await = previous_mission;
+                                                let error = match restore_mission_after_failed_run_acquisition(
+                                                    &mission_store, &events_tx, &mission,
+                                                ).await {
+                                                    Ok(()) => error,
+                                                    Err(rollback) => format!("{error}; status recovery required: {rollback}"),
+                                                };
                                                 let _ = respond.send(Err(format!(
                                                     "Failed to acquire mission run lease: {error}"
                                                 )));

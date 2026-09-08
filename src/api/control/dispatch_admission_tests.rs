@@ -632,7 +632,12 @@ async fn rejected_actor_dispatch_with_failed_rollback_is_durably_recoverable() {
     });
     let response = h.request(false, m.id, json!({"content":"Different work", "github_pr":"", "track":"new-track", "title":"Different work"})).await;
     assert!(!response.status().is_success());
-    assert!(response.text().await.unwrap().contains("recovery required"));
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    assert!(response
+        .text()
+        .await
+        .unwrap()
+        .contains("dispatch_recovery_required"));
     actor.await.unwrap();
     let journal = h
         .state
@@ -3098,19 +3103,21 @@ async fn assert_resume_rejection(check: &str) {
             )
             .await
             .unwrap();
-        db.execute_batch("CREATE TRIGGER refuse_queue BEFORE INSERT ON control_queue BEGIN SELECT RAISE(FAIL, 'adversarial queue failure'); END;").unwrap();
+        let failure = if check == "run" {
+            db.execute_batch("CREATE TRIGGER refuse_queue BEFORE INSERT ON mission_runs BEGIN SELECT RAISE(FAIL, 'adversarial run failure'); END;").unwrap();
+            "adversarial run failure"
+        } else {
+            db.execute_batch("CREATE TRIGGER refuse_queue BEFORE INSERT ON control_queue BEGIN SELECT RAISE(FAIL, 'adversarial queue failure'); END;").unwrap();
+            "adversarial queue failure"
+        };
         let mut events = h.control.events_tx.subscribe();
         let response = h.request(true, m.id, json!({"content":"different work", "track":"new-track", "github_pr":"", "title":"different work"})).await;
         assert!(!response.status().is_success());
-        assert!(response
-            .text()
-            .await
-            .unwrap()
-            .contains("adversarial queue failure"));
-        if check == "metadata" {
+        assert!(response.text().await.unwrap().contains(failure));
+        if check == "metadata" || check == "run" {
             h.unchanged(&before).await;
         }
-        if check == "actor" {
+        if check == "actor" || check == "run" {
             assert_eq!(*h.control.current_mission.read().await, Some(prior.id));
         }
         let mut statuses = Vec::new();
@@ -3124,7 +3131,7 @@ async fn assert_resume_rejection(check: &str) {
                 }
             }
         }
-        if check == "events" {
+        if check == "events" || check == "run" {
             assert!(statuses.contains(&MissionStatus::Active));
             assert_eq!(
                 statuses.last(),
@@ -3140,7 +3147,7 @@ async fn assert_resume_rejection(check: &str) {
             .await
             .unwrap();
         let (current, history) = rx.await.unwrap();
-        if check == "actor" {
+        if check == "actor" || check == "run" {
             assert_eq!(current, Some(prior.id));
             assert_eq!(
                 history,
@@ -3165,6 +3172,106 @@ async fn adversarial_resume_rejection_restores_actor_context_and_history() {
 #[tokio::test]
 async fn adversarial_resume_rejection_compensates_active_event() {
     assert_resume_rejection("events").await;
+}
+
+#[tokio::test]
+async fn adversarial_resume_run_acquisition_rejection_restores_actor_and_metadata() {
+    assert_resume_rejection("run").await;
+}
+
+#[tokio::test]
+async fn adversarial_project_recovery_conflict_is_409() {
+    let h = Harness::new().await;
+    let m = h.writer(MissionStatus::Paused, None).await;
+    h.state
+        .projects
+        .save_dispatch_admission(&m.id.to_string(), &json!({"phase":"pending"}))
+        .unwrap();
+    let response = h
+        .state
+        .http_client
+        .patch(format!("{}/missions/{}/project", h.url, m.id))
+        .json(&json!({"track":"different-track"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    h.unchanged(&m).await;
+}
+
+#[tokio::test]
+async fn adversarial_startup_recovery_does_not_skip_its_own_identity_restore() {
+    let admission = DISPATCH_ADMISSION.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteMissionStore::new(dir.path().join("missions"), "admission-test")
+        .await
+        .unwrap();
+    let m = store
+        .create_mission(
+            Some("old active work"),
+            None,
+            None,
+            None,
+            None,
+            Some("test-no-execution"),
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .update_mission_status(m.id, MissionStatus::Active)
+        .await
+        .unwrap();
+    let db =
+        rusqlite::Connection::open(dir.path().join("missions/missions-admission-test.db")).unwrap();
+    db.execute(
+        "UPDATE missions SET updated_at='2000-01-01T00:00:00Z' WHERE id=?1",
+        [m.id.to_string()],
+    )
+    .unwrap();
+    let before = store.get_mission(m.id).await.unwrap().unwrap();
+    let projects = ProjectsStore::open(dir.path().join("projects.db")).unwrap();
+    projects
+        .save_dispatch_admission(
+            &m.id.to_string(),
+            &json!({
+                "phase":"preparing", "identity_changed":true, "actor_may_have_started":false,
+                "before":{"title":before.title,"project":before.project}, "acquired":[]
+            }),
+        )
+        .unwrap();
+    let h = Harness::with_directory(
+        FixtureDir {
+            path: dir.path().to_path_buf(),
+            _cleanup: Some(dir),
+        },
+        Vec::new(),
+    )
+    .await;
+    let mut events = h.control.events_tx.subscribe();
+    drop(admission);
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if let Ok(AgentEvent::MissionStatusChanged {
+                mission_id,
+                status: MissionStatus::Interrupted,
+                summary: Some(summary),
+            }) = events.recv().await
+            {
+                if mission_id == m.id && summary.contains("server restarted") {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("receipt recovery must not suppress restart of an old Active mission");
+    assert!(h
+        .state
+        .projects
+        .dispatch_admission(&m.id.to_string())
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -3263,6 +3370,15 @@ async fn adversarial_project_edit_cleanup_retries_after_database_reopen() {
 
 #[tokio::test]
 async fn adversarial_concurrent_tags_survive_rejected_retag_and_rollback_retry() {
+    assert_concurrent_tags_rejection(false).await;
+}
+
+#[tokio::test]
+async fn adversarial_resume_cleanup_recovery_conflict_is_409() {
+    assert_concurrent_tags_rejection(true).await;
+}
+
+async fn assert_concurrent_tags_rejection(resume: bool) {
     let h = Harness::new().await;
     let m = h.writer(MissionStatus::Paused, None).await;
     let (tx, mut rx) = mpsc::channel(1);
@@ -3302,15 +3418,18 @@ async fn adversarial_concurrent_tags_survive_rejected_retag_and_rollback_retry()
             .unwrap();
         let db = rusqlite::Connection::open(path).unwrap();
         db.execute_batch("CREATE TRIGGER refuse_rollback BEFORE UPDATE OF track ON missions BEGIN SELECT RAISE(FAIL, 'rollback failure'); END;").unwrap();
-        let ControlCommand::UserMessage { respond, .. } = command else {
-            panic!()
-        };
-        respond
-            .send(UserMessageAck::Rejected("injected refusal".into()))
-            .unwrap();
+        match command {
+            ControlCommand::UserMessage { respond, .. } => respond
+                .send(UserMessageAck::Rejected("injected refusal".into()))
+                .unwrap(),
+            ControlCommand::ResumeMission { respond, .. } => {
+                respond.send(Err("injected refusal".into())).unwrap()
+            }
+            _ => panic!(),
+        }
     });
-    let response = h.request(false, m.id, json!({"content":"different work", "track":"new-track", "github_pr":"", "title":"different work"})).await;
-    assert!(!response.status().is_success());
+    let response = h.request(resume, m.id, json!({"content":"different work", "track":"new-track", "github_pr":"", "title":"different work"})).await;
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
     actor.await.unwrap();
     let db = rusqlite::Connection::open(h._dir.path().join("missions/missions-admission-test.db"))
         .unwrap();
@@ -3756,4 +3875,56 @@ async fn startup_recovery_does_not_activate_new_work_while_waiting_for_admission
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn adversarial_pr_lookup_cannot_omit_parked_writer_moving_across_pages() {
+    let h = Harness::new().await;
+    let m = h.writer(MissionStatus::Paused, Some("repo#999")).await;
+    let db_path = h._dir.path().join("missions/missions-admission-test.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute(
+        "UPDATE missions SET updated_at='2000-01-01T00:00:00Z' WHERE id=?1",
+        [m.id.to_string()],
+    )
+    .unwrap();
+    let mut marker = None;
+    for _ in 0..205 {
+        let mission = h
+            .control
+            .mission_store
+            .create_mission(
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("test-no-execution"),
+                None,
+            )
+            .await
+            .unwrap();
+        marker = Some(mission.id);
+    }
+    let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = moved.clone();
+    OWNERSHIP_PAGE_HOOKS.lock().unwrap().insert(
+        marker.unwrap(),
+        Box::new(move || {
+            // A concurrent status/history/metadata writer can move the old writer
+            // to the front after the first read, without using admission locks.
+            let db = rusqlite::Connection::open(db_path).unwrap();
+            db.execute(
+                "UPDATE missions SET updated_at='2099-01-01T00:00:00Z' WHERE id=?1",
+                [m.id.to_string()],
+            )
+            .unwrap();
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }),
+    );
+    let found = find_existing_pr_writer(&h.control.mission_store, "repo#999", None)
+        .await
+        .unwrap();
+    assert!(moved.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(found.map(|writer| writer.id), Some(m.id));
 }
