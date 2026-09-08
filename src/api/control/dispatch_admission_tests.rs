@@ -3121,7 +3121,16 @@ async fn assert_resume_rejection(check: &str) {
             assert_eq!(*h.control.current_mission.read().await, Some(prior.id));
         }
         let mut statuses = Vec::new();
+        let mut control_statuses = Vec::new();
         while let Ok(event) = events.try_recv() {
+            if let AgentEvent::Status {
+                state,
+                queue_len,
+                mission_id,
+            } = &event
+            {
+                control_statuses.push((*state, *queue_len, *mission_id));
+            }
             if let AgentEvent::MissionStatusChanged {
                 mission_id, status, ..
             } = event
@@ -3137,6 +3146,24 @@ async fn assert_resume_rejection(check: &str) {
                 statuses.last(),
                 Some(&status),
                 "rejection must compensate Active event"
+            );
+        }
+        if check == "run" {
+            let shared = h.control.status.read().await;
+            assert_eq!(
+                shared.state,
+                ControlRunState::Idle,
+                "rejected resume must restore shared control status"
+            );
+            assert_eq!(shared.queue_len, 0);
+            assert_eq!(shared.mission_id, None);
+            assert!(control_statuses
+                .iter()
+                .any(|s| s.0 == ControlRunState::Running));
+            assert_eq!(
+                control_statuses.last(),
+                Some(&(ControlRunState::Idle, 0, None)),
+                "rejection must compensate the Running event"
             );
         }
         db.execute_batch("DROP TRIGGER refuse_queue").unwrap();

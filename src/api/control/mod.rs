@@ -21993,6 +21993,15 @@ async fn control_actor_loop(
                                                     Ok(()) => error,
                                                     Err(rollback) => format!("{error}; status recovery required: {rollback}"),
                                                 };
+                                                // No runner was started. Compensate the shared
+                                                // Running presentation before returning rejection.
+                                                set_and_emit_status(
+                                                    &status,
+                                                    &events_tx,
+                                                    ControlRunState::Idle,
+                                                    queue.len(),
+                                                    None,
+                                                ).await;
                                                 let _ = respond.send(Err(format!(
                                                     "Failed to acquire mission run lease: {error}"
                                                 )));

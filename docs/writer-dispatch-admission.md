@@ -77,16 +77,29 @@ in-memory snapshot only after the disk replacement succeeds.
 This is a journaled cross-store protocol, not a transaction spanning both SQLite
 databases. `mission_dispatch_admissions` in `projects.db` records the previous
 assignment, proposed assignment, provisional lease ids and admission phase before
-identity persistence. The original leases remain held until the actor accepts
-the message/resume. A known actor rejection restores identity/title
-before the HTTP response; client disconnection does not cancel cleanup.
+identity persistence. Provisional lease acquisition and the initial journal insert
+share one `BEGIN IMMEDIATE` transaction in projectsDB. A crash cannot expose a
+lease without its recovery receipt. The original leases remain held until the
+actor accepts the message/resume.
+
+The journal also retains the prior status metadata and actor context. Rejection
+restores diagnostics, terminal evidence and status timestamps through a dedicated
+snapshot write, without creating a new status transition or changing the mission's
+activity timestamp. It restores current mission/history and emits compensating
+mission status events. Failed resume run acquisition also resets shared control
+status and emits an Idle event before returning the error. Client disconnection
+does not cancel cleanup. Identity rollback applies capability-tag deltas under the
+store lock so unrelated concurrent tags survive.
 
 Successful acceptance retains the new lease and releases the old leases. A retag
 reaches this step only after quiescence was checked before mutation; acceptance
 alone is not evidence that the old execution stopped.
 Cleanup failure after acceptance is not reported as a rejected dispatch. Both
 leases remain fenced and an error is logged. Known `accepted`/`rejected` journal
-phases are recovered before the next admission or project edit. Legacy accepted
+phases are recovered before the next admission or project edit and by periodic
+sweep, including offline stores with no live session. `preparing` receipts recover
+pre-actor crashes; provisional `project-edit` receipts reconcile only fields owned
+by the edit to decide whether metadata committed. Legacy accepted
 retags without the new lifetime marker stay fenced for operator reconciliation,
 because their original acceptance did not establish quiescence. If an outcome
 was lost with the actor response or to a crash (`pending`), the server refuses with
