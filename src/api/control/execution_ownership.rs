@@ -235,17 +235,13 @@ pub(crate) async fn snapshot(hub: &ControlHub) -> Result<Snapshot, String> {
         );
         // SQLite ignores this argument; file/memory have no persisted queue.
         snapshot.queue(&store.load_control_queue("").await?)?;
-        let mut offset = 0;
-        loop {
-            let page = store.list_missions(200, offset).await?;
-            let count = page.len();
-            for mission in page {
-                snapshot.mission(mission);
-            }
-            if count < 200 {
-                break;
-            }
-            offset += count;
+        // One store read: updated_at can change between offset pages and
+        // omission here would release a parked mission's writer claims.
+        let missions = store.list_missions(usize::MAX, 0).await?;
+        #[cfg(test)]
+        super::dispatch_admission_tests::after_ownership_page(&missions);
+        for mission in missions {
+            snapshot.mission(mission);
         }
     }
     tokio::task::spawn_blocking(move || {

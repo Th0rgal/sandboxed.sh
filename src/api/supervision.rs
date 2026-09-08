@@ -39,13 +39,56 @@ pub(crate) async fn recover_server_shutdown_missions(
     mission_store: Arc<dyn MissionStore>,
     events_tx: broadcast::Sender<AgentEvent>,
     cmd_tx: mpsc::Sender<ControlCommand>,
+    control_hub: ControlHub,
+    startup_at: chrono::DateTime<chrono::Utc>,
 ) {
+    // Active can be an uncommitted activation. Reconcile receipts before
+    // synthesizing server_shutdown or enqueueing a restart, and leave unknown
+    // actor outcomes quarantined. Serialize this entire status scan with new
+    // admissions, then release both guards before awaiting actor responses.
+    let Some(state) = control_hub.wait_for_admission_state().await else {
+        return;
+    };
+    let admission_guard = super::control::DISPATCH_ADMISSION.lock().await;
+    let file_guard = match super::control::dispatch_admission::durable_lock(&state.config).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::warn!(%error, "Startup admission lock unavailable");
+            return;
+        }
+    };
+    if let Err(error) = super::control::dispatch_admission::recover_sweep(&state).await {
+        tracing::warn!(%error, "Startup admission recovery unavailable");
+        return;
+    }
+    let excluded: HashSet<Uuid> = match state.projects.dispatch_admissions() {
+        Ok(journals) => journals
+            .into_iter()
+            .filter_map(|(id, _)| Uuid::parse_str(&id).ok())
+            .collect(),
+        Err(error) => {
+            tracing::warn!(%error, "Startup admission inventory unavailable");
+            return;
+        }
+    };
     let mut to_resume = Vec::new();
     let mut seen = HashSet::new();
 
     match mission_store.get_all_active_missions().await {
         Ok(active_missions) => {
+            #[cfg(test)]
+            let scanned: Vec<_> = active_missions.iter().map(|mission| mission.id).collect();
             for mission in active_missions {
+                if excluded.contains(&mission.id) {
+                    continue;
+                }
+                // Waiting for admission recovery must not turn newly created
+                // or freshly updated live work into a crash-recovery candidate.
+                if chrono::DateTime::parse_from_rfc3339(&mission.updated_at)
+                    .map_or(true, |updated| updated > startup_at)
+                {
+                    continue;
+                }
                 if mission.mission_mode == super::mission_store::MissionMode::Assistant {
                     tracing::debug!(
                         mission_id = %mission.id,
@@ -116,6 +159,10 @@ pub(crate) async fn recover_server_shutdown_missions(
                     to_resume.push(mission.id);
                 }
             }
+            #[cfg(test)]
+            for id in scanned {
+                super::control::dispatch_admission_tests::notify_wait(id, "startup_scanned");
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -131,6 +178,9 @@ pub(crate) async fn recover_server_shutdown_missions(
     {
         Ok(mission_ids) => {
             for mission_id in mission_ids {
+                if excluded.contains(&mission_id) {
+                    continue;
+                }
                 if seen.insert(mission_id) {
                     to_resume.push(mission_id);
                 }
@@ -144,6 +194,8 @@ pub(crate) async fn recover_server_shutdown_missions(
         }
     }
 
+    drop(file_guard);
+    drop(admission_guard);
     if to_resume.is_empty() {
         tracing::debug!("Startup recovery: no server-shutdown missions to auto-resume");
         return;

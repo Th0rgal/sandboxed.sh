@@ -4201,6 +4201,7 @@ pub struct ControlState {
 #[derive(Clone)]
 pub struct ControlHub {
     admission_state: Arc<std::sync::OnceLock<std::sync::Weak<AppState>>>,
+    admission_ready: Arc<tokio::sync::Notify>,
     sessions: Arc<RwLock<HashMap<String, ControlState>>>,
     config: Config,
     root_agent: AgentRef,
@@ -4229,6 +4230,7 @@ impl ControlHub {
     ) -> Self {
         Self {
             admission_state: Arc::new(std::sync::OnceLock::new()),
+            admission_ready: Arc::new(tokio::sync::Notify::new()),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             config,
             root_agent,
@@ -4242,6 +4244,17 @@ impl ControlHub {
 
     pub(crate) fn bind_admission_state(&self, state: &Arc<AppState>) {
         let _ = self.admission_state.set(Arc::downgrade(state));
+        self.admission_ready.notify_waiters();
+    }
+
+    pub(crate) async fn wait_for_admission_state(&self) -> Option<Arc<AppState>> {
+        loop {
+            let ready = self.admission_ready.notified();
+            if let Some(state) = self.admission_state.get() {
+                return state.upgrade();
+            }
+            ready.await;
+        }
     }
 
     /// Set the Telegram bridge reference (called after AppState is created).
@@ -9298,10 +9311,9 @@ async fn restore_mission_after_failed_run_acquisition(
     mission: &Mission,
 ) -> Result<(), String> {
     store
-        .update_mission_status_with_reason(
+        .restore_mission_status(
             mission.id,
-            mission.status,
-            mission.terminal_reason.as_deref(),
+            &crate::api::mission_store::MissionStatusSnapshot::capture(mission),
         )
         .await?;
     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
@@ -9353,7 +9365,9 @@ async fn acquire_pr_writer_lease_for_message(
             .update_mission_project(
                 mission.id,
                 crate::api::mission_store::MissionProjectPatch {
-                    tags: Some(tags),
+                    tag_patch: Some(crate::api::mission_store::MissionTagPatch::capabilities(
+                        &tags,
+                    )),
                     ..Default::default()
                 },
             )
@@ -9376,7 +9390,9 @@ async fn rollback_message_writer_tag(
             .update_mission_project(
                 mission.id,
                 crate::api::mission_store::MissionProjectPatch {
-                    tags: Some(mission.project.tags.clone()),
+                    tag_patch: Some(crate::api::mission_store::MissionTagPatch::capabilities(
+                        &mission.project.tags,
+                    )),
                     ..Default::default()
                 },
             )
@@ -10679,6 +10695,7 @@ pub async fn create_mission(
                     intent: intent.clone().map(Some),
                     github_pr: github_pr.clone().map(Some),
                     tags: tags.clone(),
+                    tag_patch: None,
                     desired_state: desired_state.clone().map(Some),
                     next_check_at: next_check_at.clone().map(Some),
                 },
@@ -12703,7 +12720,7 @@ async fn update_mission_project_locked(
             .map_err(|error| (StatusCode::CONFLICT, error))?;
     }
     let track_changed = track.is_some() || project.is_some() || could_change_writer_status;
-    let mut acquired_lease = None;
+    let mut lease_request = None;
     let track = if let (true, Some(slug), Some(key)) = (
         track_changed,
         effective_project.as_deref(),
@@ -12730,64 +12747,86 @@ async fn update_mission_project_locked(
             mode,
             Some(&format!("project-edit:{}", Uuid::new_v4())),
         );
-        match state.projects.acquire_track_lease(&request) {
-            Ok(lease) => {
-                acquired_lease = Some(lease.id);
-            }
-            Err(super::projects_store::LeaseError::Store(error)) => {
-                return Err(internal_error(error))
-            }
-            Err(super::projects_store::LeaseError::NotFound) => {
-                return Err(internal_error(format!(
-                    "track '{}' of '{slug}' vanished between absorption and lease",
-                    outcome.key
-                )))
-            }
-            Err(error @ super::projects_store::LeaseError::Owned { .. }) => {
-                return Err((
-                    StatusCode::CONFLICT,
-                    super::track_leases::owned_body(slug, &outcome.key, &error).to_string(),
-                ));
-            }
-        }
+        lease_request = Some(request);
         Some(Some(outcome.key))
     } else {
         track
     };
 
+    let patch = crate::api::mission_store::MissionProjectPatch {
+        title: None,
+        project,
+        track,
+        intent,
+        github_pr,
+        tags: None,
+        tag_patch: tags.as_ref().map(|tags| {
+            crate::api::mission_store::MissionTagPatch::between(&current.project.tags, tags)
+        }),
+        desired_state,
+        next_check_at,
+    };
+    let mut after = current.project.clone();
+    if let Some(value) = &patch.project {
+        after.project = value.clone();
+    }
+    if let Some(value) = &patch.track {
+        after.track = value.clone();
+    }
+    if let Some(value) = &patch.intent {
+        after.intent = value.clone();
+    }
+    if let Some(value) = &patch.github_pr {
+        after.github_pr = value.clone();
+    }
+    if let Some(value) = &patch.desired_state {
+        after.desired_state = value.clone();
+    }
+    if let Some(value) = &patch.next_check_at {
+        after.next_check_at = value.clone();
+    }
+    if let Some(delta) = &patch.tag_patch {
+        delta.apply(&mut after.tags);
+    }
+    if track_changed {
+        // Recovery compares only fields owned by this edit. The metadata write
+        // is atomic; after a crash it either committed or still names `before`.
+        // Unrelated tag additions must not prevent that decision.
+        let journal = serde_json::json!({"phase": "project-edit",
+            "before": {"project": current.project}, "after": {"project": after}});
+        state
+            .projects
+            .begin_dispatch_admission(&id.to_string(), &journal, lease_request.as_ref())
+            .map_err(|error| match (&lease_request, &error) {
+                (Some(request), super::projects_store::LeaseError::Owned { .. }) => (
+                    StatusCode::CONFLICT,
+                    super::track_leases::owned_body(&request.slug, &request.track, &error)
+                        .to_string(),
+                ),
+                _ => internal_error(error.to_string()),
+            })?;
+    }
     let persisted = control
         .mission_store
-        .update_mission_project(
-            id,
-            crate::api::mission_store::MissionProjectPatch {
-                title: None,
-                project,
-                track,
-                intent,
-                github_pr,
-                tags,
-                desired_state,
-                next_check_at,
-            },
-        )
+        .update_mission_project(id, patch)
         .await;
     if let Err(error) = persisted {
-        if let Some(lease) = acquired_lease {
-            state
-                .projects
-                .expire_lease(&lease)
+        if track_changed {
+            // Keep the receipt when compensation itself fails, so sweep or
+            // restart retries the exact provisional claim instead of renewing it.
+            dispatch_admission::finish_project_edit(&state, &control.mission_store, id, false)
+                .await
                 .map_err(internal_error)?;
         }
         return Err(internal_error(error));
     }
+    #[cfg(test)]
+    dispatch_admission_tests::crash_checkpoint("project_edit_after_metadata");
     if track_changed {
-        // The metadata commit succeeded. Cleanup failure retains extra leases
-        // and must not report that the assignment edit was rejected.
-        if let Err(error) = state
-            .projects
-            .retain_attempt_lease(&id.to_string(), acquired_lease.as_deref())
+        if let Err(error) =
+            dispatch_admission::finish_project_edit(&state, &control.mission_store, id, true).await
         {
-            tracing::error!(mission_id = %id, %error, "Committed project edit retains old leases pending sweep");
+            tracing::error!(mission_id = %id, %error, "Committed project edit cleanup is journaled for retry");
         }
     }
 
@@ -14696,9 +14735,23 @@ pub async fn resume_mission(
             .map_err(session_unavailable)?;
         #[cfg(test)]
         dispatch_admission_tests::notify_wait(mission_id, "enqueued");
-        rx.await
-            .map_err(recv_failed)?
-            .map_err(|e| (StatusCode::BAD_REQUEST, e))
+        rx.await.map_err(recv_failed)?.map_err(|e| {
+            let conflict = e.contains("writer_identity_stale")
+                || e.contains("continue_identity")
+                || e.contains("assignment_busy")
+                || e.contains("writer lease")
+                || e.contains("track_owned")
+                || e.contains("dispatch_recovery_required")
+                || e.contains("writer_reuse_requires_retag");
+            (
+                if conflict {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                e,
+            )
+        })
     }
     .await;
 
@@ -16322,7 +16375,7 @@ fn spawn_control_session(
 
     // Spawn the main control actor
     tokio::spawn(control_actor_loop(
-        control_hub,
+        control_hub.clone(),
         config.clone(),
         root_agent,
         mcp,
@@ -16353,8 +16406,9 @@ fn spawn_control_session(
         let store = Arc::clone(&state.mission_store);
         let tx = events_tx.clone();
         let cmd = state.cmd_tx.clone();
+        let startup_at = chrono::Utc::now();
         tokio::spawn(async move {
-            recover_server_shutdown_missions(store, tx, cmd).await;
+            recover_server_shutdown_missions(store, tx, cmd, control_hub, startup_at).await;
         });
     }
 
@@ -19292,7 +19346,12 @@ async fn control_actor_loop(
                         let busy = busy || if let Some(id) = target {
                             background_tasks.read().await.get(&id).is_some_and(|tasks| !tasks.is_empty())
                         } else { false };
-                        match dispatch_admission::admit_dispatch_with_lifetime(*admission, *command, admission_guard, busy).await {
+                        let actor_before = serde_json::json!({
+                            "user_id": session_user_id,
+                            "current_mission": *current_mission.read().await,
+                            "history": history,
+                        });
+                        match dispatch_admission::admit_dispatch_with_lifetime(*admission, *command, admission_guard, busy, Some(actor_before)).await {
                             Some(cmd) => (cmd, None),
                             None => continue,
                         }
@@ -21431,6 +21490,10 @@ async fn control_actor_loop(
                             }
                         }
                     }
+                    #[cfg(test)]
+                    ControlCommand::InspectActorContext { respond } => {
+                        let _ = respond.send((*current_mission.read().await, history.clone()));
+                    }
                     ControlCommand::ListRunning { respond } => {
                         // Return info about currently running missions
                         let mut running_list = Vec::new();
@@ -21756,6 +21819,9 @@ async fn control_actor_loop(
                                 )
                                 .await;
 
+                                let previous_mission = *current_mission.read().await;
+                                let previous_history = history.clone();
+
                                 // Load the mission's history into current state
                                 history = mission.history.iter()
                                     .map(|e| (e.role.clone(), e.content.clone()))
@@ -21767,6 +21833,8 @@ async fn control_actor_loop(
                                     .update_mission_status(mission_id, MissionStatus::Active)
                                     .await
                                 {
+                                    history = previous_history;
+                                    *current_mission.write().await = previous_mission;
                                     let _ = respond.send(Err(format!("Failed to resume mission {mission_id}: {e}")));
                                     continue;
                                 } else {
@@ -21811,6 +21879,13 @@ async fn control_actor_loop(
                                         &recovered_consumed_user_messages, &mut last_persisted_queue,
                                     ).await {
                                         queue.retain(|(queued_id, ..)| *queued_id != resume_message_id);
+                                        history = previous_history;
+                                        *current_mission.write().await = previous_mission;
+                                        let rollback = restore_mission_after_failed_run_acquisition(&mission_store, &events_tx, &mission).await;
+                                        let error = match rollback {
+                                            Ok(()) => error,
+                                            Err(rollback) => format!("{error}; status recovery required: {rollback}"),
+                                        };
                                         let _ = respond.send(Err(format!("Failed to persist resumed mission queue: {error}")));
                                         continue;
                                     }
@@ -29865,6 +29940,7 @@ mod tests {
             .update_mission_project(
                 mission.id,
                 mission_store::MissionProjectPatch {
+                    tag_patch: None,
                     title: None,
                     project: None,
                     track: None,

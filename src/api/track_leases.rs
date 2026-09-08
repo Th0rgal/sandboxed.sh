@@ -165,6 +165,7 @@ pub struct LeaseSweepReport {
 pub async fn sweep(state: &Arc<AppState>) -> Result<LeaseSweepReport, String> {
     let _admission = super::control::DISPATCH_ADMISSION.lock().await;
     let _file_guard = super::control::dispatch_admission::durable_lock(&state.config).await?;
+    super::control::dispatch_admission::recover_sweep(state).await?;
     let ownership = super::control::execution_ownership::snapshot(&state.control).await?;
     let mut report = LeaseSweepReport::default();
     let leases: Vec<TrackLease> = state.projects.live_leases(None)?;

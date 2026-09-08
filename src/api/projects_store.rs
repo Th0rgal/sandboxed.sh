@@ -2921,122 +2921,164 @@ impl ProjectsStore {
     /// `idempotency_key`. Runs under `BEGIN IMMEDIATE` so two creators cannot
     /// both see "no writer" and both win.
     pub fn acquire_track_lease(&self, request: &LeaseRequest) -> Result<TrackLease, LeaseError> {
+        let mut connection = self.lock().map_err(LeaseError::Store)?;
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| LeaseError::Store(e.to_string()))?;
+        let lease = Self::acquire_track_lease_on(&tx, request)?;
+        tx.commit().map_err(|e| LeaseError::Store(e.to_string()))?;
+        Ok(lease)
+    }
+
+    /// The recovery receipt and every provisional claim commit together. Never
+    /// overwrite an unresolved admission, including on idempotent retries.
+    pub fn begin_dispatch_admission(
+        &self,
+        attempt: &str,
+        receipt: &serde_json::Value,
+        request: Option<&LeaseRequest>,
+    ) -> Result<Option<TrackLease>, LeaseError> {
+        let mut connection = self.lock().map_err(LeaseError::Store)?;
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| LeaseError::Store(e.to_string()))?;
+        if request.is_some_and(|request| request.attempt_id != attempt) {
+            return Err(LeaseError::Store(
+                "admission attempt does not match lease".into(),
+            ));
+        }
+        let lease = request
+            .map(|request| Self::acquire_track_lease_on(&tx, request))
+            .transpose()?;
+        let mut receipt = receipt.clone();
+        receipt["acquired"] =
+            serde_json::json!(lease.iter().map(|lease| &lease.id).collect::<Vec<_>>());
+        tx.execute(
+            "INSERT INTO mission_dispatch_admissions(attempt_id, receipt) VALUES (?1, ?2)",
+            params![attempt, receipt.to_string()],
+        )
+        .map_err(|e| LeaseError::Store(e.to_string()))?;
+        #[cfg(test)]
+        crate::api::control::dispatch_admission_tests::crash_checkpoint(
+            if receipt["phase"] == "project-edit" {
+                "project_edit_before_commit"
+            } else {
+                "dispatch_before_commit"
+            },
+        );
+        tx.commit().map_err(|e| LeaseError::Store(e.to_string()))?;
+        #[cfg(test)]
+        crate::api::control::dispatch_admission_tests::crash_checkpoint(
+            if receipt["phase"] == "project-edit" {
+                "project_edit_after_commit"
+            } else {
+                "dispatch_after_commit"
+            },
+        );
+        Ok(lease)
+    }
+
+    fn acquire_track_lease_on(
+        connection: &Connection,
+        request: &LeaseRequest,
+    ) -> Result<TrackLease, LeaseError> {
         let now = Utc::now();
         let now_text = now.to_rfc3339();
         let until = (now + chrono::Duration::seconds(request.ttl_secs.max(60) as i64)).to_rfc3339();
-        let connection = self.lock().map_err(LeaseError::Store)?;
-        connection
-            .execute_batch("BEGIN IMMEDIATE")
+        // The timestamp schedules renewal, not ownership release. A
+        // backend outage can outlast the TTL while its remote job runs.
+        // Idempotent replay only for an unreleased lease of the same attempt.
+        // A released/expired row is history; a live row under the same key
+        // held by another attempt means the dispatch key was reused by a
+        // retry that created a second mission — exactly the duplicate the
+        // lease exists to refuse.
+        let replay = connection
+            .query_row(
+                &format!(
+                    "{LEASE_SELECT} WHERE l.idempotency_key = ?1 \
+                           AND l.state IN ('reserved','active')"
+                ),
+                params![request.idempotency_key],
+                lease_from_row,
+            )
+            .optional()
             .map_err(|e| LeaseError::Store(e.to_string()))?;
-        let result = (|| -> Result<TrackLease, LeaseError> {
-            // The timestamp schedules renewal, not ownership release. A
-            // backend outage can outlast the TTL while its remote job runs.
-            // Idempotent replay only for an unreleased lease of the same attempt.
-            // A released/expired row is history; a live row under the same key
-            // held by another attempt means the dispatch key was reused by a
-            // retry that created a second mission — exactly the duplicate the
-            // lease exists to refuse.
-            let replay = connection
+        if let Some(existing) = &replay {
+            if existing.attempt_id != request.attempt_id {
+                return Err(LeaseError::Owned {
+                    holder_attempt_id: existing.attempt_id.clone(),
+                    lease_until: existing.lease_until.clone(),
+                    lease_id: existing.id.clone(),
+                });
+            }
+            if existing.mode == request.mode {
+                return Ok(existing.clone());
+            }
+        }
+        let Some(track_id) = Self::resolve_track_id_on(connection, &request.slug, &request.track)
+            .map_err(LeaseError::Store)?
+        else {
+            return Err(LeaseError::NotFound);
+        };
+        if request.mode == "writer" {
+            let holder = connection
                 .query_row(
                     &format!(
-                        "{LEASE_SELECT} WHERE l.idempotency_key = ?1 \
-                           AND l.state IN ('reserved','active')"
+                        "{LEASE_SELECT} WHERE l.track_id = ?1 AND l.mutation_domain = ?2 \
+                               AND l.mode = 'writer' AND l.state IN ('reserved','active') \
+                               AND l.attempt_id != ?3 \
+                             ORDER BY l.created_at LIMIT 1"
                     ),
-                    params![request.idempotency_key],
+                    params![track_id, request.mutation_domain, request.attempt_id],
                     lease_from_row,
                 )
                 .optional()
                 .map_err(|e| LeaseError::Store(e.to_string()))?;
-            if let Some(existing) = &replay {
-                if existing.attempt_id != request.attempt_id {
-                    return Err(LeaseError::Owned {
-                        holder_attempt_id: existing.attempt_id.clone(),
-                        lease_until: existing.lease_until.clone(),
-                        lease_id: existing.id.clone(),
-                    });
-                }
-                if existing.mode == request.mode {
-                    return Ok(existing.clone());
-                }
+            if let Some(holder) = holder {
+                return Err(LeaseError::Owned {
+                    holder_attempt_id: holder.attempt_id,
+                    lease_until: holder.lease_until,
+                    lease_id: holder.id,
+                });
             }
-            let Some(track_id) =
-                Self::resolve_track_id_on(&connection, &request.slug, &request.track)
-                    .map_err(LeaseError::Store)?
-            else {
-                return Err(LeaseError::NotFound);
-            };
-            if request.mode == "writer" {
-                let holder = connection
-                    .query_row(
-                        &format!(
-                            "{LEASE_SELECT} WHERE l.track_id = ?1 AND l.mutation_domain = ?2 \
-                               AND l.mode = 'writer' AND l.state IN ('reserved','active') \
-                               AND l.attempt_id != ?3 \
-                             ORDER BY l.created_at LIMIT 1"
-                        ),
-                        params![track_id, request.mutation_domain, request.attempt_id],
-                        lease_from_row,
-                    )
-                    .optional()
-                    .map_err(|e| LeaseError::Store(e.to_string()))?;
-                if let Some(holder) = holder {
-                    return Err(LeaseError::Owned {
-                        holder_attempt_id: holder.attempt_id,
-                        lease_until: holder.lease_until,
-                        lease_id: holder.id,
-                    });
-                }
-            }
-            if let Some(existing) = replay {
-                connection.execute("UPDATE track_leases SET mode = ?2, lease_until = ?3, updated_at = ?4 WHERE id = ?1", params![existing.id, request.mode, until, now_text]).map_err(|e| LeaseError::Store(e.to_string()))?;
-                return connection
-                    .query_row(
-                        &format!("{LEASE_SELECT} WHERE l.id = ?1"),
-                        params![existing.id],
-                        lease_from_row,
-                    )
-                    .map_err(|e| LeaseError::Store(e.to_string()));
-            }
-            let id = Uuid::new_v4().to_string();
-            connection
-                .execute(
-                    "INSERT INTO track_leases \
+        }
+        if let Some(existing) = replay {
+            connection.execute("UPDATE track_leases SET mode = ?2, lease_until = ?3, updated_at = ?4 WHERE id = ?1", params![existing.id, request.mode, until, now_text]).map_err(|e| LeaseError::Store(e.to_string()))?;
+            return connection
+                .query_row(
+                    &format!("{LEASE_SELECT} WHERE l.id = ?1"),
+                    params![existing.id],
+                    lease_from_row,
+                )
+                .map_err(|e| LeaseError::Store(e.to_string()));
+        }
+        let id = Uuid::new_v4().to_string();
+        connection
+            .execute(
+                "INSERT INTO track_leases \
                        (id, slug, track_id, mutation_domain, attempt_id, mode, state, lease_until, \
                         idempotency_key, created_at, updated_at) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9, ?9)",
-                    params![
-                        id,
-                        request.slug,
-                        track_id,
-                        request.mutation_domain,
-                        request.attempt_id,
-                        request.mode,
-                        until,
-                        request.idempotency_key,
-                        now_text
-                    ],
-                )
-                .map_err(|e| LeaseError::Store(e.to_string()))?;
-            connection
-                .query_row(
-                    &format!("{LEASE_SELECT} WHERE l.id = ?1"),
-                    params![id],
-                    lease_from_row,
-                )
-                .map_err(|e| LeaseError::Store(e.to_string()))
-        })();
-        match result {
-            Ok(lease) => {
-                connection
-                    .execute_batch("COMMIT")
-                    .map_err(|e| LeaseError::Store(e.to_string()))?;
-                Ok(lease)
-            }
-            Err(error) => {
-                let _ = connection.execute_batch("ROLLBACK");
-                Err(error)
-            }
-        }
+                params![
+                    id,
+                    request.slug,
+                    track_id,
+                    request.mutation_domain,
+                    request.attempt_id,
+                    request.mode,
+                    until,
+                    request.idempotency_key,
+                    now_text
+                ],
+            )
+            .map_err(|e| LeaseError::Store(e.to_string()))?;
+        connection
+            .query_row(
+                &format!("{LEASE_SELECT} WHERE l.id = ?1"),
+                params![id],
+                lease_from_row,
+            )
+            .map_err(|e| LeaseError::Store(e.to_string()))
     }
 
     /// Revalidate a queued assignment without creating a new binding or

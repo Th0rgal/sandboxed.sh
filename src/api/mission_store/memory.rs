@@ -410,6 +410,22 @@ impl MissionStore for InMemoryMissionStore {
             .await
     }
 
+    async fn restore_mission_status(
+        &self,
+        id: Uuid,
+        snapshot: &super::MissionStatusSnapshot,
+    ) -> Result<(), String> {
+        let mut missions = self.missions.write().await;
+        let mission = missions
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission {id} not found"))?;
+        if mission.status != MissionStatus::Active && mission.status != snapshot.status {
+            return Err("mission status changed during rejected activation".into());
+        }
+        snapshot.restore(mission);
+        Ok(())
+    }
+
     async fn set_terminal_evidence(&self, id: Uuid, evidence: &str) -> Result<(), String> {
         let mut missions = self.missions.write().await;
         let mission = missions
@@ -697,6 +713,9 @@ impl MissionStore for InMemoryMissionStore {
         }
         if let Some(tags) = patch.tags {
             mission.project.tags = tags;
+        }
+        if let Some(delta) = patch.tag_patch {
+            delta.apply(&mut mission.project.tags);
         }
         if let Some(desired_state) = patch.desired_state {
             mission.project.desired_state = desired_state;

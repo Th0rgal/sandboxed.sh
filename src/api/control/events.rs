@@ -364,6 +364,10 @@ pub enum UserMessageAck {
 /// Internal control commands (queued and processed by the actor).
 #[derive(Debug)]
 pub enum ControlCommand {
+    #[cfg(test)]
+    InspectActorContext {
+        respond: oneshot::Sender<(Option<Uuid>, Vec<(String, String)>)>,
+    },
     UpdateProject {
         mission_id: Uuid,
         user: crate::api::auth::AuthUser,

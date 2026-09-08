@@ -396,6 +396,39 @@ impl MissionStore for FileMissionStore {
             .await
     }
 
+    async fn restore_mission_status(
+        &self,
+        id: Uuid,
+        snapshot: &super::MissionStatusSnapshot,
+    ) -> Result<(), String> {
+        let _persist = self.persist_lock.lock().await;
+        let mut missions = self.missions.write().await;
+        let mut next = missions.clone();
+        let mission = next
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission {id} not found"))?;
+        if mission.status != MissionStatus::Active && mission.status != snapshot.status {
+            return Err("mission status changed during rejected activation".into());
+        }
+        snapshot.restore(mission);
+        let snapshot = MissionStoreSnapshot {
+            missions: next.clone(),
+            trees: self.trees.read().await.clone(),
+            runs: self.runs.read().await.clone(),
+            deferred_goals: self.deferred_goals.read().await.clone(),
+        };
+        let data = serde_json::to_vec_pretty(&snapshot).map_err(|e| e.to_string())?;
+        let tmp_path = self.path.with_extension("json.tmp");
+        fs::write(&tmp_path, data)
+            .await
+            .map_err(|e| e.to_string())?;
+        fs::rename(&tmp_path, &self.path)
+            .await
+            .map_err(|e| e.to_string())?;
+        *missions = next;
+        Ok(())
+    }
+
     async fn set_terminal_evidence(&self, id: Uuid, evidence: &str) -> Result<(), String> {
         let mut missions = self.missions.write().await;
         let mission = missions
@@ -701,6 +734,9 @@ impl MissionStore for FileMissionStore {
         }
         if let Some(tags) = patch.tags {
             mission.project.tags = tags;
+        }
+        if let Some(delta) = patch.tag_patch {
+            delta.apply(&mut mission.project.tags);
         }
         if let Some(desired_state) = patch.desired_state {
             mission.project.desired_state = desired_state;

@@ -184,6 +184,90 @@ impl MissionProject {
     }
 }
 
+/// Atomic tag delta. Admission owns only the PR capability tags; unrelated
+/// internal tags must survive a stale identity snapshot and its rollback.
+#[derive(Debug, Clone, Default)]
+pub struct MissionTagPatch {
+    pub remove: Vec<String>,
+    pub add: Vec<String>,
+}
+impl MissionTagPatch {
+    pub fn between(before: &[String], after: &[String]) -> Self {
+        Self {
+            remove: before
+                .iter()
+                .filter(|tag| !after.contains(tag))
+                .cloned()
+                .collect(),
+            add: after
+                .iter()
+                .filter(|tag| !before.contains(tag))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    pub fn capabilities(tags: &[String]) -> Self {
+        Self {
+            remove: vec!["pr-writer".into(), "pr-readonly".into()],
+            add: tags
+                .iter()
+                .filter(|tag| matches!(tag.as_str(), "pr-writer" | "pr-readonly"))
+                .cloned()
+                .collect(),
+        }
+    }
+    pub fn apply(&self, tags: &mut Vec<String>) {
+        tags.retain(|tag| !self.remove.contains(tag));
+        for tag in &self.add {
+            if !tags.contains(tag) {
+                tags.push(tag.clone());
+            }
+        }
+    }
+}
+
+/// Status and the metadata changed by activation. Restoration must be one
+/// store mutation, never another transition that synthesizes new timestamps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionStatusSnapshot {
+    pub status: MissionStatus,
+    pub interrupted_at: Option<String>,
+    pub paused_at: Option<String>,
+    pub resumable: bool,
+    pub terminal_reason: Option<String>,
+    pub terminal_evidence: Option<String>,
+    pub first_viewed_at: Option<String>,
+    pub awaiting_kind: Option<AwaitingKind>,
+    pub last_status_change_at: Option<String>,
+}
+impl MissionStatusSnapshot {
+    pub fn capture(mission: &Mission) -> Self {
+        Self {
+            status: mission.status,
+            interrupted_at: mission.interrupted_at.clone(),
+            paused_at: mission.paused_at.clone(),
+            resumable: mission.resumable,
+            terminal_reason: mission.terminal_reason.clone(),
+            terminal_evidence: mission.terminal_evidence.clone(),
+            first_viewed_at: mission.first_viewed_at.clone(),
+            awaiting_kind: mission.awaiting_kind,
+            last_status_change_at: mission.activity.last_status_change_at.clone(),
+        }
+    }
+    pub fn restore(&self, mission: &mut Mission) {
+        mission.status = self.status;
+        mission.interrupted_at = self.interrupted_at.clone();
+        mission.paused_at = self.paused_at.clone();
+        mission.resumable = self.resumable;
+        mission.terminal_reason = self.terminal_reason.clone();
+        mission.terminal_evidence = self.terminal_evidence.clone();
+        mission.first_viewed_at = self.first_viewed_at.clone();
+        mission.awaiting_kind = self.awaiting_kind;
+        mission.activity.last_status_change_at = self.last_status_change_at.clone();
+    }
+}
+
 /// Tri-state patch for project metadata: each field is `None` to leave
 /// unchanged, `Some(None)` to clear, `Some(Some(v))` to set. `tags` is
 /// `Some(vec)` to replace the whole list.
@@ -196,6 +280,7 @@ pub struct MissionProjectPatch {
     pub intent: Option<Option<String>>,
     pub github_pr: Option<Option<String>>,
     pub tags: Option<Vec<String>>,
+    pub tag_patch: Option<MissionTagPatch>,
     pub desired_state: Option<Option<String>>,
     pub next_check_at: Option<Option<String>>,
 }
@@ -209,6 +294,7 @@ impl MissionProjectPatch {
             && self.intent.is_none()
             && self.github_pr.is_none()
             && self.tags.is_none()
+            && self.tag_patch.is_none()
             && self.desired_state.is_none()
             && self.next_check_at.is_none()
     }
@@ -2194,6 +2280,16 @@ pub trait MissionStore: Send + Sync {
 
     /// Update mission status.
     async fn update_mission_status(&self, id: Uuid, status: MissionStatus) -> Result<(), String>;
+
+    /// Restore a rejected activation without discarding its prior diagnostics.
+    async fn restore_mission_status(
+        &self,
+        id: Uuid,
+        snapshot: &MissionStatusSnapshot,
+    ) -> Result<(), String> {
+        let _ = (id, snapshot);
+        Err("mission store does not support atomic status restoration".into())
+    }
 
     /// Persist server-decided placement authority.  Project metadata is
     /// intentionally excluded: it is editable by users and cannot decide
@@ -4329,5 +4425,94 @@ mod tests {
         assert!(m.is_past_deadline(now));
         m.scheduling.deadline = Some((now + chrono::Duration::minutes(1)).to_rfc3339());
         assert!(!m.is_past_deadline(now));
+    }
+}
+
+#[cfg(test)]
+mod admission_restore_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn status_restore_preserves_metadata_and_unrelated_tags_in_every_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores: Vec<Box<dyn MissionStore>> = vec![
+            Box::new(InMemoryMissionStore::new()),
+            Box::new(
+                FileMissionStore::new(dir.path().to_path_buf(), "file")
+                    .await
+                    .unwrap(),
+            ),
+            Box::new(
+                SqliteMissionStore::new(dir.path().to_path_buf(), "sqlite")
+                    .await
+                    .unwrap(),
+            ),
+        ];
+        for store in stores {
+            let mission = store
+                .create_mission(None, None, None, None, None, None, None)
+                .await
+                .unwrap();
+            store
+                .update_mission_status_with_reason(
+                    mission.id,
+                    MissionStatus::Interrupted,
+                    Some("original diagnosis"),
+                )
+                .await
+                .unwrap();
+            store
+                .set_mission_paused_at(mission.id, Some("2026-01-01T01:00:00Z".to_string()))
+                .await
+                .unwrap();
+            store
+                .set_terminal_evidence(mission.id, "original observation")
+                .await
+                .unwrap();
+            let before = store.get_mission(mission.id).await.unwrap().unwrap();
+            let saved = MissionStatusSnapshot::capture(&before);
+            store
+                .update_mission_status(mission.id, MissionStatus::Active)
+                .await
+                .unwrap();
+            store.set_mission_paused_at(mission.id, None).await.unwrap();
+            store
+                .update_mission_project(
+                    mission.id,
+                    MissionProjectPatch {
+                        tags: Some(vec!["orphaned".into()]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .restore_mission_status(mission.id, &saved)
+                .await
+                .unwrap();
+            let after = store.get_mission(mission.id).await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(MissionStatusSnapshot::capture(&after)).unwrap(),
+                serde_json::to_value(&saved).unwrap()
+            );
+            assert_eq!(after.project.tags, vec!["orphaned"]);
+        }
+        let reopened = FileMissionStore::new(dir.path().to_path_buf(), "file")
+            .await
+            .unwrap();
+        let missions = reopened.list_missions(10, 0).await.unwrap();
+        assert_eq!(missions[0].status, MissionStatus::Interrupted);
+        assert_eq!(
+            missions[0].terminal_reason.as_deref(),
+            Some("original diagnosis")
+        );
+        assert_eq!(
+            missions[0].paused_at.as_deref(),
+            Some("2026-01-01T01:00:00Z")
+        );
+        assert_eq!(
+            missions[0].terminal_evidence.as_deref(),
+            Some("original observation")
+        );
     }
 }
