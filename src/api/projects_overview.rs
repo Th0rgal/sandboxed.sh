@@ -2827,6 +2827,9 @@ fn project_mode_from_missions(
     // A failed collection is unknown evidence, not an empty roster. Preserve
     // the last mode until a successful read can establish that a wait ended.
     let Some(missions) = missions else {
+        if pending_decisions > 0 {
+            return honest_controller_mode(store_mode, false, false, pending_decisions);
+        }
         return store_mode.map(str::to_string);
     };
     let has_live = missions
@@ -2963,7 +2966,6 @@ impl ProjectRowBuilder {
 
         self.missions
             .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        self.missions.truncate(8);
 
         let mut attention: Vec<String> = Vec::new();
         let mut items: Vec<AttentionItem> = Vec::new();
@@ -3379,6 +3381,9 @@ impl ProjectRowBuilder {
         )
         .or(self.next_action);
 
+        // Truncation is display-only: mode, attention and next action above
+        // must use the complete roster, including older long-running work.
+        self.missions.truncate(8);
         ProjectRow {
             slug: self.slug,
             title,
@@ -5457,7 +5462,39 @@ mod tests {
     }
 
     #[test]
+    fn old_live_work_remains_visible_to_mode_under_eight_new_acks() {
+        let mut builder = ProjectRowBuilder::new("verity".into());
+        builder.mode = Some("blocked:decision".into());
+        let mut active = awaiting_chip("old-writer", false);
+        active.status = MissionStatus::Active;
+        active.updated_at = "2026-08-04T10:00:00Z".into();
+        builder.missions.push(active);
+        for i in 0..8 {
+            builder
+                .missions
+                .push(awaiting_chip(&format!("ack-{i}"), false));
+        }
+        let row = builder.finish(&[], None, None, "2026-08-04T12:00:00Z");
+        assert_eq!(row.mode.as_deref(), Some("active"));
+        assert_eq!(row.missions.len(), 8);
+        assert!(row
+            .missions
+            .iter()
+            .all(|mission| mission.id != "old-writer"));
+    }
+
+    #[test]
     fn expired_decision_mode_clears_without_changing_pauses_or_other_blockers() {
+        for stored in [None, Some("active"), Some("blocked:decision")] {
+            assert_eq!(
+                project_mode_from_missions(stored, None, &HashMap::new(), 1).as_deref(),
+                Some("blocked:decision")
+            );
+        }
+        assert_eq!(
+            project_mode_from_missions(Some("paused:owner"), None, &HashMap::new(), 1).as_deref(),
+            Some("paused:owner")
+        );
         assert_eq!(
             project_mode_from_missions(Some("blocked:decision"), None, &HashMap::new(), 0)
                 .as_deref(),
