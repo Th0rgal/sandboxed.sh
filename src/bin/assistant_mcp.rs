@@ -548,8 +548,49 @@ fn canonical_github_pr_ref(value: &str) -> bool {
     valid_component(owner) && valid_component(repo)
 }
 
+/// Shared by send and resume so both HTTP stages carry the same contract.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct DispatchIdentityParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    continue_identity: Option<sandboxed_sh::api::writer_recycle::WriterContinuation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    github_pr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    track: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+}
+
+impl DispatchIdentityParams {
+    fn add_to(&self, body: &mut Value) {
+        body.as_object_mut().expect("request object").extend(
+            serde_json::to_value(self)
+                .expect("identity serialization")
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+    }
+}
+
+fn dispatch_identity_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["project", "track", "github_pr"],
+        "properties": {
+            "project": {"type": ["string", "null"]},
+            "track": {"type": "string", "minLength": 1},
+            "github_pr": {"type": ["string", "null"]}
+        },
+        "description": "Trusted caller assertion, not proof of unchanged objective. Assert this turn continues the mission's existing work. Copy the exact stored project, track and github_pr (explicit null if unset) from get_mission. Prose may mention excluded or collaborating PRs. Cannot accompany title/track/github_pr updates; never use for different work. Does not grant PR ownership."
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct SendMessageParams {
+    #[serde(flatten)]
+    identity: DispatchIdentityParams,
     mission_id: String,
     content: String,
 }
@@ -824,6 +865,8 @@ struct UpdateSettingsParams {
 
 #[derive(Debug, Deserialize)]
 struct ResumeMissionParams {
+    #[serde(flatten)]
+    identity: DispatchIdentityParams,
     mission_id: String,
     /// Optional steering message delivered as the resume turn's prompt instead
     /// of the default "continue where you left off" text.
@@ -1445,7 +1488,7 @@ impl AssistantMcp {
         vec![
             ToolDefinition {
                 name: "list_active_missions".to_string(),
-                description: "List active, pending, blocked, or awaiting-user missions in sandboxed.sh.".to_string(),
+                description: "List active, pending, blocked, or awaiting-user missions in sandboxed.sh. Includes goal_mode separately from mission_mode and a goal_objective preview of at most 1,000 characters plus a truncation ellipsis.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -1460,7 +1503,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "list_missions".to_string(),
-                description: "List missions on the attention horizon: live, waiting, blocked, and unabsorbed failed/interrupted attempts. Acknowledged, completed, and replaced attempts are omitted unless you pass an explicit status. Filter by project or track to see attempts on one item. Prefer get_project for the item-first inventory.".to_string(),
+                description: "List missions on the attention horizon: live, waiting, blocked, and unabsorbed failed/interrupted attempts. Acknowledged, completed, and replaced attempts are omitted unless you pass an explicit status. Filter by project or track to see attempts on one item. Prefer get_project for the item-first inventory. Includes goal_mode separately from mission_mode and a goal_objective preview of at most 1,000 characters plus a truncation ellipsis.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -1476,7 +1519,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "get_mission".to_string(),
-                description: "Compatibility alias for the compact ~2KB mission digest. It never returns the full history; use get_mission_events with a bounded limit for transcript or trace details.".to_string(),
+                description: "Compatibility alias for the compact ~2KB mission digest. It never returns the full history; use get_mission_events with a bounded limit for transcript or trace details. Includes goal_mode separately from mission_mode and a goal_objective preview of at most 1,000 characters plus a truncation ellipsis.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -1485,7 +1528,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "get_mission_digest".to_string(),
-                description: "Compact ~2KB mission status: state, awaiting_kind, last user/assistant messages (truncated), GitHub PR links, project metadata. Use this instead of get_mission/get_mission_events for recaps and 'where is it?' checks — it avoids pulling whole transcripts into context.".to_string(),
+                description: "Compact ~2KB mission status: state, awaiting_kind, last user/assistant messages (truncated), GitHub PR links, project metadata. Use this instead of get_mission/get_mission_events for recaps and 'where is it?' checks — it avoids pulling whole transcripts into context. Includes goal_mode separately from mission_mode and a goal_objective preview of at most 1,000 characters plus a truncation ellipsis.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -1573,11 +1616,15 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "send_message_to_mission".to_string(),
-                description: "Send a follow-up message to an existing mission, waking it if it is idle. This is the general way to restart a parked mission and KEEP THE SAME mission id: it activates pending, awaiting_user, acknowledged, waiting_background, interrupted, blocked, completed and failed missions alike. If the mission is already running the message is delivered to the live turn. There is no idle status that requires starting a new mission just to get the agent's attention.".to_string(),
+                description: "Send a follow-up message to an existing mission, waking it if it is idle. This is the general way to restart a parked mission and KEEP THE SAME mission id: it activates pending, awaiting_user, acknowledged, waiting_background, interrupted, blocked, completed and failed missions alike. If the mission is already running the message is delivered to the live turn. There is no idle status that requires starting a new mission just to get the agent's attention. For existing work with excluded/collaborating PR references, read get_mission and pass continue_identity with the exact stored project, track and github_pr (null if unset). For different work use explicit github_pr/track identity updates instead; ownership checks still apply.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id", "content"],
                     "properties": {
+                        "continue_identity": dispatch_identity_schema(),
+                        "github_pr": {"type": "string", "description": "Explicit retask identity update; empty string clears. Omit to preserve."},
+                        "track": {"type": "string", "description": "Explicit retask identity update; empty string clears. Omit to preserve."},
+                        "title": {"type": "string", "description": "Explicit identity title update. Cannot accompany continue_identity."},
                         "mission_id": {"type": "string"},
                         "content": {"type": "string"}
                     }
@@ -2091,7 +2138,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "get_mission_health".to_string(),
-                description: "Diagnose where a mission stands: live run state, stall severity, detected error signals (rate limit / auth / capacity / context-limit / network), suspected tool loops, the last assistant message, and a one-line recommendation. Use this first when babysitting a long-running mission — it summarizes 'where it is struggling' instead of making you read raw events.".to_string(),
+                description: "Diagnose where a mission stands: live run state, stall severity, detected error signals (rate limit / auth / capacity / context-limit / network), suspected tool loops, the last assistant message, and a one-line recommendation. Use this first when babysitting a long-running mission — it summarizes 'where it is struggling' instead of making you read raw events. Includes goal_mode separately from mission_mode and a goal_objective preview of at most 1,000 characters plus a truncation ellipsis.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -2129,11 +2176,15 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "resume_mission".to_string(),
-                description: "Restart a mission that ended without finishing — interrupted, blocked or failed — by reconstructing context from history and the work directory, then running the next turn. This is the recovery path, not the only way to wake a mission: for a mission parked in awaiting_user or acknowledged, send_message_to_mission wakes it on the same id and is the normal choice. Pass `content` to steer the resume with a concrete hint (e.g. 'you still have budget — keep going until the build passes; do not stop to ask'). Without `content` it sends the default continue-where-you-left-off prompt.".to_string(),
+                description: "Restart a mission that ended without finishing — interrupted, blocked or failed — by reconstructing context from history and the work directory, then running the next turn. This is the recovery path, not the only way to wake a mission: for a mission parked in awaiting_user or acknowledged, send_message_to_mission wakes it on the same id and is the normal choice. Pass `content` to steer the resume with a concrete hint (e.g. 'you still have budget — keep going until the build passes; do not stop to ask'). Without `content`, persisted Codex goal missions re-arm the full stored /goal objective; other missions receive the default continue-where-you-left-off prompt. Native blocked/paused/usageLimited/budgetLimited stops park as blocked with terminal_reason=native_goal_stopped after the final response drains; they never mean goal completion. Resolve the reported stop before resuming. Queued steering is delivered once in order, and explicit content remains the caller's exact next-turn input. For existing work with excluded/collaborating PR references, read get_mission and pass continue_identity with the exact stored project, track and github_pr (null if unset). For different work use explicit github_pr/track identity updates instead; ownership checks still apply.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
                     "properties": {
+                        "continue_identity": dispatch_identity_schema(),
+                        "github_pr": {"type": "string", "description": "Explicit retask identity update; empty string clears. Omit to preserve."},
+                        "track": {"type": "string", "description": "Explicit retask identity update; empty string clears. Omit to preserve."},
+                        "title": {"type": "string", "description": "Explicit identity title update. Cannot accompany continue_identity."},
                         "mission_id": {"type": "string"},
                         "content": {"type": "string", "description": "Optional steering message used as the resume turn's prompt."},
                         "clean_workspace": {"type": "boolean", "description": "Wipe the work directory before resuming. Rarely needed; default false."}
@@ -2546,15 +2597,9 @@ impl AssistantMcp {
     async fn send_message(&self, params: SendMessageParams) -> Result<Value, String> {
         let id = self.resolve_mission_id(&params.mission_id).await?;
         self.assert_mission_scope(id).await?;
-        let response = self
-            .api_post(
-                "/api/control/message",
-                json!({
-                    "mission_id": id.to_string(),
-                    "content": params.content,
-                }),
-            )
-            .await?;
+        let mut body = json!({"mission_id": id.to_string(), "content": params.content});
+        params.identity.add_to(&mut body);
+        let response = self.api_post("/api/control/message", body).await?;
         if !response.status().is_success() {
             let text = response.text().await.unwrap_or_default();
             return Err(format!("Failed to send message: {text}"));
@@ -3376,13 +3421,16 @@ impl AssistantMcp {
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
         let has_hint = hint.is_some();
-        // With a steering hint we suppress the default resume prompt and deliver
-        // our own message as the next turn instead.
+        // The backend admits the custom prompt and identity in the same actor
+        // command. Never replay identity edits in a second HTTP send.
+        let mut body = json!({
+            "clean_workspace": params.clean_workspace,
+            "skip_message": false,
+            "content": hint,
+        });
+        params.identity.add_to(&mut body);
         let response = self
-            .api_post(
-                &format!("/api/control/missions/{id}/resume"),
-                json!({ "clean_workspace": params.clean_workspace, "skip_message": has_hint }),
-            )
+            .api_post(&format!("/api/control/missions/{id}/resume"), body)
             .await?;
         if !response.status().is_success() {
             let status = response.status();
@@ -3392,31 +3440,10 @@ impl AssistantMcp {
                  Only interrupted, blocked, or failed missions can be resumed."
             ));
         }
-        let _prepared_mission: Value = response
+        let _accepted_mission: Value = response
             .json()
             .await
             .map_err(|error| format!("Failed to parse resumed mission: {error}"))?;
-        // skip_message prepares the resume without starting a turn. The hint
-        // below is what wakes it, so the preparation response can still say
-        // interrupted. Never return that snapshot as the post-resume state.
-        let steer_warning = if let Some(content) = hint {
-            match self
-                .send_message(SendMessageParams {
-                    mission_id: id.to_string(),
-                    content,
-                })
-                .await
-            {
-                Ok(_) => None,
-                Err(error) => Some(format!(
-                    "Resume preparation succeeded, but steering hint delivery failed: {error}. \
-                     Hint delivery is unconfirmed. Check get_mission_health before retrying \
-                     send_message_to_mission."
-                )),
-            }
-        } else {
-            None
-        };
         // Mutation success and state readback failure are different outcomes:
         // do not invite a duplicate resume if only this GET failed, and do not
         // substitute the old interrupted snapshot for an unknown current state.
@@ -3439,8 +3466,8 @@ impl AssistantMcp {
             "mission_id": id,
             "resume_accepted": true,
             "mission": mission,
-            "steered": has_hint && steer_warning.is_none(),
-            "steer_warning": steer_warning,
+            "steered": has_hint,
+            "steer_warning": Value::Null,
             "state_warning": state_warning,
         });
         Ok(response_body)
@@ -3547,6 +3574,9 @@ impl AssistantMcp {
             "mission_id": id.to_string(),
             "title": mission.get("title").cloned().unwrap_or(Value::Null),
             "status": status,
+            "mission_mode": mission.get("mission_mode").cloned().unwrap_or(Value::Null),
+            "goal_mode": mission.get("goal_mode").cloned().unwrap_or(Value::Null),
+            "goal_objective": compact_opt_text(mission.get("goal_objective"), 1000),
             "backend": mission.get("backend").cloned().unwrap_or(Value::Null),
             "model_override": mission.get("model_override").cloned().unwrap_or(Value::Null),
             "model_effort": mission.get("model_effort").cloned().unwrap_or(Value::Null),
@@ -3921,6 +3951,7 @@ fn compact_compute_fleet(fleet: &Value) -> Value {
                 "disk_available_bytes": node.get("disk_available_bytes").cloned().unwrap_or(Value::Null),
                 "cached_toolchains": node.get("cached_toolchains").cloned().unwrap_or_else(|| json!([])),
                 "lean_runtime_ready": node.get("lean_runtime_ready").cloned().unwrap_or(Value::Null),
+                "source_bundle_capacity": node.get("source_bundle_capacity").cloned().unwrap_or(Value::Null),
                 "error": node.get("error").cloned().unwrap_or(Value::Null),
             })
         })
@@ -3985,6 +4016,8 @@ fn compact_mission_summary(mission: Value) -> Value {
         "title": mission.get("title").cloned().unwrap_or(Value::Null),
         "status": mission.get("status").cloned().unwrap_or(Value::Null),
         "mission_mode": mission.get("mission_mode").cloned().unwrap_or(Value::Null),
+        "goal_mode": mission.get("goal_mode").cloned().unwrap_or(Value::Null),
+        "goal_objective": compact_opt_text(mission.get("goal_objective"), 1000),
         "backend": mission.get("backend").cloned().unwrap_or(Value::Null),
         "model_override": mission.get("model_override").cloned().unwrap_or(Value::Null),
         "model_effort": mission.get("model_effort").cloned().unwrap_or(Value::Null),
@@ -4713,6 +4746,204 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    struct MockControl {
+        requests: std::sync::Mutex<Vec<(String, Value)>>,
+        mission: Value,
+        refuse_resume: bool,
+    }
+
+    async fn mock_control(
+        axum::extract::State(state): axum::extract::State<std::sync::Arc<MockControl>>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        bytes: axum::body::Bytes,
+    ) -> (axum::http::StatusCode, axum::Json<Value>) {
+        let path = uri.path();
+        if method == axum::http::Method::POST {
+            let body = serde_json::from_slice(&bytes).unwrap();
+            state.requests.lock().unwrap().push((path.into(), body));
+            if state.refuse_resume && path.ends_with("/resume") {
+                return (
+                    axum::http::StatusCode::CONFLICT,
+                    axum::Json(json!({"error": "writer_identity_stale"})),
+                );
+            }
+        }
+        let value = if path == "/api/control/missions" {
+            json!([state.mission.clone()])
+        } else if path.ends_with("/events") || path.ends_with("/running") {
+            json!([])
+        } else {
+            state.mission.clone()
+        };
+        (axum::http::StatusCode::OK, axum::Json(value))
+    }
+
+    async fn mock_assistant(
+        mission: Value,
+        refuse_resume: bool,
+    ) -> (
+        AssistantMcp,
+        std::sync::Arc<MockControl>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let state = std::sync::Arc::new(MockControl {
+            requests: Default::default(),
+            mission,
+            refuse_resume,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .fallback(mock_control)
+            .with_state(state.clone());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            AssistantMcp {
+                api_url: format!("http://{addr}"),
+                api_token: None,
+                jwt_secret: None,
+                project_scope: None,
+                client: reqwest::Client::new(),
+            },
+            state,
+            task,
+        )
+    }
+
+    #[tokio::test]
+    async fn continuation_and_retag_identity_use_one_atomic_resume_request() {
+        let id = Uuid::new_v4().to_string();
+        let (mcp, state, task) = mock_assistant(json!({"id": id}), false).await;
+        for identity in [
+            json!({"continue_identity": {"project": null, "track": "trio-reserve1", "github_pr": null}}),
+            json!({"github_pr": "", "track": "new-track", "title": "New work"}),
+        ] {
+            let mut input =
+                json!({"mission_id": id, "content": "Continue RESERVE-1 PR 244; exclude PR #230."});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(identity.as_object().unwrap().clone());
+            let result = mcp
+                .resume_mission(parse_params(input).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(result["steered"], true);
+            let requests = state.requests.lock().unwrap();
+            let (path, body) = requests.last().unwrap();
+            assert!(path.ends_with("/resume"));
+            assert_eq!(body["skip_message"], false);
+            assert!(body["content"].as_str().unwrap().contains("PR 244"));
+            assert!(!requests
+                .iter()
+                .any(|(path, _)| path == "/api/control/message"));
+            for (key, expected) in identity.as_object().unwrap() {
+                assert_eq!(&body[key], expected);
+            }
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn refused_resume_does_not_send_a_steering_message() {
+        let id = Uuid::new_v4().to_string();
+        let (mcp, state, task) = mock_assistant(json!({"id": id}), true).await;
+        let err = mcp
+            .resume_mission(
+                parse_params(json!({
+                    "mission_id": id, "content": "Switch this writer to PR #90",
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("writer_identity_stale"));
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1["content"], "Switch this writer to PR #90");
+        assert!(requests[0].1.get("continue_identity").is_none());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn goal_persistence_is_visible_in_get_list_and_health() {
+        let id = Uuid::new_v4().to_string();
+        for goal_mode in [true, false] {
+            let objective = if goal_mode {
+                json!("Finish ALLOC-1")
+            } else {
+                Value::Null
+            };
+            let (mcp, _, task) = mock_assistant(
+                json!({
+                    "id": id, "status": "awaiting_user", "mission_mode": "task",
+                    "goal_mode": goal_mode, "goal_objective": objective,
+                }),
+                false,
+            )
+            .await;
+            let get = mcp
+                .get_mission(MissionIdParams {
+                    mission_id: id.clone(),
+                })
+                .await
+                .unwrap();
+            let list = mcp
+                .list_missions(parse_params(json!({})).unwrap())
+                .await
+                .unwrap();
+            let health = mcp
+                .get_mission_health(MissionHealthParams {
+                    mission_id: id.clone(),
+                })
+                .await
+                .unwrap();
+            for summary in [&get, &list["missions"][0], &health] {
+                assert_eq!(summary["mission_mode"], "task");
+                assert_eq!(summary["goal_mode"], goal_mode);
+                assert_eq!(summary["goal_objective"], objective);
+            }
+            task.abort();
+        }
+        let long = "🦀".repeat(1500);
+        let summary = compact_mission_summary(json!({"goal_mode": true, "goal_objective": long}));
+        assert_eq!(
+            summary["goal_objective"].as_str().unwrap().chars().count(),
+            1001
+        );
+        assert!(summary["goal_objective"].as_str().unwrap().ends_with('…'));
+        let legacy = compact_mission_summary(json!({}));
+        assert!(
+            legacy["goal_mode"].is_null(),
+            "missing data must not claim goal mode is disabled"
+        );
+        assert!(legacy["goal_objective"].is_null());
+    }
+
+    #[test]
+    fn dispatch_tools_declare_and_parse_the_same_identity_contract() {
+        for tool in AssistantMcp::tools().into_iter().filter(|t| {
+            matches!(
+                t.name.as_str(),
+                "send_message_to_mission" | "resume_mission"
+            )
+        }) {
+            assert_eq!(
+                tool.input_schema["properties"]["continue_identity"],
+                dispatch_identity_schema()
+            );
+            for field in ["github_pr", "track", "title"] {
+                assert_eq!(tool.input_schema["properties"][field]["type"], "string");
+            }
+        }
+        let incomplete = json!({"mission_id": "m", "content": "continue", "continue_identity": {"track": "trio-reserve1"}});
+        assert!(parse_params::<SendMessageParams>(incomplete.clone()).is_err());
+        assert!(parse_params::<ResumeMissionParams>(incomplete).is_err());
+    }
+
     #[test]
     fn writers_are_goal_mode_even_when_controller_omits_prefix() {
         assert_eq!(
@@ -4892,10 +5123,10 @@ mod tests {
 
     async fn exercise_resume_readback(
         with_hint: bool,
-        steering_status: axum::http::StatusCode,
+        resume_status: axum::http::StatusCode,
         readback_status: axum::http::StatusCode,
         fast_mode: Option<bool>,
-    ) -> (Value, Vec<String>) {
+    ) -> (Result<Value, String>, Vec<String>) {
         use axum::{
             extract::State,
             routing::{get, post},
@@ -4907,31 +5138,30 @@ mod tests {
         struct Fixture {
             id: Uuid,
             with_hint: bool,
-            steering_status: axum::http::StatusCode,
+            resume_status: axum::http::StatusCode,
             readback_status: axum::http::StatusCode,
             fast_mode: Option<bool>,
             calls: Arc<Mutex<Vec<String>>>,
         }
-        async fn prepare(State(state): State<Fixture>, Json(body): Json<Value>) -> Json<Value> {
-            assert_eq!(body["skip_message"], state.with_hint);
-            state.calls.lock().unwrap().push("prepare".into());
-            Json(json!({"id": state.id, "status": "interrupted", "updated_at": "before"}))
-        }
-        async fn steer(
+        async fn resume(
             State(state): State<Fixture>,
             Json(body): Json<Value>,
         ) -> (axum::http::StatusCode, Json<Value>) {
-            assert_eq!(body["mission_id"], state.id.to_string());
-            assert_eq!(body["content"], "Continue the existing proof");
-            state.calls.lock().unwrap().push("steer".into());
+            assert_eq!(body["skip_message"], false);
+            if state.with_hint {
+                assert_eq!(body["content"], "Continue the existing proof");
+            } else {
+                assert!(body["content"].is_null());
+            }
+            state.calls.lock().unwrap().push("resume".into());
             (
-                state.steering_status,
-                Json(json!({"accepted": state.steering_status.is_success()})),
+                state.resume_status,
+                Json(json!({"id": state.id, "status": "interrupted", "updated_at": "before"})),
             )
         }
         async fn readback(State(state): State<Fixture>) -> (axum::http::StatusCode, Json<Value>) {
             state.calls.lock().unwrap().push("readback".into());
-            let status = if state.steering_status.is_success() {
+            let status = if state.resume_status.is_success() {
                 "active"
             } else {
                 "interrupted"
@@ -4951,14 +5181,13 @@ mod tests {
         let fixture = Fixture {
             id: Uuid::new_v4(),
             with_hint,
-            steering_status,
+            resume_status,
             readback_status,
             fast_mode,
             calls: Arc::new(Mutex::new(Vec::new())),
         };
         let router = Router::new()
-            .route("/api/control/missions/:id/resume", post(prepare))
-            .route("/api/control/message", post(steer))
+            .route("/api/control/missions/:id/resume", post(resume))
             .route("/api/control/missions/:id/digest", get(readback))
             .with_state(fixture.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4977,22 +5206,23 @@ mod tests {
         let result = mcp
             .resume_mission(ResumeMissionParams {
                 mission_id: fixture.id.to_string(),
+                identity: Default::default(),
                 clean_workspace: false,
                 content: with_hint.then(|| "Continue the existing proof".to_string()),
             })
-            .await
-            .expect("accepted resume");
+            .await;
         server.abort();
         let calls = fixture.calls.lock().unwrap().clone();
         (result, calls)
     }
 
     #[tokio::test]
-    async fn resume_reads_state_after_the_hint_starts_the_turn() {
+    async fn resume_reads_state_after_atomic_resume_with_hint() {
         use axum::http::StatusCode;
         let (result, calls) =
             exercise_resume_readback(true, StatusCode::OK, StatusCode::OK, None).await;
-        assert_eq!(calls, ["prepare", "steer", "readback"]);
+        let result = result.expect("accepted resume");
+        assert_eq!(calls, ["resume", "readback"]);
         assert_eq!(result["mission"]["status"], "active");
         assert_eq!(result["mission"]["updated_at"], "after");
         assert_eq!(result["mission"]["project"], "example");
@@ -5013,25 +5243,22 @@ mod tests {
         use axum::http::StatusCode;
         let (result, calls) =
             exercise_resume_readback(false, StatusCode::OK, StatusCode::OK, None).await;
-        assert_eq!(calls, ["prepare", "readback"]);
+        let result = result.expect("accepted resume");
+        assert_eq!(calls, ["resume", "readback"]);
         assert_eq!(result["mission"]["updated_at"], "after");
         assert_eq!(result["steered"], false);
         assert!(result["steer_warning"].is_null());
     }
 
     #[tokio::test]
-    async fn resume_hint_failure_does_not_claim_a_running_mission() {
+    async fn resume_refusal_does_not_read_or_claim_current_state() {
         use axum::http::StatusCode;
         let (result, calls) =
-            exercise_resume_readback(true, StatusCode::BAD_GATEWAY, StatusCode::OK, None).await;
-        assert_eq!(calls, ["prepare", "steer", "readback"]);
-        assert_eq!(result["resume_accepted"], true);
-        assert_eq!(result["steered"], false);
-        assert_eq!(result["mission"]["status"], "interrupted");
-        assert!(result["steer_warning"]
-            .as_str()
-            .unwrap()
-            .contains("unconfirmed"));
+            exercise_resume_readback(true, StatusCode::CONFLICT, StatusCode::OK, None).await;
+        assert_eq!(calls, ["resume"]);
+        assert!(result
+            .unwrap_err()
+            .contains("Failed to resume mission (409"));
     }
 
     #[tokio::test]
@@ -5040,7 +5267,8 @@ mod tests {
         let (result, calls) =
             exercise_resume_readback(true, StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE, None)
                 .await;
-        assert_eq!(calls, ["prepare", "steer", "readback"]);
+        let result = result.expect("accepted resume");
+        assert_eq!(calls, ["resume", "readback"]);
         assert_eq!(result["resume_accepted"], true);
         assert_eq!(result["steered"], true);
         assert!(result["mission"].is_null());
@@ -5056,6 +5284,7 @@ mod tests {
         for enabled in [true, false] {
             let (result, _) =
                 exercise_resume_readback(true, StatusCode::OK, StatusCode::OK, Some(enabled)).await;
+            let result = result.expect("accepted resume");
             assert_eq!(result["mission"]["fast_mode"], enabled);
         }
     }
@@ -5691,6 +5920,7 @@ mod tests {
                     "disk_available_bytes": 100_u64 << 30,
                     "cached_toolchains": ["leanprover--lean4---v4.24.0"],
                     "lean_runtime_ready": true,
+                    "source_bundle_capacity": {"overlay_bytes": 1048576, "complete_bytes": 8388608},
                     "base_url": "must-not-leak"
                 },
                 {
@@ -5734,6 +5964,11 @@ mod tests {
         assert_eq!(compact["summary"]["lean_slots_available"], 2);
         assert_eq!(compact["summary"]["active_remote_jobs"], 1);
         assert!(compact["nodes"][0].get("base_url").is_none());
+        assert_eq!(
+            compact["nodes"][0]["source_bundle_capacity"]["complete_bytes"],
+            8388608
+        );
+        assert!(compact["nodes"][3]["source_bundle_capacity"].is_null());
         assert_eq!(compact["nodes"][2]["error"], "probe degraded");
         assert_eq!(compact["recent_jobs"][0]["node_id"], "cpu");
     }

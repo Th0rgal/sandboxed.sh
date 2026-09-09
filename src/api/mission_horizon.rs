@@ -72,7 +72,10 @@ async fn absorb(store: &dyn MissionStore, prior: &Mission, successor: Uuid) -> R
         .update_mission_project(
             prior.id,
             MissionProjectPatch {
-                tags: Some(tags),
+                tag_patch: Some(super::mission_store::MissionTagPatch::between(
+                    &prior.project.tags,
+                    &tags,
+                )),
                 ..Default::default()
             },
         )

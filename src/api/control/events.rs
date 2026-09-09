@@ -114,7 +114,7 @@ pub enum AgentEvent {
         mission_id: Option<Uuid>,
     },
     /// Goal status transitioned. Carries the canonical status string from
-    /// codex's `thread/goal/updated`: `active`, `paused`, `budgetLimited`,
+    /// codex's `thread/goal/updated`: `active`, `paused`, `blocked`, `usageLimited`, `budgetLimited`,
     /// `complete`, or `cleared` when the goal was explicitly aborted.
     GoalStatus {
         status: String,
@@ -364,6 +364,20 @@ pub enum UserMessageAck {
 /// Internal control commands (queued and processed by the actor).
 #[derive(Debug)]
 pub enum ControlCommand {
+    #[cfg(test)]
+    InspectActorContext {
+        respond: oneshot::Sender<(Option<Uuid>, Vec<(String, String)>)>,
+    },
+    UpdateProject {
+        mission_id: Uuid,
+        user: crate::api::auth::AuthUser,
+        request: super::UpdateMissionProjectRequest,
+        respond: oneshot::Sender<Result<Mission, (axum::http::StatusCode, String)>>,
+    },
+    AdmitDispatch {
+        admission: Box<super::DispatchAdmission>,
+        command: Box<ControlCommand>,
+    },
     UserMessage {
         id: Uuid,
         content: String,
@@ -502,6 +516,7 @@ pub enum ControlCommand {
     },
     /// Resume an interrupted mission
     ResumeMission {
+        content: Option<String>,
         mission_id: Uuid,
         /// If true, clean the mission's work directory before resuming
         clean_workspace: bool,

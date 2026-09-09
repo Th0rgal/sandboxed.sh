@@ -3,13 +3,31 @@
 //! Lido 2026-08-17: mission `ebfb1fd1` stayed tagged `github_pr=…#88` /
 //! `track=pr-88-repair` while being retasked as P-RESERVE-RELATIONAL. The
 //! inventory lied. A writer may be reused only when the caller updates the
-//! identity fields that named the previous work.
+//! identity fields that named the previous work, or explicitly asserts continuation.
+//! Continuation trusts the authenticated caller about prompt semantics; matching
+//! tags is not proof that the objective is unchanged.
 
 use super::control::canonical_github_pr;
+use serde::{Deserialize, Serialize};
+
+/// A controller's explicit assertion that this turn continues the stored work.
+/// All fields are required, including an explicit null for an unrecorded PR.
+/// This is a trusted semantic assertion and an identity precondition, not proof
+/// of unchanged work, a PR ownership grant, or an identity edit.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriterContinuation {
+    #[serde(deserialize_with = "Option::<String>::deserialize")]
+    pub project: Option<String>,
+    pub track: String,
+    #[serde(deserialize_with = "Option::<String>::deserialize")]
+    pub github_pr: Option<String>,
+}
 
 /// Identity a controller/writer is currently tagged with.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WriterIdentity {
+    pub project: Option<String>,
     pub title: Option<String>,
     pub github_pr: Option<String>,
     pub track: Option<String>,
@@ -19,6 +37,7 @@ pub struct WriterIdentity {
 /// (silent). `Some(None)` means "clear". `Some(Some(v))` means "set".
 #[derive(Debug, Clone, Default)]
 pub struct WriterIdentityPatch {
+    pub continue_identity: Option<WriterContinuation>,
     pub title: Option<Option<String>>,
     pub github_pr: Option<Option<String>>,
     pub track: Option<Option<String>>,
@@ -39,6 +58,25 @@ pub fn apply_writer_reuse(
     stored: &WriterIdentity,
     patch: &WriterIdentityPatch,
 ) -> Result<WriterIdentity, RecycleRefusal> {
+    if let Some(expected) = &patch.continue_identity {
+        if expected.track.trim().is_empty()
+            || stored.track.as_deref() != Some(expected.track.as_str())
+            || stored.project != expected.project
+            || stored.github_pr != expected.github_pr
+            || patch.title.is_some()
+            || patch.github_pr.is_some()
+            || patch.track.is_some()
+        {
+            return Err(RecycleRefusal {
+                error: "writer_identity_stale",
+                message: "continuation must match the stored project, nonempty track and github_pr exactly and cannot include identity updates; reread the mission, or explicitly retag different work".into(),
+            });
+        }
+        // The caller has named the work structurally. PRs/campaigns in prose
+        // can now be exclusions or collaborators; never infer ownership from
+        // those references. The normal writer capability/lease checks remain.
+        return Ok(stored.clone());
+    }
     let work_changed = dispatch_is_different_work(stored, patch);
     let identity_updated = patch.github_pr.is_some() || patch.track.is_some();
     if work_changed && !identity_updated {
@@ -54,6 +92,7 @@ pub fn apply_writer_reuse(
     }
 
     Ok(WriterIdentity {
+        project: stored.project.clone(),
         title: merge_field(&stored.title, &patch.title),
         github_pr: merge_field(&stored.github_pr, &patch.github_pr),
         track: merge_field(&stored.track, &patch.track),
@@ -236,10 +275,162 @@ mod tests {
 
     fn stored_pr88() -> WriterIdentity {
         WriterIdentity {
+            project: Some("lido".into()),
             title: Some("Repair Lido PR #88 second current-head findings".into()),
             github_pr: Some("lfglabs-dev/lido-srv3-proof-closure#88".into()),
             track: Some("pr-88-repair".into()),
         }
+    }
+
+    fn continuation(stored: &WriterIdentity, hint: &str) -> WriterIdentityPatch {
+        WriterIdentityPatch {
+            continue_identity: Some(WriterContinuation {
+                project: stored.project.clone(),
+                track: stored.track.clone().unwrap(),
+                github_pr: stored.github_pr.clone(),
+            }),
+            work_hint: Some(hint.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn explicit_same_track_allows_exclusions_and_collaborator_references() {
+        let stored = WriterIdentity {
+            project: Some("lido".into()),
+            title: Some("ALLOC-1".into()),
+            track: Some("trio-alloc1".into()),
+            github_pr: Some("lfglabs-dev/lido-srv3-proof-closure#242".into()),
+        };
+        for hint in [
+            "Resume ALLOC-1. No-go: do not touch PR #230 or PR #231.",
+            "Finish ALLOC-1; coordinate interface assumptions with PR 230 and P-RESERVE-1.",
+            "Continue ALLOC-1 after reading https://github.com/other/repo/pull/231 for context.",
+        ] {
+            let patch = continuation(&stored, hint);
+            assert_eq!(apply_writer_reuse(&stored, &patch).unwrap(), stored);
+            // No phrase whitelist: legacy callers must still supply identity
+            // updates or the explicit continuation when they name other work.
+            let legacy = WriterIdentityPatch {
+                continue_identity: None,
+                ..patch
+            };
+            assert!(apply_writer_reuse(&stored, &legacy).is_err());
+        }
+    }
+
+    #[test]
+    fn reserve_continuation_does_not_invent_missing_pr_metadata() {
+        let stored = WriterIdentity {
+            project: Some("lido".into()),
+            title: Some("RESERVE-1".into()),
+            track: Some("trio-reserve1".into()),
+            github_pr: None,
+        };
+        let patch = continuation(&stored, "Continue RESERVE-1 on our existing PR 244.");
+        assert_eq!(apply_writer_reuse(&stored, &patch).unwrap(), stored);
+        let legacy = WriterIdentityPatch {
+            continue_identity: None,
+            ..patch
+        };
+        assert!(apply_writer_reuse(&stored, &legacy).is_err());
+    }
+
+    #[test]
+    fn continuation_rejects_wrong_track_pr_and_missing_identity() {
+        let stored = stored_pr88();
+        for (track, pr) in [
+            ("p-reserve-relational", stored.github_pr.clone()),
+            ("pr-88-repair", Some("other/repository#88".into())),
+            ("pr-88-repair", None),
+            ("", stored.github_pr.clone()),
+            ("PR-88-REPAIR", stored.github_pr.clone()),
+        ] {
+            let patch = WriterIdentityPatch {
+                continue_identity: Some(WriterContinuation {
+                    project: stored.project.clone(),
+                    track: track.into(),
+                    github_pr: pr,
+                }),
+                work_hint: Some("Implement P-RESERVE-RELATIONAL".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                apply_writer_reuse(&stored, &patch).unwrap_err().error,
+                "writer_identity_stale"
+            );
+            assert!(apply_writer_reuse(&WriterIdentity::default(), &patch).is_err());
+        }
+    }
+
+    #[test]
+    fn continuation_is_invalid_after_project_or_pr_metadata_changes() {
+        let original = stored_pr88();
+        let patch = continuation(&original, "Continue the assigned work; consult PR #90.");
+        for updated in [
+            WriterIdentity {
+                project: Some("another-project".into()),
+                ..original.clone()
+            },
+            WriterIdentity {
+                project: None,
+                ..original.clone()
+            },
+            WriterIdentity {
+                github_pr: None,
+                ..original.clone()
+            },
+        ] {
+            assert!(apply_writer_reuse(&updated, &patch).is_err());
+        }
+        let missing_pr = WriterIdentity {
+            github_pr: None,
+            ..original.clone()
+        };
+        let old_assertion = continuation(&missing_pr, "Continue PR #88");
+        assert!(apply_writer_reuse(&original, &old_assertion).is_err());
+    }
+
+    #[test]
+    fn continuation_cannot_be_combined_with_identity_edits_even_noops() {
+        let stored = stored_pr88();
+        for edit in [
+            WriterIdentityPatch {
+                github_pr: Some(None),
+                ..Default::default()
+            },
+            WriterIdentityPatch {
+                track: Some(stored.track.clone()),
+                ..Default::default()
+            },
+            WriterIdentityPatch {
+                title: Some(Some("different work".into())),
+                ..Default::default()
+            },
+        ] {
+            let patch = WriterIdentityPatch {
+                continue_identity: continuation(&stored, "").continue_identity,
+                ..edit
+            };
+            assert!(apply_writer_reuse(&stored, &patch).is_err());
+        }
+    }
+
+    #[test]
+    fn continuation_requires_explicit_nullable_pr_and_rejects_typos() {
+        for raw in [
+            serde_json::json!({"project": "lido", "track": "trio-reserve1"}),
+            serde_json::json!({"project": "lido", "github_pr": null}),
+            serde_json::json!({"track": "trio-reserve1", "github_pr": null}),
+            serde_json::json!({"project": "lido", "track": "trio-reserve1", "github_pr": null, "pr": "244"}),
+        ] {
+            assert!(serde_json::from_value::<WriterContinuation>(raw).is_err());
+        }
+        let parsed: WriterContinuation = serde_json::from_value(serde_json::json!({
+            "project": "lido", "track": "trio-reserve1", "github_pr": null,
+        }))
+        .unwrap();
+        assert!(parsed.github_pr.is_none());
     }
 
     #[test]
@@ -265,6 +456,7 @@ mod tests {
                 github_pr: Some(None),
                 track: Some(Some("p-reserve-relational".into())),
                 work_hint: Some("Implement P-RESERVE-RELATIONAL".into()),
+                ..WriterIdentityPatch::default()
             },
         )
         .expect("retag ok");
@@ -274,6 +466,37 @@ mod tests {
             next.title.as_deref(),
             Some("P-RESERVE-RELATIONAL first slice")
         );
+    }
+
+    #[test]
+    fn explicit_pr_metadata_update_preserves_the_existing_track() {
+        let stored = WriterIdentity {
+            project: Some("lido".into()),
+            title: Some("RESERVE-1".into()),
+            track: Some("trio-reserve1".into()),
+            github_pr: None,
+        };
+        let next = apply_writer_reuse(
+            &stored,
+            &WriterIdentityPatch {
+                github_pr: Some(Some("lfglabs-dev/lido-srv3-proof-closure#244".into())),
+                work_hint: Some("Continue RESERVE-1 on PR 244".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(next.track, stored.track);
+        assert_eq!(next.project, stored.project);
+        assert_eq!(next.title, stored.title);
+        assert_eq!(
+            next.github_pr.as_deref(),
+            Some("lfglabs-dev/lido-srv3-proof-closure#244")
+        );
+        let title_only = WriterIdentityPatch {
+            title: Some(Some("Switch this writer to PR #90".into())),
+            ..Default::default()
+        };
+        assert!(apply_writer_reuse(&stored, &title_only).is_err());
     }
 
     #[test]
@@ -337,6 +560,7 @@ mod tests {
     #[test]
     fn whitespace_only_tags_are_untagged() {
         let stored = WriterIdentity {
+            project: Some("lido".into()),
             github_pr: Some("  ".into()),
             track: Some("".into()),
             title: None,

@@ -460,7 +460,10 @@ pub(crate) async fn run_logged_command(
                     kill_contained_process(systemd_scope.as_ref(), pid, &mut child).await;
                     RunOutcome::Exited(status.code())
                 }
-                Ok(Err(err)) => return Err(err.into()),
+                Ok(Err(err)) => {
+                    kill_contained_process(systemd_scope.as_ref(), pid, &mut child).await;
+                    return Err(err.into());
+                },
                 Err(_) => {
                     kill_contained_process(systemd_scope.as_ref(), pid, &mut child).await;
                     RunOutcome::TimedOut { limit_secs }
@@ -685,42 +688,83 @@ async fn kill_contained_process(
 ) {
     #[cfg(target_os = "linux")]
     if let Some(scope) = _systemd_scope {
-        let mut stop_command = tokio::process::Command::new("systemctl");
+        retry_process_cleanup(pid, child, || stop_systemd_scope(scope)).await;
+        return;
+    }
+    retry_process_cleanup(pid, child, || std::future::ready(true)).await;
+}
+
+/// The job remains running (and keeps its capacity/ownership) until both the
+/// process group and containment scope have confirmed cleanup. Do not turn a
+/// failed stop request into a terminal execution response.
+async fn retry_process_cleanup<F, Fut>(
+    pid: Option<u32>,
+    child: &mut tokio::process::Child,
+    mut stop_scope: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut group_stopped = false;
+    let mut scope_stopped = false;
+    loop {
+        if !scope_stopped {
+            scope_stopped = stop_scope().await;
+        }
+        // Once retired, never signal a process-group id again: it can be
+        // reused while an unavailable scope manager is still being retried.
+        if !group_stopped {
+            group_stopped = kill_process_group(pid, child).await;
+        }
+        if group_stopped && scope_stopped {
+            return;
+        }
+        tracing::warn!(
+            ?pid,
+            group_stopped,
+            scope_stopped,
+            "node job cleanup is unconfirmed; retaining execution and retrying"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn stop_systemd_scope(scope: &SystemdScope) -> bool {
+    let command = || {
+        let mut command = tokio::process::Command::new("systemctl");
+        command
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
         if scope.mode == SystemdScopeMode::User {
-            stop_command.arg("--user");
+            command.arg("--user");
             if let Some(runtime_dir) = &scope.user_runtime_dir {
-                stop_command.env("XDG_RUNTIME_DIR", runtime_dir).env(
+                command.env("XDG_RUNTIME_DIR", runtime_dir).env(
                     "DBUS_SESSION_BUS_ADDRESS",
                     format!("unix:path={}", runtime_dir.join("bus").display()),
                 );
             }
         }
-        let stop = stop_command
-            .arg("stop")
-            .arg(&scope.unit)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        match tokio::time::timeout(KILL_GRACE, stop).await {
-            Ok(Ok(status)) if !status.success() => {
-                tracing::warn!(scope = %scope.unit, %status, "failed to stop node job systemd scope");
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(scope = %scope.unit, %error, "could not stop node job systemd scope");
-            }
-            Err(_) => {
-                tracing::warn!(scope = %scope.unit, "timed out stopping node job systemd scope");
-            }
-            Ok(Ok(_)) => {}
-        }
+        command
+    };
+    let mut stop = command();
+    stop.arg("stop").arg(&scope.unit).stdout(Stdio::null());
+    if matches!(tokio::time::timeout(KILL_GRACE, stop.status()).await, Ok(Ok(status)) if status.success())
+    {
+        return true;
     }
-    kill_process_group(pid, child).await;
+    // A failed scope launch may never have registered a unit. Verify absence
+    // with the manager; a failed connection/query itself is not that proof.
+    let mut show = command();
+    show.args(["show", "--property=LoadState", "--value", &scope.unit]);
+    matches!(tokio::time::timeout(KILL_GRACE, show.output()).await,
+        Ok(Ok(output)) if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "not-found")
 }
 
 /// SIGTERM the job's process group, escalating to SIGKILL after a grace
 /// period. Falls back to killing the direct child when the pid is unknown.
-async fn kill_process_group(pid: Option<u32>, child: &mut tokio::process::Child) {
+async fn kill_process_group(pid: Option<u32>, child: &mut tokio::process::Child) -> bool {
     if let Some(pid) = pid {
         unsafe {
             libc::kill(-(pid as i32), libc::SIGTERM);
@@ -737,14 +781,55 @@ async fn kill_process_group(pid: Option<u32>, child: &mut tokio::process::Child)
             }
         }
         let _ = child.wait().await;
+        !process_group_has_live_members(pid)
     } else {
-        let _ = child.kill().await;
+        child.kill().await.is_ok()
     }
 }
 
-fn process_group_exists(pid: u32) -> bool {
+fn process_group_has_live_members(pid: u32) -> bool {
     let result = unsafe { libc::kill(-(pid as i32), 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // An orphaned zombie can keep a process-group id observable until
+        // init reaps it, but it can no longer execute or mutate the assignment.
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return true;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return true;
+            };
+            if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+                continue;
+            }
+            let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return true,
+            };
+            let Some((_, fields)) = stat.rsplit_once(") ") else {
+                return true;
+            };
+            let mut fields = fields.split_whitespace();
+            let state = fields.next();
+            let _parent = fields.next();
+            let Some(group) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+                return true;
+            };
+            if group == pid && !matches!(state, Some("Z" | "X")) {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
 }
 
 async fn wait_for_process_group_exit(
@@ -757,7 +842,7 @@ async fn wait_for_process_group_exit(
         // Reap the leader promptly; an unreaped zombie keeps the process
         // group observable even after every live process has exited.
         let _ = child.try_wait();
-        if !process_group_exists(pid) {
+        if !process_group_has_live_members(pid) {
             return true;
         }
         if Instant::now() >= deadline {
@@ -987,6 +1072,51 @@ mod tests {
         let record = wait_for_terminal(&store, job_id).await;
         assert_eq!(record.state, JobState::Failed);
         assert!(record.error.as_deref().unwrap_or("").contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_does_not_complete_until_scope_stop_is_confirmed() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let confirmed = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30"])
+            .process_group(0)
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        let cleanup = tokio::spawn({
+            let confirmed = confirmed.clone();
+            let attempts = attempts.clone();
+            async move {
+                retry_process_cleanup(pid, &mut child, || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(confirmed.load(Ordering::SeqCst))
+                })
+                .await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while attempts.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !cleanup.is_finished(),
+            "a failed scope stop cannot authorize terminal state"
+        );
+        assert!(
+            !process_group_has_live_members(pid.unwrap()),
+            "the actual process group has already stopped"
+        );
+        confirmed.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(3), cleanup)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

@@ -110,6 +110,9 @@ fn automatic_retry(
     terminal_reason: Option<TerminalReason>,
     output: &str,
 ) -> AutomaticRetry {
+    if terminal_reason == Some(TerminalReason::NativeGoalStopped) {
+        return AutomaticRetry::Suppressed;
+    }
     if task.backend != "chatgpt_ui" {
         return AutomaticRetry::Allowed;
     }
@@ -125,6 +128,7 @@ fn persisted_terminal_reason(reason: Option<&str>) -> Option<TerminalReason> {
     match reason {
         Some("turn_complete") => Some(TerminalReason::TurnComplete),
         Some("completed") => Some(TerminalReason::Completed),
+        Some("native_goal_stopped") => Some(TerminalReason::NativeGoalStopped),
         Some("cancelled") => Some(TerminalReason::Cancelled),
         Some("server_shutdown") => Some(TerminalReason::ServerShutdown),
         Some("llm_error") => Some(TerminalReason::LlmError),
@@ -455,6 +459,11 @@ pub fn classify_outcome(
     success: bool,
     output: &str,
 ) -> BoardTaskOutcome {
+    // Native non-completion is authoritative, regardless of final prose or
+    // an inconsistent success flag. Keep the board resumable and dependents gated.
+    if terminal_reason == Some(TerminalReason::NativeGoalStopped) {
+        return BoardTaskOutcome::Blocked;
+    }
     let failed = matches!(
         terminal_reason,
         Some(TerminalReason::Cancelled)
@@ -1462,7 +1471,11 @@ pub async fn scheduler_pass(
                     settle_task(
                         mission_store,
                         task.clone(),
-                        classify_outcome(None, true, &last),
+                        classify_outcome(
+                            persisted_terminal_reason(worker.terminal_reason.as_deref()),
+                            true,
+                            &last,
+                        ),
                         &last,
                         persisted_terminal_reason(worker.terminal_reason.as_deref()),
                     )
@@ -1482,7 +1495,13 @@ pub async fn scheduler_pass(
                     settle_task(
                         mission_store,
                         task.clone(),
-                        BoardTaskOutcome::Failed,
+                        if persisted_terminal_reason(worker.terminal_reason.as_deref())
+                            == Some(TerminalReason::NativeGoalStopped)
+                        {
+                            classify_outcome(Some(TerminalReason::NativeGoalStopped), false, &last)
+                        } else {
+                            BoardTaskOutcome::Failed
+                        },
                         &last,
                         persisted_terminal_reason(worker.terminal_reason.as_deref()),
                     )
@@ -1935,6 +1954,236 @@ pub async fn on_worker_settled(
 mod tests {
     use super::*;
     use crate::api::mission_store::{InMemoryMissionStore, NewBoardTask};
+
+    // Exercise both production entry points, including the recovery scheduler,
+    // against stored tasks. Native statuses collapse to NativeGoalStopped at
+    // the driver boundary; preserve the status evidence separately as in actors.
+    async fn native_goal_board_matrix(recovery: bool) {
+        for native_status in [
+            "blocked",
+            "paused",
+            "usageLimited",
+            "budgetLimited",
+            "complete",
+        ] {
+            for output in [
+                "Fixed the parser; external validation unavailable.",
+                "",
+                "BLOCKED: external validation unavailable",
+            ] {
+                let complete = native_status == "complete";
+                let reason = if complete {
+                    TerminalReason::Completed
+                } else {
+                    TerminalReason::NativeGoalStopped
+                };
+                let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+                let boss = store
+                    .create_mission_with_parent(
+                        Some("boss"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let worker = store
+                    .create_mission_with_parent(
+                        Some("worker"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        Some(boss.id),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .upsert_board_tasks(
+                        boss.id,
+                        vec![
+                            NewBoardTask {
+                                task_key: "parser".into(),
+                                title: "parser".into(),
+                                prompt: "repair".into(),
+                                backend: "codex".into(),
+                                ..Default::default()
+                            },
+                            NewBoardTask {
+                                task_key: "dependent".into(),
+                                title: "dependent".into(),
+                                prompt: "validate".into(),
+                                backend: "codex".into(),
+                                depends_on: vec!["parser".into()],
+                                ..Default::default()
+                            },
+                        ],
+                    )
+                    .await
+                    .unwrap();
+                let mut task = store
+                    .list_board_tasks(boss.id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|t| t.task_key == "parser")
+                    .unwrap();
+                task.status = BoardTaskStatus::Running;
+                task.worker_mission_id = Some(worker.id);
+                task.attempts = 1;
+                store.save_board_task(&task).await.unwrap();
+                store
+                    .update_mission_status_with_reason(
+                        worker.id,
+                        if complete {
+                            MissionStatus::Completed
+                        } else {
+                            MissionStatus::Blocked
+                        },
+                        Some(if complete {
+                            "completed"
+                        } else {
+                            "native_goal_stopped"
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .set_terminal_evidence(
+                        worker.id,
+                        &format!(
+                            "Native Codex goal status={native_status}; objective: repair parser"
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                if !output.is_empty() {
+                    store
+                        .update_mission_history(
+                            worker.id,
+                            &[MissionHistoryEntry {
+                                role: "assistant".into(),
+                                content: output.into(),
+                            }],
+                        )
+                        .await
+                        .unwrap();
+                }
+                if recovery {
+                    let (tx, _rx) = mpsc::channel(16);
+                    let snapshot = RunnerSnapshot {
+                        present: HashSet::new(),
+                        running_ids: HashSet::new(),
+                        running_count: 0,
+                        main_running: false,
+                    };
+                    let inflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
+                    scheduler_pass(
+                        None,
+                        &store,
+                        &tx,
+                        &snapshot,
+                        0,
+                        &mut HashMap::new(),
+                        &inflight,
+                    )
+                    .await;
+                } else {
+                    on_worker_settled(&store, worker.id, output, Some(reason), complete).await;
+                }
+                let tasks = store.list_board_tasks(boss.id).await.unwrap();
+                let saved = tasks.iter().find(|t| t.id == task.id).unwrap();
+                let expected = if !complete || output.starts_with("BLOCKED") {
+                    BoardTaskOutcome::Blocked
+                } else if output.is_empty() {
+                    BoardTaskOutcome::Failed
+                } else {
+                    BoardTaskOutcome::Success
+                };
+                // Empty complete output follows the existing failed/retry policy.
+                if complete && output.is_empty() {
+                    assert_eq!(saved.status, BoardTaskStatus::Pending);
+                    assert_eq!(saved.prior_outcome, Some(expected));
+                } else {
+                    assert_eq!(
+                        saved.status,
+                        BoardTaskStatus::Settled,
+                        "{native_status} {output:?}, recovery={recovery}"
+                    );
+                    assert_eq!(saved.outcome, Some(expected));
+                    assert_eq!(saved.worker_mission_id, Some(worker.id));
+                    assert_eq!(
+                        saved.result_digest.as_deref(),
+                        Some(digest_excerpt(output).as_str())
+                    );
+                }
+                assert_eq!(saved.attempts, 1);
+                assert_eq!(
+                    ready_tasks(&tasks)
+                        .iter()
+                        .any(|t| t.task_key == "dependent"),
+                    expected == BoardTaskOutcome::Success
+                );
+                // A duplicate late live notification cannot override settlement.
+                if expected == BoardTaskOutcome::Blocked {
+                    on_worker_settled(
+                        &store,
+                        worker.id,
+                        "Fixed everything.",
+                        Some(TerminalReason::Completed),
+                        true,
+                    )
+                    .await;
+                    assert_eq!(
+                        store
+                            .get_board_task_by_worker(worker.id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .outcome,
+                        Some(BoardTaskOutcome::Blocked)
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_goal_live_board_settlement_gates_dependents() {
+        native_goal_board_matrix(false).await;
+    }
+
+    #[tokio::test]
+    async fn native_goal_recovery_board_settlement_gates_dependents() {
+        native_goal_board_matrix(true).await;
+    }
+
+    #[test]
+    fn native_goal_stop_overrides_prose_and_success_flag() {
+        for success in [false, true] {
+            for output in [
+                "Fixed the parser; external validation unavailable.",
+                "",
+                "BLOCKED: unavailable",
+                "Error: unavailable",
+            ] {
+                assert_eq!(
+                    classify_outcome(Some(TerminalReason::NativeGoalStopped), success, output),
+                    BoardTaskOutcome::Blocked
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn durable_delivery_stays_pending_until_actor_acknowledges() {

@@ -396,6 +396,39 @@ impl MissionStore for FileMissionStore {
             .await
     }
 
+    async fn restore_mission_status(
+        &self,
+        id: Uuid,
+        snapshot: &super::MissionStatusSnapshot,
+    ) -> Result<(), String> {
+        let _persist = self.persist_lock.lock().await;
+        let mut missions = self.missions.write().await;
+        let mut next = missions.clone();
+        let mission = next
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission {id} not found"))?;
+        if mission.status != MissionStatus::Active && mission.status != snapshot.status {
+            return Err("mission status changed during rejected activation".into());
+        }
+        snapshot.restore(mission);
+        let snapshot = MissionStoreSnapshot {
+            missions: next.clone(),
+            trees: self.trees.read().await.clone(),
+            runs: self.runs.read().await.clone(),
+            deferred_goals: self.deferred_goals.read().await.clone(),
+        };
+        let data = serde_json::to_vec_pretty(&snapshot).map_err(|e| e.to_string())?;
+        let tmp_path = self.path.with_extension("json.tmp");
+        fs::write(&tmp_path, data)
+            .await
+            .map_err(|e| e.to_string())?;
+        fs::rename(&tmp_path, &self.path)
+            .await
+            .map_err(|e| e.to_string())?;
+        *missions = next;
+        Ok(())
+    }
+
     async fn set_terminal_evidence(&self, id: Uuid, evidence: &str) -> Result<(), String> {
         let mut missions = self.missions.write().await;
         let mission = missions
@@ -678,10 +711,15 @@ impl MissionStore for FileMissionStore {
         if patch.is_empty() {
             return Ok(());
         }
+        let _persist = self.persist_lock.lock().await;
         let mut missions = self.missions.write().await;
-        let mission = missions
+        let mut next = missions.clone();
+        let mission = next
             .get_mut(&id)
             .ok_or_else(|| format!("Mission {} not found", id))?;
+        if let Some(title) = patch.title {
+            mission.title = title;
+        }
         if let Some(project) = patch.project {
             mission.project.project = project;
         }
@@ -697,15 +735,34 @@ impl MissionStore for FileMissionStore {
         if let Some(tags) = patch.tags {
             mission.project.tags = tags;
         }
+        if let Some(delta) = patch.tag_patch {
+            delta.apply(&mut mission.project.tags);
+        }
         if let Some(desired_state) = patch.desired_state {
             mission.project.desired_state = desired_state;
         }
         if let Some(next_check_at) = patch.next_check_at {
             mission.project.next_check_at = next_check_at;
         }
-        mission.updated_at = now_string();
-        drop(missions);
-        self.persist().await
+        if !patch.preserve_updated_at {
+            mission.updated_at = now_string();
+        }
+        let snapshot = MissionStoreSnapshot {
+            missions: next.clone(),
+            trees: self.trees.read().await.clone(),
+            runs: self.runs.read().await.clone(),
+            deferred_goals: self.deferred_goals.read().await.clone(),
+        };
+        let data = serde_json::to_vec_pretty(&snapshot).map_err(|e| e.to_string())?;
+        let tmp_path = self.path.with_extension("json.tmp");
+        fs::write(&tmp_path, data)
+            .await
+            .map_err(|e| e.to_string())?;
+        fs::rename(&tmp_path, &self.path)
+            .await
+            .map_err(|e| e.to_string())?;
+        *missions = next;
+        Ok(())
     }
 
     async fn set_mission_awaiting_kind(
@@ -898,6 +955,42 @@ impl MissionStore for FileMissionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn assignment_write_failure_preserves_memory_and_disk_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileMissionStore::new(dir.path().to_path_buf(), "assignment")
+            .await
+            .unwrap();
+        let mission = store
+            .create_mission(Some("Original"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        fs::create_dir(store.path.with_extension("json.tmp"))
+            .await
+            .unwrap();
+        let error = store
+            .update_mission_project(
+                mission.id,
+                super::super::MissionProjectPatch {
+                    title: Some(Some("Changed".into())),
+                    track: Some(Some("changed".into())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.is_empty());
+        let current = store.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(current.title, mission.title);
+        assert_eq!(current.project, mission.project);
+        let reopened = FileMissionStore::new(dir.path().to_path_buf(), "assignment")
+            .await
+            .unwrap();
+        let current = reopened.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(current.title, mission.title);
+        assert_eq!(current.project, mission.project);
+    }
 
     #[tokio::test]
     async fn update_mission_metadata_is_noop_when_fields_missing() {

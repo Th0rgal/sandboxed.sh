@@ -121,7 +121,9 @@ fn failure_class_for_terminal_reason(reason: TerminalReason) -> FailureClass {
         TerminalReason::Stalled | TerminalReason::InfiniteLoop | TerminalReason::MaxIterations => {
             FailureClass::AgentError
         }
-        TerminalReason::Cancelled | TerminalReason::ServerShutdown => FailureClass::AgentError,
+        TerminalReason::Cancelled
+        | TerminalReason::ServerShutdown
+        | TerminalReason::NativeGoalStopped => FailureClass::AgentError,
         TerminalReason::LlmError => FailureClass::ProviderError,
         TerminalReason::TurnComplete | TerminalReason::Completed => FailureClass::Unknown,
     }
@@ -164,7 +166,9 @@ pub(crate) fn turn_outcome_for_result(
         let reason = result.terminal_reason.unwrap_or(TerminalReason::LlmError);
         if matches!(
             reason,
-            TerminalReason::Cancelled | TerminalReason::ServerShutdown
+            TerminalReason::Cancelled
+                | TerminalReason::ServerShutdown
+                | TerminalReason::NativeGoalStopped
         ) {
             interrupted_turn_outcome(reason)
         } else {
@@ -2703,6 +2707,8 @@ pub struct MissionRunner {
     /// JoinHandle here, so the deadline must travel with the runner rather than
     /// only being tracked by the control actor's main-runner state.
     cancellation_force_clear_deadline: Option<Instant>,
+    /// Abort is a request, not proof that the task has stopped.
+    force_abort_requested: bool,
 }
 
 const RUNNER_FORCE_CLEAR_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
@@ -2752,6 +2758,7 @@ impl MissionRunner {
             durable_run: None,
             cancellation_requested: false,
             cancellation_force_clear_deadline: None,
+            force_abort_requested: false,
         }
     }
 
@@ -2931,6 +2938,23 @@ impl MissionRunner {
     /// force-killed: that is the cancel-timeout drain race that turned
     /// Lido's same writer into a "CAMPAGNE RELANCÉE" every ~30 minutes.
     pub fn force_clear_cancelled_if_due(&mut self) -> bool {
+        if self.force_abort_requested {
+            if self
+                .running_handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished())
+            {
+                return false;
+            }
+            self.running_handle = None;
+            self.cancel_token = None;
+            self.inflight_message = None;
+            self.reset_turn_tool_calls();
+            self.state = MissionRunState::Finished;
+            self.cancellation_force_clear_deadline = None;
+            self.force_abort_requested = false;
+            return true;
+        }
         if !self.cancellation_requested
             || self
                 .cancellation_force_clear_deadline
@@ -2953,15 +2977,14 @@ impl MissionRunner {
             return false;
         }
 
-        if let Some(handle) = self.running_handle.take() {
+        if let Some(handle) = self.running_handle.as_ref() {
             handle.abort();
         }
-        self.cancel_token = None;
-        self.inflight_message = None;
-        self.reset_turn_tool_calls();
-        self.state = MissionRunState::Finished;
-        self.cancellation_force_clear_deadline = None;
-        true
+        // Keep the runner, durable run, and assignment registered until the
+        // abort has actually completed. A task in synchronous work can still
+        // mutate its old assignment after abort() returns.
+        self.force_abort_requested = true;
+        false
     }
 
     pub fn inflight_message(&self) -> Option<&QueuedMessage> {
@@ -3155,7 +3178,10 @@ impl MissionRunner {
                     // produced no output", "OpenCode CLI exited with status: ...")
                     // would contaminate context for future turns.
                     self.history.push(("user".to_string(), result.1.clone()));
-                    if result.2.success && !result.2.output.trim().is_empty() {
+                    if (result.2.success
+                        || result.2.terminal_reason == Some(TerminalReason::NativeGoalStopped))
+                        && !result.2.output.trim().is_empty()
+                    {
                         self.history
                             .push(("assistant".to_string(), result.2.output.clone()));
                     }
@@ -3496,6 +3522,17 @@ async fn run_mission_turn(
     boss_user_id: Option<String>,
     pr_readonly: bool,
 ) -> AgentResult {
+    #[cfg(test)]
+    if let Some(result) = super::control::dispatch_admission_tests::native_goal_fixture(
+        mission_id,
+        &user_message,
+        events_tx.clone(),
+        cancel.clone(),
+    )
+    .await
+    {
+        return result;
+    }
     let mut config = config;
     // Operator-note bridge: flush any pending Ask-assistant writes into this
     // turn's message so the working agent learns about out-of-band edits it
@@ -13370,10 +13407,64 @@ mod tests {
         // not keep a truly stuck handle alive.
         runner.last_activity = std::time::Instant::now() - std::time::Duration::from_secs(120);
 
+        assert!(!runner.force_clear_cancelled_if_due());
+        assert!(runner.running_handle.is_some());
+        while !runner.check_finished() {
+            tokio::task::yield_now().await;
+        }
         assert!(runner.force_clear_cancelled_if_due());
         assert!(runner.running_handle.is_none());
         assert!(matches!(runner.state, MissionRunState::Finished));
         assert!(!runner.force_clear_cancelled_if_due());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_request_keeps_assignment_runner_until_synchronous_work_stops() {
+        let mut runner = MissionRunner::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            None,
+            Some("codex".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let old_work = barrier.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        runner.state = MissionRunState::Running;
+        runner.running_handle = Some(tokio::spawn(async move {
+            entered_tx.send(()).unwrap();
+            // Model a tool doing synchronous work: abort cannot stop it until
+            // it returns to the executor. No timing sleeps establish order.
+            old_work.wait();
+            (
+                Uuid::new_v4(),
+                String::new(),
+                AgentResult::failure("stopped", 0),
+            )
+        }));
+        entered_rx.await.unwrap();
+        runner.cancel();
+        runner.last_activity = std::time::Instant::now() - std::time::Duration::from_secs(120);
+        runner.cancellation_force_clear_deadline = Some(std::time::Instant::now());
+        assert!(!runner.force_clear_cancelled_if_due());
+        assert!(runner.is_running());
+        assert!(!runner.check_finished());
+        assert!(!runner.force_clear_cancelled_if_due());
+        barrier.wait();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !runner.check_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(runner.force_clear_cancelled_if_due());
+        assert!(runner.is_finished());
+        assert!(runner.running_handle.is_none());
     }
 
     #[tokio::test]

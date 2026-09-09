@@ -1055,6 +1055,36 @@ impl SqliteMissionStore {
         })
     }
 
+    /// Open only an existing store for admission recovery. The caller holds
+    /// the durable admission lock; this never creates a store or actor and
+    /// never runs migrations while locating the owner of a pending receipt.
+    pub(crate) async fn open_for_admission_recovery(path: PathBuf) -> Result<Self, String> {
+        let user = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("missions-"))
+            .ok_or_else(|| "invalid mission database path".to_string())?;
+        let content_dir = path
+            .parent()
+            .ok_or_else(|| "missing mission database directory".to_string())?
+            .join("mission_data")
+            .join(user);
+        let conn = tokio::task::spawn_blocking(move || {
+            let conn =
+                Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+                    .map_err(|e| e.to_string())?;
+            conn.busy_timeout(std::time::Duration::from_secs(10))
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>(conn)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            content_dir,
+        })
+    }
+
     /// Test-only: force-set a mission's `updated_at` and (if any) the timestamp
     /// of every persisted event for that mission. Lets tests exercise the
     /// stale-cleanup path with deterministic clock values without sleeping or
@@ -3169,6 +3199,50 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn restore_mission_status(
+        &self,
+        id: Uuid,
+        snapshot: &super::MissionStatusSnapshot,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let snapshot = snapshot.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+            let changed = tx
+                .execute(
+                    "UPDATE missions SET status=?2, interrupted_at=?3, paused_at=?4, resumable=?5,
+                 terminal_reason=?6, first_viewed_at=?7, awaiting_kind=?8,
+                 last_status_change_at=?9 WHERE id=?1 AND (status='active' OR status=?2)",
+                    params![
+                        id.to_string(),
+                        status_to_string(snapshot.status),
+                        snapshot.interrupted_at,
+                        snapshot.paused_at,
+                        snapshot.resumable,
+                        snapshot.terminal_reason,
+                        snapshot.first_viewed_at,
+                        snapshot.awaiting_kind.map(|kind| kind.as_str().to_string()),
+                        snapshot.last_status_change_at
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            if changed != 1 {
+                return Err("mission status changed during rejected activation".into());
+            }
+            // Evidence uses a side table, not a positional missions column.
+            if let Some(evidence) = snapshot.terminal_evidence {
+                tx.execute("INSERT INTO mission_terminal_evidence(mission_id, evidence, recorded_at) VALUES (?1, ?2, ?3)
+                    ON CONFLICT(mission_id) DO UPDATE SET evidence=excluded.evidence", params![id.to_string(), evidence, now_string()]).map_err(|e| e.to_string())?;
+            } else {
+                tx.execute("DELETE FROM mission_terminal_evidence WHERE mission_id=?1", params![id.to_string()]).map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn set_terminal_evidence(&self, id: Uuid, evidence: &str) -> Result<(), String> {
         let conn = self.conn.clone();
         let id_str = id.to_string();
@@ -4400,24 +4474,44 @@ impl MissionStore for SqliteMissionStore {
 
         let conn = self.conn.clone();
         let now = now_string();
+        let title_set = patch.title.is_some();
+        let title = patch.title.flatten();
         let project_set = patch.project.is_some();
         let track_set = patch.track.is_some();
         let intent_set = patch.intent.is_some();
         let github_pr_set = patch.github_pr.is_some();
-        let tags_set = patch.tags.is_some();
+        let tags_set = patch.tags.is_some() || patch.tag_patch.is_some();
         let desired_state_set = patch.desired_state.is_some();
         let next_check_at_set = patch.next_check_at.is_some();
         let project = patch.project.flatten();
         let track = patch.track.flatten();
         let intent = patch.intent.flatten();
         let github_pr = patch.github_pr.flatten();
-        let tags_json = patch.tags.as_deref().and_then(tags_to_json);
+        let mut tags_json = patch.tags.as_deref().and_then(tags_to_json);
         let desired_state = patch.desired_state.flatten();
         let next_check_at = patch.next_check_at.flatten();
 
         tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            conn.execute(
+            let mut conn = conn.blocking_lock();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+            if let Some(delta) = patch.tag_patch {
+                let raw: Option<String> = tx
+                    .query_row(
+                        "SELECT tags FROM missions WHERE id=?1",
+                        params![id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let mut tags: Vec<String> = match tags_json.as_ref().or(raw.as_ref()) {
+                    Some(raw) => serde_json::from_str(raw).map_err(|e| e.to_string())?,
+                    None => Vec::new(),
+                };
+                delta.apply(&mut tags);
+                tags_json = tags_to_json(&tags);
+            }
+            tx.execute(
                 "UPDATE missions
                  SET project = CASE WHEN ?1 THEN ?2 ELSE project END,
                      track = CASE WHEN ?3 THEN ?4 ELSE track END,
@@ -4426,7 +4520,8 @@ impl MissionStore for SqliteMissionStore {
                      tags = CASE WHEN ?9 THEN ?10 ELSE tags END,
                      desired_state = CASE WHEN ?11 THEN ?12 ELSE desired_state END,
                      next_check_at = CASE WHEN ?13 THEN ?14 ELSE next_check_at END,
-                     updated_at = ?15
+                     updated_at = CASE WHEN ?19 THEN updated_at ELSE ?15 END,
+                     title = CASE WHEN ?17 THEN ?18 ELSE title END
                  WHERE id = ?16",
                 params![
                     project_set,
@@ -4445,10 +4540,13 @@ impl MissionStore for SqliteMissionStore {
                     next_check_at,
                     now,
                     id.to_string(),
+                    title_set,
+                    title,
+                    patch.preserve_updated_at,
                 ],
             )
             .map_err(|e| e.to_string())?;
-            Ok(())
+            tx.commit().map_err(|e| e.to_string())
         })
         .await
         .map_err(|e| e.to_string())?
@@ -13372,6 +13470,9 @@ mod tests {
             .update_mission_project(
                 mission.id,
                 MissionProjectPatch {
+                    preserve_updated_at: false,
+                    tag_patch: None,
+                    title: None,
                     project: Some(Some("verity-core".to_string())),
                     track: Some(Some("C3-bridge-collapse".to_string())),
                     intent: Some(Some("review_merge_pr".to_string())),
@@ -16314,6 +16415,9 @@ mod tests {
             .expect("store");
 
         let tag = |project: &str| MissionProjectPatch {
+            preserve_updated_at: false,
+            tag_patch: None,
+            title: None,
             project: Some(Some(project.to_string())),
             track: None,
             intent: None,
