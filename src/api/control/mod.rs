@@ -17968,6 +17968,100 @@ fn is_transport_failure_evidence(evidence: &crate::agents::CompletionEvidence) -
     )
 }
 
+fn is_grok_acp_transport_failure(result: &crate::agents::AgentResult) -> bool {
+    result
+        .data
+        .as_ref()
+        .and_then(|data| data.get("grok_acp_transport_failure"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+const GROK_TRANSPORT_RECOVERY_RESERVED: &str = "Grok ACP transport recovery reserved (1/1 for this mission). Reconcile the existing checkout and jobs before continuing; automatic recovery will not repeat.";
+
+async fn grok_transport_recovery_was_reserved(
+    store: &dyn MissionStore,
+    mission_id: Uuid,
+) -> Result<bool, String> {
+    // Page only messages/errors, not a bounded tail that could forget an old
+    // attempt. Include legacy recovery messages when upgrading an actor.
+    let mut offset = 0;
+    loop {
+        let events = store
+            .get_events(
+                mission_id,
+                Some(&["user_message", "error"]),
+                Some(100),
+                Some(offset),
+            )
+            .await?;
+        if events.iter().any(|event| {
+            (event.event_type == "error" && event.content == GROK_TRANSPORT_RECOVERY_RESERVED)
+                || (event.event_type == "user_message"
+                    && event.metadata.get("source").and_then(|v| v.as_str())
+                        == Some("transport_auto_resume"))
+        }) {
+            return Ok(true);
+        }
+        if events.len() < 100 {
+            return Ok(false);
+        }
+        offset += events.len();
+    }
+}
+
+/// Shared by the serial and parallel completion paths in the single control
+/// actor. Grok gets one recovery per mission, deliberately stricter than a
+/// budget reset at each new checkpoint. Persist the reservation before queueing
+/// so an actor restart (or a crash between reservation and queueing) cannot
+/// replay the same incident. Other backends retain their existing three tries.
+async fn reserve_transport_auto_resume(
+    store: &dyn MissionStore,
+    attempts: &mut HashMap<Uuid, u8>,
+    mission_id: Uuid,
+    grok_acp: bool,
+) -> bool {
+    let count = attempts.entry(mission_id).or_insert(0);
+    if *count >= if grok_acp { 1 } else { 3 } {
+        return false;
+    }
+    *count += 1;
+    if !grok_acp {
+        return true;
+    }
+
+    let reserve = async {
+        if grok_transport_recovery_was_reserved(store, mission_id).await? {
+            return Ok(false);
+        }
+        // Queued UserMessage events intentionally are not persisted. Record
+        // the reservation as an error diagnostic instead of falsely claiming
+        // that a recovery message has already started executing.
+        store
+            .log_event(
+                mission_id,
+                &AgentEvent::Error {
+                    message: GROK_TRANSPORT_RECOVERY_RESERVED.to_string(),
+                    mission_id: Some(mission_id),
+                    resumable: true,
+                },
+            )
+            .await?;
+        if !grok_transport_recovery_was_reserved(store, mission_id).await? {
+            return Err("mission store did not persist the Grok recovery reservation".to_string());
+        }
+        Ok(true)
+    }
+    .await;
+    match reserve {
+        Ok(reserved) => reserved,
+        Err(error) => {
+            tracing::warn!(%mission_id, %error, "Grok transport recovery withheld: durable budget unavailable");
+            false
+        }
+    }
+}
+
 const TRANSPORT_AUTO_RESUME_PROMPT: &str = "The previous turn ended because its provider transport disconnected. Reconcile the current workspace, remote jobs, and repository head, then resume the same task. Do not duplicate an accepted job or create a replacement writer.";
 
 const CHATGPT_UI_TRANSPORT_FALLBACK_PROMPT: &str = "The previous ChatGPT UI turn failed to start. Repeat the original user request exactly. Do not reconcile git, PRs, Lean, remote jobs, or repository head.";
@@ -18818,7 +18912,6 @@ async fn control_actor_loop(
     // quota/capacity, source failures, stalls, and loops are deliberately not
     // eligible. Writer leases are re-acquired by the normal start path.
     let mut transport_auto_resumed_missions: HashMap<Uuid, u8> = HashMap::new();
-    const TRANSPORT_AUTO_RESUME_MAX: u8 = 3;
     // Track subtasks for the main runner
     let mut main_runner_subtasks: Vec<super::mission_runner::SubtaskInfo> = Vec::new();
     // Track number of in-flight tool calls on the main runner so the stall
@@ -22499,6 +22592,7 @@ async fn control_actor_loop(
                     let mut completed_terminal_evidence = None;
                     let mut completed_completion_confidence = None;
                     let mut completed_transport_failure = false;
+                    let mut completed_grok_acp_transport_failure = false;
                     let mut completed_waiting_remote_job = false;
                     // Captured for the post-turn `grok_goal` sentinel hook (see
                     // `post_turn_handle_grok_goal`), which runs after this
@@ -22516,6 +22610,8 @@ async fn control_actor_loop(
                                 Some(completion_evidence.completion_confidence);
                             completed_transport_failure =
                                 is_transport_failure_evidence(&completion_evidence);
+                            completed_grok_acp_transport_failure =
+                                is_grok_acp_transport_failure(&agent_result);
                             completed_agent_output = agent_result.output.clone();
                             if let Some(run) = running_run.take() {
                                 completed_waiting_remote_job =
@@ -22815,16 +22911,13 @@ async fn control_actor_loop(
                     if !completed_waiting_remote_job {
                         if let Some(mission_id) = completed_mission_id {
                         if completed_transport_failure
-                            && {
-                                let count = transport_auto_resumed_missions
-                                    .entry(mission_id)
-                                    .or_insert(0);
-                                *count < TRANSPORT_AUTO_RESUME_MAX && {
-                                    *count += 1;
-                                    true
-                                }
-                            }
                             && !queue_has_pending_target_mission(&queue, mission_id)
+                            && reserve_transport_auto_resume(
+                                mission_store.as_ref(),
+                                &mut transport_auto_resumed_missions,
+                                mission_id,
+                                completed_grok_acp_transport_failure,
+                            ).await
                         {
                             let resume_message = transport_auto_resume_message_for_mission(
                                 mission_store.as_ref(),
@@ -23425,15 +23518,12 @@ async fn control_actor_loop(
                                 && is_transport_failure_evidence(&completion_evidence)
                                 && !cancellation_requested
                                 && was_queue_empty
-                                && {
-                                    let count = transport_auto_resumed_missions
-                                        .entry(*mission_id)
-                                        .or_insert(0);
-                                    *count < TRANSPORT_AUTO_RESUME_MAX && {
-                                        *count += 1;
-                                        true
-                                    }
-                                }
+                                && reserve_transport_auto_resume(
+                                    mission_store.as_ref(),
+                                    &mut transport_auto_resumed_missions,
+                                    *mission_id,
+                                    is_grok_acp_transport_failure(&result),
+                                ).await
                             {
                                 tracing::info!(
                                     mission_id = %mission_id,
@@ -34079,6 +34169,131 @@ Investigate <service/> failures.
         ));
         assert!(!is_transport_failure_evidence(
             &completion_evidence_for_agent_result(&auth)
+        ));
+    }
+
+    #[tokio::test]
+    async fn grok_transport_recovery_budget_survives_restart_and_event_pagination() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "grok-retry")
+            .await
+            .unwrap();
+        let mission = store
+            .create_mission(
+                Some("grok retry"),
+                None,
+                None,
+                None,
+                None,
+                Some("grok"),
+                None,
+            )
+            .await
+            .unwrap();
+        // The reservation must be found beyond an arbitrary first page.
+        for _ in 0..110 {
+            store
+                .log_event(
+                    mission.id,
+                    &AgentEvent::UserMessage {
+                        id: Uuid::new_v4(),
+                        content: "checkpoint".to_string(),
+                        queued: false,
+                        mission_id: Some(mission.id),
+                        source: Some("api:test".to_string()),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let mut attempts = HashMap::new();
+        assert!(reserve_transport_auto_resume(&store, &mut attempts, mission.id, true).await);
+        assert!(!reserve_transport_auto_resume(&store, &mut attempts, mission.id, true).await);
+        drop(store);
+        let reopened =
+            mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "grok-retry")
+                .await
+                .unwrap();
+        let mut restarted_actor = HashMap::new();
+        assert!(
+            !reserve_transport_auto_resume(&reopened, &mut restarted_actor, mission.id, true).await
+        );
+        let reservations = reopened
+            .get_events(mission.id, Some(&["error"]), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            reservations.len(),
+            1,
+            "serial/parallel retries must share one durable reservation"
+        );
+        assert_eq!(reservations[0].content, GROK_TRANSPORT_RECOVERY_RESERVED);
+    }
+
+    #[tokio::test]
+    async fn grok_transport_recovery_gate_fails_closed_without_changing_other_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "grok-retry")
+            .await
+            .unwrap();
+        let mission = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("missions-grok-retry.db")).unwrap();
+        db.execute("DROP TABLE mission_events", []).unwrap();
+        let mut attempts = HashMap::new();
+        assert!(!reserve_transport_auto_resume(&store, &mut attempts, mission.id, true).await);
+        let other = Uuid::new_v4();
+        for _ in 0..3 {
+            assert!(reserve_transport_auto_resume(&store, &mut attempts, other, false).await);
+        }
+        assert!(!reserve_transport_auto_resume(&store, &mut attempts, other, false).await);
+    }
+
+    #[tokio::test]
+    async fn grok_transport_recovery_respects_preexisting_recovery_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "grok-retry")
+            .await
+            .unwrap();
+        let mission = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::UserMessage {
+                    id: Uuid::new_v4(),
+                    content: "prior recovery".to_string(),
+                    queued: false,
+                    mission_id: Some(mission.id),
+                    source: Some("transport_auto_resume".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !reserve_transport_auto_resume(&store, &mut HashMap::new(), mission.id, true).await
+        );
+    }
+
+    #[test]
+    fn grok_transport_timeout_cannot_be_promoted_to_success() {
+        let mut result = crate::agents::AgentResult::failure("Grok ACP transport-idle timeout after 600s without a protocol event; checkout preserved", 0)
+            .with_terminal_reason(TerminalReason::LlmError)
+            .with_data(serde_json::json!({
+                "failure_class": "transport_error",
+                "transport_failure_stage": "grok_acp_transport_idle",
+                "grok_acp_transport_failure": true,
+            }));
+        maybe_recover_soft_llm_error(&mut result);
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+        assert!(is_grok_acp_transport_failure(&result));
+        assert!(is_transport_failure_evidence(
+            &completion_evidence_for_agent_result(&result)
         ));
     }
 
