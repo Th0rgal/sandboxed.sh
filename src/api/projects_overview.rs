@@ -628,15 +628,15 @@ pub async fn get_project(
     let requested = slug;
     let resolved = resolve_roster_slug(&state.projects, &requested).map_err(store_err)?;
     let lookup = resolved.as_deref().unwrap_or(&requested).to_string();
-    let missions = match state
+    let (missions, missions_available) = match state
         .control
         .collect_attention_missions_for_project(&lookup)
         .await
     {
-        Ok(missions) => missions,
+        Ok(missions) => (missions, true),
         Err(error) => {
             tracing::warn!(project = %lookup, %error, "get_project: attention collect failed");
-            Vec::new()
+            (Vec::new(), false)
         }
     };
     let slug = match resolved {
@@ -685,20 +685,11 @@ pub async fn get_project(
     ) {
         project.next_action = Some(derived);
     }
-    let has_live = missions
-        .iter()
-        .any(|mission| super::controller_honesty::is_live_writer_status(mission.status));
-    let needs_operator = missions.iter().any(|mission| {
-        mission.awaiting_kind.is_some()
-            && matches!(
-                mission.status,
-                crate::api::control::events::MissionStatus::AwaitingUser
-            )
-    });
-    project.mode = honest_controller_mode(
+    let waiting_user_waits = state.control.collect_waiting_user_waits().await;
+    project.mode = project_mode_from_missions(
         project.mode.as_deref(),
-        has_live,
-        needs_operator,
+        missions_available.then_some(missions.as_slice()),
+        &waiting_user_waits,
         decisions.len() as u32,
     );
     Ok(Json(serde_json::json!({
@@ -2816,7 +2807,42 @@ pub(crate) fn honest_controller_mode(
     if pending_decisions > 0 || needs_operator {
         return Some("blocked:decision".to_string());
     }
+    // A prior decision block is a derived state, not a durable pause. Once
+    // its evidence disappears, clear it rather than making the controller
+    // wait for a decision that no longer exists. Other blockers remain intact.
+    if store_mode.is_some_and(|mode| mode.eq_ignore_ascii_case("blocked:decision")) {
+        return None;
+    }
     store_mode.map(str::to_string)
+}
+
+/// Use the same qualified mission attention as the board, including live
+/// AskUserQuestion waits. A completed report awaiting ACK is not a decision.
+fn project_mode_from_missions(
+    store_mode: Option<&str>,
+    missions: Option<&[Mission]>,
+    waiting_user_waits: &HashMap<uuid::Uuid, Option<String>>,
+    pending_decisions: u32,
+) -> Option<String> {
+    // A failed collection is unknown evidence, not an empty roster. Preserve
+    // the last mode until a successful read can establish that a wait ended.
+    let Some(missions) = missions else {
+        return store_mode.map(str::to_string);
+    };
+    let has_live = missions
+        .iter()
+        .any(|mission| super::controller_honesty::is_live_writer_status(mission.status));
+    let needs_operator = missions.iter().any(|mission| {
+        mission_chip(
+            mission,
+            waiting_user_waits.contains_key(&mission.id),
+            waiting_user_waits
+                .get(&mission.id)
+                .and_then(|started| started.as_deref()),
+        )
+        .needs_operator
+    });
+    honest_controller_mode(store_mode, has_live, needs_operator, pending_decisions)
 }
 
 struct ProjectRowBuilder {
@@ -3002,7 +3028,7 @@ impl ProjectRowBuilder {
         let has_live_mission = self
             .missions
             .iter()
-            .any(|chip| !chip.status.is_terminal() && chip.status != MissionStatus::Acknowledged);
+            .any(|chip| super::controller_honesty::is_live_writer_status(chip.status));
         // Live work and parked decisions beat the last CTRL trailer. A
         // writer already running is `active` even if the last cron said
         // `blocked:cannot-merge`; a pending question with no writer is
@@ -5346,6 +5372,122 @@ mod tests {
         assert_eq!(
             honest_controller_mode(Some("active"), true, false, 0).as_deref(),
             Some("active")
+        );
+    }
+
+    #[test]
+    fn project_detail_and_board_agree_on_ack_decision_and_live_waits() {
+        let now = chrono::Utc::now();
+        let old = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let fresh = now.to_rfc3339();
+        for (kind, origin, timestamp, live_wait, expected) in [
+            ("ack", Some("hermes-session"), old.as_str(), false, None),
+            (
+                "decision",
+                None,
+                old.as_str(),
+                false,
+                Some("blocked:decision"),
+            ),
+            (
+                "decision",
+                Some("hermes-session"),
+                fresh.as_str(),
+                false,
+                None,
+            ),
+            (
+                "decision",
+                Some("hermes-session"),
+                old.as_str(),
+                false,
+                Some("blocked:decision"),
+            ),
+            ("ack", None, old.as_str(), true, Some("blocked:decision")),
+        ] {
+            let mission: Mission = serde_json::from_value(serde_json::json!({
+                "id": uuid::Uuid::new_v4(), "status": if live_wait { "active" } else { "awaiting_user" },
+                "history": [], "created_at": timestamp, "updated_at": timestamp,
+                "last_status_change_at": timestamp,
+                "awaiting_kind": kind, "origin_session_id": origin,
+            }))
+            .unwrap();
+            let mut waits = HashMap::new();
+            if live_wait {
+                waits.insert(mission.id, Some(timestamp.to_string()));
+            }
+            let mut board = ProjectRowBuilder::new("verity".into());
+            board.mode = Some("blocked:decision".into());
+            board.missions.push(mission_chip(
+                &mission,
+                live_wait,
+                live_wait.then_some(timestamp),
+            ));
+            let detail = project_mode_from_missions(
+                Some("blocked:decision"),
+                Some(std::slice::from_ref(&mission)),
+                &waits,
+                0,
+            );
+            assert_eq!(
+                detail.as_deref(),
+                expected,
+                "kind={kind}, origin={origin:?}"
+            );
+            assert_eq!(board.finish(&[], None, None, &fresh).mode, detail);
+            if kind == "ack" && !live_wait {
+                let mut active = mission.clone();
+                active.id = uuid::Uuid::new_v4();
+                active.status = MissionStatus::Active;
+                active.awaiting_kind = None;
+                let mut board = ProjectRowBuilder::new("verity".into());
+                board.mode = Some("blocked:decision".into());
+                board.missions.push(mission_chip(&mission, false, None));
+                board.missions.push(mission_chip(&active, false, None));
+                let detail = project_mode_from_missions(
+                    Some("blocked:decision"),
+                    Some(&[mission, active]),
+                    &waits,
+                    0,
+                );
+                assert_eq!(detail.as_deref(), Some("active"));
+                assert_eq!(board.finish(&[], None, None, &fresh).mode, detail);
+            }
+        }
+    }
+
+    #[test]
+    fn expired_decision_mode_clears_without_changing_pauses_or_other_blockers() {
+        assert_eq!(
+            project_mode_from_missions(Some("blocked:decision"), None, &HashMap::new(), 0)
+                .as_deref(),
+            Some("blocked:decision"),
+            "unavailable mission evidence cannot clear a real question"
+        );
+        assert_eq!(
+            project_mode_from_missions(Some("blocked:decision"), Some(&[]), &HashMap::new(), 0),
+            None,
+            "a successful empty roster can clear stale decision state"
+        );
+        assert_eq!(
+            honest_controller_mode(Some("blocked:decision"), false, false, 0),
+            None
+        );
+        assert_eq!(
+            honest_controller_mode(Some("blocked:decision"), true, false, 0).as_deref(),
+            Some("active")
+        );
+        assert_eq!(
+            honest_controller_mode(Some("paused:owner"), false, false, 0).as_deref(),
+            Some("paused:owner")
+        );
+        assert_eq!(
+            honest_controller_mode(Some("blocked:decision"), false, false, 1).as_deref(),
+            Some("blocked:decision")
+        );
+        assert_eq!(
+            honest_controller_mode(Some("blocked:transport-cap"), false, false, 0).as_deref(),
+            Some("blocked:transport-cap")
         );
     }
 
