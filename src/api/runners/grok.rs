@@ -1130,6 +1130,101 @@ struct GrokAcpToolCall {
     name: String,
     latest_update: serde_json::Value,
     result_emitted: bool,
+    started_at: Option<tokio::time::Instant>,
+    deadline: Option<tokio::time::Instant>,
+    in_progress: bool,
+}
+
+#[derive(Clone, Copy)]
+struct GrokAcpIdlePolicy {
+    diagnostic: std::time::Duration,
+    transport: std::time::Duration,
+    tool_grace: std::time::Duration,
+    shutdown: std::time::Duration,
+}
+
+impl Default for GrokAcpIdlePolicy {
+    fn default() -> Self {
+        Self {
+            diagnostic: std::time::Duration::from_secs(180),
+            transport: std::time::Duration::from_secs(600),
+            tool_grace: std::time::Duration::from_secs(30),
+            shutdown: std::time::Duration::from_secs(10),
+        }
+    }
+}
+
+impl GrokAcpToolCall {
+    fn observe(
+        &mut self,
+        update: &serde_json::Value,
+        now: tokio::time::Instant,
+        policy: GrokAcpIdlePolicy,
+    ) {
+        // ACP updates are partial. In particular, the in_progress update can
+        // omit the rawInput supplied with the original pending tool call.
+        if let (Some(current), Some(delta)) =
+            (self.latest_update.as_object_mut(), update.as_object())
+        {
+            current.extend(delta.clone());
+        } else {
+            self.latest_update = update.clone();
+        }
+        match update.get("status").and_then(|v| v.as_str()) {
+            Some("in_progress") if !self.result_emitted => {
+                self.in_progress = true;
+                let started = *self.started_at.get_or_insert(now);
+                // Grok Bash `timeout` and task-output `timeout_ms` are in
+                // milliseconds. Zero/missing/invalid means no observed finite
+                // deadline, not an unlimited exemption from transport checks.
+                let input = &self.latest_update["rawInput"];
+                let timeout = input.get("timeout_ms").or_else(|| input.get("timeout"));
+                let millis = timeout.and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                });
+                self.deadline = millis.filter(|ms| *ms > 0).and_then(|ms| {
+                    started
+                        .checked_add(std::time::Duration::from_millis(ms))?
+                        .checked_add(policy.tool_grace)
+                });
+            }
+            Some("completed" | "failed" | "pending") => {
+                self.in_progress = false;
+                self.deadline = None;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn grok_acp_idle_deadline(
+    last_event: tokio::time::Instant,
+    calls: &HashMap<String, GrokAcpToolCall>,
+    policy: GrokAcpIdlePolicy,
+) -> tokio::time::Instant {
+    calls
+        .values()
+        .filter(|call| call.in_progress && !call.result_emitted)
+        .filter_map(|call| call.deadline)
+        .fold(last_event + policy.transport, std::cmp::max)
+}
+
+fn grok_acp_note_activity(
+    last_event: &mut tokio::time::Instant,
+    diagnostic_emitted: &mut bool,
+    events: &broadcast::Sender<AgentEvent>,
+    mission_id: Uuid,
+) {
+    *last_event = tokio::time::Instant::now();
+    if std::mem::take(diagnostic_emitted) {
+        let _ = events.send(AgentEvent::AgentPhase {
+            phase: "executing".to_string(),
+            detail: Some("Grok activity resumed".to_string()),
+            agent: Some("grok".to_string()),
+            mission_id: Some(mission_id),
+        });
+    }
 }
 
 fn grok_acp_update_is_terminal(update: &serde_json::Value) -> bool {
@@ -1157,8 +1252,6 @@ async fn run_grok_acp_turn(
     session_id: Option<&str>,
     is_continuation: bool,
 ) -> Result<AgentResult, GrokAcpFallback> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
     let workspace_exec = WorkspaceExec::new(workspace.clone());
 
     let cli_path =
@@ -1178,10 +1271,42 @@ async fn run_grok_acp_turn(
     // --no-auto-update). cwd comes from spawn_streaming's working dir and
     // the session/new params.
     let args = vec!["agent".to_string(), "stdio".to_string()];
-    let mut child = workspace_exec
+    let child = workspace_exec
         .spawn_streaming(work_dir, &cli_path, &args, env)
         .await
         .map_err(|e| format!("failed to spawn grok agent stdio: {e}"))?;
+
+    run_grok_acp_process(
+        child,
+        &workspace_exec.translate_path_for_container(work_dir),
+        message,
+        model,
+        mission_id,
+        events_tx,
+        cancel,
+        session_id,
+        is_continuation,
+        GrokAcpIdlePolicy::default(),
+    )
+    .await
+}
+
+// Kept below discovery/auth so the real protocol and process lifecycle can be
+// exercised with a local ACP fixture, without credentials or inference calls.
+#[allow(clippy::too_many_arguments)]
+async fn run_grok_acp_process(
+    mut child: tokio::process::Child,
+    acp_cwd: &str,
+    message: &str,
+    model: Option<&str>,
+    mission_id: Uuid,
+    events_tx: broadcast::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    session_id: Option<&str>,
+    is_continuation: bool,
+    idle_policy: GrokAcpIdlePolicy,
+) -> Result<AgentResult, GrokAcpFallback> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     let mut stdin = child
         .stdin
@@ -1284,7 +1409,6 @@ async fn run_grok_acp_turn(
         .await?;
         let _ = await_response(&mut lines, GROK_ACP_INIT_ID, 30).await?;
 
-        let acp_cwd = workspace_exec.translate_path_for_container(work_dir);
         let mut acp_session_id: Option<String> = None;
         if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
             // Sessions persist server-side; `session/load` resumes prior context.
@@ -1451,13 +1575,18 @@ async fn run_grok_acp_turn(
     let mut usage = crate::cost::TokenUsage::default();
     let mut stop_reason: Option<String> = None;
     let mut transport_error: Option<String> = None;
-
-    // Idle guard: tool executions stream tool_call_update events, so a long
-    // silent gap means the CLI is stuck (or waiting on something that will
-    // never arrive in headless mode).
-    let idle_limit = std::time::Duration::from_secs(180);
+    let mut transport_failure_stage = "stream_closed";
+    let mut last_event = tokio::time::Instant::now();
+    let mut idle_diagnostic_emitted = false;
+    let mut awaiting_input = false;
 
     loop {
+        let deadline = grok_acp_idle_deadline(last_event, &tool_calls, idle_policy);
+        let next_check = if idle_diagnostic_emitted {
+            deadline
+        } else {
+            last_event + idle_policy.diagnostic
+        };
         let line = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -1475,27 +1604,60 @@ async fn run_grok_acp_turn(
                 )
                 .with_terminal_reason(TerminalReason::AuthError));
             }
-            line = tokio::time::timeout(idle_limit, lines.next_line()) => match line {
-                Err(_) => {
+            _ = tokio::time::sleep_until(next_check) => {
+                let idle_secs = last_event.elapsed().as_secs();
+                let wait_state = if awaiting_input {
+                    "awaiting_client_input"
+                } else if tool_calls.values().any(|call| call.in_progress && !call.result_emitted) {
+                    "awaiting_tool_results"
+                } else {
+                    "awaiting_inference"
+                };
+                if tokio::time::Instant::now() >= deadline {
+                    transport_failure_stage = "grok_acp_transport_idle";
                     transport_error = Some(format!(
-                        "Grok ACP produced no events for {}s; killing the CLI",
-                        idle_limit.as_secs()
+                        "Grok ACP transport-idle timeout after {idle_secs}s without a protocol event \
+                         ({wait_state}); no active tool has an unexpired observed deadline. \
+                         Checkout and session are preserved; reconcile existing work before recovery."
                     ));
                     let _ = child.kill().await;
                     break;
                 }
-                Ok(Err(e)) => {
+                // Process existence is diagnostic, not proof of useful work.
+                // A healthy inference or foreground tool can be silent for
+                // longer than 180s. Only its hard deadline can terminate it.
+                let process_running = matches!(child.try_wait(), Ok(None));
+                tracing::warn!(
+                    %mission_id,
+                    idle_secs,
+                    wait_state,
+                    process_running,
+                    remaining_secs = deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs(),
+                    "Grok ACP is silent; continuing to observe until the transport/tool deadline"
+                );
+                let _ = events_tx.send(AgentEvent::AgentPhase {
+                    phase: "waiting".to_string(),
+                    detail: Some(format!("Grok has been silent for {idle_secs}s ({wait_state}); observing until its deadline.")),
+                    agent: Some("grok".to_string()),
+                    mission_id: Some(mission_id),
+                });
+                idle_diagnostic_emitted = true;
+                continue;
+            }
+            line = lines.next_line() => match line {
+                Err(e) => {
+                    transport_failure_stage = "stdout_read";
                     transport_error = Some(format!("Grok ACP stdout read failed: {e}"));
                     break;
                 }
-                Ok(Ok(None)) => {
+                Ok(None) => {
                     if stop_reason.is_none() {
                         transport_error =
                             Some("Grok ACP stream closed before the prompt completed".to_string());
                     }
                     break;
                 }
-                Ok(Ok(Some(line))) => line,
+                Ok(Some(line)) => line,
             }
         };
 
@@ -1507,6 +1669,13 @@ async fn run_grok_acp_turn(
         // one we expect is a permission prompt — auto-approve it, mirroring
         // the streaming path's --always-approve.
         if let (Some(req_id), Some(method)) = (value.get("id"), value.get("method")) {
+            grok_acp_note_activity(
+                &mut last_event,
+                &mut idle_diagnostic_emitted,
+                &events_tx,
+                mission_id,
+            );
+            awaiting_input = true;
             if method == "session/request_permission" {
                 let option_id = value
                     .pointer("/params/options")
@@ -1523,16 +1692,26 @@ async fn run_grok_acp_turn(
                     .and_then(|o| o.get("optionId"))
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let _ = send(
-                    &mut stdin,
-                    serde_json::json!({
+                let response = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        let _ = child.kill().await;
+                        return Ok(AgentResult::failure("Mission cancelled", 0)
+                            .with_terminal_reason(TerminalReason::Cancelled));
+                    }
+                    response = tokio::time::timeout(idle_policy.transport, send(&mut stdin, serde_json::json!({
                         "jsonrpc": "2.0",
                         "id": req_id,
                         "params": null,
                         "result": { "outcome": { "outcome": "selected", "optionId": option_id } }
-                    }),
-                )
-                .await;
+                    }))) => response.unwrap_or_else(|_| Err("permission response write timed out".to_string())),
+                };
+                if let Err(error) = response {
+                    transport_failure_stage = "permission_response";
+                    transport_error = Some(format!("Grok ACP permission response failed: {error}"));
+                    break;
+                }
+                awaiting_input = false;
             }
             continue;
         }
@@ -1540,6 +1719,9 @@ async fn run_grok_acp_turn(
         // Prompt completion.
         if value.get("id").and_then(|v| v.as_u64()) == Some(GROK_ACP_PROMPT_ID) {
             if let Some(err) = value.get("error") {
+                // A JSON-RPC error is a provider/agent response, not proof of
+                // a broken transport. Do not auto-replay it as an idle retry.
+                transport_failure_stage = "prompt_error";
                 transport_error = Some(format!("Grok ACP prompt failed: {err}"));
                 break;
             }
@@ -1572,6 +1754,13 @@ async fn run_grok_acp_turn(
             _ => None,
         };
         let Some(update) = update else { continue };
+        grok_acp_note_activity(
+            &mut last_event,
+            &mut idle_diagnostic_emitted,
+            &events_tx,
+            mission_id,
+        );
+        awaiting_input = false;
         match update.get("sessionUpdate").and_then(|v| v.as_str()) {
             Some("agent_thought_chunk") => {
                 if let Some(text) = update.pointer("/content/text").and_then(|v| v.as_str()) {
@@ -1623,14 +1812,9 @@ async fn run_grok_acp_turn(
                     args,
                     mission_id: Some(mission_id),
                 });
-                tool_calls.insert(
-                    id,
-                    GrokAcpToolCall {
-                        name,
-                        latest_update: update,
-                        result_emitted: false,
-                    },
-                );
+                let entry = tool_calls.entry(id).or_default();
+                entry.name = name;
+                entry.observe(&update, last_event, idle_policy);
             }
             Some("tool_call_update") => {
                 let Some(id) = update.get("toolCallId").and_then(|v| v.as_str()) else {
@@ -1644,7 +1828,7 @@ async fn run_grok_acp_turn(
                         .unwrap_or("tool")
                         .to_string();
                 }
-                entry.latest_update = update.clone();
+                entry.observe(&update, last_event, idle_policy);
                 if grok_acp_update_is_terminal(&update) && !entry.result_emitted {
                     entry.result_emitted = true;
                     let _ = events_tx.send(AgentEvent::ToolResult {
@@ -1659,7 +1843,22 @@ async fn run_grok_acp_turn(
         }
     }
     drop(stdin);
-    let _ = child.wait().await;
+    // EOF and a terminal response must not hang forever on a CLI/descendant
+    // that keeps the process alive. This tears down only our harness process;
+    // it never resets or removes the mission checkout/session.
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            let _ = child.kill().await;
+            return Ok(AgentResult::failure("Mission cancelled", 0)
+                .with_terminal_reason(TerminalReason::Cancelled));
+        }
+        exit = tokio::time::timeout(idle_policy.shutdown, child.wait()) => {
+            if exit.is_err() {
+                let _ = child.kill().await;
+            }
+        }
+    }
 
     // The CLI doesn't always stamp a terminal status on the last
     // tool_call_update — flush whatever we have so every ToolCall gets a
@@ -1685,8 +1884,21 @@ async fn run_grok_acp_turn(
         } else {
             format!("{err}\nstderr tail:\n{stderr_tail}")
         };
-        return Ok(AgentResult::failure(detail, 0)
+        return Ok(AgentResult::failure(detail.clone(), 0)
             .with_terminal_reason(TerminalReason::LlmError)
+            .with_terminal_evidence(detail)
+            .with_data(serde_json::json!({
+                "failure_class": if transport_failure_stage == "prompt_error" {
+                    "provider_error"
+                } else {
+                    "transport_error"
+                },
+                "transport_failure_stage": transport_failure_stage,
+                "grok_acp_transport_failure": true,
+                "pending_tools": tool_calls.values().filter(|call| !call.result_emitted).count(),
+                "idle_seconds": last_event.elapsed().as_secs(),
+                "awaiting_input": awaiting_input,
+            }))
             .with_model(model_used.unwrap_or_else(|| "grok-build".to_string())));
     }
 
@@ -1735,6 +1947,258 @@ mod tests {
     use super::*;
     use crate::workspace::WorkspaceType;
     use std::fs;
+
+    #[test]
+    fn grok_acp_idle_deadlines_distinguish_pending_running_and_finished_tools() {
+        use std::time::Duration;
+        let policy = GrokAcpIdlePolicy::default();
+        let now = tokio::time::Instant::now();
+        let mut calls = HashMap::new();
+        assert_eq!(policy.diagnostic, Duration::from_secs(180));
+        assert_eq!(
+            grok_acp_idle_deadline(now, &calls, policy),
+            now + Duration::from_secs(600)
+        );
+
+        let call = calls
+            .entry("build".to_string())
+            .or_insert_with(GrokAcpToolCall::default);
+        call.observe(
+            &serde_json::json!({"status": "pending", "rawInput": {"timeout": "3600000"}}),
+            now,
+            policy,
+        );
+        assert_eq!(
+            grok_acp_idle_deadline(now, &calls, policy),
+            now + Duration::from_secs(600)
+        );
+        calls.get_mut("build").unwrap().observe(
+            &serde_json::json!({"status": "in_progress"}),
+            now,
+            policy,
+        );
+        let tool_deadline = now + Duration::from_secs(3630);
+        assert_eq!(grok_acp_idle_deadline(now, &calls, policy), tool_deadline);
+        // Repeated status updates cannot restart the tool's own timeout.
+        calls.get_mut("build").unwrap().observe(
+            &serde_json::json!({"status": "in_progress"}),
+            now + Duration::from_secs(200),
+            policy,
+        );
+        assert_eq!(grok_acp_idle_deadline(now, &calls, policy), tool_deadline);
+        calls.get_mut("build").unwrap().observe(
+            &serde_json::json!({"status": "completed"}),
+            now,
+            policy,
+        );
+        assert_eq!(
+            grok_acp_idle_deadline(now, &calls, policy),
+            now + Duration::from_secs(600)
+        );
+    }
+
+    #[test]
+    fn grok_acp_unknown_or_unbounded_tools_do_not_disable_idle_guard() {
+        let policy = GrokAcpIdlePolicy::default();
+        let now = tokio::time::Instant::now();
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({"timeout": 0}),
+            serde_json::json!({"timeout": -1}),
+            serde_json::json!({"timeout": "forever"}),
+        ] {
+            let mut calls = HashMap::new();
+            let mut call = GrokAcpToolCall::default();
+            call.observe(
+                &serde_json::json!({"status": "in_progress", "rawInput": input}),
+                now,
+                policy,
+            );
+            calls.insert("tool".to_string(), call);
+            assert_eq!(
+                grok_acp_idle_deadline(now, &calls, policy),
+                now + policy.transport
+            );
+        }
+    }
+
+    async fn grok_acp_fixture(
+        scenario: &str,
+        cancel_after_tool: bool,
+    ) -> (AgentResult, Vec<AgentEvent>, std::time::Duration) {
+        use std::process::Stdio;
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("proof-artifact"), "preserved checkout").unwrap();
+        let child = tokio::process::Command::new("python3")
+            .arg("-u")
+            .arg("-c")
+            .arg(include_str!("fixtures/grok_acp.py"))
+            .arg(scenario)
+            .current_dir(root.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (events_tx, mut events_rx) = broadcast::channel(64);
+        let cancel = CancellationToken::new();
+        if cancel_after_tool {
+            let mut cancel_rx = events_tx.subscribe();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                while let Ok(event) = cancel_rx.recv().await {
+                    if matches!(event, AgentEvent::ToolCall { .. }) {
+                        cancel.cancel();
+                        break;
+                    }
+                    if matches!(event, AgentEvent::TextDelta { ref content, .. } if content == "closing stdout")
+                    {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        cancel.cancel();
+                        break;
+                    }
+                }
+            });
+        }
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_grok_acp_process(
+                child,
+                root.path().to_str().unwrap(),
+                "fixture prompt",
+                Some("fixture-model"),
+                Uuid::new_v4(),
+                events_tx,
+                cancel,
+                None,
+                false,
+                GrokAcpIdlePolicy {
+                    diagnostic: Duration::from_millis(180),
+                    transport: Duration::from_millis(600),
+                    tool_grace: Duration::from_millis(30),
+                    shutdown: Duration::from_millis(120),
+                },
+            ),
+        )
+        .await
+        .expect("ACP lifecycle must remain bounded")
+        .unwrap_or_else(|e| panic!("unexpected pre-prompt fallback: {}", e.reason));
+        let elapsed = start.elapsed();
+        // Post-prompt recovery belongs to the control actor; the protocol
+        // runner must never replay a prompt itself, even after repeated EOF.
+        assert_eq!(
+            fs::read_to_string(root.path().join("accepted-prompts")).unwrap(),
+            "accepted\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("proof-artifact")).unwrap(),
+            "preserved checkout"
+        );
+        let mut events = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            events.push(event);
+        }
+        (result, events, elapsed)
+    }
+
+    #[tokio::test]
+    async fn grok_acp_silent_inference_survives_diagnostic_deadline() {
+        let (result, events, _) = grok_acp_fixture("silent_success", false).await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(result.output, "fixture completed");
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::AgentPhase { detail: Some(detail), .. } if detail.contains("awaiting_inference"))));
+    }
+
+    #[tokio::test]
+    async fn grok_acp_dead_transport_times_out_with_evidence_and_no_replay() {
+        for scenario in ["dead", "junk", "missing_status", "completed_tool_dead"] {
+            let (result, _, elapsed) = grok_acp_fixture(scenario, false).await;
+            assert!(!result.success, "scenario: {scenario}");
+            assert!(elapsed >= std::time::Duration::from_millis(600));
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "{scenario}: {elapsed:?}"
+            );
+            assert_eq!(
+                result.data.as_ref().unwrap()["transport_failure_stage"],
+                "grok_acp_transport_idle"
+            );
+            assert_eq!(
+                result.data.as_ref().unwrap()["failure_class"],
+                "transport_error"
+            );
+            assert!(result
+                .terminal_evidence
+                .unwrap()
+                .contains("fixture stderr diagnostic"));
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_acp_long_tool_survives_transport_idle_under_its_own_deadline() {
+        let (result, events, elapsed) = grok_acp_fixture("long_tool", false).await;
+        assert!(result.success, "{}", result.output);
+        assert!(elapsed > std::time::Duration::from_millis(600));
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::AgentPhase { detail: Some(detail), .. } if detail.contains("awaiting_tool_results"))));
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolResult { result, .. } if result["status"] == "completed")));
+    }
+
+    #[tokio::test]
+    async fn grok_acp_stale_running_tool_times_out_after_its_deadline() {
+        let (result, _, elapsed) = grok_acp_fixture("expired_tool", false).await;
+        assert!(!result.success);
+        assert_eq!(
+            result.data.unwrap()["transport_failure_stage"],
+            "grok_acp_transport_idle"
+        );
+        assert!(elapsed >= std::time::Duration::from_millis(1200));
+        assert!(elapsed < std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn grok_acp_cancellation_interrupts_a_long_tool_without_recovery() {
+        let (result, _, elapsed) = grok_acp_fixture("cancel", true).await;
+        assert_eq!(result.terminal_reason, Some(TerminalReason::Cancelled));
+        assert!(elapsed < std::time::Duration::from_millis(600));
+        assert!(result.data.is_none());
+    }
+
+    #[tokio::test]
+    async fn grok_acp_input_wait_is_distinct_from_inference_idle() {
+        let (result, events, _) = grok_acp_fixture("input", false).await;
+        assert!(result.output.contains("awaiting_client_input"));
+        assert_eq!(result.data.unwrap()["awaiting_input"], true);
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::AgentPhase { detail: Some(detail), .. } if detail.contains("awaiting_client_input"))));
+    }
+
+    #[tokio::test]
+    async fn grok_acp_closed_stdout_does_not_hang_waiting_for_process_exit() {
+        let (result, _, elapsed) = grok_acp_fixture("eof", false).await;
+        assert!(!result.success);
+        assert_eq!(
+            result.data.unwrap()["transport_failure_stage"],
+            "stream_closed"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn grok_acp_cancellation_during_eof_teardown_is_not_a_transport_retry() {
+        let (result, _, elapsed) = grok_acp_fixture("eof_cancel", true).await;
+        assert_eq!(result.terminal_reason, Some(TerminalReason::Cancelled));
+        assert!(result.data.is_none());
+        assert!(elapsed < std::time::Duration::from_millis(600));
+    }
+
+    #[tokio::test]
+    async fn grok_acp_prompt_error_is_not_retried_as_a_transport_failure() {
+        let (result, _, _) = grok_acp_fixture("prompt_error", false).await;
+        assert!(!result.success);
+        assert_eq!(result.data.unwrap()["failure_class"], "provider_error");
+    }
 
     fn container_workspace_at(path: &std::path::Path) -> Workspace {
         Workspace {
