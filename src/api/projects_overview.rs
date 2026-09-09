@@ -686,8 +686,8 @@ pub async fn get_project(
         project.next_action = Some(derived);
     }
     let waiting_user_waits = state.control.collect_waiting_user_waits().await;
-    project.mode = project_mode_from_missions(
-        project.mode.as_deref(),
+    project_mode_projection(
+        &mut project,
         missions_available.then_some(missions.as_slice()),
         &waiting_user_waits,
         decisions.len() as u32,
@@ -2784,6 +2784,44 @@ fn synthetic_project_record(slug: &str) -> super::projects_store::ProjectRecord 
     }
 }
 
+/// Persisted state uses a mode/blocker pair; legacy delivery strings may
+/// carry the reason after a colon. An explicit blocker wins over that suffix.
+fn is_decision_block(mode: Option<&str>, blocker: Option<&str>) -> bool {
+    let Some(mode) = mode else {
+        return false;
+    };
+    let (base, suffix) = mode
+        .split_once(':')
+        .map_or((mode, None), |(base, why)| (base, Some(why)));
+    base.eq_ignore_ascii_case("blocked")
+        && blocker
+            .or(suffix)
+            .is_some_and(|why| why.eq_ignore_ascii_case("decision"))
+}
+
+fn project_mode_projection(
+    project: &mut ProjectRecord,
+    missions: Option<&[Mission]>,
+    waits: &HashMap<uuid::Uuid, Option<String>>,
+    pending_decisions: u32,
+) {
+    let was_decision = is_decision_block(project.mode.as_deref(), project.blocker.as_deref());
+    project.mode = project_mode_from_missions(
+        project.mode.as_deref(),
+        project.blocker.as_deref(),
+        missions,
+        waits,
+        pending_decisions,
+    );
+    let decision_evidence = pending_decisions > 0
+        || missions.is_some_and(|rows| mission_roster_needs_operator(rows, waits));
+    if project.mode.as_deref() == Some("blocked:decision") && decision_evidence {
+        project.blocker = Some("decision".into());
+    } else if missions.is_some() && was_decision {
+        project.blocker = None;
+    }
+}
+
 /// Roster/CTRL mode is the default; live work and parked decisions win.
 /// `paused` is never overridden — the operator (or controller) parked it.
 /// Raw `awaiting_user` is not a decision block. A `pending_user` ledger row
@@ -2791,6 +2829,7 @@ fn synthetic_project_record(slug: &str) -> super::projects_store::ProjectRecord 
 /// qualified `needs_operator` page). Live work still wins.
 pub(crate) fn honest_controller_mode(
     store_mode: Option<&str>,
+    store_blocker: Option<&str>,
     has_live_mission: bool,
     needs_operator: bool,
     pending_decisions: u32,
@@ -2810,7 +2849,7 @@ pub(crate) fn honest_controller_mode(
     // A prior decision block is a derived state, not a durable pause. Once
     // its evidence disappears, clear it rather than making the controller
     // wait for a decision that no longer exists. Other blockers remain intact.
-    if store_mode.is_some_and(|mode| mode.eq_ignore_ascii_case("blocked:decision")) {
+    if is_decision_block(store_mode, store_blocker) {
         return None;
     }
     store_mode.map(str::to_string)
@@ -2820,6 +2859,7 @@ pub(crate) fn honest_controller_mode(
 /// AskUserQuestion waits. A completed report awaiting ACK is not a decision.
 fn project_mode_from_missions(
     store_mode: Option<&str>,
+    store_blocker: Option<&str>,
     missions: Option<&[Mission]>,
     waiting_user_waits: &HashMap<uuid::Uuid, Option<String>>,
     pending_decisions: u32,
@@ -2828,14 +2868,34 @@ fn project_mode_from_missions(
     // the last mode until a successful read can establish that a wait ended.
     let Some(missions) = missions else {
         if pending_decisions > 0 {
-            return honest_controller_mode(store_mode, false, false, pending_decisions);
+            return honest_controller_mode(
+                store_mode,
+                store_blocker,
+                false,
+                false,
+                pending_decisions,
+            );
         }
         return store_mode.map(str::to_string);
     };
     let has_live = missions
         .iter()
         .any(|mission| super::controller_honesty::is_live_writer_status(mission.status));
-    let needs_operator = missions.iter().any(|mission| {
+    let needs_operator = mission_roster_needs_operator(missions, waiting_user_waits);
+    honest_controller_mode(
+        store_mode,
+        store_blocker,
+        has_live,
+        needs_operator,
+        pending_decisions,
+    )
+}
+
+fn mission_roster_needs_operator(
+    missions: &[Mission],
+    waiting_user_waits: &HashMap<uuid::Uuid, Option<String>>,
+) -> bool {
+    missions.iter().any(|mission| {
         mission_chip(
             mission,
             waiting_user_waits.contains_key(&mission.id),
@@ -2844,8 +2904,7 @@ fn project_mode_from_missions(
                 .and_then(|started| started.as_deref()),
         )
         .needs_operator
-    });
-    honest_controller_mode(store_mode, has_live, needs_operator, pending_decisions)
+    })
 }
 
 struct ProjectRowBuilder {
@@ -2855,6 +2914,7 @@ struct ProjectRowBuilder {
     next_action: Option<String>,
     /// Roster mode + controller link, attached alongside title/next_action.
     mode: Option<String>,
+    mode_blocker: Option<String>,
     controller_cron_id: Option<String>,
     /// Last successful run of the linked controller job (scheduler-side
     /// heartbeat), resolved by the handler from the Hermes cron jobs file.
@@ -2886,6 +2946,7 @@ impl ProjectRowBuilder {
             title: None,
             next_action: None,
             mode: None,
+            mode_blocker: None,
             controller_cron_id: None,
             controller_heartbeat_at: None,
             tracker: None,
@@ -2917,6 +2978,7 @@ impl ProjectRowBuilder {
             self.title = record.title;
             self.next_action = record.next_action;
             self.mode = record.mode;
+            self.mode_blocker = record.blocker;
             self.controller_cron_id = record.controller_cron_id;
             self.mode_signal_at = mode_signal_at;
             return;
@@ -2925,9 +2987,12 @@ impl ProjectRowBuilder {
         if !canonical_has_roster {
             self.next_action = self.next_action.take().or(record.next_action);
         }
-        self.mode = self.mode.take().or(record.mode);
+        if self.mode.is_none() && record.mode.is_some() {
+            self.mode = record.mode;
+            self.mode_blocker = record.blocker;
+            self.mode_signal_at = mode_signal_at.clone();
+        }
         self.controller_cron_id = self.controller_cron_id.take().or(record.controller_cron_id);
-        self.mode_signal_at = self.mode_signal_at.take().or(mode_signal_at);
     }
 
     /// Attach the store-derived latest update: the newest state event plus the
@@ -2966,6 +3031,46 @@ impl ProjectRowBuilder {
 
         self.missions
             .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+        // Only qualified operator pages count as "awaiting user". Ack and
+        // in-grace controller-owned questions stay off the attention shelf.
+        let awaiting_user = self
+            .missions
+            .iter()
+            .filter(|chip| chip.needs_operator)
+            .count();
+        let has_live_mission = self
+            .missions
+            .iter()
+            .any(|chip| super::controller_honesty::is_live_writer_status(chip.status));
+        // Live work and parked decisions beat the last CTRL trailer. A
+        // writer already running is `active` even if the last cron said
+        // `blocked:cannot-merge`; a pending question with no writer is
+        // `blocked:decision`. Operator `paused` is never overridden.
+        let (stored_mode, stored_blocker) = if self.mode.is_some() {
+            (self.mode.as_deref(), self.mode_blocker.as_deref())
+        } else {
+            self.latest_update.as_ref().map_or((None, None), |update| {
+                (update.mode.as_deref(), update.blocker.as_deref())
+            })
+        };
+        let was_decision = is_decision_block(stored_mode, stored_blocker);
+        self.mode = honest_controller_mode(
+            stored_mode,
+            stored_blocker,
+            has_live_mission,
+            awaiting_user > 0,
+            self.pending_decisions,
+        );
+        if was_decision && self.mode.as_deref() != Some("blocked:decision") {
+            self.mode_blocker = None;
+            if let Some(update) = self.latest_update.as_mut() {
+                if is_decision_block(update.mode.as_deref(), update.blocker.as_deref()) {
+                    update.mode = self.mode.clone();
+                    update.blocker = None;
+                }
+            }
+        }
 
         let mut attention: Vec<String> = Vec::new();
         let mut items: Vec<AttentionItem> = Vec::new();
@@ -3020,31 +3125,6 @@ impl ProjectRowBuilder {
                 });
             }
         }
-        // Only qualified operator pages count as "awaiting user". Ack and
-        // in-grace controller-owned questions stay off the attention shelf.
-        let awaiting_user = self
-            .missions
-            .iter()
-            .filter(|chip| chip.needs_operator)
-            .count();
-        let has_live_mission = self
-            .missions
-            .iter()
-            .any(|chip| super::controller_honesty::is_live_writer_status(chip.status));
-        // Live work and parked decisions beat the last CTRL trailer. A
-        // writer already running is `active` even if the last cron said
-        // `blocked:cannot-merge`; a pending question with no writer is
-        // `blocked:decision`. Operator `paused` is never overridden.
-        self.mode = honest_controller_mode(
-            self.mode.as_deref().or_else(|| {
-                self.latest_update
-                    .as_ref()
-                    .and_then(|update| update.mode.as_deref())
-            }),
-            has_live_mission,
-            awaiting_user > 0,
-            self.pending_decisions,
-        );
         if awaiting_user > 0 {
             attention.push(match awaiting_user {
                 1 => "1 mission awaiting user input".to_string(),
@@ -5355,27 +5435,27 @@ mod tests {
     #[test]
     fn honest_mode_prefers_live_work_and_parked_decisions_over_cron_prose() {
         assert_eq!(
-            honest_controller_mode(Some("blocked:cannot-merge"), true, false, 1).as_deref(),
+            honest_controller_mode(Some("blocked:cannot-merge"), None, true, false, 1).as_deref(),
             Some("active")
         );
         assert_eq!(
-            honest_controller_mode(Some("active"), false, false, 2).as_deref(),
+            honest_controller_mode(Some("active"), None, false, false, 2).as_deref(),
             Some("blocked:decision")
         );
         assert_eq!(
-            honest_controller_mode(Some("paused:owner"), true, false, 1).as_deref(),
+            honest_controller_mode(Some("paused:owner"), None, true, false, 1).as_deref(),
             Some("paused:owner")
         );
         assert_eq!(
-            honest_controller_mode(Some("blocked:transport-cap"), false, false, 0).as_deref(),
+            honest_controller_mode(Some("blocked:transport-cap"), None, false, false, 0).as_deref(),
             Some("blocked:transport-cap")
         );
         assert_eq!(
-            honest_controller_mode(Some("active"), true, true, 0).as_deref(),
+            honest_controller_mode(Some("active"), None, true, true, 0).as_deref(),
             Some("blocked:decision")
         );
         assert_eq!(
-            honest_controller_mode(Some("active"), true, false, 0).as_deref(),
+            honest_controller_mode(Some("active"), None, true, false, 0).as_deref(),
             Some("active")
         );
     }
@@ -5430,6 +5510,7 @@ mod tests {
             ));
             let detail = project_mode_from_missions(
                 Some("blocked:decision"),
+                None,
                 Some(std::slice::from_ref(&mission)),
                 &waits,
                 0,
@@ -5451,6 +5532,7 @@ mod tests {
                 board.missions.push(mission_chip(&active, false, None));
                 let detail = project_mode_from_missions(
                     Some("blocked:decision"),
+                    None,
                     Some(&[mission, active]),
                     &waits,
                     0,
@@ -5459,6 +5541,123 @@ mod tests {
                 assert_eq!(board.finish(&[], None, None, &fresh).mode, detail);
             }
         }
+    }
+
+    #[test]
+    fn persisted_decision_pairs_project_consistently_after_http_and_ctrl_writes() {
+        let now = chrono::Utc::now();
+        let timestamp = now.to_rfc3339();
+        for via_ctrl in [false, true] {
+            let store = ProjectsStore::open_in_memory().unwrap();
+            store
+                .upsert_project("verity", None, None, None, None)
+                .unwrap();
+            if via_ctrl {
+                ingest_deliveries(&store, &HashMap::new(), &HashMap::new(), vec![parse_delivery(
+                    "session", now.timestamp() as f64 + 1.0,
+                    "[Cron delivery: Verity]\nWaiting\n[CTRL: verity | mode=blocked:decision | wait=0 | next=wait]\n[STATE_SIGNATURE: verity|waiting]\n"
+                )]);
+            } else {
+                store
+                    .set_mode("verity", "blocked", None, Some("decision"))
+                    .unwrap();
+                store
+                    .record_state(
+                        "verity",
+                        "waiting",
+                        Some("Waiting"),
+                        &timestamp,
+                        Some("session"),
+                    )
+                    .unwrap();
+            }
+            let record = store.get_project("verity").unwrap().unwrap();
+            assert_eq!(record.mode.as_deref(), Some("blocked"));
+            assert_eq!(record.blocker.as_deref(), Some("decision"));
+            for (available, pending, expected_mode, expected_blocker) in [
+                (true, 0, None, None),
+                (false, 0, Some("blocked"), Some("decision")),
+                (false, 1, Some("blocked:decision"), Some("decision")),
+                (true, 1, Some("blocked:decision"), Some("decision")),
+            ] {
+                let mut projected = record.clone();
+                project_mode_projection(
+                    &mut projected,
+                    available.then_some(&[]),
+                    &HashMap::new(),
+                    pending,
+                );
+                assert_eq!(projected.mode.as_deref(), expected_mode);
+                assert_eq!(projected.blocker.as_deref(), expected_blocker);
+            }
+            let state = store.latest_states().unwrap().remove("verity").unwrap();
+            let mut board = ProjectRowBuilder::new("verity".into());
+            board.apply_roster(record.clone(), true);
+            board.attach_store_update(
+                store_update(
+                    "verity",
+                    &state,
+                    record.mode.clone(),
+                    record.blocker.clone(),
+                ),
+                1,
+                1,
+            );
+            let row = board.finish(&[], None, None, &timestamp);
+            assert_eq!(row.mode, None);
+            assert!(row
+                .attention_reasons
+                .iter()
+                .all(|reason| !reason.contains("blocker reported")));
+            let update = row.latest_update.unwrap();
+            assert_eq!(update.mode, None);
+            assert_eq!(update.blocker, None);
+            // These are read projections: controller history stays intact.
+            assert_eq!(store.get_project("verity").unwrap().unwrap(), record);
+        }
+    }
+
+    #[test]
+    fn persisted_nondecision_pairs_and_canonical_alias_provenance_are_preserved() {
+        let store = ProjectsStore::open_in_memory().unwrap();
+        store
+            .upsert_project("verity", None, None, None, None)
+            .unwrap();
+        store
+            .upsert_project("alias", None, None, None, None)
+            .unwrap();
+        for (mode, blocker) in [
+            ("blocked", "transport-cap"),
+            ("blocked", "manual"),
+            ("paused", "decision"),
+        ] {
+            store.set_mode("verity", mode, None, Some(blocker)).unwrap();
+            store
+                .set_mode("alias", "blocked", None, Some("decision"))
+                .unwrap();
+            let record = store.get_project("verity").unwrap().unwrap();
+            let mut projected = record.clone();
+            project_mode_projection(&mut projected, Some(&[]), &HashMap::new(), 0);
+            assert_eq!(projected.mode.as_deref(), Some(mode));
+            assert_eq!(projected.blocker.as_deref(), Some(blocker));
+            let mut board = ProjectRowBuilder::new("verity".into());
+            board.apply_roster(record, true);
+            board.apply_roster(store.get_project("alias").unwrap().unwrap(), true);
+            let row = board.finish(&[], None, None, &chrono::Utc::now().to_rfc3339());
+            assert_eq!(row.mode.as_deref(), Some(mode));
+        }
+        store
+            .set_mode("verity", "blocked:decision", None, Some("manual"))
+            .unwrap();
+        let mut conflicting = store.get_project("verity").unwrap().unwrap();
+        project_mode_projection(&mut conflicting, Some(&[]), &HashMap::new(), 0);
+        assert_eq!(conflicting.blocker.as_deref(), Some("manual"));
+        project_mode_projection(&mut conflicting, None, &HashMap::new(), 1);
+        assert_eq!(conflicting.blocker.as_deref(), Some("decision"));
+        assert!(
+            !is_decision_block(Some("blocked:decision"), Some("manual")),
+            "explicit provenance wins over legacy suffix"
+        );
     }
 
     #[test]
@@ -5487,43 +5686,50 @@ mod tests {
     fn expired_decision_mode_clears_without_changing_pauses_or_other_blockers() {
         for stored in [None, Some("active"), Some("blocked:decision")] {
             assert_eq!(
-                project_mode_from_missions(stored, None, &HashMap::new(), 1).as_deref(),
+                project_mode_from_missions(stored, None, None, &HashMap::new(), 1).as_deref(),
                 Some("blocked:decision")
             );
         }
         assert_eq!(
-            project_mode_from_missions(Some("paused:owner"), None, &HashMap::new(), 1).as_deref(),
+            project_mode_from_missions(Some("paused:owner"), None, None, &HashMap::new(), 1)
+                .as_deref(),
             Some("paused:owner")
         );
         assert_eq!(
-            project_mode_from_missions(Some("blocked:decision"), None, &HashMap::new(), 0)
+            project_mode_from_missions(Some("blocked:decision"), None, None, &HashMap::new(), 0)
                 .as_deref(),
             Some("blocked:decision"),
             "unavailable mission evidence cannot clear a real question"
         );
         assert_eq!(
-            project_mode_from_missions(Some("blocked:decision"), Some(&[]), &HashMap::new(), 0),
+            project_mode_from_missions(
+                Some("blocked:decision"),
+                None,
+                Some(&[]),
+                &HashMap::new(),
+                0
+            ),
             None,
             "a successful empty roster can clear stale decision state"
         );
         assert_eq!(
-            honest_controller_mode(Some("blocked:decision"), false, false, 0),
+            honest_controller_mode(Some("blocked:decision"), None, false, false, 0),
             None
         );
         assert_eq!(
-            honest_controller_mode(Some("blocked:decision"), true, false, 0).as_deref(),
+            honest_controller_mode(Some("blocked:decision"), None, true, false, 0).as_deref(),
             Some("active")
         );
         assert_eq!(
-            honest_controller_mode(Some("paused:owner"), false, false, 0).as_deref(),
+            honest_controller_mode(Some("paused:owner"), None, false, false, 0).as_deref(),
             Some("paused:owner")
         );
         assert_eq!(
-            honest_controller_mode(Some("blocked:decision"), false, false, 1).as_deref(),
+            honest_controller_mode(Some("blocked:decision"), None, false, false, 1).as_deref(),
             Some("blocked:decision")
         );
         assert_eq!(
-            honest_controller_mode(Some("blocked:transport-cap"), false, false, 0).as_deref(),
+            honest_controller_mode(Some("blocked:transport-cap"), None, false, false, 0).as_deref(),
             Some("blocked:transport-cap")
         );
     }
