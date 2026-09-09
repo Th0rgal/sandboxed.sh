@@ -542,6 +542,28 @@ async fn track_dispatch_unreadable_store_cannot_release_terminal_owner() {
 
 #[tokio::test]
 async fn track_dispatch_http_creation_reconciles_without_deadlocking_actor_or_pr_lock() {
+    // Keep this HTTP/lock regression independent of the production 150 GiB
+    // disk floor without changing environment shared by other parallel tests.
+    const CHILD: &str = "TERMINAL_TRACK_LEASE_HTTP_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "api::control::dispatch_admission_tests::track_dispatch_http_creation_reconciles_without_deadlocking_actor_or_pr_lock",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("MISSION_DISK_EMERGENCY_RESERVE_GB", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated HTTP regression failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     for pr in [None, Some("repo#244")] {
         let h = Harness::new().await;
         h.state.backend_registry.write().await.register(Arc::new(
