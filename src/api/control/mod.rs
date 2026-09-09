@@ -9685,9 +9685,12 @@ async fn bind_mission_to_track(
     }
     let request =
         track_leases::lease_request(project, &outcome.key, &mission_id, mode, idempotency_key);
-    match state.projects.acquire_track_lease(&request) {
+    match track_leases::acquire_locked(state, &request).await {
         Ok(_) => Ok(outcome.key),
-        Err(super::projects_store::LeaseError::Store(error)) => Err(internal_error(error)),
+        Err(super::projects_store::LeaseError::Store(error)) => {
+            interrupt_new_mission(control, mission.id, "track_lease_unavailable").await;
+            Err(internal_error(error))
+        }
         Err(super::projects_store::LeaseError::NotFound) => Err(internal_error(format!(
             "track '{}' of '{project}' vanished between absorption and lease",
             outcome.key
@@ -10499,6 +10502,13 @@ pub async fn create_mission(
         }
     };
 
+    // Match actor/sweep lock order before taking the PR-writer lock. The track
+    // conflict path may reconcile a terminal predecessor, so admission must
+    // remain serialized until the new lease and assignment are both persisted.
+    let admission_guard = DISPATCH_ADMISSION.lock().await;
+    let admission_file_guard = dispatch_admission::durable_lock(&state.config)
+        .await
+        .map_err(internal_error)?;
     // Close the preflight-to-create race under the store-only mutex. Exactly
     // one concurrent creator wins; a loser is durably interrupted before it
     // can receive a goal or become a writer.
@@ -10739,6 +10749,8 @@ pub async fn create_mission(
         }
     }
     drop(pr_writer_guard);
+    drop(admission_file_guard);
+    drop(admission_guard);
 
     // Creation origin ("hermes" + owning session id). Written once here so
     // clients can group foreign-origin missions under their conversation.
