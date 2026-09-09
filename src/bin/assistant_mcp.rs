@@ -4032,7 +4032,15 @@ fn compact_digest_mission_summary(digest: Value) -> Value {
             "desired_state",
             "next_check_at",
         ] {
-            mission[key] = project.get(key).cloned().unwrap_or(Value::Null);
+            mission[key] = project.get(key).cloned().unwrap_or_else(|| {
+                // MissionProject omits empty tags during serialization. Keep
+                // the existing array contract for an untagged mission.
+                if key == "tags" {
+                    json!([])
+                } else {
+                    Value::Null
+                }
+            });
         }
     }
     // Today's digest does not expose fast_mode. Missing means unknown, not
@@ -4892,6 +4900,7 @@ mod tests {
 
     async fn exercise_resume_readback(
         with_hint: bool,
+        with_tags: bool,
         steering_status: axum::http::StatusCode,
         readback_status: axum::http::StatusCode,
         fast_mode: Option<bool>,
@@ -4907,6 +4916,7 @@ mod tests {
         struct Fixture {
             id: Uuid,
             with_hint: bool,
+            with_tags: bool,
             steering_status: axum::http::StatusCode,
             readback_status: axum::http::StatusCode,
             fast_mode: Option<bool>,
@@ -4943,6 +4953,9 @@ mod tests {
                     "github_pr": "https://github.com/example/repo/pull/1",
                     "desired_state": "running", "next_check_at": "later"}
             });
+            if !state.with_tags {
+                digest["project"].as_object_mut().unwrap().remove("tags");
+            }
             if let Some(fast_mode) = state.fast_mode {
                 digest["fast_mode"] = json!(fast_mode);
             }
@@ -4951,6 +4964,7 @@ mod tests {
         let fixture = Fixture {
             id: Uuid::new_v4(),
             with_hint,
+            with_tags,
             steering_status,
             readback_status,
             fast_mode,
@@ -4991,7 +5005,7 @@ mod tests {
     async fn resume_reads_state_after_the_hint_starts_the_turn() {
         use axum::http::StatusCode;
         let (result, calls) =
-            exercise_resume_readback(true, StatusCode::OK, StatusCode::OK, None).await;
+            exercise_resume_readback(true, true, StatusCode::OK, StatusCode::OK, None).await;
         assert_eq!(calls, ["prepare", "steer", "readback"]);
         assert_eq!(result["mission"]["status"], "active");
         assert_eq!(result["mission"]["updated_at"], "after");
@@ -5012,7 +5026,7 @@ mod tests {
     async fn resume_without_hint_also_returns_fresh_state() {
         use axum::http::StatusCode;
         let (result, calls) =
-            exercise_resume_readback(false, StatusCode::OK, StatusCode::OK, None).await;
+            exercise_resume_readback(false, true, StatusCode::OK, StatusCode::OK, None).await;
         assert_eq!(calls, ["prepare", "readback"]);
         assert_eq!(result["mission"]["updated_at"], "after");
         assert_eq!(result["steered"], false);
@@ -5023,7 +5037,8 @@ mod tests {
     async fn resume_hint_failure_does_not_claim_a_running_mission() {
         use axum::http::StatusCode;
         let (result, calls) =
-            exercise_resume_readback(true, StatusCode::BAD_GATEWAY, StatusCode::OK, None).await;
+            exercise_resume_readback(true, true, StatusCode::BAD_GATEWAY, StatusCode::OK, None)
+                .await;
         assert_eq!(calls, ["prepare", "steer", "readback"]);
         assert_eq!(result["resume_accepted"], true);
         assert_eq!(result["steered"], false);
@@ -5037,9 +5052,14 @@ mod tests {
     #[tokio::test]
     async fn resume_readback_failure_does_not_return_the_old_snapshot() {
         use axum::http::StatusCode;
-        let (result, calls) =
-            exercise_resume_readback(true, StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE, None)
-                .await;
+        let (result, calls) = exercise_resume_readback(
+            true,
+            true,
+            StatusCode::OK,
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+        )
+        .await;
         assert_eq!(calls, ["prepare", "steer", "readback"]);
         assert_eq!(result["resume_accepted"], true);
         assert_eq!(result["steered"], true);
@@ -5055,9 +5075,19 @@ mod tests {
         use axum::http::StatusCode;
         for enabled in [true, false] {
             let (result, _) =
-                exercise_resume_readback(true, StatusCode::OK, StatusCode::OK, Some(enabled)).await;
+                exercise_resume_readback(true, true, StatusCode::OK, StatusCode::OK, Some(enabled))
+                    .await;
             assert_eq!(result["mission"]["fast_mode"], enabled);
         }
+    }
+
+    #[tokio::test]
+    async fn resume_untagged_digest_preserves_empty_array() {
+        use axum::http::StatusCode;
+        let (result, _) =
+            exercise_resume_readback(true, false, StatusCode::OK, StatusCode::OK, None).await;
+        assert_eq!(result["mission"]["tags"], json!([]));
+        assert!(result["mission"]["tags"].is_array());
     }
 
     #[test]
