@@ -3392,14 +3392,13 @@ impl AssistantMcp {
                  Only interrupted, blocked, or failed missions can be resumed."
             ));
         }
-        let mission: Value = response
+        let _prepared_mission: Value = response
             .json()
             .await
             .map_err(|error| format!("Failed to parse resumed mission: {error}"))?;
-        // If we have a steering hint, deliver it as the next turn. If the post
-        // fails, the mission is already active — surface that as a soft warning
-        // (not an error) so the caller knows resume succeeded but the hint did
-        // not land. They can retry the hint without re-resuming.
+        // skip_message prepares the resume without starting a turn. The hint
+        // below is what wakes it, so the preparation response can still say
+        // interrupted. Never return that snapshot as the post-resume state.
         let steer_warning = if let Some(content) = hint {
             match self
                 .send_message(SendMessageParams {
@@ -3410,18 +3409,39 @@ impl AssistantMcp {
             {
                 Ok(_) => None,
                 Err(error) => Some(format!(
-                    "Mission resumed, but steering hint could not be delivered: {error}. \
-                     The mission is already active; retry send_message_to_mission to land \
-                     the hint."
+                    "Resume preparation succeeded, but steering hint delivery failed: {error}. \
+                     A new turn is not confirmed. Check get_mission_health before retrying \
+                     send_message_to_mission."
                 )),
             }
         } else {
             None
         };
+        // Mutation success and state readback failure are different outcomes:
+        // do not invite a duplicate resume if only this GET failed, and do not
+        // substitute the old interrupted snapshot for an unknown current state.
+        let (mission, state_warning) = match self
+            .get_mission_digest(MissionIdParams {
+                mission_id: id.to_string(),
+            })
+            .await
+        {
+            Ok(digest) => (compact_digest_mission_summary(digest), None),
+            Err(error) => (
+                Value::Null,
+                Some(format!(
+                    "Resume request accepted, but current mission state could not be read: {error}. \
+                     Check get_mission_health; do not repeat the resume solely for this readback failure."
+                )),
+            ),
+        };
         let response_body = json!({
-            "mission": compact_mission_summary(mission),
+            "mission_id": id,
+            "resume_accepted": true,
+            "mission": mission,
             "steered": has_hint && steer_warning.is_none(),
             "steer_warning": steer_warning,
+            "state_warning": state_warning,
         });
         Ok(response_body)
     }
@@ -3992,6 +4012,22 @@ fn compact_mission_summary(mission: Value) -> Value {
         "last_activity_at": mission.get("last_activity_at").cloned().unwrap_or(Value::Null),
         "last_status_change_at": mission.get("last_status_change_at").cloned().unwrap_or(Value::Null),
     })
+}
+
+/// The digest nests project tags; retain the mutation tools' flat summary
+/// shape while projecting only fields present in the fresh readback.
+fn compact_digest_mission_summary(digest: Value) -> Value {
+    let mut mission = digest.get("mission").cloned().unwrap_or(digest);
+    if let Some(project) = mission
+        .get("project")
+        .filter(|value| value.is_object())
+        .cloned()
+    {
+        for key in ["project", "track", "intent", "tags"] {
+            mission[key] = project.get(key).cloned().unwrap_or(Value::Null);
+        }
+    }
+    compact_mission_summary(mission)
 }
 
 /// Verity's HTTP `get_project` is ~120 unabsorbed tracks / ~64KB. Dumping that
@@ -4839,6 +4875,150 @@ mod tests {
                 .expect("resolve"),
             id
         );
+    }
+
+    async fn exercise_resume_readback(
+        with_hint: bool,
+        steering_status: axum::http::StatusCode,
+        readback_status: axum::http::StatusCode,
+    ) -> (Value, Vec<String>) {
+        use axum::{
+            extract::State,
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Fixture {
+            id: Uuid,
+            with_hint: bool,
+            steering_status: axum::http::StatusCode,
+            readback_status: axum::http::StatusCode,
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+        async fn prepare(State(state): State<Fixture>, Json(body): Json<Value>) -> Json<Value> {
+            assert_eq!(body["skip_message"], state.with_hint);
+            state.calls.lock().unwrap().push("prepare".into());
+            Json(json!({"id": state.id, "status": "interrupted", "updated_at": "before"}))
+        }
+        async fn steer(
+            State(state): State<Fixture>,
+            Json(body): Json<Value>,
+        ) -> (axum::http::StatusCode, Json<Value>) {
+            assert_eq!(body["mission_id"], state.id.to_string());
+            assert_eq!(body["content"], "Continue the existing proof");
+            state.calls.lock().unwrap().push("steer".into());
+            (
+                state.steering_status,
+                Json(json!({"accepted": state.steering_status.is_success()})),
+            )
+        }
+        async fn readback(State(state): State<Fixture>) -> (axum::http::StatusCode, Json<Value>) {
+            state.calls.lock().unwrap().push("readback".into());
+            let status = if state.steering_status.is_success() {
+                "active"
+            } else {
+                "interrupted"
+            };
+            (
+                state.readback_status,
+                Json(json!({
+                    "id": state.id, "status": status, "updated_at": "after",
+                    "backend": "grok", "model_override": "verified-model",
+                    "project": {"project": "example", "track": "existing", "intent": "implementation", "tags": ["example"]}
+                })),
+            )
+        }
+        let fixture = Fixture {
+            id: Uuid::new_v4(),
+            with_hint,
+            steering_status,
+            readback_status,
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let router = Router::new()
+            .route("/api/control/missions/:id/resume", post(prepare))
+            .route("/api/control/message", post(steer))
+            .route("/api/control/missions/:id/digest", get(readback))
+            .with_state(fixture.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mcp = AssistantMcp {
+            api_url,
+            api_token: None,
+            jwt_secret: None,
+            project_scope: None,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        };
+        let result = mcp
+            .resume_mission(ResumeMissionParams {
+                mission_id: fixture.id.to_string(),
+                clean_workspace: false,
+                content: with_hint.then(|| "Continue the existing proof".to_string()),
+            })
+            .await
+            .expect("accepted resume");
+        server.abort();
+        let calls = fixture.calls.lock().unwrap().clone();
+        (result, calls)
+    }
+
+    #[tokio::test]
+    async fn resume_reads_state_after_the_hint_starts_the_turn() {
+        use axum::http::StatusCode;
+        let (result, calls) = exercise_resume_readback(true, StatusCode::OK, StatusCode::OK).await;
+        assert_eq!(calls, ["prepare", "steer", "readback"]);
+        assert_eq!(result["mission"]["status"], "active");
+        assert_eq!(result["mission"]["updated_at"], "after");
+        assert_eq!(result["mission"]["project"], "example");
+        assert_eq!(result["mission"]["track"], "existing");
+        assert_eq!(result["steered"], true);
+        assert!(result["state_warning"].is_null());
+    }
+
+    #[tokio::test]
+    async fn resume_without_hint_also_returns_fresh_state() {
+        use axum::http::StatusCode;
+        let (result, calls) = exercise_resume_readback(false, StatusCode::OK, StatusCode::OK).await;
+        assert_eq!(calls, ["prepare", "readback"]);
+        assert_eq!(result["mission"]["updated_at"], "after");
+        assert_eq!(result["steered"], false);
+        assert!(result["steer_warning"].is_null());
+    }
+
+    #[tokio::test]
+    async fn resume_hint_failure_does_not_claim_a_running_mission() {
+        use axum::http::StatusCode;
+        let (result, calls) =
+            exercise_resume_readback(true, StatusCode::BAD_GATEWAY, StatusCode::OK).await;
+        assert_eq!(calls, ["prepare", "steer", "readback"]);
+        assert_eq!(result["resume_accepted"], true);
+        assert_eq!(result["steered"], false);
+        assert_eq!(result["mission"]["status"], "interrupted");
+        assert!(result["steer_warning"]
+            .as_str()
+            .unwrap()
+            .contains("not confirmed"));
+    }
+
+    #[tokio::test]
+    async fn resume_readback_failure_does_not_return_the_old_snapshot() {
+        use axum::http::StatusCode;
+        let (result, calls) =
+            exercise_resume_readback(true, StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE).await;
+        assert_eq!(calls, ["prepare", "steer", "readback"]);
+        assert_eq!(result["resume_accepted"], true);
+        assert_eq!(result["steered"], true);
+        assert!(result["mission"].is_null());
+        assert!(result["state_warning"]
+            .as_str()
+            .unwrap()
+            .contains("do not repeat"));
     }
 
     #[test]
