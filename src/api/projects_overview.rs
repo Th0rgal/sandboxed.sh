@@ -655,7 +655,22 @@ pub async fn get_project(
     };
     let grant = state.projects.get_grant(&slug).map_err(store_err)?;
     let tracks = collect_family_tracks(&state.projects, &slug).map_err(store_err)?;
-    let decisions = state.projects.open_decisions(&slug).map_err(store_err)?;
+    let decisions = {
+        let mut all = state.projects.open_decisions(&slug).map_err(store_err)?;
+        let mut seen: std::collections::HashSet<String> =
+            all.iter().map(|d| d.at.clone()).collect();
+        for key in project_tag_keys(&slug) {
+            if key == slug {
+                continue;
+            }
+            for d in state.projects.open_decisions(&key).map_err(store_err)? {
+                if seen.insert(d.at.clone()) {
+                    all.push(d);
+                }
+            }
+        }
+        all
+    };
     let recent = state
         .projects
         .recent_activity(&slug, 20)
@@ -685,10 +700,16 @@ pub async fn get_project(
     ) {
         project.next_action = Some(derived);
     }
-    let waiting_user_waits = state.control.collect_waiting_user_waits().await;
+    let (waiting_user_waits, waits_complete) =
+        state.control.collect_waiting_user_waits().await;
+    let effective_missions = if missions_available && waits_complete {
+        Some(missions.as_slice())
+    } else {
+        None
+    };
     project_mode_projection(
         &mut project,
-        missions_available.then_some(missions.as_slice()),
+        effective_missions,
         &waiting_user_waits,
         decisions.len() as u32,
     );
@@ -2357,7 +2378,8 @@ pub async fn projects_overview(
         .collect_project_missions(chrono::Duration::hours(TERMINAL_MISSION_HORIZON_HOURS))
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let waiting_user_waits = state.control.collect_waiting_user_waits().await;
+    let (waiting_user_waits, _waits_complete) =
+        state.control.collect_waiting_user_waits().await;
 
     // Delivery-derived facts come from the projects store, which the
     // background ingestor keeps current — the overview never scans the Hermes
@@ -7265,5 +7287,59 @@ mod tests {
             vec!["mission_failed|a".to_string(), "no_controller|".to_string()]
         );
         assert!(resolved_keys(&current, &current).is_empty());
+    }
+
+    #[test]
+    fn incomplete_wait_inventory_preserves_stored_decision_mode() {
+        let store =
+            super::super::projects_store::ProjectsStore::open_in_memory().unwrap();
+        store
+            .upsert_project("verity", None, None, None, None)
+            .unwrap();
+        store
+            .set_mode("verity", "blocked", None, Some("decision"))
+            .unwrap();
+        let record = store.get_project("verity").unwrap().unwrap();
+        let mut with_complete = record.clone();
+        project_mode_projection(&mut with_complete, Some(&[]), &HashMap::new(), 0);
+        assert_eq!(with_complete.mode, None, "complete empty roster clears decision");
+
+        let mut with_incomplete = record.clone();
+        project_mode_projection(&mut with_incomplete, None, &HashMap::new(), 0);
+        assert_eq!(
+            with_incomplete.mode.as_deref(),
+            Some("blocked"),
+            "unavailable evidence preserves stored mode"
+        );
+        assert_eq!(with_incomplete.blocker.as_deref(), Some("decision"));
+    }
+
+    #[test]
+    fn alias_decisions_aggregate_across_tag_keys() {
+        let store =
+            super::super::projects_store::ProjectsStore::open_in_memory().unwrap();
+        store
+            .upsert_project("verity", None, None, None, None)
+            .unwrap();
+        store
+            .upsert_project("verity-lido", None, None, None, None)
+            .unwrap();
+        store
+            .record_decision(
+                "verity-lido",
+                &super::super::projects_store::NewDecision {
+                    question: "merge lido PR?".into(),
+                    rationale: None,
+                    kind: None,
+                    authority: "escalation".into(),
+                    status: "pending_user".into(),
+                    evidence: None,
+                },
+            )
+            .unwrap();
+        let canonical_only = store.open_decisions("verity").unwrap();
+        let alias_only = store.open_decisions("verity-lido").unwrap();
+        assert!(canonical_only.is_empty());
+        assert_eq!(alias_only.len(), 1);
     }
 }

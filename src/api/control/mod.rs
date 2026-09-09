@@ -4435,19 +4435,26 @@ impl ControlHub {
     /// Live AskUserQuestion waits: mission id → user-wait tool `started_at`.
     /// Presence means `WaitingUser`; the value is the grace clock (None if the
     /// tool row is not registered yet — treated as just started).
-    pub(crate) async fn collect_waiting_user_waits(&self) -> HashMap<Uuid, Option<String>> {
+    ///
+    /// Returns `(waits, complete)`. When `complete` is false at least one store
+    /// or page failed — the map is a best-effort subset, not negative evidence.
+    pub(crate) async fn collect_waiting_user_waits(
+        &self,
+    ) -> (HashMap<Uuid, Option<String>>, bool) {
         let mut waits = HashMap::new();
         let Ok(inventory) = self.mission_store_inventory().await else {
-            return waits;
+            return (waits, false);
         };
+        let mut complete = true;
         for store in inventory.live {
             let Ok(runs) = store.list_active_mission_runs().await else {
+                complete = false;
                 continue;
             };
             let store_waits = user_wait_starts_for_runs(store.as_ref(), &runs).await;
             waits.extend(store_waits);
         }
-        waits
+        (waits, complete)
     }
 
     /// Board tasks across every store whose boss mission belongs to this
