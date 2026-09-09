@@ -540,19 +540,18 @@ async fn track_dispatch_unreadable_store_cannot_release_terminal_owner() {
     );
 }
 
-#[tokio::test]
-async fn track_dispatch_http_creation_reconciles_without_deadlocking_actor_or_pr_lock() {
+fn isolated_track_http_test(test_name: &str) -> bool {
     // Keep this HTTP/lock regression independent of the production 150 GiB
     // disk floor without changing environment shared by other parallel tests.
     const CHILD: &str = "TERMINAL_TRACK_LEASE_HTTP_TEST_CHILD";
-    if std::env::var_os(CHILD).is_none() {
+    if std::env::var(CHILD).ok().as_deref() != Some(test_name) {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "api::control::dispatch_admission_tests::track_dispatch_http_creation_reconciles_without_deadlocking_actor_or_pr_lock",
+                &format!("api::control::dispatch_admission_tests::{test_name}"),
                 "--nocapture",
             ])
-            .env(CHILD, "1")
+            .env(CHILD, test_name)
             .env("MISSION_DISK_EMERGENCY_RESERVE_GB", "0")
             .output()
             .unwrap();
@@ -562,6 +561,16 @@ async fn track_dispatch_http_creation_reconciles_without_deadlocking_actor_or_pr
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        return true;
+    }
+    false
+}
+
+#[tokio::test]
+async fn track_dispatch_http_creation_reconciles_without_deadlocking_actor_or_pr_lock() {
+    if isolated_track_http_test(
+        "track_dispatch_http_creation_reconciles_without_deadlocking_actor_or_pr_lock",
+    ) {
         return;
     }
     for pr in [None, Some("repo#244")] {
@@ -587,6 +596,65 @@ async fn track_dispatch_http_creation_reconciles_without_deadlocking_actor_or_pr
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].attempt_id, mission.id.to_string());
     }
+}
+
+#[tokio::test]
+async fn track_dispatch_lock_failure_interrupts_candidate_and_releases_disk() {
+    if isolated_track_http_test(
+        "track_dispatch_lock_failure_interrupts_candidate_and_releases_disk",
+    ) {
+        return;
+    }
+    let h = Harness::new().await;
+    h.state.backend_registry.write().await.register(Arc::new(
+        crate::backend::opencode::OpenCodeBackend::new("http://127.0.0.1:9".into(), None, false),
+    ));
+    let old = h.writer(MissionStatus::Acknowledged, None).await;
+    // A directory at the lock-file path makes the real open fail, while
+    // leaving the actor's separate disk ledger and mission store writable.
+    let admission_guard = DISPATCH_ADMISSION.lock().await;
+    let file_guard = dispatch_admission::durable_lock(&h.state.config)
+        .await
+        .unwrap();
+    let lock_path = h
+        .state
+        .config
+        .working_dir
+        .join(".sandboxed-sh/missions/.dispatch-admission.lock");
+    std::fs::remove_file(&lock_path).unwrap();
+    std::fs::create_dir(&lock_path).unwrap();
+    drop(file_guard);
+    drop(admission_guard);
+    let response = h.state.http_client.post(format!("{}/missions", h.url))
+        .json(&json!({"title":"rejected replacement", "backend":"opencode", "project":"lido", "track":"trio-reserve1", "writer":true, "estimated_disk_gib":1}))
+        .timeout(std::time::Duration::from_secs(10)).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = response.text().await.unwrap();
+    let candidates = h
+        .control
+        .mission_store
+        .list_missions_filtered(&Default::default(), 10, 0)
+        .await
+        .unwrap();
+    let candidate = candidates.iter().find(|m| m.id != old.id).unwrap();
+    assert_eq!(candidate.status, MissionStatus::Interrupted);
+    assert_eq!(
+        candidate.terminal_reason.as_deref(),
+        Some("dispatch_admission_unavailable")
+    );
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["mission_id"], candidate.id.to_string());
+    assert!(body["cleanup_error"].is_null());
+    assert!(!read_disk_reservation_ledger(&h.state.config)
+        .unwrap()
+        .reservations
+        .contains_key(&candidate.id));
+    assert_eq!(
+        h.state.projects.live_leases(None).unwrap()[0].attempt_id,
+        old.id.to_string()
+    );
+    assert!(candidate.project.track.is_none());
+    assert!(candidate.history.is_empty());
 }
 
 #[tokio::test]
