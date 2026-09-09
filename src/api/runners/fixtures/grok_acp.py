@@ -57,7 +57,10 @@ for line in sys.stdin:
             emit({"jsonrpc": "2.0", "id": 22, "method": "session/request_input",
                   "params": {"sessionId": "fixture-session"}})
             time.sleep(3)
-        elif scenario == "eof":
+        elif scenario in ("eof", "eof_cancel"):
+            if scenario == "eof_cancel":
+                update({"sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "closing stdout"}})
             os.close(sys.stdout.fileno())
             time.sleep(3)
             break

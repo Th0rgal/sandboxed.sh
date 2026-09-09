@@ -1846,11 +1846,18 @@ async fn run_grok_acp_process(
     // EOF and a terminal response must not hang forever on a CLI/descendant
     // that keeps the process alive. This tears down only our harness process;
     // it never resets or removes the mission checkout/session.
-    if tokio::time::timeout(idle_policy.shutdown, child.wait())
-        .await
-        .is_err()
-    {
-        let _ = child.kill().await;
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            let _ = child.kill().await;
+            return Ok(AgentResult::failure("Mission cancelled", 0)
+                .with_terminal_reason(TerminalReason::Cancelled));
+        }
+        exit = tokio::time::timeout(idle_policy.shutdown, child.wait()) => {
+            if exit.is_err() {
+                let _ = child.kill().await;
+            }
+        }
     }
 
     // The CLI doesn't always stamp a terminal status on the last
@@ -2046,6 +2053,12 @@ mod tests {
                         cancel.cancel();
                         break;
                     }
+                    if matches!(event, AgentEvent::TextDelta { ref content, .. } if content == "closing stdout")
+                    {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        cancel.cancel();
+                        break;
+                    }
                 }
             });
         }
@@ -2170,6 +2183,14 @@ mod tests {
             "stream_closed"
         );
         assert!(elapsed < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn grok_acp_cancellation_during_eof_teardown_is_not_a_transport_retry() {
+        let (result, _, elapsed) = grok_acp_fixture("eof_cancel", true).await;
+        assert_eq!(result.terminal_reason, Some(TerminalReason::Cancelled));
+        assert!(result.data.is_none());
+        assert!(elapsed < std::time::Duration::from_millis(600));
     }
 
     #[tokio::test]

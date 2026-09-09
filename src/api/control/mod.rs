@@ -18020,7 +18020,11 @@ async fn reserve_transport_auto_resume(
     attempts: &mut HashMap<Uuid, u8>,
     mission_id: Uuid,
     grok_acp: bool,
+    cancellation_requested: bool,
 ) -> bool {
+    if cancellation_requested {
+        return false;
+    }
     let count = attempts.entry(mission_id).or_insert(0);
     if *count >= if grok_acp { 1 } else { 3 } {
         return false;
@@ -22575,6 +22579,9 @@ async fn control_actor_loop(
                     // Save the running mission ID before clearing it - we need it for persist and auto-complete
                     // (current_mission can change if user clicks "New Mission" while task was running)
                     let completed_mission_id = running_mission_id;
+                    let completed_cancellation_requested = running_cancel
+                        .as_ref()
+                        .is_some_and(CancellationToken::is_cancelled);
                     running = None;
                     running_cancel = None;
                     if let Some(mid) = running_mission_id {
@@ -22917,6 +22924,7 @@ async fn control_actor_loop(
                                 &mut transport_auto_resumed_missions,
                                 mission_id,
                                 completed_grok_acp_transport_failure,
+                                completed_cancellation_requested,
                             ).await
                         {
                             let resume_message = transport_auto_resume_message_for_mission(
@@ -23523,6 +23531,7 @@ async fn control_actor_loop(
                                     &mut transport_auto_resumed_missions,
                                     *mission_id,
                                     is_grok_acp_transport_failure(&result),
+                                    cancellation_requested,
                                 ).await
                             {
                                 tracing::info!(
@@ -34207,8 +34216,12 @@ Investigate <service/> failures.
                 .unwrap();
         }
         let mut attempts = HashMap::new();
-        assert!(reserve_transport_auto_resume(&store, &mut attempts, mission.id, true).await);
-        assert!(!reserve_transport_auto_resume(&store, &mut attempts, mission.id, true).await);
+        assert!(
+            reserve_transport_auto_resume(&store, &mut attempts, mission.id, true, false).await
+        );
+        assert!(
+            !reserve_transport_auto_resume(&store, &mut attempts, mission.id, true, false).await
+        );
         drop(store);
         let reopened =
             mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "grok-retry")
@@ -34216,7 +34229,14 @@ Investigate <service/> failures.
                 .unwrap();
         let mut restarted_actor = HashMap::new();
         assert!(
-            !reserve_transport_auto_resume(&reopened, &mut restarted_actor, mission.id, true).await
+            !reserve_transport_auto_resume(
+                &reopened,
+                &mut restarted_actor,
+                mission.id,
+                true,
+                false
+            )
+            .await
         );
         let reservations = reopened
             .get_events(mission.id, Some(&["error"]), None, None)
@@ -34243,12 +34263,16 @@ Investigate <service/> failures.
         let db = rusqlite::Connection::open(dir.path().join("missions-grok-retry.db")).unwrap();
         db.execute("DROP TABLE mission_events", []).unwrap();
         let mut attempts = HashMap::new();
-        assert!(!reserve_transport_auto_resume(&store, &mut attempts, mission.id, true).await);
+        assert!(
+            !reserve_transport_auto_resume(&store, &mut attempts, mission.id, true, false).await
+        );
         let other = Uuid::new_v4();
         for _ in 0..3 {
-            assert!(reserve_transport_auto_resume(&store, &mut attempts, other, false).await);
+            assert!(
+                reserve_transport_auto_resume(&store, &mut attempts, other, false, false).await
+            );
         }
-        assert!(!reserve_transport_auto_resume(&store, &mut attempts, other, false).await);
+        assert!(!reserve_transport_auto_resume(&store, &mut attempts, other, false, false).await);
     }
 
     #[tokio::test]
@@ -34275,7 +34299,33 @@ Investigate <service/> failures.
             .await
             .unwrap();
         assert!(
-            !reserve_transport_auto_resume(&store, &mut HashMap::new(), mission.id, true).await
+            !reserve_transport_auto_resume(&store, &mut HashMap::new(), mission.id, true, false)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn grok_transport_recovery_cancelled_completion_does_not_consume_or_queue_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "grok-retry")
+            .await
+            .unwrap();
+        let mission = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let mut attempts = HashMap::new();
+        assert!(
+            !reserve_transport_auto_resume(&store, &mut attempts, mission.id, true, true).await
+        );
+        assert!(attempts.is_empty());
+        assert!(store
+            .get_events(mission.id, Some(&["error"]), None, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            reserve_transport_auto_resume(&store, &mut attempts, mission.id, true, false).await
         );
     }
 
