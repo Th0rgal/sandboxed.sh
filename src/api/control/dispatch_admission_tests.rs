@@ -4575,9 +4575,7 @@ async fn http_idle_message_continuation_captures_predecessor_before_delivery() {
         ),
     ] {
         let h = Harness::new().await;
-        let m = h
-            .writer(MissionStatus::AwaitingUser, Some("repo#244"))
-            .await;
+        let m = h.writer(MissionStatus::Active, Some("repo#244")).await;
         let store = h.control.mission_store.clone();
         let prior = store
             .begin_mission_run(m.id, "prior-actor", None)
@@ -4586,6 +4584,10 @@ async fn http_idle_message_continuation_captures_predecessor_before_delivery() {
         if ended {
             store
                 .finish_mission_run(prior.run_id, prior.generation, Some("turn_complete"))
+                .await
+                .unwrap();
+            store
+                .update_mission_status(m.id, MissionStatus::AwaitingUser)
                 .await
                 .unwrap();
         }
@@ -4622,6 +4624,10 @@ async fn http_idle_message_continuation_captures_predecessor_before_delivery() {
             if should_continue {
                 // The next native run can already finish before HTTP receives
                 // its acknowledgement. The reply must retain generation 1.
+                store
+                    .update_mission_status(mission_id, MissionStatus::Active)
+                    .await
+                    .unwrap();
                 let successor = store
                     .begin_mission_run(mission_id, "next-actor", None)
                     .await
@@ -4633,6 +4639,10 @@ async fn http_idle_message_continuation_captures_predecessor_before_delivery() {
                         successor.generation,
                         Some("turn_complete"),
                     )
+                    .await
+                    .unwrap();
+                store
+                    .update_mission_status(mission_id, MissionStatus::AwaitingUser)
                     .await
                     .unwrap();
             }
