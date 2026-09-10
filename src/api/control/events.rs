@@ -7,6 +7,14 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Immutable outcome coupled to a native execution at terminal publication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionCompletionSnapshot {
+    pub result_summary: Option<String>,
+    pub terminal_reason: Option<String>,
+    pub terminal_evidence: Option<String>,
+}
+
 /// A structured event emitted by the control session.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -124,6 +132,11 @@ pub enum AgentEvent {
     },
     /// Mission status changed (by agent or user)
     MissionStatusChanged {
+        /// Captured by the terminal writer, never inferred from a successor run.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        execution: Option<MissionRun>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        completion: Option<MissionCompletionSnapshot>,
         mission_id: Uuid,
         status: MissionStatus,
         summary: Option<String>,

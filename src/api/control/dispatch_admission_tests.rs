@@ -3796,6 +3796,8 @@ async fn assert_startup_identity_recovery(preceding_sweep: bool) {
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
             if let Ok(AgentEvent::MissionStatusChanged {
+                completion: None,
+                execution: None,
                 mission_id,
                 status: MissionStatus::Interrupted,
                 summary: Some(summary),
