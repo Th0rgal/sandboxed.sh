@@ -66,6 +66,10 @@ for line in sys.stdin:
             save()
         else:
             assert params['threadId'] == state['id']
+            if mode in ('restored-goal-hint', 'restored-goal-stopped'):
+                # Real CLI 0.153.0 publishes the restored goal at resume,
+                # before goal/get and the subsequent explicit activation.
+                notify('thread/goal/updated', {'threadId': state['id'], 'goal': state['goal']})
         active = mode in ('active', 'active-no-id')
         turns = [{'id': 'active-turn', 'status': 'inProgress'}] if mode == 'active' else []
         if method == 'thread/resume' and mode == 'goal-snapshot':
@@ -96,6 +100,12 @@ for line in sys.stdin:
         save()
     emit({'id': req['id'], 'result': result})
     if method in ('turn/start', 'thread/goal/set') and (method == 'turn/start' or params['status'] == 'active'):
+        if mode == 'restored-goal-stopped':
+            # A real stop after activation, before a turn starts, must survive.
+            state['goal']['status'] = 'blocked'
+            save()
+            notify('thread/goal/updated', {'threadId': state['id'], 'goal': state['goal']})
+            continue
         started()
         if mode in ('goal-snapshot', 'goal-snapshot-no-turn'):
             state['goal']['status'] = 'blocked'
@@ -108,7 +118,7 @@ for line in sys.stdin:
             os._exit(0)
         if mode == 'crash-once':
             os._exit(0)
-        if mode not in ('hold', 'hint', 'pause-error'):
+        if mode not in ('hold', 'hint', 'pause-error', 'restored-goal-hint'):
             finish()
     elif method == 'turn/steer':
         finish()

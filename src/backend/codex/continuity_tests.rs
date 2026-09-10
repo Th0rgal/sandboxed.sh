@@ -689,3 +689,97 @@ async fn codex_continuity_enrollment_keeps_existing_legacy_and_unknown_sessions_
         .expect("missing binding is refused");
     assert!(failure.to_string().contains("codex_continuity_missing"));
 }
+
+#[tokio::test]
+async fn codex_continuity_resume_restored_goal_snapshot_does_not_drop_current_hint() {
+    let mut f = Fixture::new();
+    f.run("normal", "/goal preserve this exact objective").await;
+    let before = f.state()["goal"].clone();
+    f.config.current_message = "CONTINUE-CANARY".into();
+    let events = f.run("restored-goal-hint", "old outer transcript").await;
+    assert_eq!(f.state()["hints"], json!(["CONTINUE-CANARY"]));
+    assert_eq!(f.requests("thread/start").len(), 1);
+    assert_eq!(f.requests("thread/resume").len(), 1);
+    assert_eq!(f.requests("turn/steer").len(), 1);
+    assert_eq!(
+        f.requests("thread/goal/set")[1],
+        json!({"threadId":"native-thread-1", "status":"active"})
+    );
+    assert_eq!(f.state()["goal"]["objective"], before["objective"]);
+    assert_eq!(f.state()["goal"]["tokenBudget"], before["tokenBudget"]);
+    assert!(
+        f.state()["goal"]["tokensUsed"].as_i64().unwrap() >= before["tokensUsed"].as_i64().unwrap()
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ExecutionEvent::Error { .. })),
+        "{events:?}"
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, ExecutionEvent::GoalStatus { status, .. } if status == "blocked")
+    ));
+    f.assert_processes_stopped();
+}
+
+#[tokio::test]
+async fn codex_continuity_resume_keeps_real_stop_after_reactivation() {
+    let mut f = Fixture::new();
+    f.run("normal", "/goal preserve this exact objective").await;
+    f.config.current_message = "current hint".into();
+    let events = f.run("restored-goal-stopped", "old transcript").await;
+    assert!(f.requests("turn/steer").is_empty());
+    assert!(events.iter().any(
+        |event| matches!(event, ExecutionEvent::GoalStatus { status, .. } if status == "blocked")
+    ));
+    assert!(events.iter().any(|event| matches!(event, ExecutionEvent::Error { message } if message.contains("steer_unconfirmed"))));
+    assert_eq!(f.state()["goal"]["status"], "blocked");
+    f.assert_processes_stopped();
+}
+
+#[tokio::test]
+async fn codex_continuity_snapshot_drain_retains_errors_requests_and_nonmatching_goals() {
+    use super::app_server::{InboundMessage, ThreadGoal};
+    let goal = ThreadGoal {
+        thread_id: "native-thread".into(),
+        objective: "goal".into(),
+        status: "blocked".into(),
+        token_budget: Some(100),
+        tokens_used: 7,
+        time_used_seconds: 2,
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    tx.send(InboundMessage::Notification {
+        method: "thread/goal/updated".into(),
+        params: json!({"threadId":goal.thread_id,"goal":goal}),
+    })
+    .await
+    .unwrap();
+    let retained = vec![
+        InboundMessage::Notification {
+            method: "error".into(),
+            params: json!({"error":{"message":"real error"}}),
+        },
+        InboundMessage::ServerRequest {
+            id: json!(9),
+            method: "item/tool/call".into(),
+            params: json!({"callId":"real-tool"}),
+        },
+        InboundMessage::Notification {
+            method: "thread/goal/updated".into(),
+            params: json!({"threadId":goal.thread_id,"turnId":"real-turn","goal":goal}),
+        },
+        InboundMessage::Notification {
+            method: "thread/goal/updated".into(),
+            params: json!({"threadId":"another-thread","goal":goal}),
+        },
+    ];
+    for message in &retained {
+        tx.send(message.clone()).await.unwrap();
+    }
+    let actual = super::drain_restored_goal_snapshot(&mut rx, &goal);
+    assert_eq!(
+        format!("{actual:?}"),
+        format!("{:?}", std::collections::VecDeque::from(retained))
+    );
+}

@@ -330,7 +330,7 @@ async fn send_message_streaming_app_server(
 
         // Take the inbound channel before issuing any further RPC — `goal/set`
         // and `turn/start` start emitting notifications before they return.
-        let inbound = match session_arc.take_inbound().await {
+        let mut inbound = match session_arc.take_inbound().await {
             Some(rx) => rx,
             None => {
                 let _ = session_arc.shutdown().await;
@@ -357,6 +357,7 @@ async fn send_message_streaming_app_server(
         // Issue the priming RPC. For goal missions, codex auto-starts the first
         // turn after `goal/set`; for non-goal, we explicitly send `turn/start`.
         let mut pending_steer = None;
+        let mut pre_activation_messages = std::collections::VecDeque::new();
         let mut existing_objective = None;
         let mut already_primed = false;
         if let Some(lease) = native_lease.as_mut() {
@@ -387,6 +388,11 @@ async fn send_message_streaming_app_server(
                     let active = thread.status.as_ref().is_some_and(|s| s.get("type").and_then(|t| t.as_str()) == Some("active"))
                         || thread.turns.iter().any(|t| t["status"] == "inProgress");
                     if !active {
+                        // thread/resume publishes the restored goal before our
+                        // goal/get response. It is a snapshot, not a new stop
+                        // after this explicit resume. Keep every other queued
+                        // notification/request and all post-activation events.
+                        pre_activation_messages = drain_restored_goal_snapshot(&mut inbound, &goal);
                         session_for_rpc.goal_status(&thread_id, "active").await?;
                         let after = session_for_rpc.goal_get(&thread_id).await?.goal
                             .ok_or_else(|| anyhow::anyhow!("codex_continuity_goal_missing: goal disappeared while resuming"))?;
@@ -475,10 +481,16 @@ async fn send_message_streaming_app_server(
         } else {
             String::new()
         };
-        Ok((thread, inbound, is_goal_mission, pending_steer, initial_objective))
+        Ok((thread, inbound, is_goal_mission, pending_steer, initial_objective, pre_activation_messages))
     }.await;
-    let (thread, inbound, is_goal_mission, mut pending_steer, initial_objective) = match preparation
-    {
+    let (
+        thread,
+        inbound,
+        is_goal_mission,
+        mut pending_steer,
+        initial_objective,
+        pre_activation_messages,
+    ) = match preparation {
         Ok(prepared) => prepared,
         Err(error) => {
             session_arc.shutdown().await;
@@ -524,7 +536,7 @@ async fn send_message_streaming_app_server(
                 translator.goal_active_turns.insert(id.clone());
             }
         }
-        let mut recovered_notifications = std::collections::VecDeque::new();
+        let mut recovered_notifications = pre_activation_messages;
         let steer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut terminal = false;
         let mut stream_closed_unexpectedly = false;
@@ -1628,6 +1640,34 @@ impl AppServerEventTranslator {
                 .is_none_or(|id| self.goal_completed_turns.contains(id));
         TranslateOutcome { events, terminal }
     }
+}
+
+/// Retain the pre-activation queue, except an exact restored-goal snapshot.
+/// Called only for an idle persisted goal, after goal/get and before goal/set.
+/// The RPC response acts as an ordering boundary: later real stop notifications
+/// stay in `inbound` and are interpreted normally, even with the same status.
+fn drain_restored_goal_snapshot(
+    inbound: &mut mpsc::Receiver<app_server::InboundMessage>,
+    goal: &app_server::ThreadGoal,
+) -> std::collections::VecDeque<app_server::InboundMessage> {
+    let mut retained = std::collections::VecDeque::new();
+    while let Ok(message) = inbound.try_recv() {
+        let restored = match &message {
+            app_server::InboundMessage::Notification { method, params }
+                if method == "thread/goal/updated"
+                    && params["threadId"] == goal.thread_id
+                    && params.get("turnId").is_none_or(serde_json::Value::is_null) =>
+            {
+                serde_json::from_value::<app_server::ThreadGoal>(params["goal"].clone())
+                    .is_ok_and(|snapshot| snapshot == *goal)
+            }
+            _ => false,
+        };
+        if !restored {
+            retained.push_back(message);
+        }
+    }
+    retained
 }
 
 /// Create a registry entry for the Codex backend.

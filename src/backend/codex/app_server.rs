@@ -162,7 +162,7 @@ pub struct ThreadHandle {
     pub turns: Vec<Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadGoal {
     pub thread_id: String,
