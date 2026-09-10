@@ -614,6 +614,24 @@ pub(crate) fn summarize_codex_usage_caps(
     msg
 }
 
+/// Select native continuity without mistaking MissionStore's initial UUID for
+/// evidence that Codex already ran. All stores allocate that bookkeeping id at
+/// creation. Prior assistant history or any legacy rollout directory still
+/// requires an explicit migration; unknown session identifiers stay legacy.
+pub(crate) fn native_continuity_enabled(
+    has_binding: bool,
+    session_id: Option<&str>,
+    is_continuation: bool,
+    legacy_rollouts: bool,
+) -> bool {
+    let unexecuted_bookkeeping_id = session_id.is_none_or(|id| {
+        Uuid::parse_str(id).is_ok_and(|id| id.get_version() == Some(uuid::Version::Random))
+    });
+    has_binding
+        || session_id.is_some_and(|id| id.starts_with(continuity::SESSION_PREFIX))
+        || (!is_continuation && unexecuted_bookkeeping_id && !legacy_rollouts)
+}
+
 /// Run a codex turn through the unified credential pool with rotation and
 /// account-level cooldown handling. Shared by the initial mission dispatch
 /// and the control-channel follow-up path so a usage-capped ChatGPT account
@@ -641,9 +659,12 @@ pub(crate) async fn run_codex_turn_with_rotation(
         Err(error) => return continuity_failure(error),
     };
     let legacy_rollouts = mission_work_dir.join(".codex/sessions").is_dir();
-    let enabled = binding.is_some()
-        || session_id.is_some_and(|id| id.starts_with(continuity::SESSION_PREFIX))
-        || (!is_continuation && session_id.is_none() && !legacy_rollouts);
+    let enabled = native_continuity_enabled(
+        binding.is_some(),
+        session_id,
+        is_continuation,
+        legacy_rollouts,
+    );
     let native_input = NativeTurnInput {
         path,
         current_message,

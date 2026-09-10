@@ -507,3 +507,185 @@ async fn codex_continuity_projection_and_plain_hint_keep_native_goal_stopped_cla
     }
     assert!(projected);
 }
+
+/// Regression for the production create_mission -> first dispatch -> native
+/// projection -> persisted mission reload path. A hand-built None session id
+/// missed this: the real SQLite store creates a UUID before Codex ever runs.
+#[tokio::test]
+async fn codex_continuity_fresh_sqlite_mission_enrolls_and_reloads_same_thread() {
+    use crate::api::mission_store::{MissionStore, SqliteMissionStore};
+    use crate::api::runners::codex::native_continuity_enabled;
+
+    let mut f = Fixture::new();
+    let store = SqliteMissionStore::new(f.dir.path().join("store"), "native-enrollment")
+        .await
+        .unwrap();
+    let mission = store
+        .create_mission(
+            Some("fresh native goal"),
+            None,
+            None,
+            Some("synthetic-model"),
+            None,
+            Some("codex"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        mission.session_id.is_some(),
+        "exercise the real bookkeeping UUID"
+    );
+    assert!(mission.history.is_empty());
+    assert!(native_continuity_enabled(
+        false,
+        mission.session_id.as_deref(),
+        mission
+            .history
+            .iter()
+            .any(|entry| entry.role == "assistant"),
+        false
+    ));
+    f.config.identity.mission_id = mission.id;
+    f.config.path = continuity::binding_path(f.dir.path(), mission.id);
+    f.config.projected_session = mission.session_id;
+    let events = f
+        .run("normal", "/goal real store creation regression")
+        .await;
+    let native_id = events
+        .iter()
+        .find_map(|event| match event {
+            ExecutionEvent::CodexSessionBound {
+                thread_id,
+                goal_mode: true,
+            } => Some(thread_id.clone()),
+            _ => None,
+        })
+        .expect("fresh stored mission emits a real native binding");
+    let projected = format!("{}{}", continuity::SESSION_PREFIX, native_id);
+    store
+        .update_mission_session_id(mission.id, &projected)
+        .await
+        .unwrap();
+    let persisted = store.get_mission(mission.id).await.unwrap().unwrap();
+    f.config.projected_session = persisted.session_id;
+    let before = f.state()["goal"].clone();
+    f.config.current_message = "current checkpoint hint".into();
+    assert!(native_continuity_enabled(
+        true,
+        f.config.projected_session.as_deref(),
+        true,
+        true
+    ));
+    f.run(
+        "normal",
+        "stale outer transcript must not become a new goal",
+    )
+    .await;
+    assert_eq!(f.requests("thread/start").len(), 1);
+    assert_eq!(f.requests("thread/resume").len(), 1);
+    assert_eq!(
+        continuity::read(&f.config.path)
+            .unwrap()
+            .unwrap()
+            .thread_id
+            .as_deref(),
+        Some(native_id.as_str())
+    );
+    assert_eq!(f.state()["goal"]["objective"], before["objective"]);
+    assert_eq!(f.state()["goal"]["tokenBudget"], before["tokenBudget"]);
+    assert!(
+        f.state()["goal"]["tokensUsed"].as_u64().unwrap() >= before["tokensUsed"].as_u64().unwrap()
+    );
+    f.assert_processes_stopped();
+}
+
+#[tokio::test]
+async fn codex_continuity_enrollment_keeps_existing_legacy_and_unknown_sessions_fenced() {
+    use crate::api::mission_store::{MissionStore, SqliteMissionStore};
+    use crate::api::runners::codex::native_continuity_enabled;
+    let f = Fixture::new();
+    let store = SqliteMissionStore::new(f.dir.path().join("store"), "legacy-enrollment")
+        .await
+        .unwrap();
+    let mission = store
+        .create_mission(
+            Some("existing legacy"),
+            None,
+            None,
+            None,
+            None,
+            Some("codex"),
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .log_event(
+            mission.id,
+            &crate::api::control::AgentEvent::AssistantMessage {
+                id: Uuid::new_v4(),
+                content: "prior executed work".into(),
+                success: true,
+                cost_cents: 0,
+                cost_source: crate::agents::CostSource::Unknown,
+                usage: None,
+                model: None,
+                model_normalized: None,
+                mission_id: Some(mission.id),
+                shared_files: None,
+                resumable: false,
+                completion_evidence: None,
+            },
+        )
+        .await
+        .unwrap();
+    let persisted = store.get_mission(mission.id).await.unwrap().unwrap();
+    assert_eq!(persisted.history.len(), 1);
+    assert!(!native_continuity_enabled(
+        false,
+        persisted.session_id.as_deref(),
+        persisted
+            .history
+            .iter()
+            .any(|entry| entry.role == "assistant"),
+        false
+    ));
+    // A legacy run can crash after a tool but before its first assistant final.
+    // Its rollout storage remains a fence even with no assistant history.
+    std::fs::create_dir(f.dir.path().join(".codex/sessions")).unwrap();
+    assert!(!native_continuity_enabled(
+        false,
+        mission.session_id.as_deref(),
+        false,
+        f.dir.path().join(".codex/sessions").is_dir()
+    ));
+    assert!(!native_continuity_enabled(
+        false,
+        Some("unknown-harness-session"),
+        false,
+        false
+    ));
+    assert!(!native_continuity_enabled(
+        false,
+        Some("01900000-0000-7000-8000-000000000001"),
+        false,
+        false
+    ));
+    // A native projection with a lost binding must enter the native path and
+    // fail closed there, never fall back to legacy or create a fresh thread.
+    let projected = format!("{}missing-native-thread", continuity::SESSION_PREFIX);
+    assert!(native_continuity_enabled(
+        false,
+        Some(&projected),
+        true,
+        false
+    ));
+    let mut cfg = f.config.clone();
+    cfg.projected_session = Some(projected);
+    let failure = continuity::Lease::acquire(&cfg)
+        .await
+        .err()
+        .expect("missing binding is refused");
+    assert!(failure.to_string().contains("codex_continuity_missing"));
+}
