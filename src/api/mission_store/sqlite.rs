@@ -3518,6 +3518,23 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|error| error.to_string())?
     }
 
+    async fn get_latest_mission_run(&self, mission_id: Uuid) -> Result<Option<MissionRun>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT run_id, mission_id, generation, execution_state, owner_actor_id, scope_unit, started_at, heartbeat_at, stopping_at, ended_at, terminal_reason
+                 FROM mission_runs WHERE mission_id = ?1 ORDER BY generation DESC LIMIT 1",
+                params![mission_id.to_string()],
+                parse_mission_run_row,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
     async fn list_active_mission_runs(&self) -> Result<Vec<MissionRun>, String> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -5502,14 +5519,17 @@ impl MissionStore for SqliteMissionStore {
             ),
             AgentEvent::TextOp { .. } => return Ok(()),
             AgentEvent::MissionStatusChanged {
-                status, summary, ..
+                status,
+                summary,
+                execution,
+                ..
             } => (
                 "mission_status_changed",
                 None,
                 None,
                 None,
                 summary.clone().unwrap_or_default(),
-                serde_json::json!({ "status": status.to_string() }),
+                serde_json::json!({ "status": status.to_string(), "execution": execution }),
             ),
             AgentEvent::MissionMetadataUpdated {
                 title,
@@ -12302,6 +12322,7 @@ mod tests {
                 .log_event(
                     mission.id,
                     &AgentEvent::MissionStatusChanged {
+                        execution: None,
                         mission_id: mission.id,
                         status: *status,
                         summary: Some(format!("{title} status change")),

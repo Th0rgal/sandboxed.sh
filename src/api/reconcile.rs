@@ -610,6 +610,7 @@ pub async fn run(state: &Arc<AppState>) -> ReconcileReport {
             }
             report.missions_interrupted += 1;
             let _ = session.events_tx.send(AgentEvent::MissionStatusChanged {
+                execution: None,
                 mission_id: mission.id,
                 status: MissionStatus::Interrupted,
                 summary: Some(

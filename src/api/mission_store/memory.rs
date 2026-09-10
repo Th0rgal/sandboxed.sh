@@ -167,6 +167,17 @@ impl MissionStore for InMemoryMissionStore {
             .cloned())
     }
 
+    async fn get_latest_mission_run(&self, mission_id: Uuid) -> Result<Option<MissionRun>, String> {
+        Ok(self
+            .runs
+            .read()
+            .await
+            .values()
+            .filter(|run| run.mission_id == mission_id)
+            .max_by_key(|run| run.generation)
+            .cloned())
+    }
+
     async fn list_active_mission_runs(&self) -> Result<Vec<MissionRun>, String> {
         Ok(self
             .runs

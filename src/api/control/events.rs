@@ -124,6 +124,9 @@ pub enum AgentEvent {
     },
     /// Mission status changed (by agent or user)
     MissionStatusChanged {
+        /// Captured by the terminal writer, never inferred from a successor run.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        execution: Option<MissionRun>,
         mission_id: Uuid,
         status: MissionStatus,
         summary: Option<String>,

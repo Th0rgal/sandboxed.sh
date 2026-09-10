@@ -5553,7 +5553,9 @@ fn mission_execution_projection(run: &MissionRun, status: MissionStatus) -> serd
                 .max(0) as u64
         })
         .unwrap_or(u64::MAX);
-    let conflict = if status == MissionStatus::Acknowledged || status.is_terminal() {
+    let conflict = if run.execution_state.is_terminal() {
+        None
+    } else if status == MissionStatus::Acknowledged || status.is_terminal() {
         Some(format!("status_{status}_with_non_terminal_run"))
     } else if heartbeat_age > 60 && run.execution_state != MissionExecutionState::WaitingUser {
         Some(format!("run_heartbeat_stale_{heartbeat_age}s"))
@@ -5567,6 +5569,8 @@ fn mission_execution_projection(run: &MissionRun, status: MissionStatus) -> serd
         "health": if conflict.is_some() { "reconciling" } else { "healthy" },
         "heartbeat_at": run.heartbeat_at,
         "scope_unit": run.scope_unit,
+        "ended_at": run.ended_at,
+        "terminal_reason": run.terminal_reason,
         "status_conflict": conflict,
     })
 }
@@ -7461,19 +7465,19 @@ pub async fn get_mission_digest(
             }
         }
     }
-    let active_run = control
+    let latest_run = control
         .mission_store
-        .get_active_mission_run(mission.id)
+        .get_latest_mission_run(mission.id)
         .await
         .map_err(internal_error)?;
-    let waiting_for_user_tool = active_run
+    let waiting_for_user_tool = latest_run
         .as_ref()
         .is_some_and(|run| run.execution_state == MissionExecutionState::WaitingUser);
-    let wait_started_at = match active_run.as_ref() {
+    let wait_started_at = match latest_run.as_ref() {
         Some(run) => user_wait_tool_started_at(control.mission_store.as_ref(), run).await,
         None => None,
     };
-    let execution = active_run
+    let execution = latest_run
         .as_ref()
         .map(|run| mission_execution_projection(run, mission.status));
 
@@ -9263,6 +9267,7 @@ async fn activate_mission_for_message(
                     .await?;
                 store.set_deferred_goal(mission.id, None).await?;
                 let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                    execution: None,
                     mission_id: mission.id,
                     status: MissionStatus::Interrupted,
                     summary: Some(format!("{reason}: {error}")),
@@ -9283,6 +9288,7 @@ async fn activate_mission_for_message(
         // after the next failure.
         let _ = store.set_deferred_goal(mission.id, None).await;
         let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+            execution: None,
             mission_id: mission.id,
             status: MissionStatus::Active,
             summary: None,
@@ -9317,6 +9323,7 @@ async fn restore_mission_after_failed_run_acquisition(
         )
         .await?;
     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+        execution: None,
         mission_id: mission.id,
         status: mission.status,
         summary: Some("Run acquisition failed; prior mission status restored".to_string()),
@@ -9720,6 +9727,7 @@ async fn interrupt_new_mission(control: &ControlState, mission_id: Uuid, reason:
         tracing::warn!(mission_id = %mission_id, %error, reason, "could not interrupt rejected mission");
     }
     let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        execution: None,
         mission_id,
         status: MissionStatus::Interrupted,
         summary: Some(reason.to_string()),
@@ -10528,6 +10536,7 @@ pub async fn create_mission(
                     )
                     .await?;
                 let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                    execution: None,
                     mission_id: mission.id,
                     status: MissionStatus::Interrupted,
                     summary: Some(reason.to_string()),
@@ -10576,6 +10585,7 @@ pub async fn create_mission(
                 .await
                 .map_err(internal_error)?;
             let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                execution: None,
                 mission_id: mission.id,
                 status: MissionStatus::Interrupted,
                 summary: Some(reason.to_string()),
@@ -10898,6 +10908,7 @@ pub async fn create_mission(
                     )
                     .await;
                 let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                    execution: None,
                     mission_id: mission.id,
                     status: MissionStatus::Failed,
                     summary: Some(message.clone()),
@@ -10965,6 +10976,7 @@ async fn dispatch_remote_mission_mvp(
         .update_mission_status(mission.id, MissionStatus::Active)
         .await?;
     let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        execution: None,
         mission_id: mission.id,
         status: MissionStatus::Active,
         summary: Some(format!("Dispatching to remote node '{}'", node.id)),
@@ -11136,6 +11148,7 @@ pub(crate) async fn ensure_remote_build_wait(
             .update_mission_status(mission_id, MissionStatus::Active)
             .await?;
         owner.send(AgentEvent::MissionStatusChanged {
+            execution: None,
             mission_id,
             status: MissionStatus::Active,
             summary: Some(format!(
@@ -11583,6 +11596,7 @@ async fn finalize_remote_mission(
         .update_mission_status_with_reason(mission_id, status, Some(status_reason))
         .await?;
     owner.send(AgentEvent::MissionStatusChanged {
+        execution: None,
         mission_id,
         status,
         summary: Some(format!("Remote node '{node_id}' finished")),
@@ -11768,6 +11782,7 @@ async fn dispatch_remote_job(
         return Err(err);
     }
     let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        execution: None,
         mission_id: mission.id,
         status: MissionStatus::Active,
         summary: Some(format!(
@@ -13158,6 +13173,7 @@ pub async fn mark_mission_opened(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Mission {} not found", id)))?;
     if newly_set.is_some() {
         let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+            execution: None,
             mission_id: id,
             status: mission.status,
             summary: None,
@@ -14346,7 +14362,7 @@ pub async fn get_mission_snapshot(
         .find(|info| info.mission_id == mission_id);
     let execution = control
         .mission_store
-        .get_active_mission_run(mission_id)
+        .get_latest_mission_run(mission_id)
         .await
         .map_err(internal_error)?
         .as_ref()
@@ -15311,6 +15327,11 @@ fn stored_event_to_agent_event(event: &mission_store::StoredEvent) -> Option<Age
                 .and_then(|v| v.as_str())
                 .and_then(|s| serde_json::from_value::<MissionStatus>(serde_json::json!(s)).ok())?;
             Some(AgentEvent::MissionStatusChanged {
+                execution: event
+                    .metadata
+                    .get("execution")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok()),
                 mission_id: event.mission_id,
                 status,
                 summary: None,
@@ -15948,7 +15969,8 @@ async fn paloma_webhook_forwarder_loop(
     let in_flight_c = Arc::clone(&in_flight);
     let forward = move |mission_id: Uuid,
                         status: MissionStatus,
-                        old_status: Option<MissionStatus>| {
+                        old_status: Option<MissionStatus>,
+                        event_execution: Option<MissionRun>| {
         let http = http_c.clone();
         let url = url_c.clone();
         let secret = secret_c.clone();
@@ -15974,11 +15996,19 @@ async fn paloma_webhook_forwarder_loop(
                 .and_then(|mission| mission.title.clone())
                 .unwrap_or_else(|| mission_id.to_string());
             let project = mission.as_ref().map(|m| &m.project);
-            let run = mission_store
-                .get_active_mission_run(mission_id)
-                .await
-                .ok()
-                .flatten();
+            let run = match event_execution {
+                Some(run) => Some(run),
+                None => mission_store
+                    .get_latest_mission_run(mission_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|run| {
+                        mission
+                            .as_ref()
+                            .is_some_and(|m| m.status == status && run.started_at <= m.updated_at)
+                    }),
+            };
             let mut remote_jobs = crate::remote_node::job_ledger::load(&working_dir)
                 .await
                 .unwrap_or_default()
@@ -16265,13 +16295,16 @@ async fn paloma_webhook_forwarder_loop(
                     "webhook reconcile: forwarding a status transition the \
                      broadcast never delivered"
                 );
-                forward(mission.id, status, prior);
+                forward(mission.id, status, prior, None);
             }
             continue;
         };
         match result {
             Ok(AgentEvent::MissionStatusChanged {
-                mission_id, status, ..
+                mission_id,
+                status,
+                execution,
+                ..
             }) => {
                 let old_status = markers.lock().await.get(mission_id);
                 if old_status == Some(status) {
@@ -16284,7 +16317,7 @@ async fn paloma_webhook_forwarder_loop(
                 if !in_flight.lock().await.insert((mission_id, status)) {
                     continue;
                 }
-                forward(mission_id, status, old_status);
+                forward(mission_id, status, old_status, execution);
             }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(dropped)) => {
@@ -18374,6 +18407,11 @@ async fn maybe_finalize_terminal_mission(
                     tracing::warn!(mission_id = %mission_id, "failed to record terminal evidence: {e}");
                 }
             }
+            let execution = mission_store
+                .get_latest_mission_run(mission_id)
+                .await
+                .ok()
+                .flatten();
             if let Err(e) = mission_store
                 .update_mission_status_with_reason(
                     mission_id,
@@ -18413,6 +18451,7 @@ async fn maybe_finalize_terminal_mission(
                     new_status,
                 );
                 let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                    execution,
                     mission_id,
                     status: new_status,
                     summary: mission_status_summary_for_terminal_reason(reason),
@@ -20036,6 +20075,7 @@ async fn control_actor_loop(
                                                 } else {
                                                     let _ = events_tx.send(
                                                         AgentEvent::MissionStatusChanged {
+                                                            execution: None,
                                                             mission_id: tid,
                                                             status: MissionStatus::Pending,
                                                             summary: Some(
@@ -21034,6 +21074,7 @@ async fn control_actor_loop(
                                 new_status,
                             );
                             let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                execution: None,
                                 mission_id: id,
                                 status: new_status,
                                 summary: None,
@@ -21391,6 +21432,7 @@ async fn control_actor_loop(
                                     tracing::warn!("Failed to cancel child mission {}: {}", child.id, e);
                                 } else {
                                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        execution: None,
                                         mission_id: child.id,
                                         status: MissionStatus::Interrupted,
                                         summary: None,
@@ -21532,6 +21574,7 @@ async fn control_actor_loop(
                                             .await;
                                         let _ = events_tx.send(
                                             AgentEvent::MissionStatusChanged {
+                                                execution: None,
                                                 mission_id,
                                                 status: MissionStatus::Interrupted,
                                                 summary: None,
@@ -21634,6 +21677,7 @@ async fn control_actor_loop(
                                     )
                                     .await;
                                 let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                    execution: None,
                                     mission_id,
                                     status: MissionStatus::Paused,
                                     summary: None,
@@ -21825,6 +21869,7 @@ async fn control_actor_loop(
                                                 .await;
                                             let _ = events_tx.send(
                                                 AgentEvent::MissionStatusChanged {
+                                                    execution: None,
                                                     mission_id,
                                                     status: MissionStatus::Interrupted,
                                                     summary: None,
@@ -21934,6 +21979,7 @@ async fn control_actor_loop(
                                         MissionStatus::Active,
                                     );
                                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        execution: None,
                                         mission_id,
                                         status: MissionStatus::Active,
                                         summary: None,
@@ -22009,6 +22055,7 @@ async fn control_actor_loop(
                                     );
                                     // Send status changed event so UI updates
                                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        execution: None,
                                         mission_id,
                                         status: MissionStatus::Active,
                                         summary: None,
@@ -22570,6 +22617,7 @@ async fn control_actor_loop(
                                 }
 
                                 let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                    execution: mission_store.get_latest_mission_run(id).await.ok().flatten(),
                                     mission_id: id,
                                     status: new_status,
                                     summary,
@@ -22676,6 +22724,7 @@ async fn control_actor_loop(
                                         tracing::warn!(mission_id = %run.mission_id, %error, "Failed to keep remote-wait mission active");
                                     } else {
                                         let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                            execution: None,
                                             mission_id: run.mission_id,
                                             status: MissionStatus::Active,
                                             summary: Some("Waiting for durable remote validation".to_string()),
@@ -22906,6 +22955,7 @@ async fn control_actor_loop(
                                         MissionStatus::Failed,
                                     );
                                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        execution: None,
                                         mission_id,
                                         status: MissionStatus::Failed,
                                         summary: Some("Task execution failed unexpectedly".to_string()),
@@ -23337,6 +23387,7 @@ async fn control_actor_loop(
                                 MissionStatus::Interrupted,
                             );
                             let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                execution: None,
                                 mission_id: *mission_id,
                                 status: MissionStatus::Interrupted,
                                 summary: Some(
@@ -23397,6 +23448,7 @@ async fn control_actor_loop(
                                     tracing::warn!(mission_id = %mission_id, %error, "Failed to keep parallel remote-wait mission active");
                                 } else {
                                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        execution: None,
                                         mission_id: *mission_id,
                                         status: MissionStatus::Active,
                                         summary: Some("Waiting for durable remote validation".to_string()),
@@ -23821,6 +23873,7 @@ async fn control_actor_loop(
                                             MissionStatus::Failed,
                                         );
                                         let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                            execution: None,
                                             mission_id: m.id,
                                             status: MissionStatus::Failed,
                                             summary: Some(
@@ -23995,6 +24048,7 @@ async fn control_actor_loop(
                             MissionStatus::Interrupted,
                         );
                         let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                            execution: None,
                             mission_id: mid,
                             status: MissionStatus::Interrupted,
                             summary: Some(
@@ -34007,6 +34061,164 @@ Investigate <service/> failures.
             !promoted.contains(&mission.id),
             "a freshly-resumed mission must not be ack-promoted after demotion"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_callback_identity_persists_in_event_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "callback-event")
+                .await
+                .unwrap();
+        let mission = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let run = store
+            .begin_mission_run(mission.id, "test", None)
+            .await
+            .unwrap();
+        store
+            .finish_mission_run(run.run_id, run.generation, None)
+            .await
+            .unwrap();
+        let event = AgentEvent::MissionStatusChanged {
+            execution: store.get_latest_mission_run(mission.id).await.unwrap(),
+            mission_id: mission.id,
+            status: MissionStatus::Blocked,
+            summary: None,
+        };
+        store.log_event(mission.id, &event).await.unwrap();
+        drop(store);
+        let reopened =
+            mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "callback-event")
+                .await
+                .unwrap();
+        let events = reopened
+            .get_events(mission.id, None, Some(10), None)
+            .await
+            .unwrap();
+        let restored = events.iter().find_map(stored_event_to_agent_event).unwrap();
+        let AgentEvent::MissionStatusChanged {
+            execution: Some(identity),
+            ..
+        } = restored
+        else {
+            panic!("persisted callback lost execution identity");
+        };
+        assert_eq!(identity.run_id, run.run_id);
+        assert_eq!(identity.generation, 1);
+        assert!(identity.execution_state.is_terminal());
+        assert_eq!(
+            reopened
+                .get_latest_mission_run(mission.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .run_id,
+            run.run_id
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_callback_identity_survives_lease_release_and_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores: Vec<Arc<dyn MissionStore>> = vec![
+            Arc::new(mission_store::InMemoryMissionStore::new()),
+            Arc::new(
+                mission_store::FileMissionStore::new(dir.path().join("file"), "callback")
+                    .await
+                    .unwrap(),
+            ),
+            Arc::new(
+                mission_store::SqliteMissionStore::new(dir.path().join("sqlite"), "callback")
+                    .await
+                    .unwrap(),
+            ),
+        ];
+        for store in stores {
+            let mission = store
+                .create_mission(None, None, None, None, None, None, None)
+                .await
+                .unwrap();
+            let first = store
+                .begin_mission_run(mission.id, "test", None)
+                .await
+                .unwrap();
+            store
+                .finish_mission_run(first.run_id, first.generation, Some("native_goal_stopped"))
+                .await
+                .unwrap();
+            assert!(store
+                .get_active_mission_run(mission.id)
+                .await
+                .unwrap()
+                .is_none());
+            let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+            maybe_finalize_terminal_mission(
+                &store,
+                &tx,
+                mission.id,
+                0,
+                Some(TerminalReason::NativeGoalStopped),
+                None,
+                None,
+                true,
+                Some("phase one stopped"),
+                "callback test",
+            )
+            .await;
+            let event = rx.try_recv().unwrap();
+            let AgentEvent::MissionStatusChanged {
+                execution: Some(ref captured),
+                ..
+            } = event
+            else {
+                panic!("terminal transition lost execution identity");
+            };
+            assert_eq!(captured.run_id, first.run_id);
+            assert_eq!(captured.generation, 1);
+            assert!(captured.execution_state.is_terminal());
+            let projection = mission_execution_projection(captured, MissionStatus::Blocked);
+            assert_eq!(projection["health"], "healthy");
+            assert!(projection["status_conflict"].is_null());
+            assert!(projection["ended_at"].is_string());
+            let serialized = serde_json::to_value(&event).unwrap();
+            store
+                .update_mission_status(mission.id, MissionStatus::Active)
+                .await
+                .unwrap();
+            let second = store
+                .begin_mission_run(mission.id, "test", None)
+                .await
+                .unwrap();
+            assert_eq!(second.generation, 2);
+            assert_eq!(
+                store
+                    .get_latest_mission_run(mission.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .run_id,
+                second.run_id
+            );
+            // The queued event is an immutable first-generation receipt even
+            // if a same-mission successor has already acquired a live lease.
+            assert_eq!(serialized["execution"]["run_id"], first.run_id.to_string());
+            store
+                .finish_mission_run(second.run_id, second.generation, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_latest_mission_run(mission.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .run_id,
+                second.run_id
+            );
+        }
     }
 
     #[tokio::test]

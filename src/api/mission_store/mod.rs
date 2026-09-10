@@ -2135,6 +2135,12 @@ pub trait MissionStore: Send + Sync {
         Ok(None)
     }
 
+    /// Most recent durable generation, including a settled run. Read-only
+    /// reporting must retain identity after the active lease has been released.
+    async fn get_latest_mission_run(&self, mission_id: Uuid) -> Result<Option<MissionRun>, String> {
+        self.get_active_mission_run(mission_id).await
+    }
+
     async fn list_active_mission_runs(&self) -> Result<Vec<MissionRun>, String> {
         Ok(Vec::new())
     }

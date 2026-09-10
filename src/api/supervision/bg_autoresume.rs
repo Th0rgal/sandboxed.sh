@@ -229,6 +229,7 @@ async fn apply_reconciled_status(
         "bg-autoresume: reconciled mission background status"
     );
     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+        execution: None,
         mission_id,
         status: next,
         summary: None,
