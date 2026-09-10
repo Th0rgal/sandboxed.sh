@@ -5522,6 +5522,7 @@ impl MissionStore for SqliteMissionStore {
                 status,
                 summary,
                 execution,
+                completion,
                 ..
             } => (
                 "mission_status_changed",
@@ -5529,7 +5530,7 @@ impl MissionStore for SqliteMissionStore {
                 None,
                 None,
                 summary.clone().unwrap_or_default(),
-                serde_json::json!({ "status": status.to_string(), "execution": execution }),
+                serde_json::json!({ "status": status.to_string(), "execution": execution, "completion": completion }),
             ),
             AgentEvent::MissionMetadataUpdated {
                 title,
@@ -12322,6 +12323,7 @@ mod tests {
                 .log_event(
                     mission.id,
                     &AgentEvent::MissionStatusChanged {
+                        completion: None,
                         execution: None,
                         mission_id: mission.id,
                         status: *status,

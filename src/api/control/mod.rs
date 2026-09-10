@@ -9267,6 +9267,7 @@ async fn activate_mission_for_message(
                     .await?;
                 store.set_deferred_goal(mission.id, None).await?;
                 let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                    completion: None,
                     execution: None,
                     mission_id: mission.id,
                     status: MissionStatus::Interrupted,
@@ -9288,6 +9289,7 @@ async fn activate_mission_for_message(
         // after the next failure.
         let _ = store.set_deferred_goal(mission.id, None).await;
         let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+            completion: None,
             execution: None,
             mission_id: mission.id,
             status: MissionStatus::Active,
@@ -9323,6 +9325,7 @@ async fn restore_mission_after_failed_run_acquisition(
         )
         .await?;
     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+        completion: None,
         execution: None,
         mission_id: mission.id,
         status: mission.status,
@@ -9727,6 +9730,7 @@ async fn interrupt_new_mission(control: &ControlState, mission_id: Uuid, reason:
         tracing::warn!(mission_id = %mission_id, %error, reason, "could not interrupt rejected mission");
     }
     let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        completion: None,
         execution: None,
         mission_id,
         status: MissionStatus::Interrupted,
@@ -10536,6 +10540,7 @@ pub async fn create_mission(
                     )
                     .await?;
                 let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                    completion: None,
                     execution: None,
                     mission_id: mission.id,
                     status: MissionStatus::Interrupted,
@@ -10585,6 +10590,7 @@ pub async fn create_mission(
                 .await
                 .map_err(internal_error)?;
             let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                completion: None,
                 execution: None,
                 mission_id: mission.id,
                 status: MissionStatus::Interrupted,
@@ -10908,6 +10914,7 @@ pub async fn create_mission(
                     )
                     .await;
                 let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                    completion: None,
                     execution: None,
                     mission_id: mission.id,
                     status: MissionStatus::Failed,
@@ -10976,6 +10983,7 @@ async fn dispatch_remote_mission_mvp(
         .update_mission_status(mission.id, MissionStatus::Active)
         .await?;
     let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        completion: None,
         execution: None,
         mission_id: mission.id,
         status: MissionStatus::Active,
@@ -11148,6 +11156,7 @@ pub(crate) async fn ensure_remote_build_wait(
             .update_mission_status(mission_id, MissionStatus::Active)
             .await?;
         owner.send(AgentEvent::MissionStatusChanged {
+            completion: None,
             execution: None,
             mission_id,
             status: MissionStatus::Active,
@@ -11596,6 +11605,7 @@ async fn finalize_remote_mission(
         .update_mission_status_with_reason(mission_id, status, Some(status_reason))
         .await?;
     owner.send(AgentEvent::MissionStatusChanged {
+        completion: None,
         execution: None,
         mission_id,
         status,
@@ -11782,6 +11792,7 @@ async fn dispatch_remote_job(
         return Err(err);
     }
     let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        completion: None,
         execution: None,
         mission_id: mission.id,
         status: MissionStatus::Active,
@@ -13173,6 +13184,7 @@ pub async fn mark_mission_opened(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Mission {} not found", id)))?;
     if newly_set.is_some() {
         let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+            completion: None,
             execution: None,
             mission_id: id,
             status: mission.status,
@@ -15327,6 +15339,11 @@ fn stored_event_to_agent_event(event: &mission_store::StoredEvent) -> Option<Age
                 .and_then(|v| v.as_str())
                 .and_then(|s| serde_json::from_value::<MissionStatus>(serde_json::json!(s)).ok())?;
             Some(AgentEvent::MissionStatusChanged {
+                completion: event
+                    .metadata
+                    .get("completion")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok()),
                 execution: event
                     .metadata
                     .get("execution")
@@ -15893,6 +15910,82 @@ fn webhook_forwardable_status(status: MissionStatus) -> bool {
     )
 }
 
+async fn current_callback_snapshot(
+    store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    status: MissionStatus,
+) -> Option<(MissionRun, MissionCompletionSnapshot)> {
+    let before = store.get_mission(mission_id).await.ok().flatten()?;
+    if before.status != status {
+        return None;
+    }
+    let run = store
+        .get_latest_mission_run(mission_id)
+        .await
+        .ok()
+        .flatten()?;
+    // The assistant history can lag status publication. Only a persisted
+    // event for this exact generation authenticates its terminal outcome.
+    let completion = store
+        .get_events_before(
+            mission_id,
+            i64::MAX,
+            Some(&["mission_status_changed"]),
+            Some(16),
+        )
+        .await
+        .ok()?
+        .into_iter()
+        .rev()
+        .find_map(|event| {
+            let captured: MissionRun =
+                serde_json::from_value(event.metadata.get("execution")?.clone()).ok()?;
+            if captured.run_id != run.run_id
+                || captured.generation != run.generation
+                || event.metadata.get("status")?.as_str()? != status.to_string()
+            {
+                return None;
+            }
+            serde_json::from_value::<MissionCompletionSnapshot>(
+                event.metadata.get("completion")?.clone(),
+            )
+            .ok()
+        })?;
+    let after = store.get_mission(mission_id).await.ok().flatten()?;
+    let checked_run = store
+        .get_latest_mission_run(mission_id)
+        .await
+        .ok()
+        .flatten()?;
+    if before.updated_at != after.updated_at
+        || after.status != status
+        || run.run_id != checked_run.run_id
+        || run.generation != checked_run.generation
+        || run.started_at > before.updated_at
+    {
+        return None;
+    }
+    Some((run, completion))
+}
+
+async fn callback_snapshot(
+    store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    status: MissionStatus,
+    execution: Option<MissionRun>,
+    completion: Option<MissionCompletionSnapshot>,
+    reconcile_current: bool,
+) -> (Option<MissionRun>, Option<MissionCompletionSnapshot>) {
+    if reconcile_current {
+        match current_callback_snapshot(store, mission_id, status).await {
+            Some((run, completion)) => (Some(run), Some(completion)),
+            None => (None, None),
+        }
+    } else {
+        (execution, completion)
+    }
+}
+
 async fn paloma_webhook_forwarder_loop(
     mut events_rx: broadcast::Receiver<AgentEvent>,
     mission_store: Arc<dyn MissionStore>,
@@ -15970,7 +16063,9 @@ async fn paloma_webhook_forwarder_loop(
     let forward = move |mission_id: Uuid,
                         status: MissionStatus,
                         old_status: Option<MissionStatus>,
-                        event_execution: Option<MissionRun>| {
+                        event_execution: Option<MissionRun>,
+                        event_completion: Option<MissionCompletionSnapshot>,
+                        reconcile_current: bool| {
         let http = http_c.clone();
         let url = url_c.clone();
         let secret = secret_c.clone();
@@ -15996,19 +16091,23 @@ async fn paloma_webhook_forwarder_loop(
                 .and_then(|mission| mission.title.clone())
                 .unwrap_or_else(|| mission_id.to_string());
             let project = mission.as_ref().map(|m| &m.project);
-            let run = match event_execution {
-                Some(run) => Some(run),
-                None => mission_store
-                    .get_latest_mission_run(mission_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .filter(|run| {
-                        mission
-                            .as_ref()
-                            .is_some_and(|m| m.status == status && run.started_at <= m.updated_at)
-                    }),
-            };
+            // Live events can only carry producer-captured identity. In
+            // particular, an unbound historical event must not adopt a later
+            // generation just because that generation reached the same status.
+            let (run, completion) = callback_snapshot(
+                &mission_store,
+                mission_id,
+                status,
+                event_execution,
+                event_completion,
+                reconcile_current,
+            )
+            .await;
+            if reconcile_current && run.is_none() {
+                // Keep the marker pending until the precise event is persisted.
+                in_flight.lock().await.remove(&(mission_id, status));
+                return;
+            }
             let mut remote_jobs = crate::remote_node::job_ledger::load(&working_dir)
                 .await
                 .unwrap_or_default()
@@ -16049,9 +16148,24 @@ async fn paloma_webhook_forwarder_loop(
                     })
                 }),
             );
-            let terminal_reason = mission
-                .as_ref()
-                .and_then(|mission| mission.terminal_reason.as_deref());
+            let terminal_reason = if run.is_some() {
+                completion
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.terminal_reason.as_deref())
+            } else {
+                mission
+                    .as_ref()
+                    .and_then(|mission| mission.terminal_reason.as_deref())
+            };
+            let terminal_evidence = if run.is_some() {
+                completion
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.terminal_evidence.as_deref())
+            } else {
+                mission
+                    .as_ref()
+                    .and_then(|mission| mission.terminal_evidence.as_deref())
+            };
             let recommended_action = match terminal_reason {
                 Some("server_shutdown" | "orphan_no_runner") => "resume_once",
                 Some("native_goal_stopped") => "resolve_stop_then_resume",
@@ -16077,7 +16191,11 @@ async fn paloma_webhook_forwarder_loop(
             // a mission-backed delegation returns a real work product to the
             // delegating Hermes agent (the fold prefers `result_summary`).
             // Fetched only for terminal (forwardable) transitions; best-effort.
-            let result_summary: Option<String> = if webhook_forwardable_status(status) {
+            let result_summary: Option<String> = if run.is_some() {
+                completion
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.result_summary.clone())
+            } else if webhook_forwardable_status(status) {
                 mission_store
                     .latest_assistant_text(mission_id)
                     .await
@@ -16116,9 +16234,7 @@ async fn paloma_webhook_forwarder_loop(
                 // What the terminating guard OBSERVED. Without it, consumers
                 // invent causes: "transport bug", "GitHub is disabled",
                 // "pool needs re-provisioning" — all measured this week.
-                "terminal_evidence": mission
-                    .as_ref()
-                    .and_then(|mission| mission.terminal_evidence.as_deref()),
+                "terminal_evidence": terminal_evidence,
                 "resumable": matches!(status, MissionStatus::Interrupted | MissionStatus::Failed | MissionStatus::Blocked),
                 "recommended_action": recommended_action,
                 "execution": run.as_ref().map(|run| serde_json::json!({
@@ -16295,7 +16411,7 @@ async fn paloma_webhook_forwarder_loop(
                     "webhook reconcile: forwarding a status transition the \
                      broadcast never delivered"
                 );
-                forward(mission.id, status, prior, None);
+                forward(mission.id, status, prior, None, None, true);
             }
             continue;
         };
@@ -16304,6 +16420,7 @@ async fn paloma_webhook_forwarder_loop(
                 mission_id,
                 status,
                 execution,
+                completion,
                 ..
             }) => {
                 let old_status = markers.lock().await.get(mission_id);
@@ -16317,7 +16434,7 @@ async fn paloma_webhook_forwarder_loop(
                 if !in_flight.lock().await.insert((mission_id, status)) {
                     continue;
                 }
-                forward(mission_id, status, old_status, execution);
+                forward(mission_id, status, old_status, execution, completion, false);
             }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(dropped)) => {
@@ -18451,6 +18568,11 @@ async fn maybe_finalize_terminal_mission(
                     new_status,
                 );
                 let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                    completion: Some(MissionCompletionSnapshot {
+                        result_summary: final_output.map(str::to_owned),
+                        terminal_reason: Some(terminal_reason_str.to_owned()),
+                        terminal_evidence: terminal_evidence.map(str::to_owned),
+                    }),
                     execution,
                     mission_id,
                     status: new_status,
@@ -20075,6 +20197,7 @@ async fn control_actor_loop(
                                                 } else {
                                                     let _ = events_tx.send(
                                                         AgentEvent::MissionStatusChanged {
+                                                            completion: None,
                                                             execution: None,
                                                             mission_id: tid,
                                                             status: MissionStatus::Pending,
@@ -21074,6 +21197,7 @@ async fn control_actor_loop(
                                 new_status,
                             );
                             let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                completion: None,
                                 execution: None,
                                 mission_id: id,
                                 status: new_status,
@@ -21432,6 +21556,7 @@ async fn control_actor_loop(
                                     tracing::warn!("Failed to cancel child mission {}: {}", child.id, e);
                                 } else {
                                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        completion: None,
                                         execution: None,
                                         mission_id: child.id,
                                         status: MissionStatus::Interrupted,
@@ -21574,6 +21699,7 @@ async fn control_actor_loop(
                                             .await;
                                         let _ = events_tx.send(
                                             AgentEvent::MissionStatusChanged {
+                                                completion: None,
                                                 execution: None,
                                                 mission_id,
                                                 status: MissionStatus::Interrupted,
@@ -21677,6 +21803,7 @@ async fn control_actor_loop(
                                     )
                                     .await;
                                 let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                    completion: None,
                                     execution: None,
                                     mission_id,
                                     status: MissionStatus::Paused,
@@ -21869,6 +21996,7 @@ async fn control_actor_loop(
                                                 .await;
                                             let _ = events_tx.send(
                                                 AgentEvent::MissionStatusChanged {
+                                                    completion: None,
                                                     execution: None,
                                                     mission_id,
                                                     status: MissionStatus::Interrupted,
@@ -21979,6 +22107,7 @@ async fn control_actor_loop(
                                         MissionStatus::Active,
                                     );
                                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        completion: None,
                                         execution: None,
                                         mission_id,
                                         status: MissionStatus::Active,
@@ -22055,6 +22184,7 @@ async fn control_actor_loop(
                                     );
                                     // Send status changed event so UI updates
                                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        completion: None,
                                         execution: None,
                                         mission_id,
                                         status: MissionStatus::Active,
@@ -22620,6 +22750,11 @@ async fn control_actor_loop(
                                 }
 
                                 let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                    completion: Some(MissionCompletionSnapshot {
+                                        result_summary: summary.clone(),
+                                        terminal_reason: None,
+                                        terminal_evidence: None,
+                                    }),
                                     execution,
                                     mission_id: id,
                                     status: new_status,
@@ -22727,6 +22862,7 @@ async fn control_actor_loop(
                                         tracing::warn!(mission_id = %run.mission_id, %error, "Failed to keep remote-wait mission active");
                                     } else {
                                         let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                            completion: None,
                                             execution: None,
                                             mission_id: run.mission_id,
                                             status: MissionStatus::Active,
@@ -22958,6 +23094,7 @@ async fn control_actor_loop(
                                         MissionStatus::Failed,
                                     );
                                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        completion: None,
                                         execution: None,
                                         mission_id,
                                         status: MissionStatus::Failed,
@@ -23390,6 +23527,7 @@ async fn control_actor_loop(
                                 MissionStatus::Interrupted,
                             );
                             let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                completion: None,
                                 execution: None,
                                 mission_id: *mission_id,
                                 status: MissionStatus::Interrupted,
@@ -23451,6 +23589,7 @@ async fn control_actor_loop(
                                     tracing::warn!(mission_id = %mission_id, %error, "Failed to keep parallel remote-wait mission active");
                                 } else {
                                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        completion: None,
                                         execution: None,
                                         mission_id: *mission_id,
                                         status: MissionStatus::Active,
@@ -23876,6 +24015,7 @@ async fn control_actor_loop(
                                             MissionStatus::Failed,
                                         );
                                         let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                            completion: None,
                                             execution: None,
                                             mission_id: m.id,
                                             status: MissionStatus::Failed,
@@ -24051,6 +24191,7 @@ async fn control_actor_loop(
                             MissionStatus::Interrupted,
                         );
                         let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                            completion: None,
                             execution: None,
                             mission_id: mid,
                             status: MissionStatus::Interrupted,
@@ -34067,10 +34208,103 @@ Investigate <service/> failures.
     }
 
     #[tokio::test]
+    async fn terminal_callback_identity_never_infers_unbound_live_event_from_same_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn MissionStore> = Arc::new(
+            mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "unbound")
+                .await
+                .unwrap(),
+        );
+        let mission = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            store
+                .update_mission_status(mission.id, MissionStatus::Active)
+                .await
+                .unwrap();
+            let run = store
+                .begin_mission_run(mission.id, "test", None)
+                .await
+                .unwrap();
+            store
+                .finish_mission_run(run.run_id, run.generation, None)
+                .await
+                .unwrap();
+            store
+                .update_mission_status_with_reason(
+                    mission.id,
+                    MissionStatus::Blocked,
+                    Some("second reason"),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .update_mission_history(
+                mission.id,
+                &[MissionHistoryEntry {
+                    role: "assistant".into(),
+                    content: "second result".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        let (execution, completion) = callback_snapshot(
+            &store,
+            mission.id,
+            MissionStatus::Blocked,
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert!(execution.is_none());
+        assert!(completion.is_none());
+        assert!(
+            current_callback_snapshot(&store, mission.id, MissionStatus::Blocked)
+                .await
+                .is_none(),
+            "history text alone is not a generation receipt"
+        );
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::MissionStatusChanged {
+                    execution: store.get_latest_mission_run(mission.id).await.unwrap(),
+                    completion: Some(MissionCompletionSnapshot {
+                        result_summary: Some("second result".into()),
+                        terminal_reason: Some("second reason".into()),
+                        terminal_evidence: None,
+                    }),
+                    mission_id: mission.id,
+                    status: MissionStatus::Blocked,
+                    summary: None,
+                },
+            )
+            .await
+            .unwrap();
+        // Only the explicitly current reconciliation observation may acquire
+        // the current generation. It is never treated as the old live event.
+        let (execution, completion) =
+            callback_snapshot(&store, mission.id, MissionStatus::Blocked, None, None, true).await;
+        assert_eq!(execution.unwrap().generation, 2);
+        assert_eq!(
+            completion.unwrap().result_summary.as_deref(),
+            Some("second result")
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_callback_identity_reaches_http_after_release_and_delayed_successor() {
         for resume_before_delivery in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+            let store: Arc<dyn MissionStore> = Arc::new(
+                mission_store::SqliteMissionStore::new(dir.path().join("db"), "http-callback")
+                    .await
+                    .unwrap(),
+            );
             let mission = store
                 .create_mission(None, None, None, None, None, None, None)
                 .await
@@ -34083,20 +34317,35 @@ Investigate <service/> failures.
                 .finish_mission_run(first.run_id, first.generation, Some("native_goal_stopped"))
                 .await
                 .unwrap();
+            store
+                .update_mission_history(
+                    mission.id,
+                    &[MissionHistoryEntry {
+                        role: "assistant".into(),
+                        content: "first generation result".into(),
+                    }],
+                )
+                .await
+                .unwrap();
             let (tx, rx) = tokio::sync::broadcast::channel(8);
+            let mut persist_rx = tx.subscribe();
             maybe_finalize_terminal_mission(
                 &store,
                 &tx,
                 mission.id,
                 0,
                 Some(TerminalReason::NativeGoalStopped),
-                None,
+                Some("first evidence"),
                 None,
                 true,
                 Some("first generation result"),
                 "http callback test",
             )
             .await;
+            store
+                .log_event(mission.id, &persist_rx.try_recv().unwrap())
+                .await
+                .unwrap();
             // Queue the actual finalizer event, then acquire a successor BEFORE
             // starting the forwarder. This deterministically exercises delay.
             if resume_before_delivery {
@@ -34109,9 +34358,42 @@ Investigate <service/> failures.
                     .await
                     .unwrap();
                 assert_eq!(next.generation, 2);
+                store
+                    .finish_mission_run(next.run_id, next.generation, Some("RateLimited"))
+                    .await
+                    .unwrap();
+                store
+                    .update_mission_history(
+                        mission.id,
+                        &[MissionHistoryEntry {
+                            role: "assistant".into(),
+                            content: "SECOND generation result".into(),
+                        }],
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .set_terminal_evidence(mission.id, "SECOND evidence")
+                    .await
+                    .unwrap();
+                store
+                    .update_mission_status_with_reason(
+                        mission.id,
+                        MissionStatus::Failed,
+                        Some("rate_limited"),
+                    )
+                    .await
+                    .unwrap();
             }
             let mut markers = super::super::webhook_markers::MarkerStore::load(dir.path());
-            markers.set(mission.id, MissionStatus::Active);
+            markers.set(
+                mission.id,
+                if resume_before_delivery {
+                    MissionStatus::Failed
+                } else {
+                    MissionStatus::Active
+                },
+            );
             let (body_tx, mut body_rx) = tokio::sync::mpsc::channel(2);
             let app = axum::Router::new().route(
                 "/",
@@ -34147,6 +34429,9 @@ Investigate <service/> failures.
             assert_eq!(body["execution"]["run_id"], first.run_id.to_string());
             assert_eq!(body["execution"]["generation"], 1);
             assert_eq!(body["execution"]["state"], "terminal");
+            assert_eq!(body["result_summary"], "first generation result");
+            assert_eq!(body["terminal_reason"], "native_goal_stopped");
+            assert_eq!(body["terminal_evidence"], "first evidence");
             forwarder.abort();
             server.abort();
         }
@@ -34172,6 +34457,11 @@ Investigate <service/> failures.
             .await
             .unwrap();
         let event = AgentEvent::MissionStatusChanged {
+            completion: Some(MissionCompletionSnapshot {
+                result_summary: Some("original result".into()),
+                terminal_reason: Some("native_goal_stopped".into()),
+                terminal_evidence: Some("original evidence".into()),
+            }),
             execution: store.get_latest_mission_run(mission.id).await.unwrap(),
             mission_id: mission.id,
             status: MissionStatus::Blocked,
@@ -34190,6 +34480,7 @@ Investigate <service/> failures.
         let restored = events.iter().find_map(stored_event_to_agent_event).unwrap();
         let AgentEvent::MissionStatusChanged {
             execution: Some(identity),
+            completion: Some(completion),
             ..
         } = restored
         else {
@@ -34197,6 +34488,18 @@ Investigate <service/> failures.
         };
         assert_eq!(identity.run_id, run.run_id);
         assert_eq!(identity.generation, 1);
+        assert_eq!(
+            completion.result_summary.as_deref(),
+            Some("original result")
+        );
+        assert_eq!(
+            completion.terminal_reason.as_deref(),
+            Some("native_goal_stopped")
+        );
+        assert_eq!(
+            completion.terminal_evidence.as_deref(),
+            Some("original evidence")
+        );
         assert!(identity.execution_state.is_terminal());
         assert_eq!(
             reopened

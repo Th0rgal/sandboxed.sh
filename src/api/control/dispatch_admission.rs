@@ -144,6 +144,7 @@ async fn restore_status(
             continue;
         }
         let _ = session.events_tx.send(AgentEvent::MissionStatusChanged {
+            completion: None,
             execution: None,
             mission_id: id,
             status: snapshot.status,
