@@ -11453,7 +11453,11 @@ async fn deliver_remote_build_terminal_wake(
             .await
             .map_err(|_| "remote-build terminal control session unavailable".to_string())?;
         return match tokio::time::timeout(std::time::Duration::from_secs(10), response).await {
-            Ok(Ok(UserMessageAck::Queued | UserMessageAck::Delivered)) => Ok(true),
+            Ok(Ok(
+                UserMessageAck::Queued
+                | UserMessageAck::Delivered
+                | UserMessageAck::Continued { .. },
+            )) => Ok(true),
             Ok(Ok(UserMessageAck::Rejected(error))) => Err(error),
             Ok(Ok(UserMessageAck::Dropped)) => Ok(false),
             Ok(Err(_)) => Ok(false),

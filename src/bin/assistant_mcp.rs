@@ -4831,6 +4831,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_message_preserves_authoritative_idle_continuation_receipt() {
+        let mission_id = Uuid::new_v4().to_string();
+        let reply = json!({
+            "id": Uuid::new_v4(), "mission_id": mission_id,
+            "queued": true, "message_accepted": true,
+            "previous_execution": {"run_id": Uuid::new_v4(), "generation": 7}
+        });
+        let (mcp, state, server) = mock_assistant(reply.clone(), false).await;
+        let result = mcp
+            .send_message(
+                parse_params(json!({
+                    "mission_id": mission_id, "content": "Continue the same work"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, reply);
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "/api/control/message");
+        assert_eq!(requests[0].1["mission_id"], mission_id);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn link_project_transports_explicit_reader_and_preserves_omission() {
         let id = Uuid::new_v4().to_string();
         let (mcp, state, server) = mock_assistant(json!({"id": id}), false).await;
