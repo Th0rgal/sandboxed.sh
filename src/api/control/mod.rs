@@ -15914,19 +15914,13 @@ async fn current_callback_snapshot(
     store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
     status: MissionStatus,
-) -> Option<(MissionRun, MissionCompletionSnapshot)> {
+) -> Option<(Option<MissionRun>, MissionCompletionSnapshot)> {
     let before = store.get_mission(mission_id).await.ok().flatten()?;
     if before.status != status {
         return None;
     }
-    let run = store
-        .get_latest_mission_run(mission_id)
-        .await
-        .ok()
-        .flatten()?;
-    // The assistant history can lag status publication. Only a persisted
-    // event for this exact generation authenticates its terminal outcome.
-    let completion = store
+    let run = store.get_latest_mission_run(mission_id).await.ok()?;
+    let events = store
         .get_events_before(
             mission_id,
             i64::MAX,
@@ -15934,38 +15928,82 @@ async fn current_callback_snapshot(
             Some(16),
         )
         .await
-        .ok()?
-        .into_iter()
-        .rev()
-        .find_map(|event| {
-            let captured: MissionRun =
-                serde_json::from_value(event.metadata.get("execution")?.clone()).ok()?;
-            if captured.run_id != run.run_id
-                || captured.generation != run.generation
-                || event.metadata.get("status")?.as_str()? != status.to_string()
-            {
-                return None;
+        .ok()?;
+    let event = events.into_iter().rev().find(|event| {
+        event
+            .metadata
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some(status.to_string().as_str())
+            && before
+                .activity
+                .last_status_change_at
+                .as_ref()
+                .is_none_or(|changed| event.timestamp >= *changed)
+    });
+    let (captured, completion) = match (run.as_ref(), event) {
+        (Some(run), Some(event)) => {
+            let captured: Option<MissionRun> = event
+                .metadata
+                .get("execution")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let completion: Option<MissionCompletionSnapshot> = event
+                .metadata
+                .get("completion")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            match (captured, completion) {
+                (Some(captured), Some(completion))
+                    if captured.run_id == run.run_id && captured.generation == run.generation =>
+                {
+                    (Some(captured), completion)
+                }
+                (None, None) => (
+                    None,
+                    MissionCompletionSnapshot {
+                        result_summary: (!event.content.trim().is_empty()).then_some(event.content),
+                        terminal_reason: before.terminal_reason.clone(),
+                        terminal_evidence: before.terminal_evidence.clone(),
+                    },
+                ),
+                _ => return None,
             }
-            serde_json::from_value::<MissionCompletionSnapshot>(
-                event.metadata.get("completion")?.clone(),
-            )
-            .ok()
-        })?;
+        }
+        (Some(_), None) if before.terminal_reason.as_deref() == Some("server_shutdown") => (
+            None,
+            MissionCompletionSnapshot {
+                // Startup/drain intentionally persist this status without a
+                // terminal event. Preserve its unbound outage notification.
+                result_summary: None,
+                terminal_reason: before.terminal_reason.clone(),
+                terminal_evidence: before.terminal_evidence.clone(),
+            },
+        ),
+        (Some(_), None) => return None, // exact event may still be in the logger queue
+        (None, event) => (
+            None,
+            MissionCompletionSnapshot {
+                result_summary: event
+                    .and_then(|event| (!event.content.trim().is_empty()).then_some(event.content)),
+                terminal_reason: before.terminal_reason.clone(),
+                terminal_evidence: before.terminal_evidence.clone(),
+            },
+        ),
+    };
     let after = store.get_mission(mission_id).await.ok().flatten()?;
-    let checked_run = store
-        .get_latest_mission_run(mission_id)
-        .await
-        .ok()
-        .flatten()?;
+    let checked_run = store.get_latest_mission_run(mission_id).await.ok()?;
     if before.updated_at != after.updated_at
         || after.status != status
-        || run.run_id != checked_run.run_id
-        || run.generation != checked_run.generation
-        || run.started_at > before.updated_at
+        || run.as_ref().map(|r| (r.run_id, r.generation))
+            != checked_run.as_ref().map(|r| (r.run_id, r.generation))
+        || run
+            .as_ref()
+            .is_some_and(|run| run.started_at > before.updated_at)
     {
         return None;
     }
-    Some((run, completion))
+    Some((captured, completion))
 }
 
 async fn callback_snapshot(
@@ -15978,7 +16016,7 @@ async fn callback_snapshot(
 ) -> (Option<MissionRun>, Option<MissionCompletionSnapshot>) {
     if reconcile_current {
         match current_callback_snapshot(store, mission_id, status).await {
-            Some((run, completion)) => (Some(run), Some(completion)),
+            Some((run, completion)) => (run, Some(completion)),
             None => (None, None),
         }
     } else {
@@ -16103,7 +16141,7 @@ async fn paloma_webhook_forwarder_loop(
                 reconcile_current,
             )
             .await;
-            if reconcile_current && run.is_none() {
+            if reconcile_current && completion.is_none() {
                 // Keep the marker pending until the precise event is persisted.
                 in_flight.lock().await.remove(&(mission_id, status));
                 return;
@@ -16148,7 +16186,7 @@ async fn paloma_webhook_forwarder_loop(
                     })
                 }),
             );
-            let terminal_reason = if run.is_some() {
+            let terminal_reason = if completion.is_some() || run.is_some() {
                 completion
                     .as_ref()
                     .and_then(|snapshot| snapshot.terminal_reason.as_deref())
@@ -16157,7 +16195,7 @@ async fn paloma_webhook_forwarder_loop(
                     .as_ref()
                     .and_then(|mission| mission.terminal_reason.as_deref())
             };
-            let terminal_evidence = if run.is_some() {
+            let terminal_evidence = if completion.is_some() || run.is_some() {
                 completion
                     .as_ref()
                     .and_then(|snapshot| snapshot.terminal_evidence.as_deref())
@@ -16191,7 +16229,7 @@ async fn paloma_webhook_forwarder_loop(
             // a mission-backed delegation returns a real work product to the
             // delegating Hermes agent (the fold prefers `result_summary`).
             // Fetched only for terminal (forwardable) transitions; best-effort.
-            let result_summary: Option<String> = if run.is_some() {
+            let result_summary: Option<String> = if completion.is_some() || run.is_some() {
                 completion
                     .as_ref()
                     .and_then(|snapshot| snapshot.result_summary.clone())
@@ -34267,6 +34305,56 @@ Investigate <service/> failures.
                 .await
                 .is_none(),
             "history text alone is not a generation receipt"
+        );
+        store
+            .update_mission_status_with_reason(
+                mission.id,
+                MissionStatus::Interrupted,
+                Some("server_shutdown"),
+            )
+            .await
+            .unwrap();
+        let (outage_run, outage) = callback_snapshot(
+            &store,
+            mission.id,
+            MissionStatus::Interrupted,
+            None,
+            None,
+            true,
+        )
+        .await;
+        assert!(outage_run.is_none());
+        assert_eq!(
+            outage.unwrap().terminal_reason.as_deref(),
+            Some("server_shutdown")
+        );
+        store
+            .update_mission_status_with_reason(
+                mission.id,
+                MissionStatus::Blocked,
+                Some("second reason"),
+            )
+            .await
+            .unwrap();
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::MissionStatusChanged {
+                    execution: None,
+                    completion: None,
+                    mission_id: mission.id,
+                    status: MissionStatus::Blocked,
+                    summary: Some("legacy current status".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let (legacy_run, legacy_outcome) =
+            callback_snapshot(&store, mission.id, MissionStatus::Blocked, None, None, true).await;
+        assert!(legacy_run.is_none());
+        assert_eq!(
+            legacy_outcome.unwrap().result_summary.as_deref(),
+            Some("legacy current status")
         );
         store
             .log_event(
