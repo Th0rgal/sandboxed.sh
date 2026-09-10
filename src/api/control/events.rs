@@ -365,6 +365,12 @@ pub enum UserMessageAck {
     Queued,
     /// The message was delivered and a turn is starting now.
     Delivered,
+    /// Accepted wake of an idle mission with an authenticated terminal
+    /// predecessor, captured before admission (never from later readback).
+    Continued {
+        queued: bool,
+        previous_execution: MessagePreviousExecution,
+    },
     /// The message was dropped (parallel cap reached, mission load failure,
     /// rejected goal kickoff, …). An `AgentEvent::Error` with details was
     /// emitted on the event stream.
@@ -372,6 +378,12 @@ pub enum UserMessageAck {
     /// The actor rejected the message after HTTP preflight. The reason is
     /// returned to synchronous callers instead of being visible only on SSE.
     Rejected(String),
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MessagePreviousExecution {
+    pub run_id: Uuid,
+    pub generation: u64,
 }
 
 /// Internal control commands (queued and processed by the actor).

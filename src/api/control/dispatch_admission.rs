@@ -604,6 +604,31 @@ pub(super) async fn admit_dispatch_with_lifetime(
                     return None;
                 }
             };
+            // The actor's dispatch lock fences admission. Capture the completed
+            // predecessor now: after its acknowledgement a successor may already
+            // be running (or even finished). Busy steering and legacy runs do
+            // not authenticate a distinct callback reservation.
+            let previous_execution = if !actor_busy
+                && !matches!(
+                    receipt.before.status,
+                    MissionStatus::Pending
+                        | MissionStatus::Active
+                        | MissionStatus::WaitingBackground
+                ) {
+                match receipt
+                    .store
+                    .get_latest_mission_run(receipt.before.id)
+                    .await
+                {
+                    Ok(Some(run)) if run.ended_at.is_some() => Some(MessagePreviousExecution {
+                        run_id: run.run_id,
+                        generation: run.generation,
+                    }),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let (tx, rx) = oneshot::channel();
             tokio::spawn(async move {
                 let _guard = guard;
@@ -635,6 +660,21 @@ pub(super) async fn admit_dispatch_with_lifetime(
                     Err(error) => UserMessageAck::Rejected(format!(
                         "dispatch_recovery_required: ownership retained: {error}"
                     )),
+                };
+                let ack = match (ack, previous_execution) {
+                    (UserMessageAck::Queued, Some(previous_execution)) => {
+                        UserMessageAck::Continued {
+                            queued: true,
+                            previous_execution,
+                        }
+                    }
+                    (UserMessageAck::Delivered, Some(previous_execution)) => {
+                        UserMessageAck::Continued {
+                            queued: false,
+                            previous_execution,
+                        }
+                    }
+                    (ack, _) => ack,
                 };
                 let _ = respond.send(ack);
             });

@@ -897,24 +897,26 @@ fn dispatch_board_outbox_item(
             let release_tx = cmd_tx.clone();
             tokio::spawn(async move {
                 match rx.await {
-                    Ok(UserMessageAck::Queued | UserMessageAck::Delivered) => {
-                        match store.acknowledge_board_outbox(&idempotency_key).await {
-                            Ok(()) => {
-                                inflight
-                                    .lock()
-                                    .expect("board outbox lock")
-                                    .remove(&delivery_id);
-                            }
-                            Err(error) => {
-                                tracing::warn!(target = %target_mission_id, %idempotency_key,
-                                    "board: accepted delivery acknowledgement failed: {error}");
-                                inflight
-                                    .lock()
-                                    .expect("board outbox lock")
-                                    .remove(&delivery_id);
-                            }
+                    Ok(
+                        UserMessageAck::Queued
+                        | UserMessageAck::Delivered
+                        | UserMessageAck::Continued { .. },
+                    ) => match store.acknowledge_board_outbox(&idempotency_key).await {
+                        Ok(()) => {
+                            inflight
+                                .lock()
+                                .expect("board outbox lock")
+                                .remove(&delivery_id);
                         }
-                    }
+                        Err(error) => {
+                            tracing::warn!(target = %target_mission_id, %idempotency_key,
+                                    "board: accepted delivery acknowledgement failed: {error}");
+                            inflight
+                                .lock()
+                                .expect("board outbox lock")
+                                .remove(&delivery_id);
+                        }
+                    },
                     Ok(UserMessageAck::Dropped) => {
                         let _ = release_tx
                             .send(ControlCommand::ReleaseUserMessageId { id: delivery_id })

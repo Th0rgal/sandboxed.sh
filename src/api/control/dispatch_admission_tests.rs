@@ -4473,3 +4473,107 @@ async fn adversarial_pr_lookup_cannot_omit_parked_writer_moving_across_pages() {
     assert!(moved.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(found.map(|writer| writer.id), Some(m.id));
 }
+
+#[tokio::test]
+async fn http_idle_message_continuation_captures_predecessor_before_delivery() {
+    for (busy, ended, actor_ack) in [
+        (false, true, UserMessageAck::Delivered),
+        (false, true, UserMessageAck::Queued),
+        (true, true, UserMessageAck::Queued),
+        (false, false, UserMessageAck::Delivered),
+        (false, true, UserMessageAck::Dropped),
+        (
+            false,
+            true,
+            UserMessageAck::Rejected("injected refusal".into()),
+        ),
+    ] {
+        let h = Harness::new().await;
+        let m = h
+            .writer(MissionStatus::AwaitingUser, Some("repo#244"))
+            .await;
+        let store = h.control.mission_store.clone();
+        let prior = store
+            .begin_mission_run(m.id, "prior-actor", None)
+            .await
+            .unwrap();
+        if ended {
+            store
+                .finish_mission_run(prior.run_id, prior.generation, Some("turn_complete"))
+                .await
+                .unwrap();
+        }
+        let (tx, mut rx) = mpsc::channel(1);
+        h.state
+            .control
+            .sessions
+            .write()
+            .await
+            .get_mut(&h.user.id)
+            .unwrap()
+            .cmd_tx = tx;
+        let should_accept = matches!(
+            actor_ack,
+            UserMessageAck::Delivered | UserMessageAck::Queued
+        );
+        let should_continue = !busy && ended && should_accept;
+        let expected_queued = actor_ack == UserMessageAck::Queued;
+        let mission_id = m.id;
+        let actor = tokio::spawn(async move {
+            let ControlCommand::AdmitDispatch { admission, command } = rx.recv().await.unwrap()
+            else {
+                panic!()
+            };
+            let command = dispatch_admission::admit_dispatch_with_lifetime(
+                *admission,
+                *command,
+                DISPATCH_ADMISSION.lock().await,
+                busy,
+                None,
+            )
+            .await
+            .unwrap();
+            if should_continue {
+                // The next native run can already finish before HTTP receives
+                // its acknowledgement. The reply must retain generation 1.
+                let successor = store
+                    .begin_mission_run(mission_id, "next-actor", None)
+                    .await
+                    .unwrap();
+                assert_eq!(successor.generation, 2);
+                store
+                    .finish_mission_run(
+                        successor.run_id,
+                        successor.generation,
+                        Some("turn_complete"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let ControlCommand::UserMessage { respond, .. } = command else {
+                panic!()
+            };
+            respond.send(actor_ack).unwrap();
+        });
+        let response = h.request(false, m.id, json!({"content":"Continue the same work", "continue_identity":Harness::assertion(&m)})).await;
+        actor.await.unwrap();
+        if !should_accept {
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            continue;
+        }
+        assert!(response.status().is_success());
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["mission_id"], m.id.to_string());
+        assert_ne!(body["id"], m.id.to_string());
+        assert_eq!(body["message_accepted"], true);
+        assert_eq!(body["queued"], expected_queued);
+        if should_continue {
+            assert_eq!(
+                body["previous_execution"],
+                json!({"run_id":prior.run_id,"generation":prior.generation})
+            );
+        } else {
+            assert!(body.get("previous_execution").is_none());
+        }
+    }
+}

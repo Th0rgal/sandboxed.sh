@@ -1008,28 +1008,30 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
             }
             use crate::api::control::UserMessageAck;
             match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
-                Ok(Ok(UserMessageAck::Queued)) => match (interrupt, &interrupt_error) {
-                    (true, None) => {
-                        "Steering message delivered after interrupting the current turn — \
+                Ok(Ok(UserMessageAck::Queued | UserMessageAck::Continued { queued: true, .. })) => {
+                    match (interrupt, &interrupt_error) {
+                        (true, None) => {
+                            "Steering message delivered after interrupting the current turn — \
                          the agent will act on it as soon as the cancellation settles."
-                            .to_string()
-                    }
-                    (true, Some(err)) => format!(
-                        "Steering message queued, but the requested interrupt FAILED \
+                                .to_string()
+                        }
+                        (true, Some(err)) => format!(
+                            "Steering message queued, but the requested interrupt FAILED \
                          ({err}) — the agent may still be mid-turn and will only act on \
                          the message at the next turn boundary. Verify with read_history; \
                          retry stop_agent if it must stop now."
-                    ),
-                    (false, _) => {
-                        "Steering message queued — the working agent is mid-turn and will \
+                        ),
+                        (false, _) => {
+                            "Steering message queued — the working agent is mid-turn and will \
                          act on it at the next turn boundary. Pass interrupt=true if it \
                          must take effect immediately."
-                            .to_string()
+                                .to_string()
+                        }
                     }
-                },
-                Ok(Ok(UserMessageAck::Delivered)) => {
-                    "Steering message delivered — a turn is starting on it now.".to_string()
                 }
+                Ok(Ok(
+                    UserMessageAck::Delivered | UserMessageAck::Continued { queued: false, .. },
+                )) => "Steering message delivered — a turn is starting on it now.".to_string(),
                 Ok(Ok(UserMessageAck::Dropped)) => {
                     "Error: the steering message was DROPPED — it never reached the \
                      working agent (parallel mission cap, mission load failure, or a \
