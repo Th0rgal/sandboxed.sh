@@ -8712,7 +8712,11 @@ fn normalize_mission_tags(tags: Option<&[String]>) -> Option<Vec<String>> {
 }
 
 pub(crate) fn native_goal_holds_ownership(status: MissionStatus, reason: Option<&str>) -> bool {
-    status == MissionStatus::Blocked && reason == Some("native_goal_stopped")
+    status == MissionStatus::Blocked
+        && matches!(
+            reason,
+            Some("native_goal_stopped" | "codex_continuity_required")
+        )
 }
 
 fn status_holds_pr_writer_lease(status: MissionStatus, reason: Option<&str>) -> bool {
@@ -16021,6 +16025,7 @@ async fn paloma_webhook_forwarder_loop(
             let recommended_action = match terminal_reason {
                 Some("server_shutdown" | "orphan_no_runner") => "resume_once",
                 Some("native_goal_stopped") => "resolve_stop_then_resume",
+                Some("codex_continuity_required") => "reconcile_native_session_before_resume",
                 Some("auth_error") => "disable_provider_and_reroute",
                 Some("rate_limited" | "capacity_limited") => "reroute_or_queue",
                 Some("watchdog_stalled" | "cancelled") => "inspect_artifacts",
@@ -17677,6 +17682,9 @@ fn mission_status_for_terminal_reason(
         TerminalReason::TurnComplete => None,
         TerminalReason::Completed => Some((MissionStatus::Completed, "completed")),
         TerminalReason::NativeGoalStopped => Some((MissionStatus::Blocked, "native_goal_stopped")),
+        TerminalReason::CodexContinuityRequired => {
+            Some((MissionStatus::Blocked, "codex_continuity_required"))
+        }
         TerminalReason::Cancelled => Some((MissionStatus::Interrupted, "cancelled")),
         TerminalReason::ServerShutdown => Some((MissionStatus::Interrupted, "server_shutdown")),
         TerminalReason::MaxIterations => Some((MissionStatus::Blocked, "max_iterations")),
@@ -17755,6 +17763,9 @@ fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<
         TerminalReason::MaxIterations => Some("Reached iteration limit".to_string()),
         TerminalReason::NativeGoalStopped => {
             Some("Native goal stopped — resume after external steering".to_string())
+        }
+        TerminalReason::CodexContinuityRequired => {
+            Some("Native Codex history requires reconciliation before resume".into())
         }
         TerminalReason::Cancelled => Some("Cancelled by user".to_string()),
         TerminalReason::ServerShutdown => {
@@ -22971,7 +22982,7 @@ async fn control_actor_loop(
                         }
                         let suppress_finished_automation = matches!(
                             completed_terminal_reason,
-                            Some(TerminalReason::NativeGoalStopped)
+                            Some(TerminalReason::NativeGoalStopped | TerminalReason::CodexContinuityRequired)
                                 | Some(TerminalReason::AuthError)
                                 | Some(TerminalReason::RateLimited)
                                 | Some(TerminalReason::CapacityLimited)
@@ -23515,7 +23526,7 @@ async fn control_actor_loop(
                             // capacity) to avoid noisy retry loops.
                             let suppress_finished_automation = matches!(
                                 result.terminal_reason,
-                                Some(TerminalReason::NativeGoalStopped)
+                                Some(TerminalReason::NativeGoalStopped | TerminalReason::CodexContinuityRequired)
                                     | Some(TerminalReason::AuthError)
                                     | Some(TerminalReason::RateLimited)
                                     | Some(TerminalReason::CapacityLimited)

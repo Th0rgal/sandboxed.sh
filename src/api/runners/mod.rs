@@ -58,6 +58,9 @@ pub(crate) struct TurnContext<'a> {
 pub(crate) enum TurnExtras<'a> {
     #[default]
     None,
+    Codex {
+        current_message: &'a str,
+    },
     ClaudeCode {
         secrets: Option<Arc<SecretsStore>>,
         tool_hub: Option<Arc<FrontendToolHub>>,
@@ -202,6 +205,11 @@ impl HarnessRunner for CodexRunner {
             ctx.cancel,
             ctx.app_working_dir,
             ctx.session_id,
+            match ctx.extras {
+                TurnExtras::Codex { current_message } => current_message,
+                _ => ctx.message,
+            },
+            ctx.is_continuation,
         ))
     }
 }

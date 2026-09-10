@@ -115,7 +115,7 @@ pub struct InitializeResult {
 
 /// Subset of `thread/start` params we use. Codex 0.128.0 has many more
 /// (experimental-gated) fields; add them as we adopt them.
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct ThreadStartParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -154,6 +154,28 @@ pub struct ThreadStartResult {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ThreadHandle {
     pub id: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub status: Option<Value>,
+    #[serde(default)]
+    pub turns: Vec<Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadGoal {
+    pub thread_id: String,
+    pub objective: String,
+    pub status: String,
+    pub token_budget: Option<i64>,
+    pub tokens_used: i64,
+    pub time_used_seconds: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ThreadGoalGetResponse {
+    pub goal: Option<ThreadGoal>,
 }
 
 #[derive(Debug, Serialize)]
@@ -638,6 +660,50 @@ impl AppServerSession {
             json!({
                 "threadId": thread_id,
             }),
+        )
+        .await
+    }
+
+    /// Apply the selected mission settings to the existing native history.
+    /// `config.model_reasoning_effort` is accepted by 0.144 and 0.153;
+    /// `reasoningEffort` is not a thread/resume protocol field.
+    pub async fn thread_resume_configured(
+        &self,
+        thread_id: &str,
+        overrides: &ThreadStartParams,
+    ) -> Result<ThreadStartResult> {
+        let mut params = serde_json::to_value(overrides)?;
+        let object = params.as_object_mut().expect("thread params are an object");
+        object.remove("ephemeral");
+        object.remove("reasoningEffort");
+        object.insert("threadId".into(), json!(thread_id));
+        // Explicit null clears a previously selected fast tier.
+        object.insert("serviceTier".into(), json!(overrides.service_tier));
+        if let Some(effort) = &overrides.reasoning_effort {
+            object.insert("config".into(), json!({"model_reasoning_effort": effort}));
+        }
+        self.request("thread/resume", params).await
+    }
+
+    pub async fn goal_get(&self, thread_id: &str) -> Result<ThreadGoalGetResponse> {
+        self.request("thread/goal/get", json!({"threadId": thread_id}))
+            .await
+    }
+
+    /// Omitting objective and tokenBudget preserves the existing goal counters.
+    pub async fn goal_status(&self, thread_id: &str, status: &str) -> Result<Value> {
+        self.request(
+            "thread/goal/set",
+            json!({"threadId": thread_id, "status": status}),
+        )
+        .await
+    }
+
+    pub async fn turn_steer(&self, thread_id: &str, turn_id: &str, text: &str) -> Result<Value> {
+        self.request(
+            "turn/steer",
+            json!({"threadId": thread_id, "expectedTurnId": turn_id,
+            "input": [{"type": "text", "text": text}]}),
         )
         .await
     }

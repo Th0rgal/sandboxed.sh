@@ -269,6 +269,7 @@ pub async fn run_gemini_turn(
             }
             Some(event) = event_rx.recv() => {
                 match event {
+                    ExecutionEvent::CodexSessionBound { .. } => {},
                     ExecutionEvent::TextDelta { content } => {
                         merge_stream_fragment(&mut assistant_message, &content);
                         let _ = events_tx.send(AgentEvent::TextDelta {
