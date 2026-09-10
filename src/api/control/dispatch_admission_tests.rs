@@ -1844,6 +1844,111 @@ async fn wait_native_status(h: &Harness, id: Uuid, expected: MissionStatus) -> M
 }
 
 #[tokio::test]
+async fn codex_continuity_http_actor_parks_preserves_ownership_and_suppresses_automation() {
+    for parallel in [false, true] {
+        let h = Harness::new().await;
+        let blocker = if parallel {
+            let b = h
+                .control
+                .mission_store
+                .create_mission(Some("other"), None, None, None, None, Some("codex"), None)
+                .await
+                .unwrap();
+            let dir = install_native_fixture(&h, b.id, "before").await;
+            assert!(h
+                .request(
+                    false,
+                    b.id,
+                    json!({"content":"/goal unrelated synthetic work"})
+                )
+                .await
+                .status()
+                .is_success());
+            wait_native_file(&dir.join("started")).await;
+            Some((b.id, dir))
+        } else {
+            None
+        };
+        let m = h.writer(MissionStatus::Failed, Some("repo#244")).await;
+        let dir = install_native_fixture(&h, m.id, "continuity_required").await;
+        let automation: mission_store::Automation = serde_json::from_value(json!({
+            "id":Uuid::new_v4(), "mission_id":m.id,
+            "command_source":{"type":"inline", "content":"must not automatically repeat"},
+            "trigger":{"type":"agent_finished"}, "active":true,
+            "created_at":chrono::Utc::now().to_rfc3339(), "last_triggered_at":null,
+            "stop_policy":{"type":"never"}
+        }))
+        .unwrap();
+        h.control
+            .mission_store
+            .create_automation(automation)
+            .await
+            .unwrap();
+        let response = h.request(true, m.id, json!({"content":"/goal preserve native state", "continue_identity":Harness::assertion(&m)})).await;
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+        let parked = wait_native_status(&h, m.id, MissionStatus::Blocked).await;
+        assert_eq!(
+            parked.terminal_reason.as_deref(),
+            Some("codex_continuity_required")
+        );
+        assert!(parked.goal_mode);
+        crate::api::track_leases::sweep(&h.state).await.unwrap();
+        assert_eq!(
+            h.state.projects.live_leases(None).unwrap()[0].attempt_id,
+            m.id.to_string()
+        );
+        assert_eq!(
+            find_existing_pr_writer(&h.control.mission_store, "repo#244", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            m.id
+        );
+        assert_eq!(
+            find_existing_pr_writer_in_sqlite(
+                &h._dir.path().join("missions/missions-admission-test.db"),
+                "repo#244",
+                None
+            )
+            .unwrap()
+            .unwrap()
+            .id,
+            m.id
+        );
+        // The finished-turn automation runs after 500 ms if not suppressed.
+        tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+        assert_eq!(
+            std::fs::read_to_string(dir.join("requests.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            h.control
+                .mission_store
+                .get_mission(m.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MissionStatus::Blocked
+        );
+        if let Some((id, dir)) = blocker {
+            std::fs::write(dir.join("release"), "").unwrap();
+            wait_native_status(&h, id, MissionStatus::Blocked).await;
+            NATIVE_FIXTURES.lock().unwrap().remove(&id);
+        }
+        NATIVE_FIXTURES.lock().unwrap().remove(&m.id);
+    }
+}
+
+#[tokio::test]
 async fn native_goal_http_actor_blocked_parks_and_default_resume_recovers_same_goal() {
     for order in ["before", "after", "before_started"] {
         let h = Harness::new().await;

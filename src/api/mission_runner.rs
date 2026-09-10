@@ -123,7 +123,8 @@ fn failure_class_for_terminal_reason(reason: TerminalReason) -> FailureClass {
         }
         TerminalReason::Cancelled
         | TerminalReason::ServerShutdown
-        | TerminalReason::NativeGoalStopped => FailureClass::AgentError,
+        | TerminalReason::NativeGoalStopped
+        | TerminalReason::CodexContinuityRequired => FailureClass::AgentError,
         TerminalReason::LlmError => FailureClass::ProviderError,
         TerminalReason::TurnComplete | TerminalReason::Completed => FailureClass::Unknown,
     }
@@ -169,6 +170,7 @@ pub(crate) fn turn_outcome_for_result(
             TerminalReason::Cancelled
                 | TerminalReason::ServerShutdown
                 | TerminalReason::NativeGoalStopped
+                | TerminalReason::CodexContinuityRequired
         ) {
             interrupted_turn_outcome(reason)
         } else {
@@ -1936,8 +1938,7 @@ pub(crate) use super::runners::grok::{
 pub(crate) use super::runners::codex::{
     codex_final_message_looks_like_progress_update, codex_is_goal_request,
     codex_missing_goal_final_response_message, codex_turn_requires_tool_activity,
-    extract_codex_reset_window, run_codex_turn, run_codex_turn_with_rotation,
-    summarize_codex_usage_caps,
+    extract_codex_reset_window, run_codex_turn_with_rotation, summarize_codex_usage_caps,
 };
 
 // Gemini runner moved to `super::runners::gemini` (Phase 2). Re-exported so
@@ -3931,6 +3932,10 @@ async fn run_mission_turn(
                     status: Some(Arc::clone(&status)),
                     history: &history,
                     max_history_total_chars: config.context.max_history_total_chars,
+                }
+            } else if backend_id == "codex" {
+                super::runners::TurnExtras::Codex {
+                    current_message: &user_message,
                 }
             } else {
                 super::runners::TurnExtras::None

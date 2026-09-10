@@ -28,6 +28,8 @@ pub struct CodexConfig {
     /// Extra environment variables exported to the codex app-server process
     /// (e.g. the per-mission DGX Spark offload vars). Empty by default.
     pub extra_env: std::collections::HashMap<String, String>,
+    /// Durable per-mission native identity. None preserves the legacy driver.
+    pub continuity: Option<super::continuity::Config>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +50,7 @@ impl Default for CodexConfig {
             external_chatgpt_auth: None,
             cancel_token: None,
             extra_env: std::collections::HashMap::new(),
+            continuity: None,
         }
     }
 }

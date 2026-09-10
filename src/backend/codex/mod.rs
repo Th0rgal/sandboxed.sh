@@ -1,5 +1,8 @@
 pub mod app_server;
 pub mod client;
+pub mod continuity;
+#[cfg(all(test, unix))]
+mod continuity_tests;
 mod tool_call_journal;
 
 use anyhow::Error;
@@ -194,7 +197,7 @@ fn fold_delta_into(buffer: &mut String, delta: &str) {
 /// - Otherwise → `turn/start` with a single text input item. We finish the
 ///   mission on the first `turn/completed` notification.
 async fn send_message_streaming_app_server(
-    cfg: client::CodexConfig,
+    mut cfg: client::CodexConfig,
     session: &Session,
     message: &str,
     workspace_exec: Option<&crate::workspace_exec::WorkspaceExec>,
@@ -226,6 +229,19 @@ async fn send_message_streaming_app_server(
     // the first spawn below.
     let app_cfg_for_reconnect = app_cfg.clone();
 
+    let mut native_lease = match cfg.continuity.as_ref() {
+        Some(config) => Some(continuity::Lease::acquire(config).await?),
+        None => None,
+    };
+    if let Some(lease) = &native_lease {
+        if !ToolCallJournal::at(lease.journal_path())
+            .pending()
+            .await?
+            .is_empty()
+        {
+            return Err(anyhow::anyhow!("codex_continuity_unresolved_tools: previous tool outcome needs reconciliation; no command was replayed"));
+        }
+    }
     let session_arc = AppServerSession::spawn(app_cfg, &session.directory, workspace_exec).await?;
     let session_arc = Arc::new(session_arc);
 
@@ -274,7 +290,7 @@ async fn send_message_streaming_app_server(
         .unwrap_or_else(|| session.directory.clone());
     let thread_start_params = ThreadStartParams {
         model: resolved_model,
-        cwd: Some(thread_cwd),
+        cwd: Some(thread_cwd.clone()),
         reasoning_effort: cfg.model_effort.clone(),
         service_tier: cfg.fast_mode.then(|| "fast".to_string()),
         ephemeral: None,
@@ -286,97 +302,196 @@ async fn send_message_streaming_app_server(
         approval_policy: Some("never".to_string()),
         sandbox: Some("danger-full-access".to_string()),
     };
-    let thread = match session_arc.thread_start(thread_start_params).await {
-        Ok(t) => t.thread,
-        Err(e) => {
-            let _ = session_arc.shutdown().await;
-            return Err(anyhow::anyhow!("codex thread/start failed: {}", e));
-        }
-    };
-
     let (tx, rx) = mpsc::channel::<ExecutionEvent>(256);
-
-    // Take the inbound channel before issuing any further RPC — `goal/set`
-    // and `turn/start` start emitting notifications before they return.
-    let inbound = match session_arc.take_inbound().await {
-        Some(rx) => rx,
-        None => {
-            let _ = session_arc.shutdown().await;
-            return Err(anyhow::anyhow!(
-                "codex app-server inbound stream already taken"
-            ));
-        }
-    };
-
-    // Detect /goal prefix server-side. Dashboard does this too, but the
-    // backend is the trust boundary — easier to enforce here than rely on
-    // every client.
-    let (is_goal_mission, user_payload) = parse_goal_prefix(message);
-
-    let thread_id = thread.id.clone();
-    let session_for_rpc = Arc::clone(&session_arc);
-
-    // Issue the priming RPC. For goal missions, codex auto-starts the first
-    // turn after `goal/set`; for non-goal, we explicitly send `turn/start`.
-    if is_goal_mission {
-        if user_payload.is_empty() {
-            let _ = session_arc.shutdown().await;
-            return Err(anyhow::anyhow!(
-                "/goal requires an objective — got empty string"
-            ));
-        }
-        // The goals db (`~/.codex/goals_1.sqlite`) is shared by every
-        // app-server in the container, and a freshly spawned server can
-        // receive goal/set while a sibling is still running the sqlx
-        // migrations — surfacing as a transient "no such table:
-        // thread_goals". Retry briefly before giving up (observed live:
-        // the migration completes within seconds).
-        let mut goal_set_result: anyhow::Result<serde_json::Value> = Ok(serde_json::Value::Null);
-        for attempt in 1..=3u32 {
-            goal_set_result = session_for_rpc
-                .goal_set(GoalSetParams {
-                    thread_id: thread_id.clone(),
-                    objective: user_payload.clone(),
-                    status: "active",
-                    token_budget: None,
-                })
-                .await;
-            match &goal_set_result {
-                Err(e) if attempt < 3 && e.to_string().contains("no such table") => {
-                    tracing::warn!(
-                        attempt,
-                        error = %e,
-                        "thread/goal/set hit a goals-db migration race; retrying"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(1500 * attempt as u64))
-                        .await;
-                }
-                _ => break,
+    let preparation: Result<_, Error> = async {
+        let resumed = native_lease.as_ref().is_some_and(|lease| lease.resumed);
+        let thread_result = if let Some(lease) = native_lease.as_ref().filter(|lease| lease.resumed) {
+            session_arc.thread_resume_configured(lease.binding.thread_id.as_deref().unwrap(), &thread_start_params).await
+        } else {
+            if let Some(lease) = &native_lease { lease.prepare_creation()?; }
+            session_arc.thread_start(thread_start_params.clone()).await
+        };
+        let thread = match thread_result {
+            Ok(t) => t.thread,
+            Err(e) => {
+                let _ = session_arc.shutdown().await;
+                return Err(anyhow::anyhow!("codex {} failed; no fresh-thread fallback: {}", if resumed { "thread/resume" } else { "thread/start" }, e));
             }
+        };
+        if let Some(lease) = native_lease.as_mut() {
+            if thread.cwd.as_deref() != Some(thread_cwd.as_str())
+                || (resumed && lease.binding.thread_id.as_deref() != Some(thread.id.as_str()))
+            {
+                session_arc.shutdown().await;
+                return Err(anyhow::anyhow!("codex_continuity_identity: native thread id/cwd does not match binding"));
+            }
+            lease.bind(&thread.id)?;
         }
-        if let Err(e) = goal_set_result {
-            let _ = session_arc.shutdown().await;
-            return Err(anyhow::anyhow!("codex thread/goal/set failed: {}", e));
-        }
-    } else if let Err(e) = session_for_rpc
-        .turn_start(TurnStartParams {
-            thread_id: thread_id.clone(),
-            input: vec![UserInputItem::Text {
-                text: user_payload.clone(),
-            }],
-        })
-        .await
-    {
-        let _ = session_arc.shutdown().await;
-        return Err(anyhow::anyhow!("codex turn/start failed: {}", e));
-    }
 
-    let session_id = session.id.clone();
-    let initial_objective = if is_goal_mission {
-        user_payload.clone()
-    } else {
-        String::new()
+        // Take the inbound channel before issuing any further RPC — `goal/set`
+        // and `turn/start` start emitting notifications before they return.
+        let inbound = match session_arc.take_inbound().await {
+            Some(rx) => rx,
+            None => {
+                let _ = session_arc.shutdown().await;
+                return Err(anyhow::anyhow!(
+                    "codex app-server inbound stream already taken"
+                ));
+            }
+        };
+
+        // Detect /goal prefix server-side. Dashboard does this too, but the
+        // backend is the trust boundary — easier to enforce here than rely on
+        // every client.
+        let message = if resumed {
+            cfg.continuity.as_ref().map(|c| c.current_message.as_str()).unwrap_or(message)
+        } else {
+            message
+        };
+        let (requested_goal, user_payload) = parse_goal_prefix(message);
+        let mut is_goal_mission = requested_goal;
+
+        let thread_id = thread.id.clone();
+        let session_for_rpc = Arc::clone(&session_arc);
+
+        // Issue the priming RPC. For goal missions, codex auto-starts the first
+        // turn after `goal/set`; for non-goal, we explicitly send `turn/start`.
+        let mut pending_steer = None;
+        let mut existing_objective = None;
+        let mut already_primed = false;
+        if let Some(lease) = native_lease.as_mut() {
+            let goal = session_for_rpc.goal_get(&thread_id).await
+                .map_err(|e| anyhow::anyhow!("codex_continuity_goal_unavailable: {e}"))?.goal;
+            if lease.binding.goal_seen && goal.is_none() {
+                return Err(anyhow::anyhow!("codex_continuity_goal_missing: cannot recreate a missing native goal or its counters"));
+            }
+            if let Some(goal) = goal {
+                if goal.thread_id != thread_id || (requested_goal && goal.objective != user_payload) {
+                    return Err(anyhow::anyhow!("codex_continuity_goal_identity: native objective differs; explicit reassignment required"));
+                }
+                lease.note_goal()?;
+                if goal.status != "complete" || requested_goal {
+                    if goal.status == "complete" {
+                        return Err(anyhow::anyhow!("codex_continuity_goal_complete: existing goal is already complete; refusing to reset its usage"));
+                    }
+                    if goal.token_budget.is_some_and(|budget| goal.tokens_used >= budget) {
+                        if matches!(goal.status.as_str(), "blocked" | "paused" | "usageLimited" | "budgetLimited") {
+                            return Err(continuity::NativeGoalStop {
+                                evidence: format!("codex_continuity_goal_budget: native goal/get status={}; budget remains exhausted; {}", goal.status, serde_json::to_string(&goal)?),
+                            }.into());
+                        }
+                        return Err(anyhow::anyhow!("codex_continuity_goal_budget: native token budget remains exhausted; refusing to reset its usage"));
+                    }
+                    is_goal_mission = true;
+                    existing_objective = Some(goal.objective.clone());
+                    let active = thread.status.as_ref().is_some_and(|s| s.get("type").and_then(|t| t.as_str()) == Some("active"))
+                        || thread.turns.iter().any(|t| t["status"] == "inProgress");
+                    if !active {
+                        session_for_rpc.goal_status(&thread_id, "active").await?;
+                        let after = session_for_rpc.goal_get(&thread_id).await?.goal
+                            .ok_or_else(|| anyhow::anyhow!("codex_continuity_goal_missing: goal disappeared while resuming"))?;
+                        if after.thread_id != goal.thread_id || after.objective != goal.objective
+                            || after.token_budget != goal.token_budget || after.tokens_used < goal.tokens_used
+                            || after.time_used_seconds < goal.time_used_seconds
+                        {
+                            return Err(anyhow::anyhow!("codex_continuity_goal_changed: resume did not preserve native identity/budget/usage"));
+                        }
+                    }
+                    if !requested_goal {
+                        if active {
+                            let turn_id = thread.turns.iter().find(|turn| turn["status"] == "inProgress")
+                                .and_then(|turn| turn["id"].as_str())
+                                .ok_or_else(|| anyhow::anyhow!("codex_continuity_steer_unconfirmed: active native turn has no id; current hint was not delivered"))?;
+                            session_for_rpc.turn_steer(&thread_id, turn_id, &user_payload).await
+                                .map_err(|e| anyhow::anyhow!("codex_continuity_steer_unconfirmed: {e}; hint was not replayed"))?;
+                        } else {
+                            pending_steer = Some(user_payload.clone());
+                        }
+                    }
+                    already_primed = true;
+                }
+            }
+            if is_goal_mission && !already_primed {
+                lease.note_goal()?;
+            }
+            tx.send(ExecutionEvent::CodexSessionBound { thread_id: thread_id.clone(), goal_mode: is_goal_mission }).await
+                .map_err(|_| anyhow::anyhow!("native session receiver closed"))?;
+        }
+        if !already_primed && is_goal_mission {
+            if user_payload.is_empty() {
+                let _ = session_arc.shutdown().await;
+                return Err(anyhow::anyhow!(
+                    "/goal requires an objective — got empty string"
+                ));
+            }
+            // The goals db (`~/.codex/goals_1.sqlite`) is shared by every
+            // app-server in the container, and a freshly spawned server can
+            // receive goal/set while a sibling is still running the sqlx
+            // migrations — surfacing as a transient "no such table:
+            // thread_goals". Retry briefly before giving up (observed live:
+            // the migration completes within seconds).
+            let mut goal_set_result: anyhow::Result<serde_json::Value> = Ok(serde_json::Value::Null);
+            for attempt in 1..=3u32 {
+                goal_set_result = session_for_rpc
+                    .goal_set(GoalSetParams {
+                        thread_id: thread_id.clone(),
+                        objective: user_payload.clone(),
+                        status: "active",
+                        token_budget: None,
+                    })
+                    .await;
+                match &goal_set_result {
+                    Err(e) if attempt < 3 && e.to_string().contains("no such table") => {
+                        tracing::warn!(
+                            attempt,
+                            error = %e,
+                            "thread/goal/set hit a goals-db migration race; retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(1500 * attempt as u64))
+                            .await;
+                    }
+                    _ => break,
+                }
+            }
+            if let Err(e) = goal_set_result {
+                let _ = session_arc.shutdown().await;
+                return Err(anyhow::anyhow!("codex thread/goal/set failed: {}", e));
+            }
+        } else if !already_primed { if let Err(e) = session_for_rpc
+            .turn_start(TurnStartParams {
+                thread_id: thread_id.clone(),
+                input: vec![UserInputItem::Text {
+                    text: user_payload.clone(),
+                }],
+            })
+            .await
+        {
+            let _ = session_arc.shutdown().await;
+            return Err(anyhow::anyhow!("codex turn/start failed: {}", e));
+        } }
+
+        let initial_objective = if is_goal_mission {
+            existing_objective.unwrap_or_else(|| user_payload.clone())
+        } else {
+            String::new()
+        };
+        Ok((thread, inbound, is_goal_mission, pending_steer, initial_objective))
+    }.await;
+    let (thread, inbound, is_goal_mission, mut pending_steer, initial_objective) = match preparation
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            session_arc.shutdown().await;
+            return Err(if native_lease.is_some() {
+                let message = format!("codex_continuity_reconciliation_required: {error}");
+                error.context(message)
+            } else {
+                error
+            });
+        }
     };
+    let session_id = session.id.clone();
+    let thread_id = thread.id.clone();
     // State the driver task needs in order to re-spawn the codex
     // app-server process if it crashes mid-mission. Owned clones (not
     // borrowed refs) so the spawned task is `'static`.
@@ -384,7 +499,10 @@ async fn send_message_streaming_app_server(
     let reconnect_cwd = session.directory.clone();
     let reconnect_workspace_exec = workspace_exec.cloned();
     let reconnect_thread_id = thread.id.clone();
-    let tool_call_journal = ToolCallJournal::new(&session.id, &thread.id);
+    let tool_call_journal = native_lease
+        .as_ref()
+        .map(|lease| ToolCallJournal::at(lease.journal_path()))
+        .unwrap_or_else(|| ToolCallJournal::new(&session.id, &thread.id));
 
     let handle = tokio::spawn(async move {
         // Seed the cached objective so the first GoalIteration event has
@@ -395,6 +513,19 @@ async fn send_message_streaming_app_server(
             native_thread_id: Some(thread_id.clone()),
             ..Default::default()
         };
+        let mut observed_turn_id = thread
+            .turns
+            .iter()
+            .find(|turn| turn["status"] == "inProgress")
+            .and_then(|turn| turn["id"].as_str())
+            .map(str::to_string);
+        if is_goal_mission {
+            if let Some(id) = &observed_turn_id {
+                translator.goal_active_turns.insert(id.clone());
+            }
+        }
+        let mut recovered_notifications = std::collections::VecDeque::new();
+        let steer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut terminal = false;
         let mut stream_closed_unexpectedly = false;
 
@@ -430,7 +561,28 @@ async fn send_message_streaming_app_server(
                             is_goal_mission,
                             "codex app-server cancellation requested"
                         );
-                        if is_goal_mission {
+                        if is_goal_mission && native_lease.is_some() {
+                            // Stop execution while keeping the native goal and its counters.
+                            let paused: anyhow::Result<_> = async {
+                                session_arc.goal_status(&thread_id, "paused").await?;
+                                let goal = session_arc.goal_get(&thread_id).await?.goal
+                                    .ok_or_else(|| anyhow::anyhow!("native goal missing after pause"))?;
+                                if goal.thread_id != thread_id || goal.status != "paused" {
+                                    anyhow::bail!("native pause was not confirmed by goal/get");
+                                }
+                                Ok(goal)
+                            }.await;
+                            let _ = session_arc.turn_interrupt(&thread_id, None).await;
+                            match paused {
+                                Ok(goal) => {
+                                    let _ = tx.send(ExecutionEvent::GoalStatus { status: goal.status, objective: goal.objective }).await;
+                                }
+                                Err(error) => {
+                                    let _ = tx.send(ExecutionEvent::Error { message: format!("codex_continuity_pause_unconfirmed: {error}; process stopped, reconcile native goal before resume") }).await;
+                                    break 'outer;
+                                }
+                            }
+                        } else if is_goal_mission {
                             if let Err(e) = session_arc.goal_clear(&thread_id).await {
                                 tracing::warn!(
                                     thread_id = %thread_id,
@@ -452,15 +604,27 @@ async fn send_message_streaming_app_server(
                             );
                         }
                         let _ = tx.send(ExecutionEvent::Cancelled).await;
-                        // Cancellation is terminal for this driver/session;
-                        // the unconditional terminal cleanup below removes the
-                        // durable journal for this non-resumable handle.
+                        // The driver stops; unresolved native tool outcomes
+                        // remain journaled for explicit reconciliation.
                         break 'outer;
                     }
-                    msg = inbound.recv() => match msg {
+                    msg = async {
+                        if let Some(snapshot) = recovered_notifications.pop_front() { Some(snapshot) }
+                        else { inbound.recv().await }
+                    } => match msg {
                         Some(m) => m,
                         None => break, // inner loop → check whether to reconnect
                     },
+                    _ = async {
+                        if pending_steer.is_some() {
+                            tokio::time::sleep_until(steer_deadline).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        let _ = tx.send(ExecutionEvent::Error { message: "codex_continuity_steer_unconfirmed: native goal did not expose a new turn; current hint was not delivered".into() }).await;
+                        break 'outer;
+                    }
                     _ = async {
                         if let Some((deadline, _)) = pending_tool_reconciliation.as_ref() {
                             tokio::time::sleep_until(*deadline).await;
@@ -484,6 +648,22 @@ async fn send_message_streaming_app_server(
 
                 match msg {
                     InboundMessage::Notification { method, params } => {
+                        if method == "turn/started" && params["threadId"] == thread_id {
+                            observed_turn_id = params["turn"]["id"].as_str().map(str::to_string);
+                            if let Some(hint) = pending_steer.take() {
+                                let turn_id = params["turn"]["id"].as_str().ok_or_else(|| {
+                                    anyhow::anyhow!("native started turn has no id")
+                                });
+                                let result = match turn_id {
+                                    Ok(id) => session_arc.turn_steer(&thread_id, id, &hint).await,
+                                    Err(error) => Err(error),
+                                };
+                                if let Err(error) = result {
+                                    let _ = tx.send(ExecutionEvent::Error { message: format!("codex_continuity_steer_unconfirmed: {error}; hint was not replayed") }).await;
+                                    break 'outer;
+                                }
+                            }
+                        }
                         let outcome =
                             translator.handle_notification(&method, &params, is_goal_mission);
                         let mut journal_failed = false;
@@ -511,6 +691,21 @@ async fn send_message_streaming_app_server(
                                 ExecutionEvent::ToolResult { id, .. } => {
                                     if let Err(err) = tool_call_journal.completed(id).await {
                                         tracing::error!(?err, tool_call_id = %id, "failed to persist codex tool-call completion");
+                                    }
+                                }
+                                ExecutionEvent::GoalStatus { .. } => {
+                                    if let Some(lease) = native_lease.as_mut() {
+                                        if let Err(error) = lease.note_goal() {
+                                            let _ = tx
+                                                .send(ExecutionEvent::Error {
+                                                    message: format!(
+                                                        "codex_continuity_goal_binding: {error}"
+                                                    ),
+                                                })
+                                                .await;
+                                            journal_failed = true;
+                                            break;
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -543,7 +738,7 @@ async fn send_message_streaming_app_server(
                         // `--dangerously-bypass-approvals-and-sandbox`; we mirror
                         // that policy here by auto-approving every elicitation.
                         let send_err = if method == "account/chatgptAuthTokens/refresh" {
-                            match cfg.external_chatgpt_auth.as_ref() {
+                            match cfg.external_chatgpt_auth.as_mut() {
                                 Some(external_auth) => {
                                     let previous_account_id = params
                                         .get("previousAccountId")
@@ -556,6 +751,7 @@ async fn send_message_streaming_app_server(
                                     .await
                                     {
                                         Ok(account) => {
+                                            external_auth.access_token = account.access_token.clone();
                                             let result = serde_json::json!({
                                                 "accessToken": account.access_token,
                                                 "chatgptAccountId": account.chatgpt_account_id,
@@ -639,19 +835,124 @@ async fn send_message_streaming_app_server(
                 .await
             {
                 tracing::error!("codex app-server reconnect: initialize failed: {}", e);
+                new_session.shutdown().await;
                 stream_closed_unexpectedly = true;
                 break 'outer;
             }
+            if let Some(auth) = &cfg.external_chatgpt_auth {
+                if let Err(error) = new_session
+                    .login_chatgpt_auth_tokens(
+                        &auth.access_token,
+                        &auth.chatgpt_account_id,
+                        auth.chatgpt_plan_type.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "codex app-server reconnect: login failed");
+                    new_session.shutdown().await;
+                    stream_closed_unexpectedly = true;
+                    break 'outer;
+                }
+            }
             let _ = new_session.send_initialized_notification().await;
-            if let Err(e) = new_session.thread_resume(&reconnect_thread_id).await {
-                tracing::error!("codex app-server reconnect: thread/resume failed: {}", e);
-                stream_closed_unexpectedly = true;
-                break 'outer;
+            let resumed_thread = new_session
+                .thread_resume_configured(&reconnect_thread_id, &thread_start_params)
+                .await;
+            let resumed_thread = match resumed_thread {
+                Ok(result)
+                    if result.thread.id == reconnect_thread_id
+                        && (native_lease.is_none()
+                            || result.thread.cwd.as_deref() == Some(thread_cwd.as_str())) =>
+                {
+                    result.thread
+                }
+                result => {
+                    if let Err(error) = result {
+                        tracing::error!(%error, "codex app-server reconnect: resume failed");
+                    } else {
+                        tracing::error!("codex app-server reconnect: native identity changed");
+                    }
+                    new_session.shutdown().await;
+                    stream_closed_unexpectedly = true;
+                    break 'outer;
+                }
+            };
+            if native_lease.is_some() {
+                // A completed turn may exist only in the resumed snapshot if EOF
+                // lost its notifications. Interpret receipts, never replay commands.
+                for turn in &resumed_thread.turns {
+                    if turn["id"].as_str() == observed_turn_id.as_deref()
+                        && matches!(
+                            turn["status"].as_str(),
+                            Some("completed" | "interrupted" | "failed")
+                        )
+                    {
+                        if let Some(items) = turn["items"].as_array() {
+                            for item in items {
+                                if item["id"].as_str().is_some_and(|id| {
+                                    translator.pending_tool_calls.contains_key(id)
+                                }) && matches!(
+                                    item["status"].as_str(),
+                                    Some("completed" | "failed")
+                                ) {
+                                    recovered_notifications.push_back(InboundMessage::Notification {
+                                        method: "item/completed".into(),
+                                        params: serde_json::json!({"threadId": thread_id, "turnId": turn["id"], "item": item}),
+                                    });
+                                }
+                            }
+                        }
+                        recovered_notifications.push_back(InboundMessage::Notification {
+                            method: "turn/completed".into(),
+                            params: serde_json::json!({"threadId": thread_id, "turn": turn}),
+                        });
+                    }
+                }
+                if is_goal_mission {
+                    let goal = new_session.goal_get(&thread_id).await;
+                    match goal {
+                        Ok(response)
+                            if response.goal.as_ref().is_some_and(|goal| {
+                                goal.thread_id == thread_id
+                                    && goal.objective == translator.goal_objective
+                            }) =>
+                        {
+                            let goal = response.goal.unwrap();
+                            if goal.status != "active" {
+                                let missing_turn_receipt =
+                                    translator.goal_active_turns.iter().any(|id| {
+                                        !resumed_thread.turns.iter().any(|turn| {
+                                            turn["id"] == *id
+                                                && matches!(
+                                                    turn["status"].as_str(),
+                                                    Some("completed" | "interrupted" | "failed")
+                                                )
+                                        })
+                                    });
+                                if missing_turn_receipt {
+                                    let _ = tx.send(ExecutionEvent::Error { message: "codex_continuity_turn_unresolved: native goal stopped but the interrupted turn has no terminal receipt".into() }).await;
+                                    new_session.shutdown().await;
+                                    break 'outer;
+                                }
+                                recovered_notifications.push_back(InboundMessage::Notification {
+                                    method: "thread/goal/updated".into(),
+                                    params: serde_json::json!({"threadId": thread_id, "turnId": null, "goal": goal}),
+                                });
+                            }
+                        }
+                        _ => {
+                            let _ = tx.send(ExecutionEvent::Error { message: "codex_continuity_goal_unavailable: reconnected goal identity could not be verified".into() }).await;
+                            new_session.shutdown().await;
+                            break 'outer;
+                        }
+                    }
+                }
             }
             let new_inbound = match new_session.take_inbound().await {
                 Some(rx) => rx,
                 None => {
                     tracing::error!("codex app-server reconnect: inbound stream missing");
+                    new_session.shutdown().await;
                     stream_closed_unexpectedly = true;
                     break 'outer;
                 }
@@ -684,6 +985,9 @@ async fn send_message_streaming_app_server(
             tracing::info!("codex app-server reconnected via thread/resume");
         }
 
+        if pending_steer.is_some() {
+            let _ = tx.send(ExecutionEvent::Error { message: "codex_continuity_steer_unconfirmed: current hint was not delivered before the native run stopped".into() }).await;
+        }
         if stream_closed_unexpectedly {
             let interrupted_ids = translator.pending_tool_ids();
             let interrupted = translator.transport_failures(&interrupted_ids);
@@ -699,15 +1003,21 @@ async fn send_message_streaming_app_server(
                 .await;
         }
 
-        // This driver will never resume its local session/thread after the
-        // handle exits. Clear the journal after clean completion,
-        // cancellation, and terminalized transport failure alike so command
-        // arguments are not retained indefinitely in /tmp.
-        if let Err(err) = tool_call_journal.clear().await {
-            tracing::warn!(?err, "failed to clean terminal codex tool-call journal");
+        // Durable native threads can outlive this driver. Unknown tool outcomes
+        // remain fenced across restart; never clear them just to enable a retry.
+        if native_lease.is_none()
+            || tool_call_journal
+                .pending()
+                .await
+                .is_ok_and(|calls| calls.is_empty())
+        {
+            if let Err(err) = tool_call_journal.clear().await {
+                tracing::warn!(?err, "failed to clean terminal codex tool-call journal");
+            }
         }
 
         let _ = session_arc.shutdown().await;
+        drop(native_lease);
 
         let _ = tx
             .send(ExecutionEvent::MessageComplete {

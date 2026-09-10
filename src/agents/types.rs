@@ -324,6 +324,8 @@ pub enum TerminalReason {
     Completed,
     /// Native goal stopped without completing its objective; external steering may resume it.
     NativeGoalStopped,
+    /// Native history/identity needs explicit reconciliation; never start fresh automatically.
+    CodexContinuityRequired,
     /// Task was cancelled by user
     Cancelled,
     /// Mission was interrupted because the server is shutting down
@@ -345,6 +347,15 @@ pub enum TerminalReason {
     CapacityLimited,
     /// Authentication credentials were rejected (expired/revoked token)
     AuthError,
+}
+
+impl TerminalReason {
+    pub fn requires_external_recovery(self) -> bool {
+        matches!(
+            self,
+            Self::NativeGoalStopped | Self::CodexContinuityRequired
+        )
+    }
 }
 
 /// Errors that can occur in agent operations.

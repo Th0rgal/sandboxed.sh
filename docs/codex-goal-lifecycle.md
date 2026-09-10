@@ -48,11 +48,14 @@ mission ownership semantics are unchanged. `goal_mode` records persistence,
 not whether a driver is live.
 
 Default resume of a persisted Codex goal reuses the full stored objective,
-not the compact MCP preview. Explicit content stays exact; plain steering is
-a single turn and an explicit `/goal` re-arms a loop with status `active`.
-The existing driver still starts a fresh native thread per outer turn; this
-patch does not introduce native-thread reuse or migrate native goal counters.
-Original native goal records and mission transcript evidence are retained.
+not the compact MCP preview. New missions now keep the actual native thread
+across outer runs. A bound goal resumes through `goal/get` and a status-only
+`goal/set`; objective, token budget and accumulated usage are preserved.
+Plain steering is delivered to the existing goal's active turn, or once its
+next turn starts. It does not silently replace the native goal with a separate
+single turn. See [native continuity](codex-native-continuity.md) for rollout,
+identity and recovery boundaries. Legacy unbound missions retain the previous
+reconstructed-context behavior until a controlled checkpoint handoff.
 
 ## Regression boundaries
 
