@@ -629,6 +629,11 @@ struct WorkspaceBashParams {
     cwd: Option<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    /// Supplying both ownership fields selects restart-safe execution.
+    #[serde(default)]
+    mission_id: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -681,25 +686,6 @@ fn workspace_job_command(
         (Some(_), Some(_)) => Err("Pass exactly one of command or argv, not both".to_string()),
         _ => Err("Pass a non-empty command or argv".to_string()),
     }
-}
-
-fn is_heavy_workspace_command(command: &str) -> bool {
-    let normalized = command
-        .split_whitespace()
-        .map(|part| part.to_ascii_lowercase())
-        .collect::<Vec<_>>()
-        .join(" ");
-    [
-        "lake build",
-        "lake test",
-        "cargo build --release",
-        "cargo test --all",
-        "npm run build",
-        "bun run build",
-        "next build",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
 }
 
 fn compact_workspace_job(job: Value) -> Value {
@@ -2085,7 +2071,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "workspace_bash".to_string(),
-                description: "Run a short diagnostic command inside a sandboxed.sh workspace. Defaults to 60 seconds and never exceeds 120 seconds. Heavy commands such as `lake build` are rejected; use start_workspace_job for long work.".to_string(),
+                description: "Run a command inside a sandboxed.sh workspace. For builds or any work that must survive this call, supply both mission_id and idempotency_key: returns a durable job id immediately, with no polling. Without those fields, runs a bounded diagnostic (default 60 seconds, maximum 120) and kills it at timeout. Command text is never used to guess execution mode.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["command"],
@@ -2093,7 +2079,9 @@ impl AssistantMcp {
                         "command": {"type": "string", "description": "Shell command to run in the workspace."},
                         "workspace_id": {"type": "string", "description": "Workspace UUID. Defaults to the assistant's default workspace."},
                         "cwd": {"type": "string", "description": "Working directory relative to the workspace root."},
-                        "timeout_secs": {"type": "integer", "description": "Timeout in seconds, default 60, max 120."}
+                        "timeout_secs": {"type": "integer", "description": "Runtime limit: diagnostic default 60/max 120; durable default 7200/max 86400."},
+                        "mission_id": {"type": "string", "description": "Owning mission UUID; supply together with idempotency_key for durable execution."},
+                        "idempotency_key": {"type": "string", "description": "Stable retry key for durable execution; requires mission_id. Reuse after a lost response."}
                     }
                 }),
             },
@@ -2508,12 +2496,26 @@ impl AssistantMcp {
         if params.command.trim().is_empty() {
             return Err("Command is empty".to_string());
         }
-        if is_heavy_workspace_command(&params.command) {
-            return Err(serde_json::to_string(&json!({
-                "error": "heavy_command_requires_durable_job",
-                "message": "This command can outlive a synchronous Hermes MCP call. Use start_workspace_job and poll get_workspace_job.",
-                "tool": "start_workspace_job"
-            })).unwrap_or_else(|_| "heavy command requires start_workspace_job".to_string()));
+        match (params.mission_id, params.idempotency_key) {
+            (Some(mission_id), Some(idempotency_key)) => {
+                if mission_id.trim().is_empty() || idempotency_key.trim().is_empty() {
+                    return Err("mission_id and idempotency_key must both be non-empty".into());
+                }
+                // Reuse the durable admission API: never submit synchronously first
+                // and then retry in the background, which could execute twice.
+                return self.start_workspace_job(StartWorkspaceJobParams {
+                    command: Some(params.command),
+                    argv: None,
+                    workspace_id: params.workspace_id,
+                    mission_id,
+                    cwd: params.cwd,
+                    timeout_secs: params.timeout_secs,
+                    resource_class: None,
+                    idempotency_key,
+                }).await;
+            }
+            (None, None) => {}
+            _ => return Err("Supply both mission_id and idempotency_key for durable execution, or omit both for a bounded diagnostic".into()),
         }
         let workspace_id = resolve_default_workspace_id(params.workspace_id).ok_or_else(|| {
             "No workspace_id given and no default workspace configured \
@@ -2548,6 +2550,7 @@ impl AssistantMcp {
         })?;
         let workspace_id = parse_uuid(&workspace_id)?;
         let mission_id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(mission_id).await?;
         let command = workspace_job_command(params.command, params.argv)?;
         let key = params.idempotency_key.trim();
         if key.is_empty() {
@@ -5920,16 +5923,125 @@ mod tests {
     }
 
     #[test]
-    fn workspace_bash_rejects_heavy_commands_and_job_argv_is_quoted() {
-        assert!(is_heavy_workspace_command("lake build Verity"));
-        assert!(is_heavy_workspace_command("cd repo && cargo test --all"));
-        assert!(!is_heavy_workspace_command("git status --short"));
+    fn workspace_job_argv_is_quoted() {
         assert_eq!(
             workspace_job_command(None, Some(vec!["printf".into(), "%s".into(), "a'b".into()]))
                 .unwrap(),
             "'printf' '%s' 'a'\\''b'"
         );
         assert!(workspace_job_command(Some("true".into()), Some(vec!["true".into()])).is_err());
+    }
+
+    #[tokio::test]
+    async fn workspace_diagnostics_do_not_classify_quoted_command_text() {
+        let workspace_id = Uuid::new_v4().to_string();
+        let (mcp, state, task) = mock_assistant(json!({"exit_code": 0}), false).await;
+        let command = "ps -eo pid,args | rg 'lake build|cargo test --all'";
+        mcp.workspace_bash(
+            parse_params(json!({
+                "workspace_id": workspace_id, "command": command, "timeout_secs": 1000
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].0,
+            format!("/api/workspaces/{workspace_id}/exec")
+        );
+        assert_eq!(requests[0].1["command"], command);
+        assert_eq!(requests[0].1["timeout_secs"], 120);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn workspace_durable_execution_routes_each_call_with_the_same_retry_key() {
+        let mission_id = Uuid::new_v4().to_string();
+        let workspace_id = Uuid::new_v4().to_string();
+        let (mcp, state, task) =
+            mock_assistant(json!({"id": mission_id, "status": "queued"}), false).await;
+        // A build and an unrecognizable script use exactly the same durable route.
+        for (index, command) in ["lake build Target", "./long-running-script"]
+            .iter()
+            .enumerate()
+        {
+            for _ in 0..2 {
+                let result = mcp.workspace_bash(parse_params(json!({
+                    "workspace_id": workspace_id, "mission_id": mission_id,
+                    "idempotency_key": format!("build-input-sha-{index}"), "command": command,
+                    "cwd": "/workspaces/proof"
+                })).unwrap()).await.unwrap();
+                assert_eq!(result["job"]["id"], mission_id);
+            }
+        }
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        for (index, (path, body)) in requests.iter().enumerate() {
+            assert_eq!(path, "/api/durable-jobs");
+            assert_eq!(
+                body["idempotency_key"],
+                format!("build-input-sha-{}", index / 2)
+            );
+            assert_eq!(body["started_by_mission_id"], mission_id);
+            assert_eq!(body["workspace_id"], workspace_id);
+            assert_eq!(body["cwd"], "/workspaces/proof");
+            assert_eq!(body["timeout_secs"], 7200);
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn workspace_partial_durable_ownership_never_executes_a_command() {
+        let (mcp, state, task) = mock_assistant(json!({}), false).await;
+        for fields in [
+            json!({"mission_id": Uuid::new_v4().to_string()}),
+            json!({"idempotency_key": "input-sha"}),
+            json!({"mission_id": "", "idempotency_key": "input-sha"}),
+            json!({"mission_id": Uuid::new_v4().to_string(), "idempotency_key": " "}),
+        ] {
+            let mut input = fields;
+            input["command"] = json!("./long-running-script");
+            assert!(mcp
+                .workspace_bash(parse_params(input).unwrap())
+                .await
+                .is_err());
+        }
+        assert!(state.requests.lock().unwrap().is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn workspace_durable_execution_respects_project_scope_on_both_entrypoints() {
+        let mission_id = Uuid::new_v4().to_string();
+        let workspace_id = Uuid::new_v4().to_string();
+        for project in [json!("eip-8282"), Value::Null, json!("verity-lido")] {
+            let (mut mcp, state, task) = mock_assistant(
+                json!({
+                    "id": mission_id, "project": project
+                }),
+                false,
+            )
+            .await;
+            mcp.project_scope = Some(["verity-lido".to_string()].into_iter().collect());
+            let input = json!({
+                "workspace_id": workspace_id, "mission_id": mission_id,
+                "idempotency_key": "same-command", "command": "./build"
+            });
+            let via_bash = mcp
+                .workspace_bash(parse_params(input.clone()).unwrap())
+                .await;
+            let direct = mcp.start_workspace_job(parse_params(input).unwrap()).await;
+            let allowed = project == json!("verity-lido");
+            assert_eq!(via_bash.is_ok(), allowed);
+            assert_eq!(direct.is_ok(), allowed);
+            assert_eq!(
+                state.requests.lock().unwrap().len(),
+                if allowed { 2 } else { 0 }
+            );
+            task.abort();
+        }
     }
 
     #[test]

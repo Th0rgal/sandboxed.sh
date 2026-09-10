@@ -21,6 +21,14 @@ reusing the key returns the original launch instead of duplicating work.
 Mission completion alone does not satisfy the track. Accepted criterion
 evidence at the governed artifact version must be recorded separately.
 
+For long workspace commands, use `start_workspace_job`, or pass both
+`mission_id` and `idempotency_key` to `workspace_bash`. Both return a durable
+job ID immediately through the same admission path; retry the same submission
+with the same key. Without that pair, `workspace_bash` is a short diagnostic
+(60 seconds by default, maximum 120) that is killed at timeout. Shell command
+text is not used to infer durability. Consume the job completion callback;
+do not keep an agent polling or launch another build to inspect the first.
+
 This is **not** the same as delegating to a CLI coding agent (Claude Code, Codex, OpenCode) via the `terminal` tool. The MCP runs an entire conversation loop inside the container; the CLI agents are interactive programs you spawn in a single `terminal()` call. Use this skill for isolated multi-step research/coding, or work that needs a specific pre-baked workspace (e.g. `tailscale-ubuntu`, `minecraft`, `dgx-spark`).
 
 ## When to use

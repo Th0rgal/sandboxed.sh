@@ -327,11 +327,16 @@ repeated failure `repeat-loop-guard` · tool-call limits `context-budget`.
 - **Do not abandon the objective.** If dispatch is refused (disk, auth, capacity): keep the original project on its objective with a named infra blocker (`blocked:disk`, `blocked:auth`, `blocked:capacity`); open or fix the platform work under its own project (`sandboxed-sh`). Do not retitle or reuse the campaign session. Lido “Corriger et merger les PRs” becoming a P0 disk ticket is the incident — a platform outage is not a new campaign.
 - **Harness ≠ project blocked.** Missing CLI, wrong-arch binary, container `nsenter` failure: `mode=active` + `next=` switch backend / repair harness, or trailer `blocked:harness` ≤ 3 ticks then workaround. Structured write: `update_project_status(..., mode=blocked, blocker=harness)`. See the trailer rule above.
 - **Never persist `mode=blocked` + `next=inspect <uuid>`.** That is a dead writer, not a no-lane. ACK or redispatch; stay `mode=active`. A tick whose only act is inspect-without-redispatch is a defect (same as two ticks with no dispatch).
-- **No foreground `timeout` > 180s / `make test*` / `lake build` inside Codex bash.** Fire `remote-lean-build` (or an existing remote job) and poll the receipt. A 2h `make` in the Codex session stream dies on every deploy (`pending tool not replayed`).
+- **Long builds need a durable job.** Use `start_workspace_job`, or
+  `workspace_bash` with both `mission_id` and `idempotency_key`, and consume the
+  completion callback. Use `remote-lean-build` when remote placement is needed.
+  Reuse the same key for retries of the same submission. `workspace_bash`
+  without that pair is a short diagnostic with a hard 120-second timeout;
+  command text does not make it durable.
 
 ## Optimisations d exécution (2026-08-10, leçons terrain)
 
-- **Jamais de polling de build en boucle.** Ne relance pas la même commande d inspection de build/CI de façon répétée (un writer a bouclé 14× sur le même poll — pur gaspillage de budget). Vérifie UNE fois avec une attente bornée (`timeout 120s lake build` ou lecture unique du receipt/log), puis poursuis le correctif ; ne re-sonde que si un délai substantiel s est écoulé.
+- **Jamais de polling de build en boucle.** Ne relance pas la même commande d inspection de build/CI de façon répétée. Lis une fois le statut et les logs du job existant, puis attends son callback ou poursuis un travail indépendant. Ne lance pas une seconde compilation pour vérifier si la première avance.
 - **Juge la vivacité d une mission par ses PROCESSUS, pas par son silence.** Les builds/preuves Lean ont de longues phases silencieuses tout en progressant. Avant de conclure qu une mission est bloquée : vérifie la présence d un process `lean`/`lake` vivant et la montée de la séquence d événements. Silence ≠ wedge. N interromps JAMAIS un `make check`/`lake build` en vol — tu perdrais des heures de calcul.
 - **La vivacité d un scan GPU n est pas un `pgrep` local.** Pour Coldcard, appelle `scripts/coldcard-skip-scan-status.sh` (SSH DGX, `scan.log` + process). Un `pgrep` sur agent-core a déclaré DEAD le 2026-08-13 alors que le scan CUDA avançait à 2.75B/4.29B.
 - **API GitHub non réactive = bascule sur git.** Si les appels `gh`/API GitHub pendent, utilise `git ls-remote`/`git fetch` comme source de vérité du head plutôt que d attendre l API ; ne bloque pas la progression sur une lenteur d API externe.

@@ -101,6 +101,21 @@ actually required; full histories are not injected by the status tools.
 - `delete_workspace_template` — requires explicit confirmation
 - `rebuild_workspace_from_template` — reapplies template fields and force-rebuilds; requires explicit confirmation
 - `workspace_bash`
+- `start_workspace_job`, `get_workspace_job`, `cancel_workspace_job`
+
+`workspace_bash` selects execution mode explicitly. Without ownership fields it
+runs a short diagnostic (60 seconds by default, hard limit 120); it does not
+classify shell strings, so searches such as `rg 'lake build'` work normally.
+For a build or any command that must survive the MCP call, supply **both**
+`mission_id` and `idempotency_key`. This uses the same durable admission as
+`start_workspace_job` and returns a job ID immediately (runtime limit 7200
+seconds by default, maximum 86400). A partial or empty pair is rejected before
+execution. Reuse the key for a retry of the same command after a lost response;
+use a new key for different work. Inspect `get_workspace_job` for a bounded
+status/log read and consume its completion callback instead of polling in a loop.
+This does not promote a synchronous command after it starts: submission chooses
+one path once, avoiding duplicate effects. `start_workspace_job` remains useful
+for its explicit `argv` and `resource_class` parameters.
 
 Configuration:
 
