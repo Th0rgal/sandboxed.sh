@@ -22585,6 +22585,9 @@ async fn control_actor_loop(
                                 }
                             }
 
+                            // Capture the actor-owned generation before any status-write await.
+                            let execution = running_run.as_ref().filter(|run| run.mission_id == id).cloned()
+                                .or_else(|| parallel_runners.get(&id).and_then(|runner| runner.durable_run.clone()));
                             if mission_store
                                 .update_mission_status(id, new_status)
                                 .await
@@ -22617,7 +22620,7 @@ async fn control_actor_loop(
                                 }
 
                                 let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                    execution: mission_store.get_latest_mission_run(id).await.ok().flatten(),
+                                    execution,
                                     mission_id: id,
                                     status: new_status,
                                     summary,
@@ -34061,6 +34064,92 @@ Investigate <service/> failures.
             !promoted.contains(&mission.id),
             "a freshly-resumed mission must not be ack-promoted after demotion"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_callback_identity_reaches_http_after_release_and_delayed_successor() {
+        for resume_before_delivery in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+            let mission = store
+                .create_mission(None, None, None, None, None, None, None)
+                .await
+                .unwrap();
+            let first = store
+                .begin_mission_run(mission.id, "test", None)
+                .await
+                .unwrap();
+            store
+                .finish_mission_run(first.run_id, first.generation, Some("native_goal_stopped"))
+                .await
+                .unwrap();
+            let (tx, rx) = tokio::sync::broadcast::channel(8);
+            maybe_finalize_terminal_mission(
+                &store,
+                &tx,
+                mission.id,
+                0,
+                Some(TerminalReason::NativeGoalStopped),
+                None,
+                None,
+                true,
+                Some("first generation result"),
+                "http callback test",
+            )
+            .await;
+            // Queue the actual finalizer event, then acquire a successor BEFORE
+            // starting the forwarder. This deterministically exercises delay.
+            if resume_before_delivery {
+                store
+                    .update_mission_status(mission.id, MissionStatus::Active)
+                    .await
+                    .unwrap();
+                let next = store
+                    .begin_mission_run(mission.id, "test", None)
+                    .await
+                    .unwrap();
+                assert_eq!(next.generation, 2);
+            }
+            let mut markers = super::super::webhook_markers::MarkerStore::load(dir.path());
+            markers.set(mission.id, MissionStatus::Active);
+            let (body_tx, mut body_rx) = tokio::sync::mpsc::channel(2);
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let body_tx = body_tx.clone();
+                    async move {
+                        body_tx.send(body).await.unwrap();
+                        axum::http::StatusCode::OK
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let workspaces =
+                Arc::new(workspace::WorkspaceStore::new(dir.path().to_path_buf()).await);
+            let forwarder = tokio::spawn(paloma_webhook_forwarder_loop(
+                rx,
+                store,
+                workspaces,
+                dir.path().to_path_buf(),
+                url,
+                None,
+                reqwest::Client::new(),
+            ));
+            let body = tokio::time::timeout(std::time::Duration::from_secs(5), body_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(body["mission_id"], mission.id.to_string());
+            assert_eq!(body["execution"]["run_id"], first.run_id.to_string());
+            assert_eq!(body["execution"]["generation"], 1);
+            assert_eq!(body["execution"]["state"], "terminal");
+            forwarder.abort();
+            server.abort();
+        }
     }
 
     #[tokio::test]
