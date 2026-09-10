@@ -4536,6 +4536,20 @@ fn build_recommendation(
     analysis: &TraceAnalysis,
 ) -> String {
     let live_state = live.get("state").and_then(Value::as_str);
+    if status == "pending"
+        && live_state != Some("running")
+        && analysis.recent_errors.iter().any(|error| {
+            error
+                .get("snippet")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("queued_assignment_unowned:"))
+        })
+    {
+        return "Queued mission could not acquire its admitted track assignment. Inspect the \
+                recorded reader/writer capability and track lease before retrying; the \
+                queued_assignment_unowned error does not by itself prove the lease was released."
+            .to_string();
+    }
     if backend == Some("chatgpt_ui") && live_state == Some("running") {
         return "ChatGPT UI Pro is still generating. The web UI may expose only a generic \
                 `Pro thinking` marker until the final answer begins, so event silence is not \
@@ -5780,6 +5794,25 @@ mod tests {
         assert!(analysis.signals.contains("rate_limited"));
         assert_eq!(analysis.recent_errors.len(), 1);
         assert!(analysis.loop_tool.is_none());
+    }
+
+    #[test]
+    fn recommendation_reports_pending_assignment_failure_without_poisoning_active_run() {
+        let analysis = analyze_trace_events(&[json!({
+            "event_type":"error", "sequence":3,
+            "content":"Cannot activate mission: queued_assignment_unowned: original track claim is no longer held"
+        })]);
+        let pending = build_recommendation("pending", None, &Value::Null, &analysis);
+        assert!(pending.contains("Queued mission could not acquire"));
+        assert!(!pending.contains("healthy"));
+        let active = build_recommendation("active", None, &json!({"state":"running"}), &analysis);
+        assert!(!active.contains("Queued mission could not acquire"));
+        let starting =
+            build_recommendation("pending", None, &json!({"state":"running"}), &analysis);
+        assert!(!starting.contains("Queued mission could not acquire"));
+        let ordinary_pending =
+            build_recommendation("pending", None, &Value::Null, &TraceAnalysis::default());
+        assert!(!ordinary_pending.contains("Queued mission could not acquire"));
     }
 
     #[test]
