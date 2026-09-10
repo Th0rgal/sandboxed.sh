@@ -10709,10 +10709,14 @@ pub async fn create_mission(
             }
         }
     }
-    if req
-        .github_pr
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
+    // Reader capability governs track admission and harness permissions even
+    // without PR metadata. Persist it before deferred dispatch can re-infer
+    // authority from an initial prompt such as "verity-integration-b".
+    if req.writer == Some(false)
+        || req
+            .github_pr
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
     {
         let capability = if request_is_writer {
             Some("pr-writer")

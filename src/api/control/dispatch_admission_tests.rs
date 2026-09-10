@@ -567,6 +567,92 @@ fn isolated_track_http_test(test_name: &str) -> bool {
 }
 
 #[tokio::test]
+async fn explicit_reader_creation_without_pr_survives_queued_activation() {
+    if isolated_track_http_test("explicit_reader_creation_without_pr_survives_queued_activation") {
+        return;
+    }
+    for pr in [None, Some("repo#244")] {
+        let h = Harness::new().await;
+        h.state.backend_registry.write().await.register(Arc::new(
+            crate::backend::opencode::OpenCodeBackend::new(
+                "http://127.0.0.1:9".into(),
+                None,
+                false,
+            ),
+        ));
+        let prompt = "Read-only review in verity-integration-b. Write output/review.md; no repository edits.";
+        // This is the production trigger: the prose heuristic sees a writer,
+        // while the explicit capability admits only a reader.
+        assert!(inferred_pr_writer(None, Some("review"), Some(prompt)));
+        let response = h
+            .state
+            .http_client
+            .post(format!("{}/missions", h.url))
+            .json(&json!({
+                "title":"bounded read-only review", "backend":"opencode",
+                "project":"lido", "track":"independent-review", "intent":"review",
+                "github_pr":pr, "writer":false, "tags":["pr-writer", "ssz"],
+                "prompt":prompt, "estimated_disk_gib":1,
+                "not_before":(chrono::Utc::now()+chrono::Duration::hours(1)).to_rfc3339()
+            }))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "{status}: {body}");
+        let created: Mission = serde_json::from_str(&body).unwrap();
+        let stored = h
+            .control
+            .mission_store
+            .get_mission(created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.project.tags.iter().any(|tag| tag == "pr-readonly"));
+        assert!(!stored.project.tags.iter().any(|tag| tag == "pr-writer"));
+        assert!(!mission_is_pr_writer_with_prompt(&stored, Some(prompt)));
+        h.control
+            .mission_store
+            .log_event(
+                created.id,
+                &AgentEvent::UserMessage {
+                    id: Uuid::new_v4(),
+                    content: prompt.into(),
+                    queued: true,
+                    mission_id: Some(created.id),
+                    source: None,
+                },
+            )
+            .await
+            .unwrap();
+        // Exercise the real dequeue revalidation against the lease acquired
+        // by HTTP creation, after the initial prompt is persisted.
+        activate_mission_for_message(
+            &h.state.control,
+            &h.control.mission_store,
+            &h.control.events_tx,
+            &stored,
+            prompt,
+        )
+        .await
+        .unwrap();
+        let leases = h.state.projects.live_leases(None).unwrap();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].attempt_id, created.id.to_string());
+        assert_eq!(leases[0].mode, "reader");
+        assert!(h
+            .control
+            .mission_store
+            .get_active_mission_run(created.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[tokio::test]
 async fn track_dispatch_http_creation_reconciles_without_deadlocking_actor_or_pr_lock() {
     if isolated_track_http_test(
         "track_dispatch_http_creation_reconciles_without_deadlocking_actor_or_pr_lock",
