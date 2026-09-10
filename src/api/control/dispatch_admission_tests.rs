@@ -567,6 +567,116 @@ fn isolated_track_http_test(test_name: &str) -> bool {
 }
 
 #[tokio::test]
+async fn explicit_reader_creation_without_pr_survives_queued_activation() {
+    if isolated_track_http_test("explicit_reader_creation_without_pr_survives_queued_activation") {
+        return;
+    }
+    assert_explicit_creation_role_survives_queued_activation(false).await;
+}
+
+#[tokio::test]
+async fn explicit_writer_creation_without_pr_survives_queued_activation() {
+    if isolated_track_http_test("explicit_writer_creation_without_pr_survives_queued_activation") {
+        return;
+    }
+    assert_explicit_creation_role_survives_queued_activation(true).await;
+}
+
+async fn assert_explicit_creation_role_survives_queued_activation(writer: bool) {
+    for pr in [None, Some("repo#244")] {
+        let h = Harness::new().await;
+        h.state.backend_registry.write().await.register(Arc::new(
+            crate::backend::opencode::OpenCodeBackend::new(
+                "http://127.0.0.1:9".into(),
+                None,
+                false,
+            ),
+        ));
+        let prompt = if writer {
+            "Read-only review and report findings without edits."
+        } else {
+            "Read-only review in verity-integration-b. Write output/review.md; no repository edits."
+        };
+        // Both directions must preserve explicit authority when the prose
+        // heuristic would infer the opposite role during queued activation.
+        assert_eq!(
+            inferred_pr_writer(None, Some("review"), Some(prompt)),
+            !writer
+        );
+        let expected_tag = if writer { "pr-writer" } else { "pr-readonly" };
+        let conflicting_tag = if writer { "pr-readonly" } else { "pr-writer" };
+        let response = h
+            .state
+            .http_client
+            .post(format!("{}/missions", h.url))
+            .json(&json!({
+                "title":"bounded read-only review", "backend":"opencode",
+                "project":"lido", "track":"independent-review", "intent":"review",
+                "github_pr":pr, "writer":writer, "tags":[conflicting_tag, "ssz"],
+                "prompt":prompt, "estimated_disk_gib":1,
+                "not_before":(chrono::Utc::now()+chrono::Duration::hours(1)).to_rfc3339()
+            }))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "{status}: {body}");
+        let created: Mission = serde_json::from_str(&body).unwrap();
+        let stored = h
+            .control
+            .mission_store
+            .get_mission(created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.project.tags.iter().any(|tag| tag == expected_tag));
+        assert!(!stored.project.tags.iter().any(|tag| tag == conflicting_tag));
+        assert_eq!(
+            mission_is_pr_writer_with_prompt(&stored, Some(prompt)),
+            writer
+        );
+        h.control
+            .mission_store
+            .log_event(
+                created.id,
+                &AgentEvent::UserMessage {
+                    id: Uuid::new_v4(),
+                    content: prompt.into(),
+                    queued: true,
+                    mission_id: Some(created.id),
+                    source: None,
+                },
+            )
+            .await
+            .unwrap();
+        // Exercise the real dequeue revalidation against the lease acquired
+        // by HTTP creation, after the initial prompt is persisted.
+        activate_mission_for_message(
+            &h.state.control,
+            &h.control.mission_store,
+            &h.control.events_tx,
+            &stored,
+            prompt,
+        )
+        .await
+        .unwrap();
+        let leases = h.state.projects.live_leases(None).unwrap();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].attempt_id, created.id.to_string());
+        assert_eq!(leases[0].mode, if writer { "writer" } else { "reader" });
+        assert!(h
+            .control
+            .mission_store
+            .get_active_mission_run(created.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[tokio::test]
 async fn track_dispatch_http_creation_reconciles_without_deadlocking_actor_or_pr_lock() {
     if isolated_track_http_test(
         "track_dispatch_http_creation_reconciles_without_deadlocking_actor_or_pr_lock",
@@ -4472,4 +4582,118 @@ async fn adversarial_pr_lookup_cannot_omit_parked_writer_moving_across_pages() {
         .unwrap();
     assert!(moved.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(found.map(|writer| writer.id), Some(m.id));
+}
+
+#[tokio::test]
+async fn http_idle_message_continuation_captures_predecessor_before_delivery() {
+    for (busy, ended, actor_ack) in [
+        (false, true, UserMessageAck::Delivered),
+        (false, true, UserMessageAck::Queued),
+        (true, true, UserMessageAck::Queued),
+        (false, false, UserMessageAck::Delivered),
+        (false, true, UserMessageAck::Dropped),
+        (
+            false,
+            true,
+            UserMessageAck::Rejected("injected refusal".into()),
+        ),
+    ] {
+        let h = Harness::new().await;
+        let m = h.writer(MissionStatus::Active, Some("repo#244")).await;
+        let store = h.control.mission_store.clone();
+        let prior = store
+            .begin_mission_run(m.id, "prior-actor", None)
+            .await
+            .unwrap();
+        if ended {
+            store
+                .finish_mission_run(prior.run_id, prior.generation, Some("turn_complete"))
+                .await
+                .unwrap();
+            store
+                .update_mission_status(m.id, MissionStatus::AwaitingUser)
+                .await
+                .unwrap();
+        }
+        let (tx, mut rx) = mpsc::channel(1);
+        h.state
+            .control
+            .sessions
+            .write()
+            .await
+            .get_mut(&h.user.id)
+            .unwrap()
+            .cmd_tx = tx;
+        let should_accept = matches!(
+            actor_ack,
+            UserMessageAck::Delivered | UserMessageAck::Queued
+        );
+        let should_continue = !busy && ended && should_accept;
+        let expected_queued = actor_ack == UserMessageAck::Queued;
+        let mission_id = m.id;
+        let actor = tokio::spawn(async move {
+            let ControlCommand::AdmitDispatch { admission, command } = rx.recv().await.unwrap()
+            else {
+                panic!()
+            };
+            let command = dispatch_admission::admit_dispatch_with_lifetime(
+                *admission,
+                *command,
+                DISPATCH_ADMISSION.lock().await,
+                busy,
+                None,
+            )
+            .await
+            .unwrap();
+            if should_continue {
+                // The next native run can already finish before HTTP receives
+                // its acknowledgement. The reply must retain generation 1.
+                store
+                    .update_mission_status(mission_id, MissionStatus::Active)
+                    .await
+                    .unwrap();
+                let successor = store
+                    .begin_mission_run(mission_id, "next-actor", None)
+                    .await
+                    .unwrap();
+                assert_eq!(successor.generation, 2);
+                store
+                    .finish_mission_run(
+                        successor.run_id,
+                        successor.generation,
+                        Some("turn_complete"),
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .update_mission_status(mission_id, MissionStatus::AwaitingUser)
+                    .await
+                    .unwrap();
+            }
+            let ControlCommand::UserMessage { respond, .. } = command else {
+                panic!()
+            };
+            respond.send(actor_ack).unwrap();
+        });
+        let response = h.request(false, m.id, json!({"content":"Continue the same work", "continue_identity":Harness::assertion(&m)})).await;
+        actor.await.unwrap();
+        if !should_accept {
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            continue;
+        }
+        assert!(response.status().is_success());
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["mission_id"], m.id.to_string());
+        assert_ne!(body["id"], m.id.to_string());
+        assert_eq!(body["message_accepted"], true);
+        assert_eq!(body["queued"], expected_queued);
+        if should_continue {
+            assert_eq!(
+                body["previous_execution"],
+                json!({"run_id":prior.run_id,"generation":prior.generation})
+            );
+        } else {
+            assert!(body.get("previous_execution").is_none());
+        }
+    }
 }

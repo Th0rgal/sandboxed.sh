@@ -239,6 +239,8 @@ struct LinkMissionToProjectParams {
     slug: String,
     #[serde(default)]
     track: Option<String>,
+    #[serde(default)]
+    writer: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1921,14 +1923,15 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "link_mission_to_project".to_string(),
-                description: "Tag a mission as belonging to your project (and optionally a track), so it appears in the project's inventory. Use this for missions you dispatch that must be grouped under the project — a worker with no project tag is invisible in the roster.".to_string(),
+                description: "Tag a mission as belonging to your project (and optionally a track), so it appears in the project's inventory. Optional writer=false persists read-only capability, including when no PR is attached; writer=true requests writer capability through the existing ownership checks. Capability or assignment changes require stopped, drained work; Pending work must be cancelled first and resumed on the same mission after the update.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id", "slug"],
                     "properties": {
                         "mission_id": {"type": "string", "description": "Mission UUID or an unambiguous leading fragment."},
                         "slug": {"type": "string"},
-                        "track": {"type": "string"}
+                        "track": {"type": "string"},
+                        "writer": {"type": "boolean", "description": "Explicit capability update. False persists read-only; true requests writer ownership. Omit to preserve existing behavior."}
                     }
                 }),
             },
@@ -3175,6 +3178,9 @@ impl AssistantMcp {
             .filter(|t| !t.is_empty())
         {
             body.insert("track".to_string(), json!(track));
+        }
+        if let Some(writer) = params.writer {
+            body.insert("writer".to_string(), json!(writer));
         }
         let response = self
             .api_post(
@@ -4530,6 +4536,20 @@ fn build_recommendation(
     analysis: &TraceAnalysis,
 ) -> String {
     let live_state = live.get("state").and_then(Value::as_str);
+    if status == "pending"
+        && live_state != Some("running")
+        && analysis.recent_errors.iter().any(|error| {
+            error
+                .get("snippet")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("queued_assignment_unowned:"))
+        })
+    {
+        return "Queued mission could not acquire its admitted track assignment. Inspect the \
+                recorded reader/writer capability and track lease before retrying; the \
+                queued_assignment_unowned error does not by itself prove the lease was released."
+            .to_string();
+    }
     if backend == Some("chatgpt_ui") && live_state == Some("running") {
         return "ChatGPT UI Pro is still generating. The web UI may expose only a generic \
                 `Pro thinking` marker until the final answer begins, so event silence is not \
@@ -4822,6 +4842,61 @@ mod tests {
             state,
             task,
         )
+    }
+
+    #[tokio::test]
+    async fn send_message_preserves_authoritative_idle_continuation_receipt() {
+        let mission_id = Uuid::new_v4().to_string();
+        let reply = json!({
+            "id": Uuid::new_v4(), "mission_id": mission_id,
+            "queued": true, "message_accepted": true,
+            "previous_execution": {"run_id": Uuid::new_v4(), "generation": 7}
+        });
+        let (mcp, state, server) = mock_assistant(reply.clone(), false).await;
+        let result = mcp
+            .send_message(
+                parse_params(json!({
+                    "mission_id": mission_id, "content": "Continue the same work"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, reply);
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "/api/control/message");
+        assert_eq!(requests[0].1["mission_id"], mission_id);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn link_project_transports_explicit_reader_and_preserves_omission() {
+        let id = Uuid::new_v4().to_string();
+        let (mcp, state, server) = mock_assistant(json!({"id": id}), false).await;
+        let tool = AssistantMcp::tools()
+            .into_iter()
+            .find(|tool| tool.name == "link_mission_to_project")
+            .unwrap();
+        assert_eq!(tool.input_schema["properties"]["writer"]["type"], "boolean");
+        for writer in [None, Some(false), Some(true)] {
+            let mut input = json!({"mission_id":id,"slug":"lido","track":"review"});
+            if let Some(writer) = writer {
+                input["writer"] = json!(writer);
+            }
+            let params = parse_params::<LinkMissionToProjectParams>(input).unwrap();
+            mcp.link_mission_to_project(params).await.unwrap();
+            let requests = state.requests.lock().unwrap();
+            let (path, body) = requests.last().unwrap();
+            assert_eq!(path, &format!("/api/control/missions/{id}/project"));
+            assert_eq!(body["project"], "lido");
+            assert_eq!(body["track"], "review");
+            assert_eq!(
+                body.get("writer"),
+                writer.map(|value| json!(value)).as_ref()
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]
@@ -5719,6 +5794,25 @@ mod tests {
         assert!(analysis.signals.contains("rate_limited"));
         assert_eq!(analysis.recent_errors.len(), 1);
         assert!(analysis.loop_tool.is_none());
+    }
+
+    #[test]
+    fn recommendation_reports_pending_assignment_failure_without_poisoning_active_run() {
+        let analysis = analyze_trace_events(&[json!({
+            "event_type":"error", "sequence":3,
+            "content":"Cannot activate mission: queued_assignment_unowned: original track claim is no longer held"
+        })]);
+        let pending = build_recommendation("pending", None, &Value::Null, &analysis);
+        assert!(pending.contains("Queued mission could not acquire"));
+        assert!(!pending.contains("healthy"));
+        let active = build_recommendation("active", None, &json!({"state":"running"}), &analysis);
+        assert!(!active.contains("Queued mission could not acquire"));
+        let starting =
+            build_recommendation("pending", None, &json!({"state":"running"}), &analysis);
+        assert!(!starting.contains("Queued mission could not acquire"));
+        let ordinary_pending =
+            build_recommendation("pending", None, &Value::Null, &TraceAnalysis::default());
+        assert!(!ordinary_pending.contains("Queued mission could not acquire"));
     }
 
     #[test]

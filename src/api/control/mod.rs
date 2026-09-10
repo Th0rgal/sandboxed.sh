@@ -3611,6 +3611,12 @@ pub struct ControlMessageRequest {
 pub struct ControlMessageResponse {
     pub id: Uuid,
     pub queued: bool,
+    pub message_accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<Uuid>,
+    /// Only populated for an accepted idle wake, not an active queued steer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_execution: Option<MessagePreviousExecution>,
     /// Non-fatal request problems (e.g. unrecognized fields that were
     /// ignored). Empty on clean requests; omitted from the JSON then.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -4961,13 +4967,14 @@ pub async fn post_message(
     if let Some(mission_id) = target_mission_id {
         dispatch_admission_tests::notify_wait(mission_id, "enqueued");
     }
-    let queued = match queued_rx.await {
-        // The wire response keeps its historical bool shape: `queued` is true
-        // only when the message is waiting for the next turn boundary.
-        // Dropped messages surface as an `AgentEvent::Error` on the stream.
-        Ok(UserMessageAck::Queued) => true,
-        Ok(UserMessageAck::Delivered) => false,
-        Ok(UserMessageAck::Dropped) => false,
+    let (queued, message_accepted, previous_execution) = match queued_rx.await {
+        Ok(UserMessageAck::Queued) => (true, true, None),
+        Ok(UserMessageAck::Delivered) => (false, true, None),
+        Ok(UserMessageAck::Continued {
+            queued,
+            previous_execution,
+        }) => (queued, true, Some(previous_execution)),
+        Ok(UserMessageAck::Dropped) => (false, false, None),
         Ok(UserMessageAck::Rejected(reason)) => {
             return Err((StatusCode::CONFLICT, reason));
         }
@@ -4976,6 +4983,9 @@ pub async fn post_message(
     Ok(Json(ControlMessageResponse {
         id,
         queued,
+        message_accepted,
+        mission_id: target_mission_id,
+        previous_execution,
         warnings,
     }))
 }
@@ -10699,10 +10709,14 @@ pub async fn create_mission(
             }
         }
     }
-    if req
-        .github_pr
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
+    // Explicit capability governs track admission and harness permissions even
+    // without PR metadata. Persist it before deferred dispatch can re-infer
+    // authority from an initial prompt such as "verity-integration-b".
+    if req.writer.is_some()
+        || req
+            .github_pr
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
     {
         let capability = if request_is_writer {
             Some("pr-writer")
@@ -11439,7 +11453,11 @@ async fn deliver_remote_build_terminal_wake(
             .await
             .map_err(|_| "remote-build terminal control session unavailable".to_string())?;
         return match tokio::time::timeout(std::time::Duration::from_secs(10), response).await {
-            Ok(Ok(UserMessageAck::Queued | UserMessageAck::Delivered)) => Ok(true),
+            Ok(Ok(
+                UserMessageAck::Queued
+                | UserMessageAck::Delivered
+                | UserMessageAck::Continued { .. },
+            )) => Ok(true),
             Ok(Ok(UserMessageAck::Rejected(error))) => Err(error),
             Ok(Ok(UserMessageAck::Dropped)) => Ok(false),
             Ok(Err(_)) => Ok(false),
