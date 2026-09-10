@@ -10709,10 +10709,10 @@ pub async fn create_mission(
             }
         }
     }
-    // Reader capability governs track admission and harness permissions even
+    // Explicit capability governs track admission and harness permissions even
     // without PR metadata. Persist it before deferred dispatch can re-infer
     // authority from an initial prompt such as "verity-integration-b".
-    if req.writer == Some(false)
+    if req.writer.is_some()
         || req
             .github_pr
             .as_deref()

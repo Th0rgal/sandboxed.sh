@@ -571,6 +571,18 @@ async fn explicit_reader_creation_without_pr_survives_queued_activation() {
     if isolated_track_http_test("explicit_reader_creation_without_pr_survives_queued_activation") {
         return;
     }
+    assert_explicit_creation_role_survives_queued_activation(false).await;
+}
+
+#[tokio::test]
+async fn explicit_writer_creation_without_pr_survives_queued_activation() {
+    if isolated_track_http_test("explicit_writer_creation_without_pr_survives_queued_activation") {
+        return;
+    }
+    assert_explicit_creation_role_survives_queued_activation(true).await;
+}
+
+async fn assert_explicit_creation_role_survives_queued_activation(writer: bool) {
     for pr in [None, Some("repo#244")] {
         let h = Harness::new().await;
         h.state.backend_registry.write().await.register(Arc::new(
@@ -580,10 +592,19 @@ async fn explicit_reader_creation_without_pr_survives_queued_activation() {
                 false,
             ),
         ));
-        let prompt = "Read-only review in verity-integration-b. Write output/review.md; no repository edits.";
-        // This is the production trigger: the prose heuristic sees a writer,
-        // while the explicit capability admits only a reader.
-        assert!(inferred_pr_writer(None, Some("review"), Some(prompt)));
+        let prompt = if writer {
+            "Read-only review and report findings without edits."
+        } else {
+            "Read-only review in verity-integration-b. Write output/review.md; no repository edits."
+        };
+        // Both directions must preserve explicit authority when the prose
+        // heuristic would infer the opposite role during queued activation.
+        assert_eq!(
+            inferred_pr_writer(None, Some("review"), Some(prompt)),
+            !writer
+        );
+        let expected_tag = if writer { "pr-writer" } else { "pr-readonly" };
+        let conflicting_tag = if writer { "pr-readonly" } else { "pr-writer" };
         let response = h
             .state
             .http_client
@@ -591,7 +612,7 @@ async fn explicit_reader_creation_without_pr_survives_queued_activation() {
             .json(&json!({
                 "title":"bounded read-only review", "backend":"opencode",
                 "project":"lido", "track":"independent-review", "intent":"review",
-                "github_pr":pr, "writer":false, "tags":["pr-writer", "ssz"],
+                "github_pr":pr, "writer":writer, "tags":[conflicting_tag, "ssz"],
                 "prompt":prompt, "estimated_disk_gib":1,
                 "not_before":(chrono::Utc::now()+chrono::Duration::hours(1)).to_rfc3339()
             }))
@@ -610,9 +631,12 @@ async fn explicit_reader_creation_without_pr_survives_queued_activation() {
             .await
             .unwrap()
             .unwrap();
-        assert!(stored.project.tags.iter().any(|tag| tag == "pr-readonly"));
-        assert!(!stored.project.tags.iter().any(|tag| tag == "pr-writer"));
-        assert!(!mission_is_pr_writer_with_prompt(&stored, Some(prompt)));
+        assert!(stored.project.tags.iter().any(|tag| tag == expected_tag));
+        assert!(!stored.project.tags.iter().any(|tag| tag == conflicting_tag));
+        assert_eq!(
+            mission_is_pr_writer_with_prompt(&stored, Some(prompt)),
+            writer
+        );
         h.control
             .mission_store
             .log_event(
@@ -641,7 +665,7 @@ async fn explicit_reader_creation_without_pr_survives_queued_activation() {
         let leases = h.state.projects.live_leases(None).unwrap();
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].attempt_id, created.id.to_string());
-        assert_eq!(leases[0].mode, "reader");
+        assert_eq!(leases[0].mode, if writer { "writer" } else { "reader" });
         assert!(h
             .control
             .mission_store
