@@ -655,8 +655,6 @@ async fn run_grok_streaming_json_turn(
     session_id: Option<&str>,
     is_continuation: bool,
 ) -> AgentResult {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
     let workspace_exec = WorkspaceExec::new(workspace.clone());
 
     let cli_path =
@@ -670,7 +668,7 @@ async fn run_grok_streaming_json_turn(
 
     let mut args = Vec::new();
     // Continuations must load this exact native ID. --session-id is an
-    // upsert and --continue picks an arbitrary latest session; neither proves
+    // new-session option and --continue picks an arbitrary latest session; neither proves
     // that the original native history is being continued.
     if let Some(sid) = session_id {
         args.push("--resume".to_string());
@@ -701,7 +699,7 @@ async fn run_grok_streaming_json_turn(
         Err(result) => return result,
     };
 
-    let mut child = match workspace_exec
+    let child = match workspace_exec
         .spawn_streaming(work_dir, &cli_path, &args, env)
         .await
     {
@@ -711,6 +709,27 @@ async fn run_grok_streaming_json_turn(
                 .with_terminal_reason(TerminalReason::LlmError);
         }
     };
+    run_grok_streaming_process(
+        child,
+        model,
+        mission_id,
+        events_tx,
+        cancel,
+        session_id.is_some(),
+    )
+    .await
+}
+
+async fn run_grok_streaming_process(
+    mut child: tokio::process::Child,
+    model: Option<&str>,
+    mission_id: Uuid,
+    events_tx: broadcast::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    is_resume: bool,
+) -> AgentResult {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
     drop(child.stdin.take());
 
     let stdout = match child.stdout.take() {
@@ -997,6 +1016,13 @@ async fn run_grok_streaming_json_turn(
         }
     }
 
+    let missing_resume = is_resume && {
+        let stderr = stderr_capture.lock().await;
+        [&*stderr, &final_result].iter().any(|text| {
+            let lower = text.to_ascii_lowercase();
+            lower.contains("no session found") || lower.contains("session not found")
+        })
+    };
     let success = exit_status.map(|status| status.success()).unwrap_or(false) && !had_error;
     let model_for_cost = model_used.as_deref().or(Some("grok-build"));
     let (cost_cents, cost_source) =
@@ -1012,7 +1038,11 @@ async fn run_grok_streaming_json_turn(
     } else {
         AgentResult::failure(final_result, cost_cents)
             .with_cost_source(cost_source)
-            .with_terminal_reason(TerminalReason::LlmError)
+            .with_terminal_reason(if missing_resume {
+                TerminalReason::NativeContinuityRequired
+            } else {
+                TerminalReason::LlmError
+            })
     };
     let success_signal = CompletionSignal::ProcessExit;
     let success_confidence = CompletionConfidence::Low;
@@ -1883,6 +1913,44 @@ mod tests {
     use super::*;
     use crate::workspace::WorkspaceType;
     use std::fs;
+
+    #[tokio::test]
+    async fn grok_streaming_missing_resume_preserves_continuity() {
+        use std::process::Stdio;
+        for (is_resume, error, expected) in [
+            (
+                true,
+                "No session found for saved-id",
+                TerminalReason::NativeContinuityRequired,
+            ),
+            (
+                true,
+                "Session not found: saved-id",
+                TerminalReason::NativeContinuityRequired,
+            ),
+            (false, "No session found", TerminalReason::LlmError),
+            (true, "401 invalid credentials", TerminalReason::LlmError),
+        ] {
+            let child = tokio::process::Command::new("sh")
+                .args(["-c", "printf '%s\\n' \"$1\" >&2; exit 1", "fixture", error])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let (events, _) = broadcast::channel(16);
+            let result = run_grok_streaming_process(
+                child,
+                None,
+                Uuid::new_v4(),
+                events,
+                CancellationToken::new(),
+                is_resume,
+            )
+            .await;
+            assert_eq!(result.terminal_reason, Some(expected));
+        }
+    }
 
     #[test]
     fn grok_acp_idle_deadlines_distinguish_pending_running_and_finished_tools() {

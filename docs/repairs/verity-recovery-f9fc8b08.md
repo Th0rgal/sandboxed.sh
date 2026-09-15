@@ -115,3 +115,15 @@ still requires source/provisioning evidence before any recovery decision.
 Validation: all 57 `workspace::tests::` tests passed in a bounded debug scope,
 including the existing lost-source guard. `cargo fmt --all` and
 `git diff --check` passed.
+
+## Review follow-up: streaming resume refusal
+
+The streaming transport now classifies a failed exact-session resume reporting
+`No session found` or `Session not found` as `native_continuity_required`, matching
+ACP's reconciliation fence. Cancellation retains its explicit terminal reason.
+First-session and authentication failures retain their existing classification.
+A real subprocess regression exercises both missing-session messages and those
+negative cases; all 21 Grok runner tests passed in a bounded debug scope.
+
+A separate review finding about legacy preallocated Grok IDs is still under
+investigation. Empty history alone must not authorize discarding native identity.
