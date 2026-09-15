@@ -519,6 +519,25 @@ CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status);
 CREATE INDEX IF NOT EXISTS idx_missions_status_updated ON missions(status, updated_at);
 
+CREATE TABLE IF NOT EXISTS mission_native_prompt_attempts (
+    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    backend TEXT NOT NULL,
+    PRIMARY KEY (mission_id, backend)
+);
+CREATE TABLE IF NOT EXISTS mission_native_prompt_claims (
+    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    backend TEXT NOT NULL,
+    claim_id TEXT NOT NULL,
+    run_stamp TEXT NOT NULL,
+    PRIMARY KEY(mission_id, backend)
+);
+CREATE TABLE IF NOT EXISTS mission_harness_sessions (
+    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    backend TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    PRIMARY KEY (mission_id, backend)
+);
+
 CREATE TABLE IF NOT EXISTS mission_runs (
     run_id TEXT PRIMARY KEY NOT NULL,
     mission_id TEXT NOT NULL,
@@ -2464,6 +2483,31 @@ impl SqliteMissionStore {
             tracing::warn!("creating mission_terminal_evidence skipped: {}", e);
         }
 
+        // Match the conservative file-store migration: an untouched pending
+        // Grok mission with no native/session or execution evidence. Use one
+        // conditional UPDATE so a concurrent writer cannot race a read/clear.
+        conn.execute(
+            "UPDATE missions SET session_id = NULL
+             WHERE backend = 'grok' AND status = 'pending'
+               AND created_at = updated_at
+               AND (last_status_change_at IS NULL OR last_status_change_at = created_at)
+               AND resumable = 0 AND interrupted_at IS NULL AND paused_at IS NULL
+               AND terminal_reason IS NULL
+               AND (desktop_sessions IS NULL OR desktop_sessions = '[]')
+               AND length(session_id) = 36 AND substr(session_id, 15, 1) = '4'
+               AND substr(session_id, 9, 1) = '-' AND substr(session_id, 14, 1) = '-'
+               AND substr(session_id, 19, 1) = '-' AND substr(session_id, 24, 1) = '-'
+               AND length(replace(session_id, '-', '')) = 32
+               AND lower(replace(session_id, '-', '')) NOT GLOB '*[^0-9a-f]*'
+               AND NOT EXISTS (SELECT 1 FROM mission_harness_sessions s WHERE s.mission_id = missions.id)
+               AND NOT EXISTS (SELECT 1 FROM mission_native_prompt_attempts p WHERE p.mission_id = missions.id)
+               AND NOT EXISTS (SELECT 1 FROM mission_runs r WHERE r.mission_id = missions.id)
+               AND NOT EXISTS (SELECT 1 FROM mission_events e WHERE e.mission_id = missions.id)
+               AND NOT EXISTS (SELECT 1 FROM mission_trees t WHERE t.mission_id = missions.id)
+               AND NOT EXISTS (SELECT 1 FROM mission_terminal_evidence e WHERE e.mission_id = missions.id)",
+            [],
+        ).map_err(|e| format!("Failed to migrate unused Grok session placeholders: {e}"))?;
+
         Ok(())
     }
 
@@ -3800,7 +3844,7 @@ impl MissionStore for SqliteMissionStore {
             paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
-            session_id: Some(session_id.clone()),
+            session_id: (backend != "grok").then(|| session_id.clone()),
             terminal_reason: None,
             terminal_evidence: None,
             parent_mission_id,
@@ -4367,7 +4411,29 @@ impl MissionStore for SqliteMissionStore {
         let id_str = id.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+            let mut connection = conn.blocking_lock();
+            let conn = connection.transaction().map_err(|e| e.to_string())?;
+            let (old_backend, old_session): (String, Option<String>) = conn.query_row(
+                "SELECT COALESCE(backend, 'opencode'), session_id FROM missions WHERE id = ?1",
+                params![id_str], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).map_err(|e| e.to_string())?;
+            let target = backend.as_deref().unwrap_or(&old_backend);
+            let selected_session = if target == old_backend {
+                old_session
+            } else {
+                if let Some(previous) = old_session {
+                    conn.execute(
+                        "INSERT INTO mission_harness_sessions (mission_id, backend, session_id) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(mission_id, backend) DO UPDATE SET session_id = excluded.session_id",
+                        params![id_str, old_backend, previous],
+                    ).map_err(|e| e.to_string())?;
+                }
+                conn.query_row(
+                    "SELECT session_id FROM mission_harness_sessions WHERE mission_id = ?1 AND backend = ?2",
+                    params![id_str, target], |row| row.get::<_, String>(0),
+                ).optional().map_err(|e| e.to_string())?
+                    .or_else(|| (target != "grok").then(|| session_id.clone()))
+            };
             let changed = conn
                 .execute(
                     "UPDATE missions
@@ -4378,9 +4444,6 @@ impl MissionStore for SqliteMissionStore {
                          fast_mode = CASE WHEN ?9 THEN ?10 ELSE fast_mode END,
                          config_profile = CASE WHEN ?11 THEN ?12 ELSE config_profile END,
                          session_id = ?13,
-                         resumable = 0,
-                         interrupted_at = NULL,
-                         terminal_reason = NULL,
                          updated_at = ?14
                      WHERE id = ?15",
                     params![
@@ -4396,7 +4459,7 @@ impl MissionStore for SqliteMissionStore {
                         fast_mode,
                         config_profile_set,
                         config_profile,
-                        session_id,
+                        selected_session,
                         now,
                         id_str,
                     ],
@@ -4405,6 +4468,7 @@ impl MissionStore for SqliteMissionStore {
             if changed == 0 {
                 return Err(format!("Mission {} not found", id_str));
             }
+            conn.commit().map_err(|e| e.to_string())?;
             Ok(())
         })
         .await
@@ -4729,22 +4793,113 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
-    async fn update_mission_session_id(&self, id: Uuid, session_id: &str) -> Result<(), String> {
+    async fn native_prompt_attempted(&self, id: Uuid, backend: &str) -> Result<bool, String> {
         let conn = self.conn.clone();
-        let now = now_string();
-        let session_id = session_id.to_string();
-
+        let backend = backend.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            conn.execute(
-                "UPDATE missions SET session_id = ?1, updated_at = ?2 WHERE id = ?3",
-                params![session_id, now, id.to_string()],
-            )
-            .map_err(|e| e.to_string())?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM mission_native_prompt_attempts WHERE mission_id = ?1 AND backend = ?2)", params![id.to_string(), backend], |r| r.get(0)).map_err(|e| e.to_string())
+        }).await.map_err(|e| e.to_string())?
+    }
+
+    async fn claim_native_prompt(
+        &self,
+        id: Uuid,
+        backend: &str,
+        session_id: Option<&str>,
+        run: Option<&super::SessionUpdateRun>,
+        claim_id: Uuid,
+    ) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let backend = backend.to_string();
+        let session_id = session_id.map(str::to_string);
+        let run_stamp = serde_json::to_string(&run).map_err(|e| e.to_string())?;
+        let run = run.map(|r| (r.run_id.to_string(), r.generation));
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let (current_backend, current_session): (String, Option<String>) = tx.query_row("SELECT COALESCE(backend, 'opencode'), session_id FROM missions WHERE id = ?1", [id.to_string()], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| e.to_string())?;
+            let latest: Option<(String, u64)> = tx.query_row("SELECT run_id, generation FROM mission_runs WHERE mission_id = ?1 ORDER BY generation DESC LIMIT 1", [id.to_string()], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(|e| e.to_string())?;
+            if backend.is_empty() || current_backend != backend || current_session != session_id || latest != run { return Ok(false); }
+            let prior: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM mission_native_prompt_attempts WHERE mission_id = ?1 AND backend = ?2)", params![id.to_string(), backend], |r| r.get(0)).map_err(|e| e.to_string())?;
+            if prior && session_id.is_none() { return Ok(false); }
+            tx.execute("INSERT OR IGNORE INTO mission_native_prompt_attempts (mission_id, backend) VALUES (?1, ?2)", params![id.to_string(), backend]).map_err(|e| e.to_string())?;
+            if !prior {
+                tx.execute("INSERT INTO mission_native_prompt_claims (mission_id, backend, claim_id, run_stamp) VALUES (?1, ?2, ?3, ?4)", params![id.to_string(), backend, claim_id.to_string(), run_stamp]).map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(true)
+        }).await.map_err(|e| e.to_string())?
+    }
+
+    async fn release_native_prompt_no_launch(
+        &self,
+        id: Uuid,
+        backend: &str,
+        run: Option<&super::SessionUpdateRun>,
+        claim_id: Uuid,
+    ) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let backend = backend.to_string();
+        let run_stamp = serde_json::to_string(&run).map_err(|e| e.to_string())?;
+        let run = run.map(|r| (r.run_id.to_string(), r.generation));
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let (current_backend, session): (String, Option<String>) = tx.query_row("SELECT COALESCE(backend, 'opencode'), session_id FROM missions WHERE id = ?1", [id.to_string()], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| e.to_string())?;
+            let latest: Option<(String, u64)> = tx.query_row("SELECT run_id, generation FROM mission_runs WHERE mission_id = ?1 ORDER BY generation DESC LIMIT 1", [id.to_string()], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(|e| e.to_string())?;
+            if backend.is_empty() || current_backend != backend || session.is_some() || latest != run { return Ok(false); }
+            let deleted = tx.execute("DELETE FROM mission_native_prompt_claims WHERE mission_id = ?1 AND backend = ?2 AND claim_id = ?3 AND run_stamp = ?4", params![id.to_string(), backend, claim_id.to_string(), run_stamp]).map_err(|e| e.to_string())?;
+            if deleted != 1 { return Ok(false); }
+            tx.execute("DELETE FROM mission_native_prompt_attempts WHERE mission_id = ?1 AND backend = ?2", params![id.to_string(), backend]).map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(true)
+        }).await.map_err(|e| e.to_string())?
+    }
+
+    async fn update_mission_session_id(
+        &self,
+        id: Uuid,
+        session_id: &str,
+        backend: &str,
+        run: Option<&super::SessionUpdateRun>,
+    ) -> Result<bool, String> {
+        if backend.is_empty() {
+            return Err("native session update requires harness provenance".into());
+        }
+        let conn = self.conn.clone();
+        let now = now_string();
+        let run = run.map(|r| (r.run_id.to_string(), r.generation));
+        let session_id = session_id.to_string();
+        let backend = backend.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = conn.blocking_lock();
+            let tx = connection.transaction().map_err(|e| e.to_string())?;
+            let current_backend: String = tx.query_row(
+                "SELECT COALESCE(backend, 'opencode') FROM missions WHERE id = ?1",
+                params![id.to_string()], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            let latest: Option<(String, u64)> = tx.query_row(
+                "SELECT run_id, generation FROM mission_runs WHERE mission_id = ?1 ORDER BY generation DESC LIMIT 1",
+                params![id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional().map_err(|e| e.to_string())?;
+            if latest != run {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO mission_harness_sessions (mission_id, backend, session_id) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(mission_id, backend) DO UPDATE SET session_id = excluded.session_id",
+                params![id.to_string(), backend, session_id],
+            ).map_err(|e| e.to_string())?;
+            if current_backend == backend {
+                tx.execute(
+                    "UPDATE missions SET session_id = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![session_id, now, id.to_string()],
+                ).map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(true)
+        }).await.map_err(|e| e.to_string())?
     }
 
     async fn update_mission_goal(
@@ -12247,6 +12402,65 @@ mod tests {
     use rusqlite::params;
     use serde_json::json;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn native_claim_sql_failure_rolls_back_insert_and_release_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteMissionStore::new(dir.path().into(), "claim-failure")
+            .await
+            .unwrap();
+        let m = store
+            .create_mission(Some("claim"), None, None, None, None, Some("grok"), None)
+            .await
+            .unwrap();
+        // Fail AFTER attempt insertion, while writing its rollback receipt.
+        store.conn.lock().await.execute_batch("CREATE TRIGGER fail_claim BEFORE INSERT ON mission_native_prompt_claims BEGIN SELECT RAISE(ABORT, 'injected claim failure'); END;").unwrap();
+        let failed = Uuid::new_v4();
+        assert!(store
+            .claim_native_prompt(m.id, "grok", None, None, failed)
+            .await
+            .is_err());
+        assert!(!store.native_prompt_attempted(m.id, "grok").await.unwrap());
+        store
+            .conn
+            .lock()
+            .await
+            .execute_batch("DROP TRIGGER fail_claim;")
+            .unwrap();
+        let receipt = Uuid::new_v4();
+        assert!(store
+            .claim_native_prompt(m.id, "grok", None, None, receipt)
+            .await
+            .unwrap());
+        assert!(!store
+            .release_native_prompt_no_launch(m.id, "grok", None, failed)
+            .await
+            .unwrap());
+        // Fail AFTER token deletion: transaction rollback must restore both rows.
+        store.conn.lock().await.execute_batch("CREATE TRIGGER fail_release BEFORE DELETE ON mission_native_prompt_attempts BEGIN SELECT RAISE(ABORT, 'injected release failure'); END;").unwrap();
+        assert!(store
+            .release_native_prompt_no_launch(m.id, "grok", None, receipt)
+            .await
+            .is_err());
+        assert!(store.native_prompt_attempted(m.id, "grok").await.unwrap());
+        store
+            .conn
+            .lock()
+            .await
+            .execute_batch("DROP TRIGGER fail_release;")
+            .unwrap();
+        assert!(store
+            .release_native_prompt_no_launch(m.id, "grok", None, receipt)
+            .await
+            .unwrap());
+        let reopened = SqliteMissionStore::new(dir.path().into(), "claim-failure")
+            .await
+            .unwrap();
+        assert!(!reopened
+            .native_prompt_attempted(m.id, "grok")
+            .await
+            .unwrap());
+    }
 
     #[tokio::test]
     async fn codex_fast_mode_round_trips_and_updates() {

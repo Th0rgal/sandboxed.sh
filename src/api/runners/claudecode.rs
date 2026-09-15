@@ -2962,6 +2962,7 @@ fn claudecode_oversized_resume_transcript(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_claudecode_turn_with_recovery(
+    mission_store: Option<std::sync::Arc<dyn crate::api::mission_store::MissionStore>>,
     workspace: &Workspace,
     work_dir: &std::path::Path,
     message: &str,
@@ -3006,10 +3007,17 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
                     transcript_bytes = size,
                     "Resume transcript exceeds cap; rotating to a fresh session before first attempt"
                 );
-                let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                if let Err(failure) = super::persist_and_publish_native_session(
+                    mission_store.as_ref(),
                     mission_id,
-                    session_id: new_session_id.clone(),
-                });
+                    "claudecode",
+                    &new_session_id,
+                    &events_tx,
+                )
+                .await
+                {
+                    return *failure;
+                }
                 let session_marker = work_dir.join(".claude-session-initiated");
                 if session_marker.exists() {
                     let _ = std::fs::remove_file(&session_marker);
@@ -3155,10 +3163,17 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
                     "Claude transport recovery is rotating to a fresh session"
                 );
 
-                let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                if let Err(failure) = super::persist_and_publish_native_session(
+                    mission_store.as_ref(),
                     mission_id,
-                    session_id: new_session_id.clone(),
-                });
+                    "claudecode",
+                    &new_session_id,
+                    &events_tx,
+                )
+                .await
+                {
+                    return *failure;
+                }
 
                 let session_marker = work_dir.join(".claude-session-initiated");
                 if session_marker.exists() {

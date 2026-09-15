@@ -877,6 +877,65 @@ struct MissionDiagnosticsParams {
     limit: usize,
 }
 
+/// Readable projection only: the persisted trace remains the raw receipt.
+fn diagnostic_result_snippet(content: &str) -> String {
+    fn collect(value: &Value, parts: &mut Vec<String>, depth: usize) {
+        if depth > 12 {
+            return;
+        }
+        match value {
+            Value::String(text) => {
+                if !text.trim().is_empty() && !parts.contains(text) {
+                    parts.push(text.clone());
+                }
+            }
+            Value::Array(values) => {
+                // Node Buffer/byte output must not become hundreds of integer tokens.
+                if !values.is_empty()
+                    && values
+                        .iter()
+                        .all(|value| value.as_u64().is_some_and(|byte| byte <= 255))
+                {
+                    let bytes: Vec<u8> = values
+                        .iter()
+                        .map(|value| value.as_u64().unwrap() as u8)
+                        .collect();
+                    if let Ok(text) = String::from_utf8(bytes) {
+                        collect(&Value::String(text), parts, depth + 1);
+                    }
+                } else {
+                    for value in values {
+                        collect(value, parts, depth + 1);
+                    }
+                }
+            }
+            Value::Object(fields) => {
+                for key in ["text", "content", "stdout", "stderr", "output", "rawOutput"] {
+                    if let Some(value) = fields.get(key) {
+                        collect(value, parts, depth + 1);
+                    }
+                }
+                if fields.get("type").and_then(Value::as_str) == Some("Buffer") {
+                    if let Some(value) = fields.get("data") {
+                        collect(value, parts, depth + 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut parts = Vec::new();
+    if let Ok(value) = serde_json::from_str::<Value>(content) {
+        collect(&value, &mut parts, 0);
+    }
+    let text = if parts.is_empty() {
+        content.to_string()
+    } else {
+        parts.join("\n")
+    };
+    truncate_snippet(&text, 800)
+}
+
 fn default_diagnostics_limit() -> usize {
     80
 }
@@ -1571,13 +1630,13 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "start_mission".to_string(),
-                description: "Start a new attempt on a work item. Pass project+track (the durable item) together with a stable idempotency_key; the server atomically declares/revises the track, reserves its owner lease, links the mission, and supersedes the previous owner. Retrying the same logical dispatch MUST reuse the key. Missions are attempts, not the work itself — use get_project_tasks for the declared roadmap and its separate unplanned_attempts. Set backend explicitly when possible. For Codex GPT-5.6/5.5/5.4, set fast_mode=true to request the native fast service tier; this consumes ChatGPT credits faster. Use backend=chatgpt_ui with model_override=gpt-5.6-pro only for exceptionally difficult read-only synthesis, research, or design-conflict questions; keep writer=false, then retrieve any generated files with list_mission_shared_files and download_shared_file. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title). Reviewers and certifiers must use writer=false: the server tags them pr-readonly and blocks git/gh mutations. Any PR-changing mission must use writer=true; the API rejects concurrent writers for the same PR and automatically runs writers in persistent /goal mode so a normal one-turn model stop cannot masquerade as completion.".to_string(),
+                description: "Start a new attempt on a work item. Pass project+track (the durable item) together with a stable idempotency_key; the server atomically declares/revises the track, reserves its owner lease, links the mission, and supersedes the previous owner. Retrying the same logical dispatch MUST reuse the key. Missions are attempts, not the work itself — use get_project_tasks for the declared roadmap and its separate unplanned_attempts. Set backend explicitly when possible. For Codex GPT-5.6/5.5/5.4, set fast_mode=true to request the native fast service tier; this consumes ChatGPT credits faster. Use backend=chatgpt_ui with model_override=gpt-5.6-pro only for exceptionally difficult read-only synthesis, research, or design-conflict questions; keep writer=false, then retrieve any generated files with list_mission_shared_files and download_shared_file. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title). Reviewers and certifiers must use writer=false: the server tags them pr-readonly and blocks git/gh mutations. Any PR-changing mission must use writer=true; the API rejects concurrent writers for the same PR and automatically runs writers in persistent /goal mode so a normal one-turn model stop cannot masquerade as completion. Codex native /goal objectives are limited to 4000 Unicode characters, including automatically promoted writer prompts; provide a bounded objective and put supporting detail in referenced artifacts. Oversized objectives are rejected before dispatch and are never truncated.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["title", "prompt"],
                     "properties": {
                         "title": {"type": "string"},
-                        "prompt": {"type": "string"},
+                        "prompt": {"type": "string", "description": "Codex native /goal objective: maximum 4000 Unicode characters, including automatic writer promotion. Put supporting detail in referenced artifacts; never rely on truncation."},
                         "workspace_id": {"type": "string"},
                         "backend": {"type": "string", "enum": ["opencode", "claudecode", "codex", "gemini", "grok", "chatgpt_ui"]},
                         "model_override": {"type": "string", "description": "Exact account-supported model ID. For ChatGPT UI Pro use the canonical ID gpt-5.6-pro; the harness verifies the visible Pro picker option. For Codex Terra use gpt-5.6-terra with medium effort. Never invent variants such as gpt-5.5-sol."},
@@ -2138,7 +2197,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "get_mission_diagnostics".to_string(),
-                description: "Deep-dive a mission: a compact timeline of the most recent tool calls (with result snippets), per-tool call counts, repeated/looping calls, and full error events. Use when get_mission_health flags a problem and you need to see exactly what the model is doing.".to_string(),
+                description: "Deep-dive a mission: recent tool calls, deduplicated result snippets, per-tool counts, repeated calls, and bounded error summaries. Use get_mission_events for raw receipts. Use when get_mission_health flags a problem and you need to see exactly what the model is doing.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -2160,14 +2219,14 @@ impl AssistantMcp {
                         "model_override": {"type": "string", "description": "Model id. Empty string clears it. When backend changes this is reset unless set explicitly."},
                         "model_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                         "fast_mode": {"type": "boolean", "description": "Enable or disable Codex fast mode for future turns. Only backend=codex with GPT-5.6/5.5/5.4."},
-                        "agent": {"type": "string", "description": "Agent name. Empty string clears it."},
+                        "agent": {"type": "string", "description": "Agent name. Omission preserves it on the same backend and clears it on a backend switch. Empty string clears it."},
                         "config_profile": {"type": "string"}
                     }
                 }),
             },
             ToolDefinition {
                 name: "resume_mission".to_string(),
-                description: "Resume an interrupted, blocked or failed mission. Bound Codex missions reattach to the same native thread, cwd, HOME and account; existing native goals preserve their objective, token budget and accumulated usage. Legacy unbound Codex missions and other backends continue from history and the work directory. For a mission parked in awaiting_user or acknowledged, send_message_to_mission wakes it on the same id and is the normal choice. Pass `content` as the exact current steering input; on a bound native goal it steers that goal's turn. Without `content`, persisted Codex goal missions resume the full stored /goal objective; other missions receive the default continue-where-you-left-off prompt. Native blocked/paused/usageLimited/budgetLimited stops park as blocked with terminal_reason=native_goal_stopped after the final response drains; they never mean goal completion. Resolve the reported stop before resuming. codex_continuity_required means native identity/history or a tool outcome requires reconciliation: do not repeat identical resumes, change accounts, or assume a fresh thread or reset budget. Queued steering retains its durable order; unconfirmed native delivery is reported explicitly. For existing work with excluded/collaborating PR references, read get_mission and pass continue_identity with the exact stored project, track and github_pr (null if unset). For different work use explicit github_pr/track identity updates instead; ownership checks still apply.".to_string(),
+                description: "Resume an interrupted, blocked or failed mission. Bound Codex missions reattach to the same native thread, cwd, HOME and account; existing native goals preserve their objective, token budget and accumulated usage. Grok resumes its recorded native session; a first handoff creates a Grok session while preserving other harness identities. For a mission parked in awaiting_user or acknowledged, send_message_to_mission wakes it on the same id and is the normal choice. Pass `content` as the exact current steering input; on a bound native goal it steers that goal's turn. A new Codex /goal objective must be at most 4000 Unicode characters; oversized objectives are rejected without truncation. Without `content`, persisted Codex goal missions resume the full stored /goal objective; other missions receive the default continue-where-you-left-off prompt. Native blocked/paused/usageLimited/budgetLimited stops park as blocked with terminal_reason=native_goal_stopped after the final response drains; they never mean goal completion. Resolve the reported stop before resuming. codex_continuity_required or native_continuity_required means native identity/history or a tool outcome requires reconciliation: do not repeat identical resumes, change accounts, or assume a fresh thread or reset budget. Queued steering retains its durable order; unconfirmed native delivery is reported explicitly. For existing work with excluded/collaborating PR references, read get_mission and pass continue_identity with the exact stored project, track and github_pr (null if unset). For different work use explicit github_pr/track identity updates instead; ownership checks still apply.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -2419,6 +2478,9 @@ impl AssistantMcp {
             .or_else(|| native_backend_from_agent(params.agent.as_deref()));
         let writer = params.writer.unwrap_or(false);
         let prompt = writer_goal_prompt(params.prompt, writer);
+        if backend.as_deref() == Some("codex") {
+            sandboxed_sh::backend::codex::validate_goal_message(&prompt)?;
+        }
         let tags = mission_start_tags(
             params.tags,
             params.request_merge_authority.unwrap_or(false),
@@ -3624,6 +3686,7 @@ impl AssistantMcp {
         let mut repeat_counts: std::collections::BTreeMap<(String, String), usize> =
             std::collections::BTreeMap::new();
         let mut errors = Vec::new();
+        let mut results = Vec::new();
 
         for event in events {
             let event_type = event
@@ -3646,6 +3709,14 @@ impl AssistantMcp {
                         "sequence": event.get("sequence").cloned().unwrap_or(Value::Null),
                         "tool": tool,
                         "args": truncate_snippet(args, 200),
+                    }));
+                }
+                "tool_result" => {
+                    let content = event.get("content").and_then(Value::as_str).unwrap_or("");
+                    results.push(json!({
+                        "sequence": event.get("sequence"),
+                        "tool_call_id": event.get("tool_call_id"),
+                        "snippet": diagnostic_result_snippet(content),
                     }));
                 }
                 "error" => {
@@ -3679,6 +3750,7 @@ impl AssistantMcp {
             "mission_id": id.to_string(),
             "events_scanned": events.len(),
             "tool_timeline": timeline_tail,
+            "tool_results": results.into_iter().rev().take(30).collect::<Vec<_>>(),
             "tool_counts": tool_counts,
             "repeated_calls": repeated,
             "errors": errors,
@@ -4347,9 +4419,15 @@ fn truncate_snippet(text: &str, max: usize) -> String {
 /// stream.
 fn error_signals_in(text: &str) -> Vec<&'static str> {
     let lower = text.to_ascii_lowercase();
+    // Match complete tokens: mission IDs and hashes often contain HTTP digits.
+    let has_code = |code: &str| {
+        lower
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+            .any(|token| token == code)
+    };
     let mut signals = Vec::new();
-    if lower.contains("429")
-        || lower.contains("529")
+    if has_code("429")
+        || has_code("529")
         || lower.contains("rate limit")
         || lower.contains("rate-limit")
         || lower.contains("rate_limit")
@@ -4365,13 +4443,17 @@ fn error_signals_in(text: &str) -> Vec<&'static str> {
         || lower.contains("hit your usage limit")
         || lower.contains("out of extra usage")
         || lower.contains("out of regular usage")
+        || lower.contains("weekly quota exhausted")
+        || lower.contains("weekly quota exceeded")
+        || lower.contains("weekly limit reached")
+        || lower.contains("weekly usage limit reached")
         || lower.contains("purchase more credits")
         || lower.contains("settings/usage")
     {
         signals.push("rate_limited");
     }
-    if lower.contains(" 401")
-        || lower.contains(" 403")
+    if has_code("401")
+        || has_code("403")
         || lower.contains("unauthorized")
         || lower.contains("forbidden")
         || lower.contains("invalid api key")
@@ -4384,7 +4466,7 @@ fn error_signals_in(text: &str) -> Vec<&'static str> {
         signals.push("auth_error");
     }
     if lower.contains("capacity")
-        || lower.contains("503")
+        || has_code("503")
         || lower.contains("service unavailable")
         || lower.contains("no capacity")
         || lower.contains("already have five missions running")
@@ -4408,10 +4490,9 @@ fn error_signals_in(text: &str) -> Vec<&'static str> {
     // (e.g. OpenCode "idle timeout: the model stopped producing output") are
     // harness-level problems, not routing/edge issues. Only tag network_error
     // for clear transport indicators.
-    let has_edge_code = lower.contains("502")
-        || lower.contains("520")
-        || lower.contains("521")
-        || lower.contains("522");
+    let has_edge_code = ["502", "520", "521", "522"]
+        .iter()
+        .any(|code| has_code(code));
     let is_transport_timeout = lower.contains("connection timed out")
         || lower.contains("request timed out")
         || lower.contains("read timeout")
@@ -5007,6 +5088,35 @@ mod tests {
             "missing data must not claim goal mode is disabled"
         );
         assert!(legacy["goal_objective"].is_null());
+    }
+
+    #[tokio::test]
+    async fn promoted_codex_goal_is_rejected_before_any_dispatch_request() {
+        let (assistant, state, task) = mock_assistant(json!({}), false).await;
+        let params = parse_params(json!({
+            "title": "oversized native goal", "backend": "codex",
+            "writer": true, "prompt": "🦀".repeat(4001),
+        }))
+        .unwrap();
+        let error = assistant.start_mission(params).await.unwrap_err();
+        task.abort();
+        assert!(error.contains("4000"), "{error}");
+        assert!(state.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn diagnostic_projection_deduplicates_text_bytes_and_raw_output() {
+        let receipt = json!({
+            "content": [{"type": "content", "content": {"type": "text", "text": "done\n"}}],
+            "rawOutput": {"stdout": {"type": "Buffer", "data": [100,111,110,101,10]}, "stderr": "warning"}
+        }).to_string();
+        assert_eq!(diagnostic_result_snippet(&receipt), "done\n\nwarning");
+        assert!(receipt.contains("rawOutput"));
+        assert_eq!(diagnostic_result_snippet("plain result"), "plain result");
+        assert_eq!(
+            diagnostic_result_snippet(r#"{"exitCode":2}"#),
+            r#"{"exitCode":2}"#
+        );
     }
 
     #[test]
@@ -5722,6 +5832,22 @@ mod tests {
         );
         assert_eq!(native_backend_from_agent(Some("build")), None);
         assert_eq!(native_backend_from_agent(None), None);
+    }
+
+    #[test]
+    fn error_signals_do_not_classify_mission_identifiers_as_http_errors() {
+        for fragment in [
+            "b522", "a502", "a520", "a521", "a503", "a429", "a529", "401", "403",
+        ] {
+            assert!(error_signals_in(&format!(
+                "Parallel mission {fragment}0000-dc42-49c3-88a0-26934b2255ce cancellation requested"
+            ))
+            .is_empty());
+        }
+        for code in ["502", "520", "521", "522"] {
+            assert!(error_signals_in(&format!("HTTP {code}: upstream failed"))
+                .contains(&"network_error"));
+        }
     }
 
     #[test]

@@ -18,6 +18,9 @@ const METADATA_SOURCE_USER: &str = "user";
 #[derive(Clone)]
 pub struct InMemoryMissionStore {
     missions: Arc<RwLock<HashMap<Uuid, Mission>>>,
+    harness_sessions: Arc<RwLock<HashMap<Uuid, HashMap<String, String>>>>,
+    native_prompts: Arc<RwLock<HashMap<Uuid, std::collections::HashSet<String>>>>,
+    native_prompt_claims: Arc<RwLock<HashMap<Uuid, HashMap<String, super::NativePromptClaim>>>>,
     trees: Arc<RwLock<HashMap<Uuid, AgentTreeNode>>>,
     board_tasks: Arc<RwLock<HashMap<Uuid, BoardTask>>>,
     /// FLEET-001 scheduling: deferred goals held outside the Mission struct
@@ -33,6 +36,9 @@ impl InMemoryMissionStore {
     pub fn new() -> Self {
         Self {
             missions: Arc::new(RwLock::new(HashMap::new())),
+            harness_sessions: Arc::new(RwLock::new(HashMap::new())),
+            native_prompts: Arc::new(RwLock::new(HashMap::new())),
+            native_prompt_claims: Arc::new(RwLock::new(HashMap::new())),
             trees: Arc::new(RwLock::new(HashMap::new())),
             board_tasks: Arc::new(RwLock::new(HashMap::new())),
             deferred_goals: Arc::new(RwLock::new(HashMap::new())),
@@ -336,7 +342,7 @@ impl MissionStore for InMemoryMissionStore {
             paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
-            session_id: Some(Uuid::new_v4().to_string()),
+            session_id: (backend != Some("grok")).then(|| Uuid::new_v4().to_string()),
             terminal_reason: None,
             terminal_evidence: None,
             parent_mission_id,
@@ -624,6 +630,16 @@ impl MissionStore for InMemoryMissionStore {
             .get_mut(&id)
             .ok_or_else(|| format!("Mission {} not found", id))?;
 
+        let selected_session = {
+            let mut sessions = self.harness_sessions.write().await;
+            super::select_harness_session(
+                mission,
+                backend,
+                session_id,
+                sessions.entry(id).or_default(),
+            )
+        };
+
         if let Some(backend) = backend {
             mission.backend = backend.to_string();
         }
@@ -642,10 +658,7 @@ impl MissionStore for InMemoryMissionStore {
         if let Some(config_profile) = config_profile {
             mission.config_profile = config_profile.map(ToString::to_string);
         }
-        mission.session_id = Some(session_id.to_string());
-        mission.resumable = false;
-        mission.interrupted_at = None;
-        mission.terminal_reason = None;
+        mission.session_id = selected_session;
         mission.updated_at = now_string();
 
         Ok(mission.clone())
@@ -768,14 +781,149 @@ impl MissionStore for InMemoryMissionStore {
         Ok(())
     }
 
-    async fn update_mission_session_id(&self, id: Uuid, session_id: &str) -> Result<(), String> {
+    async fn native_prompt_attempted(&self, id: Uuid, backend: &str) -> Result<bool, String> {
+        if !self.missions.read().await.contains_key(&id) {
+            return Err("mission not found".into());
+        }
+        Ok(self
+            .native_prompts
+            .read()
+            .await
+            .get(&id)
+            .is_some_and(|p| p.contains(backend)))
+    }
+
+    async fn claim_native_prompt(
+        &self,
+        id: Uuid,
+        backend: &str,
+        session_id: Option<&str>,
+        run: Option<&super::SessionUpdateRun>,
+        claim_id: Uuid,
+    ) -> Result<bool, String> {
+        let missions = self.missions.write().await;
+        let mission = missions.get(&id).ok_or("mission not found")?;
+        if backend.is_empty() || mission.backend != backend {
+            return Ok(false);
+        }
+        let runs = self.runs.read().await;
+        let latest = runs
+            .values()
+            .filter(|r| r.mission_id == id)
+            .max_by_key(|r| r.generation)
+            .map(super::SessionUpdateRun::from);
+        if latest.as_ref() != run || mission.session_id.as_deref() != session_id {
+            return Ok(false);
+        }
+        let mut prompts = self.native_prompts.write().await;
+        let mut claims = self.native_prompt_claims.write().await;
+        let mut next = prompts.clone();
+        let mut next_claims = claims.clone();
+        let attempted = next.entry(id).or_default();
+        if attempted.contains(backend) {
+            // A bound continuation may proceed, but cannot own rollback of old evidence.
+            return Ok(session_id.is_some());
+        }
+        attempted.insert(backend.to_string());
+        next_claims.entry(id).or_default().insert(
+            backend.to_string(),
+            super::NativePromptClaim {
+                claim_id,
+                run: run.cloned(),
+            },
+        );
+        *prompts = next;
+        *claims = next_claims;
+        Ok(true)
+    }
+
+    async fn release_native_prompt_no_launch(
+        &self,
+        id: Uuid,
+        backend: &str,
+        run: Option<&super::SessionUpdateRun>,
+        claim_id: Uuid,
+    ) -> Result<bool, String> {
+        let missions = self.missions.write().await;
+        let mission = missions.get(&id).ok_or("mission not found")?;
+        if backend.is_empty() || mission.backend != backend {
+            return Ok(false);
+        }
+        let runs = self.runs.read().await;
+        let latest = runs
+            .values()
+            .filter(|r| r.mission_id == id)
+            .max_by_key(|r| r.generation)
+            .map(super::SessionUpdateRun::from);
+        if latest.as_ref() != run || mission.session_id.is_some() {
+            return Ok(false);
+        }
+        let mut prompts = self.native_prompts.write().await;
+        let mut claims = self.native_prompt_claims.write().await;
+        if claims.get(&id).and_then(|c| c.get(backend))
+            != Some(&super::NativePromptClaim {
+                claim_id,
+                run: run.cloned(),
+            })
+        {
+            return Ok(false);
+        }
+        let mut next = prompts.clone();
+        let mut next_claims = claims.clone();
+        if let Some(p) = next.get_mut(&id) {
+            p.remove(backend);
+            if p.is_empty() {
+                next.remove(&id);
+            }
+        }
+        if let Some(c) = next_claims.get_mut(&id) {
+            c.remove(backend);
+            if c.is_empty() {
+                next_claims.remove(&id);
+            }
+        }
+        *prompts = next;
+        *claims = next_claims;
+        Ok(true)
+    }
+
+    async fn update_mission_session_id(
+        &self,
+        id: Uuid,
+        session_id: &str,
+        backend: &str,
+        run: Option<&super::SessionUpdateRun>,
+    ) -> Result<bool, String> {
         let mut missions = self.missions.write().await;
         let mission = missions
             .get_mut(&id)
             .ok_or_else(|| format!("Mission {} not found", id))?;
-        mission.session_id = Some(session_id.to_string());
-        mission.updated_at = now_string();
-        Ok(())
+        if backend.is_empty() {
+            return Err("native session update requires harness provenance".into());
+        }
+        // Same lock order as begin_mission_run: mission before runs.
+        // Keep the run read guard through the identity write so acquisition of
+        // a newer generation cannot race this check.
+        let runs = self.runs.read().await;
+        let latest = runs
+            .values()
+            .filter(|r| r.mission_id == id)
+            .max_by_key(|r| r.generation)
+            .map(super::SessionUpdateRun::from);
+        if latest.as_ref() != run {
+            return Ok(false);
+        }
+        self.harness_sessions
+            .write()
+            .await
+            .entry(id)
+            .or_default()
+            .insert(backend.to_string(), session_id.to_string());
+        if mission.backend == backend {
+            mission.session_id = Some(session_id.to_string());
+            mission.updated_at = now_string();
+        }
+        Ok(true)
     }
 
     async fn update_mission_tree(&self, id: Uuid, tree: &AgentTreeNode) -> Result<(), String> {
@@ -790,6 +938,7 @@ impl MissionStore for InMemoryMissionStore {
     async fn delete_mission(&self, id: Uuid) -> Result<bool, String> {
         let removed = self.missions.write().await.remove(&id).is_some();
         self.trees.write().await.remove(&id);
+        self.harness_sessions.write().await.remove(&id);
         Ok(removed)
     }
 
@@ -1373,7 +1522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_mission_run_settings_clears_terminal_reason() {
+    async fn update_mission_run_settings_preserves_stop_until_dispatch() {
         let store = InMemoryMissionStore::new();
         let mission = store
             .create_mission(Some("Initial"), None, None, None, None, None, None)
@@ -1403,10 +1552,10 @@ mod tests {
             .await
             .expect("update run settings");
 
-        assert_eq!(updated.terminal_reason, None);
+        assert_eq!(updated.terminal_reason.as_deref(), Some("rate_limited"));
         assert_eq!(updated.session_id.as_deref(), Some("new-session"));
-        assert!(!updated.resumable);
-        assert_eq!(updated.interrupted_at, None);
+        assert!(updated.resumable);
+        assert!(updated.interrupted_at.is_none());
     }
 
     #[tokio::test]

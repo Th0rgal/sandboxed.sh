@@ -7736,7 +7736,8 @@ where
 pub struct UpdateMissionSettingsRequest {
     /// Backend to use on the next turn ("opencode", "claudecode", "codex", etc.).
     pub backend: Option<String>,
-    /// Agent name. Omit to leave unchanged, null/empty string to clear.
+    /// Agent name. Omit to preserve on the same backend, or clear on a backend
+    /// switch. Explicit null/empty string also clears it.
     #[serde(default, deserialize_with = "deserialize_string_patch")]
     pub agent: Option<Option<String>>,
     /// Model override. Omit to leave unchanged, null/empty string to clear.
@@ -8729,7 +8730,9 @@ pub(crate) fn native_goal_holds_ownership(status: MissionStatus, reason: Option<
     status == MissionStatus::Blocked
         && matches!(
             reason,
-            Some("native_goal_stopped" | "codex_continuity_required")
+            Some(
+                "native_goal_stopped" | "codex_continuity_required" | "native_continuity_required"
+            )
         )
 }
 
@@ -10149,6 +10152,13 @@ pub async fn create_mission(
     if backend.is_none() {
         let registry = state.backend_registry.read().await;
         backend = Some(registry.default_id().to_string());
+    }
+
+    if backend.as_deref() == Some("codex") {
+        if let Some(prompt) = req.prompt.as_deref() {
+            crate::backend::codex::validate_goal_message(prompt)
+                .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        }
     }
 
     // Model effort is supported for Codex and Claude Code missions.
@@ -12976,7 +12986,13 @@ pub async fn update_mission_settings(
         }
     }
 
-    let agent = normalize_string_patch(req.agent);
+    let mut agent = normalize_string_patch(req.agent);
+    // Agent names belong to a harness just as model IDs do. Do not carry an
+    // OpenCode agent such as `build` into native Claude's --agent option.
+    // Explicit agent choices (including custom native agents) remain intact.
+    if backend_changed && agent.is_none() {
+        agent = Some(None);
+    }
     let mut model_override = normalize_string_patch(req.model_override);
     let mut model_effort = normalize_string_patch(req.model_effort);
     let mut fast_mode = req.fast_mode;
@@ -16225,7 +16241,9 @@ async fn paloma_webhook_forwarder_loop(
             let recommended_action = match terminal_reason {
                 Some("server_shutdown" | "orphan_no_runner") => "resume_once",
                 Some("native_goal_stopped") => "resolve_stop_then_resume",
-                Some("codex_continuity_required") => "reconcile_native_session_before_resume",
+                Some("codex_continuity_required" | "native_continuity_required") => {
+                    "reconcile_native_session_before_resume"
+                }
                 Some("auth_error") => "disable_provider_and_reroute",
                 Some("rate_limited" | "capacity_limited") => "reroute_or_queue",
                 Some("watchdog_stalled" | "cancelled") => "inspect_artifacts",
@@ -17891,6 +17909,9 @@ fn mission_status_for_terminal_reason(
         TerminalReason::CodexContinuityRequired => {
             Some((MissionStatus::Blocked, "codex_continuity_required"))
         }
+        TerminalReason::NativeContinuityRequired => {
+            Some((MissionStatus::Blocked, "native_continuity_required"))
+        }
         TerminalReason::Cancelled => Some((MissionStatus::Interrupted, "cancelled")),
         TerminalReason::ServerShutdown => Some((MissionStatus::Interrupted, "server_shutdown")),
         TerminalReason::MaxIterations => Some((MissionStatus::Blocked, "max_iterations")),
@@ -17972,6 +17993,9 @@ fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<
         }
         TerminalReason::CodexContinuityRequired => {
             Some("Native Codex history requires reconciliation before resume".into())
+        }
+        TerminalReason::NativeContinuityRequired => {
+            Some("Native session requires reconciliation before resume".into())
         }
         TerminalReason::Cancelled => Some("Cancelled by user".to_string()),
         TerminalReason::ServerShutdown => {
@@ -20922,8 +20946,11 @@ async fn control_actor_loop(
                                         continue;
                                     }
                                 };
+                                let turn_mission_store = mission_store.clone();
+                                let session_update_run = running_run.as_ref().map(crate::api::mission_store::SessionUpdateRun::from);
                                 running = Some(tokio::spawn(async move {
-                                    let result = run_single_control_turn(
+                                    let result = crate::api::runners::SESSION_UPDATE_RUN.scope(session_update_run, run_single_control_turn(
+                                        turn_mission_store,
                                         cfg,
                                         agent,
                                         mcp_ref,
@@ -20950,7 +20977,7 @@ async fn control_actor_loop(
                                         mission_config_profile,
                                         Some(user_id_for_turn),
                                         pr_readonly,
-                                    )
+                                    ))
                                     .await;
                                     (mid, msg, result)
                                 }));
@@ -21318,10 +21345,9 @@ async fn control_actor_loop(
                         // handoff context below when the backend changed).
                         // Long-lived missions (orchestrators, /goal loops)
                         // rarely stop, so the previous hard refusal made them
-                        // effectively unswitchable. The fresh session id this
-                        // writes is also fine mid-run: every backend falls
-                        // back to a fresh/continued session when the stored id
-                        // is not loadable.
+                        // effectively unswitchable. Session identities are
+                        // retained per backend; failed native resume requires
+                        // recovery rather than silently creating a new session.
                         if main_running || parallel_running {
                             tracing::info!(
                                 mission_id = %id,
@@ -21711,9 +21737,14 @@ async fn control_actor_loop(
                                 // success so cleanup loops do not trip their
                                 // circuit breaker by cancelling twice.
                                 match mission_store.get_mission(mission_id).await {
-                                    Ok(Some(mission)) if mission.status == MissionStatus::Interrupted
-                                        || mission.status.is_terminal()
-                                        || mission.status == MissionStatus::Acknowledged =>
+                                    // Blocked is terminal for scheduling, but a
+                                    // parked native goal still owns its track.
+                                    // Explicit cancellation must transition it
+                                    // through the no-runner cancellation path.
+                                    Ok(Some(mission)) if matches!(mission.status,
+                                        MissionStatus::Completed | MissionStatus::Failed
+                                        | MissionStatus::Interrupted | MissionStatus::NotFeasible
+                                        | MissionStatus::Acknowledged) =>
                                     {
                                         if let Err(error) = finish_detached_run_for_cancel(
                                             &mission_store,
@@ -22395,8 +22426,11 @@ async fn control_actor_loop(
                                                 continue;
                                             }
                                         };
+                                        let turn_mission_store = mission_store.clone();
+                                        let session_update_run = running_run.as_ref().map(crate::api::mission_store::SessionUpdateRun::from);
                                         running = Some(tokio::spawn(async move {
-                                            let result = run_single_control_turn(
+                                            let result = crate::api::runners::SESSION_UPDATE_RUN.scope(session_update_run, run_single_control_turn(
+                                                turn_mission_store,
                                                 cfg,
                                                 agent,
                                                 mcp_ref,
@@ -22423,7 +22457,7 @@ async fn control_actor_loop(
                                                 mission_config_profile,
                                                 Some(user_id_for_turn),
                                                 pr_readonly,
-                                            )
+                                            ))
                                             .await;
                                             (mid, msg, result)
                                         }));
@@ -23228,7 +23262,7 @@ async fn control_actor_loop(
                         }
                         let suppress_finished_automation = matches!(
                             completed_terminal_reason,
-                            Some(TerminalReason::NativeGoalStopped | TerminalReason::CodexContinuityRequired)
+                            Some(TerminalReason::NativeGoalStopped | TerminalReason::CodexContinuityRequired | TerminalReason::NativeContinuityRequired)
                                 | Some(TerminalReason::AuthError)
                                 | Some(TerminalReason::RateLimited)
                                 | Some(TerminalReason::CapacityLimited)
@@ -23510,8 +23544,11 @@ async fn control_actor_loop(
                     main_runner_active_tool_calls
                         .store(0, std::sync::atomic::Ordering::Relaxed);
                     let user_id_for_turn = session_user_id.clone();
+                    let turn_mission_store = mission_store.clone();
+                    let session_update_run = running_run.as_ref().map(crate::api::mission_store::SessionUpdateRun::from);
                     running = Some(tokio::spawn(async move {
-                        let result = run_single_control_turn(
+                        let result = crate::api::runners::SESSION_UPDATE_RUN.scope(session_update_run, run_single_control_turn(
+                            turn_mission_store,
                             cfg,
                             agent,
                             mcp_ref,
@@ -23538,7 +23575,7 @@ async fn control_actor_loop(
                             mission_config_profile,
                             Some(user_id_for_turn),
                             pr_readonly,
-                        )
+                        ))
                         .await;
                         (mid, msg, result)
                     }));
@@ -23776,7 +23813,7 @@ async fn control_actor_loop(
                             // capacity) to avoid noisy retry loops.
                             let suppress_finished_automation = matches!(
                                 result.terminal_reason,
-                                Some(TerminalReason::NativeGoalStopped | TerminalReason::CodexContinuityRequired)
+                                Some(TerminalReason::NativeGoalStopped | TerminalReason::CodexContinuityRequired | TerminalReason::NativeContinuityRequired)
                                     | Some(TerminalReason::AuthError)
                                     | Some(TerminalReason::RateLimited)
                                     | Some(TerminalReason::CapacityLimited)
@@ -23860,10 +23897,16 @@ async fn control_actor_loop(
 
                             // Always try to start next queued message (if any)
                             if !runner.is_running() {
-                                // Refresh session_id from the store in case a
-                                // SessionIdUpdate event hasn't been processed yet
-                                // (race between the events_rx and sleep poll arms).
+                                // Refresh settings together with their backend-specific
+                                // session identity before the next turn. The in-flight
+                                // turn retains its original settings.
                                 if let Ok(Some(m)) = mission_store.get_mission(*mission_id).await {
+                                    runner.backend_id = m.backend;
+                                    runner.agent_override = m.agent;
+                                    runner.model_override = m.model_override;
+                                    runner.model_effort = m.model_effort;
+                                    runner.fast_mode = m.fast_mode;
+                                    runner.config_profile = m.config_profile;
                                     if m.session_id != runner.session_id {
                                         tracing::debug!(
                                             mission_id = %mission_id,
@@ -24853,28 +24896,20 @@ async fn control_actor_loop(
                         }
                     }
 
-                    // Handle session ID updates for backends that generate their own IDs.
-                    if let AgentEvent::SessionIdUpdate { mission_id, session_id } = &event {
-                        if let Err(err) = mission_store
-                            .update_mission_session_id(*mission_id, session_id)
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to update session ID for mission {}: {}",
-                                mission_id,
-                                err
-                            );
-                        } else {
-                            tracing::debug!(
-                                mission_id = %mission_id,
-                                session_id = %session_id,
-                                "Updated mission session ID from backend"
-                            );
-                        }
-                        // Also update the parallel runner's cached session_id so the
-                        // next turn picks up the new value instead of the stale one.
-                        if let Some(runner) = parallel_runners.get_mut(mission_id) {
-                            runner.session_id = Some(session_id.clone());
+                    // Only an update from the latest acquired generation may
+                    // mutate durable identity or the parallel runner cache.
+                    if let AgentEvent::SessionIdUpdate { mission_id, session_id, backend, run } = &event {
+                        match mission_store.update_mission_session_id(*mission_id, session_id, backend, run.as_ref()).await {
+                            Ok(true) => {
+                                if let Some(runner) = parallel_runners.get_mut(mission_id) {
+                                    let cached_run = runner.durable_run.as_ref().map(crate::api::mission_store::SessionUpdateRun::from);
+                                    if runner.backend_id == *backend && cached_run == *run {
+                                        runner.session_id = Some(session_id.clone());
+                                    }
+                                }
+                            }
+                            Ok(false) => tracing::debug!(mission_id = %mission_id, "Ignored stale or unattributed native session update"),
+                            Err(err) => tracing::warn!(mission_id = %mission_id, %err, "Failed to persist native session update"),
                         }
                     }
 
@@ -24928,6 +24963,7 @@ async fn control_actor_loop(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_single_control_turn(
+    mission_store: Arc<dyn MissionStore>,
     mut config: Config,
     _root_agent: AgentRef,
     mcp: Arc<McpRegistry>,
@@ -25163,6 +25199,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(crate::api::runners::ClaudeCodeRunner.run_turn(
                 crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     message: &user_message,
@@ -25201,6 +25238,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(
                 crate::api::runners::GrokRunner.run_turn(crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     message: &grok_message_owned,
@@ -25248,6 +25286,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(
                 crate::api::runners::CodexRunner.run_turn(crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     message: codex_message,
@@ -25274,6 +25313,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(
                 crate::api::runners::GeminiRunner.run_turn(crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     message: &convo,
@@ -25300,6 +25340,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(
                 crate::api::runners::ChatGptUiRunner.run_turn(crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     // The browser always starts a fresh chat, so include the
@@ -25377,6 +25418,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(crate::api::runners::OpenCodeRunner.run_turn(
                 crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     message: &opencode_message_owned,

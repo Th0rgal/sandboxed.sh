@@ -326,6 +326,8 @@ pub enum TerminalReason {
     NativeGoalStopped,
     /// Native history/identity needs explicit reconciliation; never start fresh automatically.
     CodexContinuityRequired,
+    /// A non-Codex native session or delivery outcome requires reconciliation.
+    NativeContinuityRequired,
     /// Task was cancelled by user
     Cancelled,
     /// Mission was interrupted because the server is shutting down
@@ -353,7 +355,9 @@ impl TerminalReason {
     pub fn requires_external_recovery(self) -> bool {
         matches!(
             self,
-            Self::NativeGoalStopped | Self::CodexContinuityRequired
+            Self::NativeGoalStopped
+                | Self::CodexContinuityRequired
+                | Self::NativeContinuityRequired
         )
     }
 }

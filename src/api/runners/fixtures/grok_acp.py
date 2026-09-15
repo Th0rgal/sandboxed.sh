@@ -21,9 +21,19 @@ for line in sys.stdin:
     method = request.get("method")
     request_id = request.get("id")
     if method == "initialize":
+        if scenario == "initialize_eof":
+            break
         result = {"protocolVersion": 1}
     elif method in ("session/new", "session/load"):
-        result = {"sessionId": "fixture-session"}
+        with open("session-methods", "a", encoding="utf-8") as receipt:
+            receipt.write(method + "\n")
+        if scenario == "missing_session" and method == "session/load":
+            emit({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message": "No session found"}})
+            break
+        if scenario == "new_eof" and method == "session/new":
+            break
+        result = {} if scenario == "new_missing_id" and method == "session/new" else {"sessionId": "fixture-session"}
     elif method == "session/set_model":
         result = {}
     elif method == "session/prompt":

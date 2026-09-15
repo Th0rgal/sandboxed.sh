@@ -124,7 +124,8 @@ fn failure_class_for_terminal_reason(reason: TerminalReason) -> FailureClass {
         TerminalReason::Cancelled
         | TerminalReason::ServerShutdown
         | TerminalReason::NativeGoalStopped
-        | TerminalReason::CodexContinuityRequired => FailureClass::AgentError,
+        | TerminalReason::CodexContinuityRequired
+        | TerminalReason::NativeContinuityRequired => FailureClass::AgentError,
         TerminalReason::LlmError => FailureClass::ProviderError,
         TerminalReason::TurnComplete | TerminalReason::Completed => FailureClass::Unknown,
     }
@@ -171,6 +172,7 @@ pub(crate) fn turn_outcome_for_result(
                 | TerminalReason::ServerShutdown
                 | TerminalReason::NativeGoalStopped
                 | TerminalReason::CodexContinuityRequired
+                | TerminalReason::NativeContinuityRequired
         ) {
             interrupted_turn_outcome(reason)
         } else {
@@ -2698,6 +2700,7 @@ pub struct MissionRunner {
 
     /// Durable generation lease for the currently executing turn.
     pub durable_run: Option<crate::api::mission_store::MissionRun>,
+    session_store: Option<Arc<dyn crate::api::mission_store::MissionStore>>,
 
     /// Once cancellation is requested, this runner must drain its current
     /// handle and be removed without starting queued or automated follow-ups.
@@ -2757,6 +2760,7 @@ impl MissionRunner {
             active_tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             background_tasks: HashMap::new(),
             durable_run: None,
+            session_store: None,
             cancellation_requested: false,
             cancellation_force_clear_deadline: None,
             force_abort_requested: false,
@@ -2788,6 +2792,7 @@ impl MissionRunner {
                 run.run_id, run.generation
             ));
         }
+        self.session_store = Some(mission_store.clone());
         self.durable_run = Some(run);
         Ok(())
     }
@@ -3112,37 +3117,47 @@ impl MissionRunner {
             source: msg_source,
         });
 
+        let session_store = self.session_store.clone();
+        let session_update_run = self
+            .durable_run
+            .as_ref()
+            .map(crate::api::mission_store::SessionUpdateRun::from);
         let handle = tokio::spawn(async move {
-            let result = run_mission_turn(
-                config,
-                root_agent,
-                mcp,
-                workspaces,
-                library,
-                events_tx,
-                tool_hub,
-                status,
-                cancel,
-                hist_snapshot,
-                user_message.clone(),
-                Some(mission_ctrl),
-                tree_ref,
-                progress_ref,
-                mission_id,
-                Some(workspace_id),
-                backend_id,
-                agent_override,
-                model_override,
-                model_effort,
-                fast_mode,
-                secrets,
-                session_id,
-                config_profile,
-                working_directory,
-                user_id,
-                pr_readonly,
-            )
-            .await;
+            let result = crate::api::runners::SESSION_UPDATE_RUN
+                .scope(
+                    session_update_run,
+                    run_mission_turn(
+                        session_store,
+                        config,
+                        root_agent,
+                        mcp,
+                        workspaces,
+                        library,
+                        events_tx,
+                        tool_hub,
+                        status,
+                        cancel,
+                        hist_snapshot,
+                        user_message.clone(),
+                        Some(mission_ctrl),
+                        tree_ref,
+                        progress_ref,
+                        mission_id,
+                        Some(workspace_id),
+                        backend_id,
+                        agent_override,
+                        model_override,
+                        model_effort,
+                        fast_mode,
+                        secrets,
+                        session_id,
+                        config_profile,
+                        working_directory,
+                        user_id,
+                        pr_readonly,
+                    ),
+                )
+                .await;
             (msg_id, user_message, result)
         });
 
@@ -3495,6 +3510,7 @@ pub(crate) fn claudecode_resume_current_session_message() -> &'static str {
 /// Execute a single turn for a mission.
 #[allow(clippy::too_many_arguments)]
 async fn run_mission_turn(
+    mission_store: Option<Arc<dyn crate::api::mission_store::MissionStore>>,
     config: Config,
     _root_agent: AgentRef,
     mcp: Arc<McpRegistry>,
@@ -3684,6 +3700,24 @@ async fn run_mission_turn(
 
     // Ensure mission workspace exists and is configured for OpenCode.
     let mut workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
+    // Validate the requested source before config synchronization can create
+    // directories. A missing checkout is not a request for a new workspace.
+    let explicit_worktree = match mission_working_directory
+        .as_deref()
+        .map(|requested| {
+            resolve_mission_working_directory(&workspace.path, workspace.workspace_type, requested)
+        })
+        .transpose()
+    {
+        Ok(path) => path,
+        Err(error) => {
+            return AgentResult::failure(
+                format!("explicit working_directory is invalid: {error}"),
+                0,
+            )
+        }
+    };
+
     if let Err(e) =
         workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &workspace).await
     {
@@ -3696,7 +3730,7 @@ async fn run_mission_turn(
     let mission_work_dir_result = {
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
-        workspace::prepare_mission_workspace_with_skills_backend(
+        workspace::prepare_mission_workspace_with_skills_backend_at(
             &mut workspace,
             &mcp,
             lib_ref,
@@ -3707,6 +3741,7 @@ async fn run_mission_turn(
             boss_user_id.as_deref(),
             Some(&config.working_dir),
             !pr_readonly,
+            explicit_worktree.as_deref(),
         )
         .await
     };
@@ -3848,11 +3883,18 @@ async fn run_mission_turn(
             turn_count, summary, user_message
         );
 
-        // Update session ID and notify via events
-        let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+        // Persist before rotating or allowing a queued successor to start.
+        if let Err(failure) = crate::api::runners::persist_and_publish_native_session(
+            mission_store.as_ref(),
             mission_id,
-            session_id: new_session_id.clone(),
-        });
+            "claudecode",
+            &new_session_id,
+            &events_tx,
+        )
+        .await
+        {
+            return *failure;
+        }
 
         session_id = Some(new_session_id.clone());
 
@@ -3942,6 +3984,7 @@ async fn run_mission_turn(
             };
             runner
                 .run_turn(super::runners::TurnContext {
+                    mission_store,
                     workspace: &workspace,
                     work_dir: &mission_work_dir,
                     message: &turn_message,

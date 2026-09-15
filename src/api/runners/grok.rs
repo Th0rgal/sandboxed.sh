@@ -459,89 +459,31 @@ pub(crate) fn grok_stdout_line_requests_interactive_login(line: &str) -> bool {
         && grok_line_requests_interactive_login(line)
 }
 
-/// Resolve the env the Grok CLI needs for non-interactive auth: refresh the
-/// xAI OAuth token if stale, materialize/sync the CLI auth file, and export
-/// `XAI_API_KEY` (key > OAuth access token > ambient env). Shared by the
-/// streaming-json and ACP turn paths.
-#[allow(clippy::result_large_err)] // AgentResult carries the terminal mission record.
-async fn prepare_grok_auth_env(
+/// Resolve API-key authentication separately from native Grok auth files.
+/// OAuth access tokens are not API keys; native authentication and refresh
+/// belong to the CLI that owns the session and its auth-file format.
+#[allow(clippy::result_large_err)]
+async fn prepare_grok_env(
     workspace: &Workspace,
     app_working_dir: &std::path::Path,
     mission_id: Uuid,
 ) -> Result<HashMap<String, String>, AgentResult> {
-    let mut oauth_access_token: Option<String> = None;
-    if let Some(entry) =
-        crate::api::ai_providers::read_oauth_token_entry(crate::ai_providers::ProviderType::Xai)
-    {
-        if crate::api::ai_providers::oauth_token_expired(entry.expires_at) {
-            match crate::api::ai_providers::refresh_oauth_token_with_lock(
-                crate::ai_providers::ProviderType::Xai,
-                entry.expires_at,
-            )
-            .await
-            {
-                Ok((access, _refresh, expires_at)) => {
-                    oauth_access_token = Some(access);
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        expires_at,
-                        "Refreshed xAI OAuth token before starting Grok Build"
-                    );
-                }
-                Err(crate::api::ai_providers::OAuthRefreshError::InvalidGrant(err)) => {
-                    return Err(AgentResult::failure(
-                        format!(
-                            "Grok Build xAI OAuth refresh token is expired or revoked. Reconnect the xAI provider, then retry the mission. {}",
-                            err
-                        ),
-                        0,
-                    )
-                    .with_terminal_reason(TerminalReason::LlmError));
-                }
-                Err(err) => {
-                    return Err(AgentResult::failure(
-                        format!(
-                            "Failed to refresh xAI OAuth before starting Grok Build: {}",
-                            err
-                        ),
-                        0,
-                    )
-                    .with_terminal_reason(TerminalReason::LlmError));
-                }
-            }
-        } else {
-            oauth_access_token = Some(entry.access_token.clone());
-        }
-    }
-
-    // Grok CLI 0.2.93 rejects the legacy `auth_mode: "oauth"` shape older
-    // Sandboxed versions generated. Remove that shape on the host, then copy
-    // the newest host `~/.grok/auth.json` into the workspace HOME. Container
-    // missions otherwise keep a months-old `/root/.grok/auth.json` and 401
-    // even after Settings reconnects the host.
-    if let Err(err) = crate::api::ai_providers::remove_legacy_grok_oauth_auth_entries() {
-        tracing::warn!(
-            mission_id = %mission_id,
-            error = %err,
-            "Failed to remove obsolete Grok OAuth auth entry"
-        );
-    }
-    if let Err(err) = crate::api::ai_providers::sync_host_grok_auth_into_workspace(workspace) {
-        tracing::warn!(
-            mission_id = %mission_id,
-            error = %err,
-            "Failed to sync host Grok auth.json into workspace"
-        );
-    }
-
-    // Authenticate the Grok CLI non-interactively via XAI_API_KEY. Priority:
-    // an explicit xAI API key, then the captured OAuth access token, then any
-    // ambient env key. Setting this is what prevents the interactive-sign-in
-    // hang; the CLI prints "You are using XAI_API_KEY" and goes straight to
-    // api.x.ai.
     let mut env = HashMap::new();
     let xai_api_key = crate::api::ai_providers::get_xai_api_key_for_grok(app_working_dir)
-        .or_else(|| oauth_access_token.clone())
+        .or_else(|| {
+            workspace
+                .env_vars
+                .get("XAI_API_KEY")
+                .filter(|key| !key.trim().is_empty())
+                .cloned()
+        })
+        .or_else(|| {
+            workspace
+                .env_vars
+                .get("GROK_CODE_XAI_API_KEY")
+                .filter(|key| !key.trim().is_empty())
+                .cloned()
+        })
         .or_else(|| {
             std::env::var("XAI_API_KEY")
                 .ok()
@@ -557,9 +499,105 @@ async fn prepare_grok_auth_env(
         // backward compatibility with older builds.
         env.insert("XAI_API_KEY".to_string(), key.clone());
         env.insert("GROK_CODE_XAI_API_KEY".to_string(), key);
+    } else if let Err(error) =
+        crate::api::ai_providers::sync_host_grok_auth_into_workspace(workspace)
+    {
+        tracing::warn!(mission_id = %mission_id, "Grok native authentication preparation failed");
+        return Err(AgentResult::failure(
+            format!("Grok native authentication could not be prepared: {error}"),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError));
+    }
+
+    // Both native transports must inherit the same server-owned policy,
+    // wrapper path and mission-scoped capability as durable workspace jobs.
+    if let Some(remote_env) = workspace.remote_build_env(mission_id) {
+        env.extend(remote_env);
     }
 
     Ok(env)
+}
+
+async fn persist_grok_session(
+    store: Option<&std::sync::Arc<dyn crate::api::mission_store::MissionStore>>,
+    mission_id: Uuid,
+    session_id: &str,
+) -> Result<(), String> {
+    if let Some(store) = store {
+        return store
+            .update_mission_session_id(
+                mission_id,
+                session_id,
+                "grok",
+                super::session_update_run().as_ref(),
+            )
+            .await
+            .and_then(|accepted| {
+                if accepted {
+                    Ok(())
+                } else {
+                    Err("stale or unattributed execution generation".into())
+                }
+            })
+            .map_err(|error| format!("Grok native session could not be persisted: {error}"));
+    }
+    // Protocol-only subprocess fixtures do not own a mission store. Real
+    // launch paths must provide the actor's authoritative store.
+    #[cfg(test)]
+    {
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        Err("Grok session persistence store is unavailable".into())
+    }
+}
+
+async fn grok_session_for_turn(
+    store: &Arc<dyn crate::api::mission_store::MissionStore>,
+    mission_id: Uuid,
+) -> Result<Option<String>, String> {
+    let mission = store
+        .get_mission(mission_id)
+        .await?
+        .ok_or("Grok mission is missing")?;
+    if mission.backend != "grok" {
+        return Err("Grok no longer owns this mission backend".into());
+    }
+    if mission
+        .session_id
+        .as_deref()
+        .is_some_and(|id| id.trim().is_empty())
+    {
+        return Err("Grok native identity is empty; reconciliation required".into());
+    }
+    if mission.session_id.is_none() && store.native_prompt_attempted(mission_id, "grok").await? {
+        return Err("Prior Grok native attempt has no durable identity; session creation or prompt outcome requires reconciliation".into());
+    }
+    Ok(mission.session_id)
+}
+
+async fn claim_grok_prompt(
+    store: &Arc<dyn crate::api::mission_store::MissionStore>,
+    mission_id: Uuid,
+    session_id: Option<&str>,
+) -> Result<Uuid, String> {
+    let claim_id = Uuid::new_v4();
+    if store
+        .claim_native_prompt(
+            mission_id,
+            "grok",
+            session_id,
+            super::session_update_run().as_ref(),
+            claim_id,
+        )
+        .await?
+    {
+        Ok(claim_id)
+    } else {
+        Err("Grok prompt refused: stale generation, changed binding or prior unbound prompt outcome".into())
+    }
 }
 
 /// Execute a turn using the Grok Build CLI backend.
@@ -568,9 +606,10 @@ async fn prepare_grok_auth_env(
 /// only mode that surfaces tool calls and works for thinking on every model.
 /// Set `SANDBOXED_SH_GROK_ACP=0` to force the legacy `--output-format
 /// streaming-json` path; the dispatcher also falls back to it automatically
-/// when the ACP handshake fails before the prompt is sent.
+/// when ACP fails before prompt delivery and native continuity permits fallback.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_grok_turn(
+    mission_store: std::sync::Arc<dyn crate::api::mission_store::MissionStore>,
     workspace: &Workspace,
     work_dir: &std::path::Path,
     message: &str,
@@ -579,9 +618,28 @@ pub async fn run_grok_turn(
     events_tx: broadcast::Sender<AgentEvent>,
     cancel: CancellationToken,
     app_working_dir: &std::path::Path,
-    session_id: Option<&str>,
-    is_continuation: bool,
+    requested_session_id: Option<&str>,
+    _is_continuation: bool,
 ) -> AgentResult {
+    // Canonical native identity and durable prompt provenance, never history
+    // from another harness, decide whether a fresh session is safe.
+    let saved_session = match grok_session_for_turn(&mission_store, mission_id).await {
+        Ok(id) => id,
+        Err(error) => {
+            return AgentResult::failure(error, 0)
+                .with_terminal_reason(TerminalReason::NativeContinuityRequired)
+        }
+    };
+    if requested_session_id.is_some() && requested_session_id != saved_session.as_deref() {
+        return AgentResult::failure(
+            "Grok supplied native identity disagrees with its durable binding",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::NativeContinuityRequired);
+    }
+    let session_id = saved_session.as_deref();
+    let is_continuation = session_id.is_some();
+
     if workspace.id == crate::workspace::DEFAULT_WORKSPACE_ID && !work_dir.join(".git").exists() {
         let file_count = std::fs::read_dir(work_dir)
             .map(|mut d| {
@@ -625,6 +683,7 @@ pub async fn run_grok_turn(
 
     if env_var_bool("SANDBOXED_SH_GROK_ACP", true) {
         match run_grok_acp_turn(
+            &mission_store,
             workspace,
             work_dir,
             message,
@@ -643,21 +702,25 @@ pub async fn run_grok_turn(
                 tracing::warn!(
                     mission_id = %mission_id,
                     reason = %fallback.reason,
-                    drop_session_id = fallback.drop_session_id,
-                    "Grok ACP handshake failed before the prompt was sent; \
-                     falling back to streaming-json mode"
+                    continuity_required = fallback.continuity_required,
+                    "Grok ACP setup failed; evaluating native continuity before transport fallback"
                 );
-                // An unloadable session must not be passed as --session-id:
-                // its upsert semantics would create a fresh EMPTY session
-                // under that id. Omitting it makes the legacy path use
-                // --continue, which resumes the last session in this
-                // mission directory and preserves context.
-                let fallback_session_id = if fallback.drop_session_id {
-                    None
-                } else {
-                    session_id
+                if fallback.continuity_required {
+                    return AgentResult::failure(fallback.reason, 0)
+                        .with_terminal_reason(TerminalReason::NativeContinuityRequired);
+                }
+                // ACP may have committed session/new before a pre-prompt
+                // failure. Reload that exact binding before transport fallback.
+                let fallback_session = match grok_session_for_turn(&mission_store, mission_id).await
+                {
+                    Ok(id) => id,
+                    Err(error) => {
+                        return AgentResult::failure(error, 0)
+                            .with_terminal_reason(TerminalReason::NativeContinuityRequired)
+                    }
                 };
                 return run_grok_streaming_json_turn(
+                    &mission_store,
                     workspace,
                     work_dir,
                     message,
@@ -666,14 +729,15 @@ pub async fn run_grok_turn(
                     events_tx,
                     cancel,
                     app_working_dir,
-                    fallback_session_id,
-                    is_continuation,
+                    fallback_session.as_deref(),
+                    fallback_session.is_some(),
                 )
                 .await;
             }
         }
     }
     run_grok_streaming_json_turn(
+        &mission_store,
         workspace,
         work_dir,
         message,
@@ -695,6 +759,7 @@ pub async fn run_grok_turn(
 /// Kept as the fallback while the ACP path soaks.
 #[allow(clippy::too_many_arguments)]
 async fn run_grok_streaming_json_turn(
+    mission_store: &std::sync::Arc<dyn crate::api::mission_store::MissionStore>,
     workspace: &Workspace,
     work_dir: &std::path::Path,
     message: &str,
@@ -706,8 +771,6 @@ async fn run_grok_streaming_json_turn(
     session_id: Option<&str>,
     is_continuation: bool,
 ) -> AgentResult {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
     let workspace_exec = WorkspaceExec::new(workspace.clone());
 
     let cli_path =
@@ -720,19 +783,15 @@ async fn run_grok_streaming_json_turn(
     };
 
     let mut args = Vec::new();
-    // Use `-s/--session-id` for both first-turn and continuation when we
-    // already have a session id from the mission store. Per grok headless
-    // docs, `--session-id` has upsert semantics — loads the session if it
-    // exists, creates one with that id otherwise — so it self-heals the
-    // "orphan session" case where the first turn failed before grok could
-    // persist the session and `--resume <sid>` would error with "Session
-    // does not exist". `--resume` is strict-existence-only; we only fall
-    // through to `--continue` when we have no session id at all.
+    // Continuations must load this exact native ID. --session-id is an
+    // new-session option and --continue picks an arbitrary latest session; neither proves
+    // that the original native history is being continued.
     if let Some(sid) = session_id {
-        args.push("--session-id".to_string());
+        args.push("--resume".to_string());
         args.push(sid.to_string());
     } else if is_continuation {
-        args.push("--continue".to_string());
+        return AgentResult::failure("Grok continuation has no native session identity", 0)
+            .with_terminal_reason(TerminalReason::NativeContinuityRequired);
     }
     args.push("-p".to_string());
     args.push(message.to_string());
@@ -746,33 +805,124 @@ async fn run_grok_streaming_json_turn(
         args.push(model.to_string());
     }
 
-    // The Grok CLI authenticates non-interactively via the XAI_API_KEY env var.
-    // The xAI OAuth access token works as a bearer key against api.x.ai, so we
-    // capture the freshest one here and inject it below. Without it the CLI
-    // falls back to an interactive browser sign-in that never completes in a
-    // headless mission — the run then hangs forever ("Agent is working").
-    let env = match prepare_grok_auth_env(workspace, app_working_dir, mission_id).await {
+    // Prepare provider authentication and the same mission-scoped remote
+    // build context used by ACP and the other native runners.
+    let env = match prepare_grok_env(workspace, app_working_dir, mission_id).await {
         Ok(env) => env,
         Err(result) => return result,
     };
 
-    let mut child = match workspace_exec
+    // streaming-json passes the prompt on argv: record uncertainty before
+    // spawn, because the first observable output may follow arbitrary tools.
+    let claim_id = match claim_grok_prompt(mission_store, mission_id, session_id).await {
+        Ok(claim_id) => claim_id,
+        Err(error) => {
+            return AgentResult::failure(error, 0)
+                .with_terminal_reason(TerminalReason::NativeContinuityRequired)
+        }
+    };
+
+    let child = match workspace_exec
         .spawn_streaming(work_dir, &cli_path, &args, env)
         .await
     {
         Ok(child) => child,
         Err(e) => {
-            return AgentResult::failure(format!("Failed to start Grok Build CLI: {}", e), 0)
-                .with_terminal_reason(TerminalReason::LlmError);
+            return grok_streaming_spawn_failure(
+                mission_store,
+                mission_id,
+                session_id,
+                claim_id,
+                &e,
+            )
+            .await;
         }
     };
+    run_grok_streaming_process(
+        Some(mission_store),
+        child,
+        model,
+        mission_id,
+        events_tx,
+        cancel,
+        session_id.is_some(),
+    )
+    .await
+}
+
+async fn grok_streaming_spawn_failure(
+    store: &Arc<dyn crate::api::mission_store::MissionStore>,
+    mission_id: Uuid,
+    session_id: Option<&str>,
+    claim_id: Uuid,
+    error: &anyhow::Error,
+) -> AgentResult {
+    if error
+        .downcast_ref::<crate::workspace_exec::ConfirmedNoLaunch>()
+        .is_some()
+    {
+        grok_confirmed_no_launch(store, mission_id, session_id, claim_id, &error.to_string()).await
+    } else {
+        AgentResult::failure(format!("Grok launch outcome is uncertain: {error}"), 0)
+            .with_terminal_reason(TerminalReason::NativeContinuityRequired)
+    }
+}
+
+async fn grok_confirmed_no_launch(
+    store: &Arc<dyn crate::api::mission_store::MissionStore>,
+    mission_id: Uuid,
+    session_id: Option<&str>,
+    claim_id: Uuid,
+    error: &str,
+) -> AgentResult {
+    let released = if session_id.is_none() {
+        store
+            .release_native_prompt_no_launch(
+                mission_id,
+                "grok",
+                super::session_update_run().as_ref(),
+                claim_id,
+            )
+            .await
+    } else {
+        Ok(true)
+    }; // Existing native evidence must never be removed.
+    let reason = match released {
+        Ok(true) => TerminalReason::LlmError,
+        _ => TerminalReason::NativeContinuityRequired,
+    };
+    AgentResult::failure(
+        format!("Failed to start Grok Build CLI (confirmed no launch): {error}"),
+        0,
+    )
+    .with_terminal_reason(reason)
+}
+
+async fn run_grok_streaming_process(
+    mission_store: Option<&std::sync::Arc<dyn crate::api::mission_store::MissionStore>>,
+    mut child: tokio::process::Child,
+    model: Option<&str>,
+    mission_id: Uuid,
+    events_tx: broadcast::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    is_resume: bool,
+) -> AgentResult {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let unbound_start = mission_store.is_some() && !is_resume;
     drop(child.stdin.take());
 
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
             return AgentResult::failure("Failed to capture Grok stdout".to_string(), 0)
-                .with_terminal_reason(TerminalReason::LlmError);
+                .with_terminal_reason(if unbound_start {
+                    TerminalReason::NativeContinuityRequired
+                } else {
+                    TerminalReason::LlmError
+                });
         }
     };
     let stderr = child.stderr.take();
@@ -842,7 +992,7 @@ async fn run_grok_streaming_json_turn(
                     "Grok Build could not authenticate non-interactively (the CLI requested a browser sign-in). Reconnect the xAI / Grok Build provider in Settings → Providers, then retry the mission.".to_string(),
                     0,
                 )
-                .with_terminal_reason(TerminalReason::LlmError);
+                .with_terminal_reason(if unbound_start { TerminalReason::NativeContinuityRequired } else { TerminalReason::LlmError });
             }
             line_result = lines.next_line() => {
                 match line_result {
@@ -866,7 +1016,7 @@ async fn run_grok_streaming_json_turn(
                                         "Grok Build could not authenticate non-interactively (the CLI requested a browser sign-in). Reconnect the xAI / Grok Build provider in Settings → Providers, then retry the mission.".to_string(),
                                         0,
                                     )
-                                    .with_terminal_reason(TerminalReason::LlmError);
+                                    .with_terminal_reason(if unbound_start { TerminalReason::NativeContinuityRequired } else { TerminalReason::LlmError });
                                 }
                                 if final_result.is_empty() {
                                     final_result.push_str(&line);
@@ -878,7 +1028,15 @@ async fn run_grok_streaming_json_turn(
                             }
                         };
                         if let Some(sid) = grok_event_session_id(&value) {
+                            if let Err(error) = persist_grok_session(mission_store, mission_id, &sid).await {
+                                let _ = child.kill().await;
+                                if let Some(handle) = stderr_handle.take() { handle.abort(); }
+                                return AgentResult::failure(error, 0)
+                                    .with_terminal_reason(TerminalReason::NativeContinuityRequired);
+                            }
                             let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                                run: crate::api::runners::session_update_run(),
+                                backend: "grok".to_string(),
                                 session_id: sid,
                                 mission_id,
                             });
@@ -1051,11 +1209,29 @@ async fn run_grok_streaming_json_turn(
         }
     }
 
+    let missing_resume = is_resume && {
+        let stderr = stderr_capture.lock().await;
+        [&*stderr, &final_result].iter().any(|text| {
+            let lower = text.to_ascii_lowercase();
+            lower.contains("no session found")
+                || lower.contains("session not found")
+                || lower.contains("session does not exist")
+        })
+    };
+    let unbound_outcome = if let Some(store) = mission_store {
+        !matches!(store.get_mission(mission_id).await, Ok(Some(m)) if m.session_id.is_some())
+    } else {
+        false
+    };
     let success = exit_status.map(|status| status.success()).unwrap_or(false) && !had_error;
     let model_for_cost = model_used.as_deref().or(Some("grok-build"));
     let (cost_cents, cost_source) =
         resolve_cost_cents_and_source(None, model_for_cost, &token_usage);
-    let mut result = if success {
+    let mut result = if unbound_outcome {
+        AgentResult::failure(format!("Grok prompt outcome has no durable native identity; reconciliation required. {final_result}"), cost_cents)
+            .with_cost_source(cost_source)
+            .with_terminal_reason(TerminalReason::NativeContinuityRequired)
+    } else if success {
         AgentResult::success(final_result, cost_cents)
             .with_cost_source(cost_source)
             .with_terminal_reason(TerminalReason::TurnComplete)
@@ -1066,7 +1242,11 @@ async fn run_grok_streaming_json_turn(
     } else {
         AgentResult::failure(final_result, cost_cents)
             .with_cost_source(cost_source)
-            .with_terminal_reason(TerminalReason::LlmError)
+            .with_terminal_reason(if missing_resume {
+                TerminalReason::NativeContinuityRequired
+            } else {
+                TerminalReason::LlmError
+            })
     };
     let success_signal = CompletionSignal::ProcessExit;
     let success_confidence = CompletionConfidence::Low;
@@ -1099,27 +1279,22 @@ const GROK_ACP_SESSION_NEW_ID: u64 = 3;
 const GROK_ACP_SET_MODEL_ID: u64 = 4;
 const GROK_ACP_PROMPT_ID: u64 = 5;
 
-/// Marker embedded in handshake errors that mean "the stored session can't
-/// be resumed over ACP — the legacy path must use --continue, not
-/// --session-id". Matched by the dispatcher to set `drop_session_id`.
-const GROK_ACP_DEFER_TO_CONTINUE: &str = "deferring to --continue";
+/// Handshake failures for an exact native session require reconciliation;
+/// neither latest-session continuation nor session-ID upsert is permitted.
+const GROK_ACP_CONTINUITY_REQUIRED: &str = "native session requires reconciliation";
 
 /// Why the ACP path handed the turn back to the streaming-json fallback.
 pub(crate) struct GrokAcpFallback {
     reason: String,
-    /// True when the stored session id is not loadable over ACP: the
-    /// fallback must NOT pass it as `--session-id` (upsert semantics would
-    /// create a fresh empty session under that id) — omitting it makes the
-    /// legacy path use `--continue`, which resumes the CLI's last session
-    /// in the mission directory and preserves context.
-    drop_session_id: bool,
+    /// True when falling back could replace the original native history.
+    continuity_required: bool,
 }
 
 impl From<String> for GrokAcpFallback {
     fn from(reason: String) -> Self {
         Self {
             reason,
-            drop_session_id: false,
+            continuity_required: false,
         }
     }
 }
@@ -1236,11 +1411,12 @@ fn grok_acp_update_is_terminal(update: &serde_json::Value) -> bool {
 
 /// Execute a turn over `grok agent stdio` (ACP JSON-RPC).
 ///
-/// Returns `Err(reason)` only for failures BEFORE the prompt is sent
-/// (spawn, initialize, session setup) so the dispatcher can safely fall
-/// back to the streaming-json path without double-executing the turn.
+/// Pre-prompt failures return a fallback decision. Uncertain native creation
+/// or identity requires reconciliation; only safe failures may fall back to
+/// streaming after reloading the canonical binding and claiming durable intent.
 #[allow(clippy::too_many_arguments)]
 async fn run_grok_acp_turn(
+    mission_store: &std::sync::Arc<dyn crate::api::mission_store::MissionStore>,
     workspace: &Workspace,
     work_dir: &std::path::Path,
     message: &str,
@@ -1260,7 +1436,7 @@ async fn run_grok_acp_turn(
         .await
         .map_err(|e| format!("grok CLI unavailable: {e}"))?;
 
-    let env = match prepare_grok_auth_env(workspace, app_working_dir, mission_id).await {
+    let env = match prepare_grok_env(workspace, app_working_dir, mission_id).await {
         Ok(env) => env,
         // Auth failures are terminal for BOTH paths — surface them directly
         // instead of falling back into the same failure.
@@ -1277,6 +1453,7 @@ async fn run_grok_acp_turn(
         .map_err(|e| format!("failed to spawn grok agent stdio: {e}"))?;
 
     run_grok_acp_process(
+        Some(mission_store),
         child,
         &workspace_exec.translate_path_for_container(work_dir),
         message,
@@ -1295,6 +1472,7 @@ async fn run_grok_acp_turn(
 // exercised with a local ACP fixture, without credentials or inference calls.
 #[allow(clippy::too_many_arguments)]
 async fn run_grok_acp_process(
+    mission_store: Option<&std::sync::Arc<dyn crate::api::mission_store::MissionStore>>,
     mut child: tokio::process::Child,
     acp_cwd: &str,
     message: &str,
@@ -1308,14 +1486,11 @@ async fn run_grok_acp_process(
 ) -> Result<AgentResult, GrokAcpFallback> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "failed to capture grok stdin".to_string())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "failed to capture grok stdout".to_string())?;
+    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err("failed to capture Grok ACP pipes".to_string().into());
+    };
     let mut lines = BufReader::new(stdout).lines();
 
     // Capture stderr for diagnostics, and watch for the interactive
@@ -1392,8 +1567,9 @@ async fn run_grok_acp_process(
     // Wrapped so every early error kills the spawned CLI first — a dropped
     // tokio Child keeps running (no kill_on_drop), and the fallback path
     // would spawn a second CLI for the same turn.
+    let mut session_creation_attempted = false;
     let handshake: Result<(String, bool), String> = async {
-        let mut session_load_failed = false;
+        let session_load_failed = false;
         send(
             &mut stdin,
             serde_json::json!({
@@ -1424,34 +1600,30 @@ async fn run_grok_acp_process(
             .await?;
             match await_response(&mut lines, GROK_ACP_SESSION_ID, 60).await {
                 Ok(_) => acp_session_id = Some(sid.to_string()),
-                Err(err) if is_continuation => {
-                    // The stored session holds real prior context we cannot
-                    // reach over ACP. The streaming path's `--continue`
-                    // resumes the CLI's last session in this directory —
-                    // defer to it instead of silently dropping context.
+                Err(err) => {
+                    // A missing exact session is not permission to continue
+                    // an arbitrary last session or create an empty replacement.
                     return Err(format!(
                         "stored session {sid} not loadable over ACP on a continuation \
-                         turn ({err}); {GROK_ACP_DEFER_TO_CONTINUE}"
+                         turn ({err}); {GROK_ACP_CONTINUITY_REQUIRED}"
                     ));
                 }
-                Err(err) => {
-                    session_load_failed = true;
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        session_id = %sid,
-                        error = %err,
-                        "Grok ACP session/load failed; starting a fresh session"
-                    );
-                }
+
             }
         } else if is_continuation {
-            // Continuation with no stored session id at all: only the
-            // streaming path's `--continue` can recover the prior session.
+            // An asserted continuation without an exact ID is ambiguous.
             return Err(format!(
-                "continuation turn without a stored session id; {GROK_ACP_DEFER_TO_CONTINUE}"
+                "continuation turn without a stored session id; {GROK_ACP_CONTINUITY_REQUIRED}"
             ));
         }
         if acp_session_id.is_none() {
+            // session/new itself creates native state. Record intent before
+            // the RPC so a lost response cannot authorize another fresh entry.
+            if let Some(store) = mission_store {
+                claim_grok_prompt(store, mission_id, None).await
+                    .map_err(|error| format!("{error}; {GROK_ACP_CONTINUITY_REQUIRED}"))?;
+            }
+            session_creation_attempted = true;
             send(
                 &mut stdin,
                 serde_json::json!({
@@ -1469,7 +1641,11 @@ async fn run_grok_acp_process(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "grok ACP session/new returned no sessionId".to_string())?
                 .to_string();
+            persist_grok_session(mission_store, mission_id, &sid)
+                .await.map_err(|error| format!("{error}; {GROK_ACP_CONTINUITY_REQUIRED}"))?;
             let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                run: crate::api::runners::session_update_run(),
+                backend: "grok".to_string(),
                 mission_id,
                 session_id: sid.clone(),
             });
@@ -1481,15 +1657,16 @@ async fn run_grok_acp_process(
         ))
     }
     .await;
-    let (acp_session_id, session_load_failed) = match handshake {
+    let (acp_session_id, _session_load_failed) = match handshake {
         Ok(pair) => pair,
         Err(err) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            let drop_session_id = err.contains(GROK_ACP_DEFER_TO_CONTINUE);
+            let continuity_required =
+                session_creation_attempted || err.contains(GROK_ACP_CONTINUITY_REQUIRED);
             return Err(GrokAcpFallback {
                 reason: err,
-                drop_session_id,
+                continuity_required,
             });
         }
     };
@@ -1507,7 +1684,7 @@ async fn run_grok_acp_process(
         .or_else(|| Some("grok-build-0.1".to_string()));
     let mut selected_model: Option<String> = None;
     if let Some(model) = effective_model.as_deref() {
-        send(
+        if let Err(error) = send(
             &mut stdin,
             serde_json::json!({
                 "jsonrpc": "2.0",
@@ -1516,7 +1693,12 @@ async fn run_grok_acp_process(
                 "params": { "sessionId": acp_session_id, "modelId": model }
             }),
         )
-        .await?;
+        .await
+        {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error.into());
+        }
         match await_response(&mut lines, GROK_ACP_SET_MODEL_ID, 30).await {
             Ok(_) => {
                 selected_model = Some(model.to_string());
@@ -1540,6 +1722,15 @@ async fn run_grok_acp_process(
         }
     }
 
+    if let Some(store) = mission_store {
+        if let Err(error) = claim_grok_prompt(store, mission_id, Some(&acp_session_id)).await {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Ok(AgentResult::failure(error, 0)
+                .with_terminal_reason(TerminalReason::NativeContinuityRequired));
+        }
+    }
+
     // ── Prompt (from here on, failures are real turn failures) ─────────
     if let Err(e) = send(
         &mut stdin,
@@ -1555,16 +1746,13 @@ async fn run_grok_acp_process(
     )
     .await
     {
-        // Prompt never reached the agent — kill the CLI before handing the
-        // turn back to the fallback path (same orphan hazard as handshake).
         let _ = child.kill().await;
         let _ = child.wait().await;
-        // If the stored session already failed to load over ACP, the legacy
-        // path must not upsert an empty session under that id either.
-        return Err(GrokAcpFallback {
-            reason: e,
-            drop_session_id: session_load_failed,
-        });
+        return Ok(AgentResult::failure(
+            format!("Grok prompt delivery outcome is unknown: {e}"),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::NativeContinuityRequired));
     }
 
     let mut thinking_buffer = String::new();
@@ -1860,18 +2048,14 @@ async fn run_grok_acp_process(
         }
     }
 
-    // The CLI doesn't always stamp a terminal status on the last
-    // tool_call_update — flush whatever we have so every ToolCall gets a
-    // matching ToolResult in the UI/history.
-    for (id, call) in tool_calls.iter() {
-        if !call.result_emitted {
-            let _ = events_tx.send(AgentEvent::ToolResult {
-                tool_call_id: id.clone(),
-                name: call.name.clone(),
-                result: call.latest_update.clone(),
-                mission_id: Some(mission_id),
-            });
-        }
+    // Missing terminal tool evidence is unknown, not a synthetic ToolResult.
+    // Retain the unresolved call in the durable event stream and block replay.
+    let pending_tools = tool_calls
+        .values()
+        .filter(|call| !call.result_emitted)
+        .count();
+    if pending_tools > 0 && transport_error.is_none() {
+        transport_error = Some("Grok ended with unknown native tool outcomes".into());
     }
     if !thinking_buffer.is_empty() && !thinking_done_emitted {
         let _ = events_tx.send(thinking_final_event(thinking_buffer.clone(), mission_id));
@@ -1885,7 +2069,11 @@ async fn run_grok_acp_process(
             format!("{err}\nstderr tail:\n{stderr_tail}")
         };
         return Ok(AgentResult::failure(detail.clone(), 0)
-            .with_terminal_reason(TerminalReason::LlmError)
+            .with_terminal_reason(if pending_tools > 0 {
+                TerminalReason::NativeContinuityRequired
+            } else {
+                TerminalReason::LlmError
+            })
             .with_terminal_evidence(detail)
             .with_data(serde_json::json!({
                 "failure_class": if transport_failure_stage == "prompt_error" {
@@ -1895,7 +2083,7 @@ async fn run_grok_acp_process(
                 },
                 "transport_failure_stage": transport_failure_stage,
                 "grok_acp_transport_failure": true,
-                "pending_tools": tool_calls.values().filter(|call| !call.result_emitted).count(),
+                "pending_tools": pending_tools,
                 "idle_seconds": last_event.elapsed().as_secs(),
                 "awaiting_input": awaiting_input,
             }))
@@ -1947,6 +2135,929 @@ mod tests {
     use super::*;
     use crate::workspace::WorkspaceType;
     use std::fs;
+
+    #[tokio::test]
+    async fn grok_confirmed_no_launch_releases_only_exact_claim() {
+        use crate::api::mission_store::{
+            FileMissionStore, InMemoryMissionStore, MissionStore, SessionUpdateRun,
+            SqliteMissionStore,
+        };
+        for kind in ["memory", "file", "sqlite"] {
+            let root = tempfile::tempdir().unwrap();
+            let store: Arc<dyn MissionStore> = match kind {
+                "file" => Arc::new(
+                    FileMissionStore::new(root.path().into(), "no-launch")
+                        .await
+                        .unwrap(),
+                ),
+                "sqlite" => Arc::new(
+                    SqliteMissionStore::new(root.path().into(), "no-launch")
+                        .await
+                        .unwrap(),
+                ),
+                _ => Arc::new(InMemoryMissionStore::new()),
+            };
+            let m = store
+                .create_mission(
+                    Some("no launch"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("grok"),
+                    None,
+                )
+                .await
+                .unwrap();
+            let run = store.begin_mission_run(m.id, "first", None).await.unwrap();
+            let stamp = SessionUpdateRun::from(&run);
+            super::super::SESSION_UPDATE_RUN
+                .scope(Some(stamp.clone()), async {
+                    let first = claim_grok_prompt(&store, m.id, None).await.unwrap();
+                    // An embedded NUL deterministically fails command construction/OS
+                    // spawn, including wrapped execution: no CLI can receive argv.
+                    let exec = WorkspaceExec::new(Workspace::default_host(root.path().into()));
+                    let error = exec
+                        .spawn_streaming(root.path(), "invalid\0program", &[], HashMap::new())
+                        .await
+                        .unwrap_err();
+                    let result =
+                        grok_streaming_spawn_failure(&store, m.id, None, first, &error).await;
+                    assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+                    assert_eq!(grok_session_for_turn(&store, m.id).await.unwrap(), None);
+                    // Stored workspace values must be validated after env merge,
+                    // even when the caller supplied no invalid argv/environment.
+                    let env_claim = claim_grok_prompt(&store, m.id, None).await.unwrap();
+                    let mut workspace = Workspace::default_host(root.path().into());
+                    workspace
+                        .env_vars
+                        .insert("CLAIM_TEST_VALUE".into(), "private-fixture\0value".into());
+                    let error = WorkspaceExec::new(workspace)
+                        .spawn_streaming(
+                            root.path(),
+                            "/bin/sh",
+                            &["-c".into(), "touch must-not-launch".into()],
+                            HashMap::new(),
+                        )
+                        .await
+                        .unwrap_err();
+                    assert!(!error.to_string().contains("private-fixture"));
+                    let result =
+                        grok_streaming_spawn_failure(&store, m.id, None, env_claim, &error).await;
+                    assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+                    assert!(!root.path().join("must-not-launch").exists());
+                    assert_eq!(grok_session_for_turn(&store, m.id).await.unwrap(), None);
+                    let second = claim_grok_prompt(&store, m.id, None).await.unwrap();
+                    assert_ne!(first, second);
+                    let uncertain = grok_streaming_spawn_failure(
+                        &store,
+                        m.id,
+                        None,
+                        second,
+                        &anyhow::anyhow!("injected post-spawn registration failure"),
+                    )
+                    .await;
+                    assert_eq!(
+                        uncertain.terminal_reason,
+                        Some(TerminalReason::NativeContinuityRequired)
+                    );
+                    assert!(store.native_prompt_attempted(m.id, "grok").await.unwrap());
+                    // A delayed duplicate rollback in the SAME generation cannot
+                    // erase a new valid claim (generation comparison alone is weak).
+                    assert!(!store
+                        .release_native_prompt_no_launch(m.id, "grok", Some(&stamp), first)
+                        .await
+                        .unwrap());
+                    assert!(grok_session_for_turn(&store, m.id).await.is_err());
+                    assert!(!store
+                        .release_native_prompt_no_launch(m.id, "claude", Some(&stamp), second)
+                        .await
+                        .unwrap());
+                    assert!(store
+                        .release_native_prompt_no_launch(m.id, "grok", Some(&stamp), second)
+                        .await
+                        .unwrap());
+                })
+                .await;
+            // A released marker stays absent after persistent-store reopen.
+            let store: Arc<dyn MissionStore> = match kind {
+                "file" => Arc::new(
+                    FileMissionStore::new(root.path().into(), "no-launch")
+                        .await
+                        .unwrap(),
+                ),
+                "sqlite" => Arc::new(
+                    SqliteMissionStore::new(root.path().into(), "no-launch")
+                        .await
+                        .unwrap(),
+                ),
+                _ => store,
+            };
+            assert!(!store.native_prompt_attempted(m.id, "grok").await.unwrap());
+            let receipt = Uuid::new_v4();
+            assert!(store
+                .claim_native_prompt(m.id, "grok", None, Some(&stamp), receipt)
+                .await
+                .unwrap());
+            store
+                .finish_mission_run(run.run_id, run.generation, Some("unknown"))
+                .await
+                .unwrap();
+            let successor = store
+                .begin_mission_run(m.id, "successor", None)
+                .await
+                .unwrap();
+            assert!(!store
+                .release_native_prompt_no_launch(m.id, "grok", Some(&stamp), receipt)
+                .await
+                .unwrap());
+            assert!(store.native_prompt_attempted(m.id, "grok").await.unwrap());
+            assert!(!store
+                .release_native_prompt_no_launch(
+                    m.id,
+                    "grok",
+                    Some(&SessionUpdateRun::from(&successor)),
+                    receipt
+                )
+                .await
+                .unwrap());
+            assert!(!store
+                .claim_native_prompt(
+                    m.id,
+                    "grok",
+                    None,
+                    Some(&SessionUpdateRun::from(&successor)),
+                    Uuid::new_v4()
+                )
+                .await
+                .unwrap());
+            let successor_stamp = SessionUpdateRun::from(&successor);
+            assert!(store
+                .update_mission_session_id(m.id, "native-real", "grok", Some(&successor_stamp))
+                .await
+                .unwrap());
+            super::super::SESSION_UPDATE_RUN
+                .scope(Some(successor_stamp), async {
+                    let bound_receipt = claim_grok_prompt(&store, m.id, Some("native-real"))
+                        .await
+                        .unwrap();
+                    let error = anyhow::Error::new(crate::workspace_exec::ConfirmedNoLaunch(
+                        anyhow::anyhow!("known pre-launch failure"),
+                    ));
+                    let result = grok_streaming_spawn_failure(
+                        &store,
+                        m.id,
+                        Some("native-real"),
+                        bound_receipt,
+                        &error,
+                    )
+                    .await;
+                    assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+                    assert!(store.native_prompt_attempted(m.id, "grok").await.unwrap());
+                    assert_eq!(
+                        grok_session_for_turn(&store, m.id)
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some("native-real")
+                    );
+                })
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_native_remote_env_reaches_workspace_children() {
+        const CASE: &str = "GROK_REMOTE_ENV_FIXTURE";
+        let Ok(case) = std::env::var(CASE) else {
+            // Isolate signing configuration from the test runner and never
+            // read shared provider credentials or mutate process-global env.
+            for case in ["configured", "unconfigured"] {
+                let result = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "api::runners::grok::tests::grok_native_remote_env_reaches_workspace_children", "--nocapture"])
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env(CASE, case)
+                    .envs(if case == "configured" {
+                        vec![("PORT", "19876"), ("SANDBOXED_INTERNAL_ACTION_SECRET", "synthetic-remote-signing-secret")]
+                    } else {
+                        vec![]
+                    })
+                    .output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{case}: {}{}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            return;
+        };
+        for mode in ["host", "fallback", "container"] {
+            let root = tempfile::tempdir().unwrap();
+            let mission_id = Uuid::new_v4();
+            let mut workspace = if mode == "host" {
+                Workspace::default_host(root.path().to_path_buf())
+            } else {
+                Workspace::new_container("remote-env-fixture".into(), root.path().to_path_buf())
+            };
+            workspace.config = serde_json::json!({
+                "compute_policy": "remote_required",
+                "container_fallback": mode == "fallback",
+                "remote_build": {"node_id": "auto", "requirements": ["lean"], "timeout_secs": 321}
+            });
+            workspace
+                .env_vars
+                .insert("HOME".into(), root.path().display().to_string());
+            workspace
+                .env_vars
+                .insert("XAI_API_KEY".into(), "synthetic-provider-key".into());
+            // Caller/workspace settings cannot downgrade the authoritative policy
+            // or replace the mission identity passed by the runner.
+            workspace
+                .env_vars
+                .insert("SANDBOXED_COMPUTE_POLICY".into(), "local_allowed".into());
+            workspace
+                .env_vars
+                .insert("REMOTE_BUILD_MISSION_ID".into(), Uuid::new_v4().to_string());
+            let env = prepare_grok_env(&workspace, root.path(), mission_id)
+                .await
+                .unwrap_or_else(|_| panic!("fixture preparation failed"));
+            assert_eq!(
+                env.get("SANDBOXED_COMPUTE_POLICY").map(String::as_str),
+                Some("remote_required")
+            );
+            assert_eq!(
+                env.get("REMOTE_BUILD_MISSION_ID"),
+                Some(&mission_id.to_string())
+            );
+            assert_eq!(
+                env.get("REMOTE_BUILD_TIMEOUT_SECS").map(String::as_str),
+                Some("321")
+            );
+            assert_eq!(env.contains_key("REMOTE_BUILD_URL"), case == "configured");
+            assert_eq!(env.contains_key("REMOTE_BUILD_TOKEN"), case == "configured");
+            let wrapper = env
+                .get("REMOTE_BUILD_COMMAND")
+                .expect("mission wrapper path");
+            assert!(env["PATH"].starts_with(&format!(
+                "{}:",
+                std::path::Path::new(wrapper).parent().unwrap().display()
+            )));
+            if case == "configured" {
+                assert_eq!(
+                    env["REMOTE_BUILD_URL"],
+                    format!(
+                        "http://{}:19876/api/remote-build",
+                        workspace.host_ip_from_workspace()
+                    )
+                );
+                use base64::Engine;
+                let payload = env["REMOTE_BUILD_TOKEN"].split('.').next().unwrap();
+                let claims: serde_json::Value = serde_json::from_slice(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(payload)
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(claims["mission_id"], mission_id.to_string());
+                assert!(claims["expires_at"].as_i64().unwrap() > chrono::Utc::now().timestamp());
+            }
+            if mode != "container" {
+                let child = WorkspaceExec::new(workspace).spawn_streaming(
+                    root.path(), "/bin/sh", &["-c".into(),
+                        format!("test \"$SANDBOXED_COMPUTE_POLICY\" = remote_required && test \"$REMOTE_BUILD_MISSION_ID\" = {mission_id} && test -n \"$REMOTE_BUILD_COMMAND\" && test \"${{REMOTE_BUILD_URL:+yes}}\" = {} && test \"${{REMOTE_BUILD_TOKEN:+yes}}\" = {}", if case == "configured" { "yes" } else { "\"\"" }, if case == "configured" { "yes" } else { "\"\"" })], env
+                ).await.unwrap();
+                assert!(
+                    child.wait_with_output().await.unwrap().status.success(),
+                    "{mode}/{case}: child environment"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_unbound_prompt_survives_death_reopen_and_fences_retry() {
+        use crate::api::mission_store::{
+            FileMissionStore, InMemoryMissionStore, MissionStore, SessionUpdateRun,
+            SqliteMissionStore,
+        };
+        use std::process::Stdio;
+        for kind in ["memory", "file", "sqlite"] {
+            for outcome in ["death", "success_without_id", "persistence_failure"] {
+                let root = tempfile::tempdir().unwrap();
+                let mut store: Arc<dyn MissionStore> = match kind {
+                    "file" => Arc::new(
+                        FileMissionStore::new(root.path().into(), "unknown")
+                            .await
+                            .unwrap(),
+                    ),
+                    "sqlite" => Arc::new(
+                        SqliteMissionStore::new(root.path().into(), "unknown")
+                            .await
+                            .unwrap(),
+                    ),
+                    _ => Arc::new(InMemoryMissionStore::new()),
+                };
+                // History/identity from Codex is not evidence of prior Grok effects.
+                let mission = store
+                    .create_mission(Some("handoff"), None, None, None, None, Some("codex"), None)
+                    .await
+                    .unwrap();
+                store
+                    .update_mission_run_settings(
+                        mission.id,
+                        Some("grok"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        "generic-not-native",
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    grok_session_for_turn(&store, mission.id).await.unwrap(),
+                    None
+                );
+                let run = store
+                    .begin_mission_run(mission.id, "first", None)
+                    .await
+                    .unwrap();
+                let stamp = SessionUpdateRun::from(&run);
+                let stale = SessionUpdateRun {
+                    run_id: Uuid::new_v4(),
+                    generation: run.generation,
+                };
+                assert!(crate::api::runners::SESSION_UPDATE_RUN
+                    .scope(Some(stale), claim_grok_prompt(&store, mission.id, None))
+                    .await
+                    .is_err());
+                assert!(!store
+                    .native_prompt_attempted(mission.id, "grok")
+                    .await
+                    .unwrap());
+
+                crate::api::runners::SESSION_UPDATE_RUN
+                    .scope(
+                        Some(stamp.clone()),
+                        claim_grok_prompt(&store, mission.id, None),
+                    )
+                    .await
+                    .unwrap();
+                assert!(store
+                    .native_prompt_attempted(mission.id, "grok")
+                    .await
+                    .unwrap());
+                assert!(
+                    crate::api::runners::SESSION_UPDATE_RUN
+                        .scope(
+                            Some(stamp.clone()),
+                            claim_grok_prompt(&store, mission.id, None)
+                        )
+                        .await
+                        .is_err(),
+                    "a second unbound launch in the same run must be fenced"
+                );
+                // Model a newer lease making the old process's later ID write
+                // fail; its earlier prompt/tool acceptance must still be fenced.
+                if outcome == "persistence_failure" {
+                    store
+                        .finish_mission_run(run.run_id, run.generation, Some("fixture"))
+                        .await
+                        .unwrap();
+                    store
+                        .begin_mission_run(mission.id, "successor", None)
+                        .await
+                        .unwrap();
+                }
+                let script = r#"import pathlib,sys,json
+p=pathlib.Path('.')
+with (p/'accepted-prompts').open('a') as f: f.write('accepted\n')
+with (p/'tool-effects').open('a') as f: f.write('effect\n')
+if sys.argv[1]=='persistence_failure': print(json.dumps({'session_id':'late-native','type':'text','text':'done'}), flush=True)
+else: print(json.dumps({'type':'text','text':'accepted tool'}), flush=True)
+sys.exit(0 if sys.argv[1]=='success_without_id' else 1)
+"#;
+                let child = tokio::process::Command::new("python3")
+                    .args(["-u", "-c", script, outcome])
+                    .current_dir(root.path())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let (events, _) = broadcast::channel(32);
+                let result = crate::api::runners::SESSION_UPDATE_RUN
+                    .scope(
+                        Some(stamp),
+                        run_grok_streaming_process(
+                            Some(&store),
+                            child,
+                            None,
+                            mission.id,
+                            events,
+                            CancellationToken::new(),
+                            false,
+                        ),
+                    )
+                    .await;
+                assert_eq!(
+                    result.terminal_reason,
+                    Some(TerminalReason::NativeContinuityRequired),
+                    "{kind}/{outcome}"
+                );
+                assert!(store
+                    .get_mission(mission.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .session_id
+                    .is_none());
+                store = match kind {
+                    "file" => Arc::new(
+                        FileMissionStore::new(root.path().into(), "unknown")
+                            .await
+                            .unwrap(),
+                    ),
+                    "sqlite" => Arc::new(
+                        SqliteMissionStore::new(root.path().into(), "unknown")
+                            .await
+                            .unwrap(),
+                    ),
+                    _ => store,
+                };
+                // Model the retry's real entry gate before any prompt process
+                // can be launched. A failed guard must leave exactly one effect.
+                if grok_session_for_turn(&store, mission.id).await.is_ok() {
+                    let _ = tokio::process::Command::new("python3")
+                        .args(["-c", script, outcome])
+                        .current_dir(root.path())
+                        .output()
+                        .await
+                        .unwrap();
+                    panic!("retry allowed a second prompt: {kind}/{outcome}");
+                }
+                assert_eq!(
+                    std::fs::read_to_string(root.path().join("accepted-prompts")).unwrap(),
+                    "accepted\n"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(root.path().join("tool-effects")).unwrap(),
+                    "effect\n"
+                );
+                store
+                    .update_mission_run_settings(
+                        mission.id,
+                        Some("codex"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        "other",
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .update_mission_run_settings(
+                        mission.id,
+                        Some("grok"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        "not-native",
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    grok_session_for_turn(&store, mission.id).await.is_err(),
+                    "handoff must not erase uncertainty"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_acp_unknown_session_creation_is_durable_without_claiming_prompt_execution() {
+        use crate::api::mission_store::{
+            FileMissionStore, InMemoryMissionStore, MissionStore, SessionUpdateRun,
+            SqliteMissionStore,
+        };
+        use std::process::Stdio;
+        for kind in ["memory", "file", "sqlite"] {
+            for scenario in ["initialize_eof", "new_eof", "new_missing_id"] {
+                let root = tempfile::tempdir().unwrap();
+                let mut store: Arc<dyn MissionStore> = match kind {
+                    "file" => Arc::new(
+                        FileMissionStore::new(root.path().into(), "creation")
+                            .await
+                            .unwrap(),
+                    ),
+                    "sqlite" => Arc::new(
+                        SqliteMissionStore::new(root.path().into(), "creation")
+                            .await
+                            .unwrap(),
+                    ),
+                    _ => Arc::new(InMemoryMissionStore::new()),
+                };
+                let mission = store
+                    .create_mission(
+                        Some("unknown creation"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some("grok"),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let run = store
+                    .begin_mission_run(mission.id, "first", None)
+                    .await
+                    .unwrap();
+                let child = tokio::process::Command::new("python3")
+                    .args(["-u", "-c", include_str!("fixtures/grok_acp.py"), scenario])
+                    .current_dir(root.path())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let (events, _) = broadcast::channel(16);
+                let error = crate::api::runners::SESSION_UPDATE_RUN
+                    .scope(
+                        Some(SessionUpdateRun::from(&run)),
+                        run_grok_acp_process(
+                            Some(&store),
+                            child,
+                            root.path().to_str().unwrap(),
+                            "must not reach prompt",
+                            None,
+                            mission.id,
+                            events,
+                            CancellationToken::new(),
+                            None,
+                            false,
+                            GrokAcpIdlePolicy::default(),
+                        ),
+                    )
+                    .await
+                    .unwrap_err();
+                if scenario == "initialize_eof" {
+                    assert!(!error.continuity_required, "{kind}/{scenario}");
+                    assert!(!root.path().join("session-methods").exists());
+                    assert!(!root.path().join("accepted-prompts").exists());
+                    assert!(!store
+                        .native_prompt_attempted(mission.id, "grok")
+                        .await
+                        .unwrap());
+                    assert_eq!(
+                        grok_session_for_turn(&store, mission.id).await.unwrap(),
+                        None
+                    );
+                    assert!(crate::api::runners::SESSION_UPDATE_RUN
+                        .scope(
+                            Some(SessionUpdateRun::from(&run)),
+                            claim_grok_prompt(&store, mission.id, None)
+                        )
+                        .await
+                        .is_ok());
+                    continue;
+                }
+                assert!(error.continuity_required, "{kind}/{scenario}");
+                assert!(!root.path().join("accepted-prompts").exists());
+                assert_eq!(
+                    std::fs::read_to_string(root.path().join("session-methods")).unwrap(),
+                    "session/new\n"
+                );
+                store = match kind {
+                    "file" => Arc::new(
+                        FileMissionStore::new(root.path().into(), "creation")
+                            .await
+                            .unwrap(),
+                    ),
+                    "sqlite" => Arc::new(
+                        SqliteMissionStore::new(root.path().into(), "creation")
+                            .await
+                            .unwrap(),
+                    ),
+                    _ => store,
+                };
+                assert!(store
+                    .native_prompt_attempted(mission.id, "grok")
+                    .await
+                    .unwrap());
+                assert!(store
+                    .get_mission(mission.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .session_id
+                    .is_none());
+                assert!(grok_session_for_turn(&store, mission.id).await.is_err());
+                assert!(store
+                    .finish_mission_run(run.run_id, run.generation, Some("unknown_creation"))
+                    .await
+                    .unwrap());
+                let retry = store
+                    .begin_mission_run(mission.id, "retry", None)
+                    .await
+                    .unwrap();
+                assert!(crate::api::runners::SESSION_UPDATE_RUN
+                    .scope(
+                        Some(SessionUpdateRun::from(&retry)),
+                        claim_grok_prompt(&store, mission.id, None)
+                    )
+                    .await
+                    .is_err());
+                assert!(!root.path().join("accepted-prompts").exists());
+                assert_eq!(
+                    std::fs::read_to_string(root.path().join("session-methods")).unwrap(),
+                    "session/new\n"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_session_is_persisted_without_actor_event_delivery() {
+        use crate::api::mission_store::{FileMissionStore, MissionStore, SqliteMissionStore};
+        use std::process::Stdio;
+        use std::sync::Arc;
+        for kind in ["file", "sqlite"] {
+            let root = tempfile::tempdir().unwrap();
+            let store: Arc<dyn MissionStore> = if kind == "file" {
+                Arc::new(
+                    FileMissionStore::new(root.path().to_path_buf(), "ack")
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                Arc::new(
+                    SqliteMissionStore::new(root.path().to_path_buf(), "ack")
+                        .await
+                        .unwrap(),
+                )
+            };
+            let mission = store
+                .create_mission(
+                    Some("session ack"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("grok"),
+                    None,
+                )
+                .await
+                .unwrap();
+            let (events, _unread) = broadcast::channel(64);
+            for _ in 0..2 {
+                let saved = store
+                    .get_mission(mission.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .session_id;
+                let child = tokio::process::Command::new("python3")
+                    .args([
+                        "-u",
+                        "-c",
+                        include_str!("fixtures/grok_acp.py"),
+                        "silent_success",
+                    ])
+                    .current_dir(root.path())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let result = run_grok_acp_process(
+                    Some(&store),
+                    child,
+                    root.path().to_str().unwrap(),
+                    "fixture prompt",
+                    Some("fixture-model"),
+                    mission.id,
+                    events.clone(),
+                    CancellationToken::new(),
+                    saved.as_deref(),
+                    saved.is_some(),
+                    GrokAcpIdlePolicy::default(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("unexpected ACP fallback: {}", error.reason));
+                assert!(result.success);
+                assert_eq!(
+                    store
+                        .get_mission(mission.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .session_id
+                        .as_deref(),
+                    Some("fixture-session")
+                );
+            }
+            assert_eq!(
+                grok_session_for_turn(&store, mission.id)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("fixture-session")
+            );
+            assert_eq!(
+                fs::read_to_string(root.path().join("session-methods")).unwrap(),
+                "session/new\nsession/load\n"
+            );
+            assert_eq!(
+                fs::read_to_string(root.path().join("accepted-prompts")).unwrap(),
+                "accepted\naccepted\n"
+            );
+            // A failed store write must stop before accepting any ACP prompt,
+            // and must not authorize fallback into another native session.
+            fs::remove_file(root.path().join("accepted-prompts")).unwrap();
+            let child = tokio::process::Command::new("python3")
+                .args([
+                    "-u",
+                    "-c",
+                    include_str!("fixtures/grok_acp.py"),
+                    "silent_success",
+                ])
+                .current_dir(root.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let error = run_grok_acp_process(
+                Some(&store),
+                child,
+                root.path().to_str().unwrap(),
+                "must not run",
+                Some("fixture-model"),
+                Uuid::new_v4(),
+                events.clone(),
+                CancellationToken::new(),
+                None,
+                false,
+                GrokAcpIdlePolicy::default(),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.continuity_required);
+            assert!(!root.path().join("accepted-prompts").exists());
+
+            let child = tokio::process::Command::new("python3")
+                .args(["-c", "print('{\"session_id\":\"stream-native\",\"type\":\"text\",\"text\":\"done\"}')"])
+                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            let result = run_grok_streaming_process(
+                Some(&store),
+                child,
+                None,
+                mission.id,
+                events.clone(),
+                CancellationToken::new(),
+                false,
+            )
+            .await;
+            assert!(result.success);
+            assert_eq!(
+                store
+                    .get_mission(mission.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .session_id
+                    .as_deref(),
+                Some("stream-native")
+            );
+
+            // A late same-backend response cannot replace the successor's ID
+            // or authorize another ACP prompt.
+            let old = store
+                .begin_mission_run(mission.id, "old", None)
+                .await
+                .unwrap();
+            store
+                .finish_mission_run(old.run_id, old.generation, Some("turn_complete"))
+                .await
+                .unwrap();
+            let newer = store
+                .begin_mission_run(mission.id, "new", None)
+                .await
+                .unwrap();
+            let newer_stamp = crate::api::mission_store::SessionUpdateRun::from(&newer);
+            assert!(store
+                .update_mission_session_id(
+                    mission.id,
+                    "successor-native",
+                    "grok",
+                    Some(&newer_stamp)
+                )
+                .await
+                .unwrap());
+            let child = tokio::process::Command::new("python3")
+                .args([
+                    "-u",
+                    "-c",
+                    include_str!("fixtures/grok_acp.py"),
+                    "silent_success",
+                ])
+                .current_dir(root.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let error = crate::api::runners::SESSION_UPDATE_RUN
+                .scope(
+                    Some(crate::api::mission_store::SessionUpdateRun::from(&old)),
+                    run_grok_acp_process(
+                        Some(&store),
+                        child,
+                        root.path().to_str().unwrap(),
+                        "stale turn must not run",
+                        Some("fixture-model"),
+                        mission.id,
+                        events.clone(),
+                        CancellationToken::new(),
+                        None,
+                        false,
+                        GrokAcpIdlePolicy::default(),
+                    ),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.continuity_required);
+            assert!(!root.path().join("accepted-prompts").exists());
+            assert_eq!(
+                store
+                    .get_mission(mission.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .session_id
+                    .as_deref(),
+                Some("successor-native")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_streaming_missing_resume_preserves_continuity() {
+        use std::process::Stdio;
+        for (is_resume, error, expected) in [
+            (
+                true,
+                "No session found for saved-id",
+                TerminalReason::NativeContinuityRequired,
+            ),
+            (
+                true,
+                "Session not found: saved-id",
+                TerminalReason::NativeContinuityRequired,
+            ),
+            (
+                true,
+                "Session does not exist",
+                TerminalReason::NativeContinuityRequired,
+            ),
+            (false, "Session does not exist", TerminalReason::LlmError),
+            (false, "No session found", TerminalReason::LlmError),
+            (true, "401 invalid credentials", TerminalReason::LlmError),
+        ] {
+            let child = tokio::process::Command::new("sh")
+                .args(["-c", "printf '%s\\n' \"$1\" >&2; exit 1", "fixture", error])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let (events, _) = broadcast::channel(16);
+            let result = run_grok_streaming_process(
+                None,
+                child,
+                None,
+                Uuid::new_v4(),
+                events,
+                CancellationToken::new(),
+                is_resume,
+            )
+            .await;
+            assert_eq!(result.terminal_reason, Some(expected));
+        }
+    }
 
     #[test]
     fn grok_acp_idle_deadlines_distinguish_pending_running_and_finished_tools() {
@@ -2066,6 +3177,7 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             run_grok_acp_process(
+                None,
                 child,
                 root.path().to_str().unwrap(),
                 "fixture prompt",
@@ -2105,6 +3217,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grok_acp_missing_exact_session_requires_reconciliation_without_prompt() {
+        use std::process::Stdio;
+        let root = tempfile::tempdir().unwrap();
+        let child = tokio::process::Command::new("python3")
+            .arg("-u")
+            .arg("-c")
+            .arg(include_str!("fixtures/grok_acp.py"))
+            .arg("missing_session")
+            .current_dir(root.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (events_tx, mut events_rx) = broadcast::channel(64);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_grok_acp_process(
+                None,
+                child,
+                root.path().to_str().unwrap(),
+                "must not replay",
+                Some("fixture-model"),
+                Uuid::new_v4(),
+                events_tx,
+                CancellationToken::new(),
+                Some("original-grok-session"),
+                true,
+                GrokAcpIdlePolicy::default(),
+            ),
+        )
+        .await
+        .unwrap();
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(_) => panic!("missing native history must not run"),
+        };
+        assert!(failure.continuity_required);
+        assert!(failure.reason.contains("No session found"));
+        assert!(!root.path().join("accepted-prompts").exists());
+        while let Ok(event) = events_rx.try_recv() {
+            assert!(!matches!(
+                event,
+                AgentEvent::ToolCall { .. } | AgentEvent::SessionIdUpdate { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn grok_acp_silent_inference_survives_diagnostic_deadline() {
         let (result, events, _) = grok_acp_fixture("silent_success", false).await;
         assert!(result.success, "{}", result.output);
@@ -2115,7 +3277,16 @@ mod tests {
     #[tokio::test]
     async fn grok_acp_dead_transport_times_out_with_evidence_and_no_replay() {
         for scenario in ["dead", "junk", "missing_status", "completed_tool_dead"] {
-            let (result, _, elapsed) = grok_acp_fixture(scenario, false).await;
+            let (result, events, elapsed) = grok_acp_fixture(scenario, false).await;
+            if scenario == "missing_status" {
+                assert_eq!(
+                    result.terminal_reason,
+                    Some(TerminalReason::NativeContinuityRequired)
+                );
+                assert!(!events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::ToolResult { .. })));
+            }
             assert!(!result.success, "scenario: {scenario}");
             assert!(elapsed >= std::time::Duration::from_millis(600));
             assert!(
@@ -2148,7 +3319,14 @@ mod tests {
 
     #[tokio::test]
     async fn grok_acp_stale_running_tool_times_out_after_its_deadline() {
-        let (result, _, elapsed) = grok_acp_fixture("expired_tool", false).await;
+        let (result, events, elapsed) = grok_acp_fixture("expired_tool", false).await;
+        assert_eq!(
+            result.terminal_reason,
+            Some(TerminalReason::NativeContinuityRequired)
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolResult { .. })));
         assert!(!result.success);
         assert_eq!(
             result.data.unwrap()["transport_failure_stage"],
