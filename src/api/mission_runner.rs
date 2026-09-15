@@ -3883,13 +3883,18 @@ async fn run_mission_turn(
             turn_count, summary, user_message
         );
 
-        // Update session ID and notify via events
-        let _ = events_tx.send(AgentEvent::SessionIdUpdate {
-            run: crate::api::runners::session_update_run(),
-            backend: "claudecode".to_string(),
+        // Persist before rotating or allowing a queued successor to start.
+        if let Err(failure) = crate::api::runners::persist_and_publish_native_session(
+            mission_store.as_ref(),
             mission_id,
-            session_id: new_session_id.clone(),
-        });
+            "claudecode",
+            &new_session_id,
+            &events_tx,
+        )
+        .await
+        {
+            return failure;
+        }
 
         session_id = Some(new_session_id.clone());
 

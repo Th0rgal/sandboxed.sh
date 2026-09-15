@@ -385,3 +385,65 @@ replays unknown tool outcomes.
 
 Validation: all 23 Grok runner tests passed in the bounded debug scope;
 `cargo fmt --all` and `git diff --check` passed.
+
+
+## Reviewer7eb F3: acknowledged binding before successor acquisition
+
+The review reproduced a completion-before-broadcast interleaving in each store:
+OpenCode returned with its native ID only in an unread event, the actor refreshed
+the placeholder and acquired a successor, and generation fencing correctly
+rejected the now-stale event. This is an ordering regression introduced by the
+new fence, not evidence that the fence should accept old generations.
+
+OpenCode now awaits the store write before returning completion. Both Claude
+recovery rotations and the periodic mission-runner rotation await that same
+acknowledgement before changing the local session or launching the rotated turn.
+The explicit store comes from TurnContext/the owning mission runner. The shared
+helper captures the already-acquired run stamp, awaits the generation-checked
+write, then emits a notification. A missing store, failed write or stale stamp
+returns NativeContinuityRequired and emits no successful binding notification.
+No completion arm can overtake this awaited write. Grok already persists its
+binding before prompt acceptance; Codex's separate native continuity binding is
+persisted by its driver before its bound notification.
+
+The focused regression covers OpenCode and Claude on memory/file/SQLite stores,
+reopens persistent stores after acknowledgement, leaves notifications unread,
+then executes completion, identity refresh and successor acquisition. The exact
+ID is available before acquisition; delayed actor writes and genuinely stale
+helper calls remain rejected. Failed acknowledgements emit no binding event.
+This is a deterministic queued-completion store interleaving regression using
+the production helper, not a live CLI or full actor scheduling certification.
+
+## Reviewer7eb F1: unresolved legacy provenance, compatibility consequence
+
+The reviewer used real goal metadata updates and private legacy file/SQLite
+records to reproduce a retained UUID. That reproduction is accepted. A legacy
+record has no field proving whether its UUID came from generic allocation or a
+native session. A metadata-touched pending record with no saved run/history/map
+can also reflect a pre-upgrade native identity whose execution evidence was not
+saved. Calling update_mission_goal or update_mission_title proves a metadata
+write occurred; it does not prove there was never an earlier native effect.
+Neither a UUID shape, origin conversation nor absence of modern run rows supplies
+that proof. Removing the timestamp fence would erase some ambiguous identities.
+
+The random allocation and missing provenance are pre-existing defects. However,
+the new exact-session-only resume intentionally removes the old upsert/latest-
+session fallback, so retained placeholders now surface as continuity-required
+failures. This is a compatibility limitation exposed by this PR, not a claim
+that behavior is unchanged or F1 is fixed. New missions/handoffs do not allocate
+Grok placeholders; the narrow untouched migration handles only its existing
+supported subset. Metadata-touched legacy records remain fail-closed, retaining
+their IDs and leases pending independent native-session/provenance evidence.
+No production record was cleared. A future repair needs attested no-execution
+provenance or an explicit evidence-backed reconciliation operation; it must not
+infer permission to create a new session from a failed native load alone.
+
+
+F3 validation after the source change: 49 focused tests passed (one new
+acknowledgement/interleaving test, seven OpenCode, 12 Claude, 23 Grok, three
+handoff/generation store tests, and three cancellation/concurrent-writer/HTTP
+admission tests). The debug build completed in 3m03s under the private 12 GiB,
+200% CPU scope. Formatting and diff checks passed. The operator-reported
+build61d0ba97 exit 0 on ed3d0e55 is a receipt for the preceding head, not this
+source change. This checkpoint awaits independent exact-head review; no repeated
+CI polling, merge, restart or deployment was performed.
