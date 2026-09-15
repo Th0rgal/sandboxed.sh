@@ -182,12 +182,12 @@ test targets compiled; cargo fmt --all and git diff --check passed.
 
 ## Review follow-up: garbage collection and resumability
 
-Both GC phases retain source directories for Failed, Interrupted, Blocked,
-AwaitingUser and Paused missions, regardless of retention age. Those statuses
+Both GC phases retain source directories for Completed, Acknowledged, Failed,
+Interrupted, Blocked, AwaitingUser and Paused missions, regardless of retention age. Those statuses
 still support recovery/replies, so automatic source deletion conflicts with the
 source-loss guard. Same-workspace short-ID collisions now prefer these protected
-statuses over collectible terminal entries. Completed, Acknowledged and NotFeasible
-statuses retain their existing retention-based eligibility.
+statuses over collectible terminal entries. Only NotFeasible retains status-based retention eligibility; orphan cleanup
+still requires its existing independent checks.
 
 The legacy long-stop cutoff remains in the configuration/report shape for
 compatibility but no longer authorizes source deletion for resumable/replyable
@@ -196,7 +196,7 @@ explicitly handle retained work rather than expect automatic source recreation.
 Previously deleted source still requires restoration or a verified explicit
 worktree; no intentional-deletion bypass is introduced.
 
-All seven GC tests passed in a bounded debug scope, including five protected
+All seven GC tests passed in a bounded debug scope, including protected
 statuses past retention and short-ID collisions. No production GC sweep or
 configuration change was performed.
 
@@ -249,3 +249,14 @@ fixtures only; validation of the new head is reported in the PR.
 Local validation: all 73 admission tests and 21 Codex continuity tests passed;
 both previously failing tests also passed ten additional runs each.
 `cargo fmt --all` and `git diff --check` passed.
+
+## Review follow-up: terminal reply targets
+
+Completed and Acknowledged are explicitly reactivated by user messages, so they
+also retain source in both GC phases and receive collision protection. The GC
+regression checks all ten running/recoverable/replyable statuses against the
+control-plane reactivation predicate (with Active/Paused handled explicitly),
+and verifies that NotFeasible remains collectible after retention. This further
+increases retained disk usage; a future archival/deletion lifecycle must make
+source availability explicit before allowing recovery. No such lifecycle or
+production cleanup change is deployed by this PR.

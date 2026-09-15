@@ -12,9 +12,9 @@
 //! be opened from the dashboard; "Load earlier messages" continues to work.
 //!
 //! Terminal statuses we collect:
-//!     Completed, Acknowledged, NotFeasible
+//!     NotFeasible
 //!
-//! Resumable Failed/Interrupted/Blocked and replyable AwaitingUser/Paused
+//! Resumable Failed/Interrupted/Blocked and replyable Completed/Acknowledged/AwaitingUser/Paused
 //! missions retain their source directories regardless of retention age, as do
 //! running missions. Missing source must never become a config-only resume.
 
@@ -188,7 +188,9 @@ fn protection_rank(status: &MissionStatus) -> u8 {
         | MissionStatus::Paused
         | MissionStatus::Failed
         | MissionStatus::Interrupted
-        | MissionStatus::Blocked => 1,
+        | MissionStatus::Blocked
+        | MissionStatus::Completed
+        | MissionStatus::Acknowledged => 1,
         _ => 0,
     }
 }
@@ -1098,10 +1100,7 @@ async fn orphan_sweep(
 /// Retain source for every status that supports recovery or a later reply.
 /// Terminal presentation alone does not authorize deleting a resume target.
 fn is_gc_eligible_status(status: &MissionStatus) -> bool {
-    matches!(
-        status,
-        MissionStatus::Completed | MissionStatus::Acknowledged | MissionStatus::NotFeasible
-    )
+    matches!(status, MissionStatus::NotFeasible)
 }
 
 /// Best-effort recursive size for telemetry. A failure here doesn't block
@@ -1144,12 +1143,21 @@ mod tests {
         let now = Utc::now();
         let cutoff = now - chrono::Duration::days(7);
         for status in [
+            MissionStatus::Active,
+            MissionStatus::Pending,
+            MissionStatus::WaitingBackground,
+            MissionStatus::Completed,
+            MissionStatus::Acknowledged,
             MissionStatus::Failed,
             MissionStatus::Interrupted,
             MissionStatus::Blocked,
             MissionStatus::AwaitingUser,
             MissionStatus::Paused,
         ] {
+            assert!(
+                super::super::control::message_activates_mission(status)
+                    || matches!(status, MissionStatus::Active | MissionStatus::Paused)
+            );
             assert!(
                 !is_gc_eligible_status(&status),
                 "{status:?} must retain source"
@@ -1168,7 +1176,7 @@ mod tests {
             let entries = vec![
                 protected,
                 MissionIndexEntry {
-                    status: MissionStatus::Completed,
+                    status: MissionStatus::NotFeasible,
                     updated_at: now - chrono::Duration::days(40),
                     workspace_id,
                 },
@@ -1184,13 +1192,10 @@ mod tests {
                 true
             ));
         }
-        for status in [
-            MissionStatus::Completed,
-            MissionStatus::Acknowledged,
-            MissionStatus::NotFeasible,
-        ] {
-            assert!(is_gc_eligible_status(&status));
-        }
+        assert!(!super::super::control::message_activates_mission(
+            MissionStatus::NotFeasible
+        ));
+        assert!(is_gc_eligible_status(&MissionStatus::NotFeasible));
     }
 
     #[test]
@@ -1246,7 +1251,7 @@ mod tests {
         ));
 
         let terminal_only = vec![MissionIndexEntry {
-            status: MissionStatus::Completed,
+            status: MissionStatus::NotFeasible,
             updated_at: now - chrono::Duration::days(40),
             workspace_id,
         }];
