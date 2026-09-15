@@ -540,11 +540,27 @@ pub(crate) fn sync_grok_auth_files(
 /// or `$HOME/.grok`) but leaves a stale guest copy (the 2026-05-16 401). Copy
 /// the newest host file when native-file authentication is selected. If the
 /// host has no usable file, preserve the workspace's native credential.
+/// An explicit host HOME owns its credentials and never imports a global cache.
 pub fn sync_host_grok_auth_into_workspace(
     workspace: &crate::workspace::Workspace,
 ) -> Result<Option<PathBuf>, String> {
+    sync_workspace_grok_auth_from_sources(workspace, &grok_auth_paths())
+}
+
+fn sync_workspace_grok_auth_from_sources(
+    workspace: &crate::workspace::Workspace,
+    sources: &[PathBuf],
+) -> Result<Option<PathBuf>, String> {
     let dest = workspace_grok_auth_path(workspace)?;
-    let installed = sync_grok_auth_files(&grok_auth_paths(), &dest)?;
+    if !crate::workspace::use_nspawn_for_workspace(workspace)
+        && workspace.env_vars.contains_key("HOME")
+    {
+        // This includes container fallback: an explicit host HOME is an
+        // account boundary, even if its cache is missing or unreadable. Let
+        // the native CLI handle authentication rather than switch accounts.
+        return Ok(dest.is_file().then_some(dest));
+    }
+    let installed = sync_grok_auth_files(sources, &dest)?;
     if installed.is_some() {
         tracing::info!(
             workspace_id = %workspace.id,
@@ -919,6 +935,54 @@ mod grok_oauth_tests {
         let installed = sync_grok_auth_files(&[missing], &dest).expect("sync");
         assert_eq!(installed, Some(dest.clone()));
         assert_eq!(std::fs::read_to_string(dest).unwrap(), "{}");
+    }
+
+    #[test]
+    fn grok_auth_explicit_host_home_never_imports_another_account() {
+        for fallback in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("account-home");
+            let dest = home.join(".grok/auth.json");
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            let own = serde_json::json!({
+                GROK_OAUTH_CLIENT_KEY: {"auth_mode": "oidc", "key": "workspace-account"}
+            })
+            .to_string();
+            std::fs::write(&dest, &own).unwrap();
+            let source = temp.path().join("global-auth.json");
+            std::fs::write(
+                &source,
+                serde_json::json!({
+                    GROK_OAUTH_CLIENT_KEY: {"auth_mode": "oidc", "key": "unrelated-global-account"}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let mut workspace = if fallback {
+                crate::workspace::Workspace::new_container("fallback".into(), temp.path().into())
+            } else {
+                crate::workspace::Workspace::default_host(temp.path().into())
+            };
+            if fallback {
+                workspace.config = serde_json::json!({"container_fallback": true});
+            }
+            workspace
+                .env_vars
+                .insert("HOME".into(), home.display().to_string());
+            let sources = [source];
+            assert_eq!(
+                super::sync_workspace_grok_auth_from_sources(&workspace, &sources).unwrap(),
+                Some(dest.clone())
+            );
+            assert_eq!(std::fs::read_to_string(&dest).unwrap(), own);
+            // Absence also cannot authorize importing another account.
+            std::fs::remove_file(&dest).unwrap();
+            assert_eq!(
+                super::sync_workspace_grok_auth_from_sources(&workspace, &sources).unwrap(),
+                None
+            );
+            assert!(!dest.exists());
+        }
     }
 
     #[test]

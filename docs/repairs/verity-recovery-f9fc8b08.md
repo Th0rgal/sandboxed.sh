@@ -260,3 +260,22 @@ and verifies that NotFeasible remains collectible after retention. This further
 increases retained disk usage; a future archival/deletion lifecycle must make
 source availability explicit before allowing recovery. No such lifecycle or
 production cleanup change is deployed by this PR.
+
+## Review follow-up: explicit host Grok credentials
+
+Native-file authentication now treats an explicit host HOME as an account
+boundary, including container fallback. Launch preparation validates that HOME
+but does not import a default-home or service-global auth cache, whether the
+workspace file is present or missing. This prevents unrelated global credentials
+from overwriting the workspace account and invalidating native-session identity.
+The native CLI handles missing/invalid credentials in that explicitly selected
+HOME. Default container auth synchronization retains its existing behavior.
+
+The isolated regression supplies distinct synthetic workspace/global accounts,
+checks preservation for host and container-fallback launches, then removes the
+workspace credential and verifies that no global credential is imported. No live
+credential was read or modified by the regression. This does not certify the
+reported live Grok 401 or replace the outstanding isolated provider smoke test.
+
+All 18 Grok auth tests passed locally in a bounded debug scope.
+`cargo fmt --all` and `git diff --check` passed.
