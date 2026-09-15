@@ -463,7 +463,7 @@ pub(crate) fn grok_stdout_line_requests_interactive_login(line: &str) -> bool {
 /// OAuth access tokens are not API keys; native authentication and refresh
 /// belong to the CLI that owns the session and its auth-file format.
 #[allow(clippy::result_large_err)]
-async fn prepare_grok_auth_env(
+async fn prepare_grok_env(
     workspace: &Workspace,
     app_working_dir: &std::path::Path,
     mission_id: Uuid,
@@ -508,6 +508,12 @@ async fn prepare_grok_auth_env(
             0,
         )
         .with_terminal_reason(TerminalReason::LlmError));
+    }
+
+    // Both native transports must inherit the same server-owned policy,
+    // wrapper path and mission-scoped capability as durable workspace jobs.
+    if let Some(remote_env) = workspace.remote_build_env(mission_id) {
+        env.extend(remote_env);
     }
 
     Ok(env)
@@ -717,12 +723,9 @@ async fn run_grok_streaming_json_turn(
         args.push(model.to_string());
     }
 
-    // The Grok CLI authenticates non-interactively via the XAI_API_KEY env var.
-    // The xAI OAuth access token works as a bearer key against api.x.ai, so we
-    // capture the freshest one here and inject it below. Without it the CLI
-    // falls back to an interactive browser sign-in that never completes in a
-    // headless mission — the run then hangs forever ("Agent is working").
-    let env = match prepare_grok_auth_env(workspace, app_working_dir, mission_id).await {
+    // Prepare provider authentication and the same mission-scoped remote
+    // build context used by ACP and the other native runners.
+    let env = match prepare_grok_env(workspace, app_working_dir, mission_id).await {
         Ok(env) => env,
         Err(result) => return result,
     };
@@ -1268,7 +1271,7 @@ async fn run_grok_acp_turn(
         .await
         .map_err(|e| format!("grok CLI unavailable: {e}"))?;
 
-    let env = match prepare_grok_auth_env(workspace, app_working_dir, mission_id).await {
+    let env = match prepare_grok_env(workspace, app_working_dir, mission_id).await {
         Ok(env) => env,
         // Auth failures are terminal for BOTH paths — surface them directly
         // instead of falling back into the same failure.
@@ -1954,6 +1957,116 @@ mod tests {
     use super::*;
     use crate::workspace::WorkspaceType;
     use std::fs;
+
+    #[tokio::test]
+    async fn grok_native_remote_env_reaches_workspace_children() {
+        const CASE: &str = "GROK_REMOTE_ENV_FIXTURE";
+        let Ok(case) = std::env::var(CASE) else {
+            // Isolate signing configuration from the test runner and never
+            // read shared provider credentials or mutate process-global env.
+            for case in ["configured", "unconfigured"] {
+                let result = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "api::runners::grok::tests::grok_native_remote_env_reaches_workspace_children", "--nocapture"])
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env(CASE, case)
+                    .envs(if case == "configured" {
+                        vec![("PORT", "19876"), ("SANDBOXED_INTERNAL_ACTION_SECRET", "synthetic-remote-signing-secret")]
+                    } else {
+                        vec![]
+                    })
+                    .output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{case}: {}{}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            return;
+        };
+        for mode in ["host", "fallback", "container"] {
+            let root = tempfile::tempdir().unwrap();
+            let mission_id = Uuid::new_v4();
+            let mut workspace = if mode == "host" {
+                Workspace::default_host(root.path().to_path_buf())
+            } else {
+                Workspace::new_container("remote-env-fixture".into(), root.path().to_path_buf())
+            };
+            workspace.config = serde_json::json!({
+                "compute_policy": "remote_required",
+                "container_fallback": mode == "fallback",
+                "remote_build": {"node_id": "auto", "requirements": ["lean"], "timeout_secs": 321}
+            });
+            workspace
+                .env_vars
+                .insert("HOME".into(), root.path().display().to_string());
+            workspace
+                .env_vars
+                .insert("XAI_API_KEY".into(), "synthetic-provider-key".into());
+            // Caller/workspace settings cannot downgrade the authoritative policy
+            // or replace the mission identity passed by the runner.
+            workspace
+                .env_vars
+                .insert("SANDBOXED_COMPUTE_POLICY".into(), "local_allowed".into());
+            workspace
+                .env_vars
+                .insert("REMOTE_BUILD_MISSION_ID".into(), Uuid::new_v4().to_string());
+            let env = prepare_grok_env(&workspace, root.path(), mission_id)
+                .await
+                .unwrap_or_else(|_| panic!("fixture preparation failed"));
+            assert_eq!(
+                env.get("SANDBOXED_COMPUTE_POLICY").map(String::as_str),
+                Some("remote_required")
+            );
+            assert_eq!(
+                env.get("REMOTE_BUILD_MISSION_ID"),
+                Some(&mission_id.to_string())
+            );
+            assert_eq!(
+                env.get("REMOTE_BUILD_TIMEOUT_SECS").map(String::as_str),
+                Some("321")
+            );
+            assert_eq!(env.contains_key("REMOTE_BUILD_URL"), case == "configured");
+            assert_eq!(env.contains_key("REMOTE_BUILD_TOKEN"), case == "configured");
+            let wrapper = env
+                .get("REMOTE_BUILD_COMMAND")
+                .expect("mission wrapper path");
+            assert!(env["PATH"].starts_with(&format!(
+                "{}:",
+                std::path::Path::new(wrapper).parent().unwrap().display()
+            )));
+            if case == "configured" {
+                assert_eq!(
+                    env["REMOTE_BUILD_URL"],
+                    format!(
+                        "http://{}:19876/api/remote-build",
+                        workspace.host_ip_from_workspace()
+                    )
+                );
+                use base64::Engine;
+                let payload = env["REMOTE_BUILD_TOKEN"].split('.').next().unwrap();
+                let claims: serde_json::Value = serde_json::from_slice(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(payload)
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(claims["mission_id"], mission_id.to_string());
+                assert!(claims["expires_at"].as_i64().unwrap() > chrono::Utc::now().timestamp());
+            }
+            if mode != "container" {
+                let child = WorkspaceExec::new(workspace).spawn_streaming(
+                    root.path(), "/bin/sh", &["-c".into(),
+                        format!("test \"$SANDBOXED_COMPUTE_POLICY\" = remote_required && test \"$REMOTE_BUILD_MISSION_ID\" = {mission_id} && test -n \"$REMOTE_BUILD_COMMAND\" && test \"${{REMOTE_BUILD_URL:+yes}}\" = {} && test \"${{REMOTE_BUILD_TOKEN:+yes}}\" = {}", if case == "configured" { "yes" } else { "\"\"" }, if case == "configured" { "yes" } else { "\"\"" })], env
+                ).await.unwrap();
+                assert!(
+                    child.wait_with_output().await.unwrap().status.success(),
+                    "{mode}/{case}: child environment"
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn grok_session_is_persisted_without_actor_event_delivery() {

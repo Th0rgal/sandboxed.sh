@@ -229,8 +229,9 @@ and cgroup placement are separate: f43's local workload was in `missions.slice`.
 The diagnostic host required remote execution and had a wrapper, but exposed no
 fleet/submission MCP discovery. No benchmark ran. Inspected runner source cleans
 outputs; the deployed binary was not attested. Remaining bounded work includes
-host launch-scope coverage, Grok remote-environment propagation, catalog exposure
-under its existing owner, and deployed-binary/job receipts before measurement.
+host launch-scope coverage, catalog exposure under its existing owner, and
+deployed-binary/job receipts before measurement. Grok environment propagation
+is addressed by the paired-diagnostic follow-up below.
 These are measurement blockers; they do not establish that Lean isolation is slow.
 Detailed evidence and acceptance criteria are saved in
 `output/architecture-572ed047-assessment.md` in this repair workspace. No message
@@ -293,3 +294,38 @@ Hermes origin attribution remains preserved.
 The file fixture now writes the actual flattened activity field. All 104
 mission-store tests passed in a bounded debug scope; formatting and diff checks
 passed.
+
+## Paired diagnostic follow-up: native Grok remote environment
+
+The operator reports that resumed native Grok f43, with workspace
+`remote_required`, saw `remote-lean-build` exit 75 because REMOTE_BUILD_URL was
+unset. The owning durable workspace_bash job
+`caa4174f-6b88-5507-af9e-a594f6c5c0aa` on the same workspace/mission reported
+URL, TOKEN, MISSION_ID and POLICY present (booleans only). This establishes an
+available credentialed executor path and isolates an environment-preparation
+difference; it is not evidence of blanket remote-service unavailability. The
+operator is using that durable route without copying credentials. This repair
+did not contact or mutate that mission/job.
+
+Both Grok ACP and streaming-JSON already share environment preparation. That
+function now calls `Workspace::remote_build_env(mission_id)`, the same factory
+used by durable jobs and other native runners. It supplies the effective policy,
+mission ID, endpoint, expiring scoped capability, wrapper PATH and configured
+remote requirements. Workspace environment values cannot downgrade the supplied
+policy or replace the runner's mission ID. Missing server configuration still
+preserves remote_required without inventing an endpoint or token.
+
+An isolated subprocess regression uses synthetic signing/provider values and
+checks configured/unconfigured factories for host, container-fallback and
+container layouts. Actual host/fallback WorkspaceExec child processes must
+receive the policy, current mission identity and expected endpoint/token presence.
+The test checks capability mission/expiry claims and wrapper PATH; existing
+capability tests cover signature/scope validation. No network request, credential
+copy, real native session or nspawn deployment is used by this regression.
+
+The regression failed before the injection change (missing remote_required).
+Production rollout and a native remote submission receipt are still outstanding;
+this source fix does not attest a deployed binary or measure Lean performance.
+
+Validation: all 23 Grok runner tests passed in a bounded debug scope.
+`cargo fmt --all` and `git diff --check` passed.
