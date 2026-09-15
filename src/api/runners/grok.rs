@@ -513,6 +513,29 @@ async fn prepare_grok_auth_env(
     Ok(env)
 }
 
+async fn persist_grok_session(
+    store: Option<&std::sync::Arc<dyn crate::api::mission_store::MissionStore>>,
+    mission_id: Uuid,
+    session_id: &str,
+) -> Result<(), String> {
+    if let Some(store) = store {
+        return store
+            .update_mission_session_id(mission_id, session_id, "grok")
+            .await
+            .map_err(|error| format!("Grok native session could not be persisted: {error}"));
+    }
+    // Protocol-only subprocess fixtures do not own a mission store. Real
+    // launch paths must provide the actor's authoritative store.
+    #[cfg(test)]
+    {
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        Err("Grok session persistence store is unavailable".into())
+    }
+}
+
 /// Execute a turn using the Grok Build CLI backend.
 ///
 /// Dispatches to the ACP path (`grok agent stdio`) by default — it is the
@@ -522,6 +545,7 @@ async fn prepare_grok_auth_env(
 /// when the ACP handshake fails before the prompt is sent.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_grok_turn(
+    mission_store: std::sync::Arc<dyn crate::api::mission_store::MissionStore>,
     workspace: &Workspace,
     work_dir: &std::path::Path,
     message: &str,
@@ -580,6 +604,7 @@ pub async fn run_grok_turn(
 
     if env_var_bool("SANDBOXED_SH_GROK_ACP", true) {
         match run_grok_acp_turn(
+            &mission_store,
             workspace,
             work_dir,
             message,
@@ -607,6 +632,7 @@ pub async fn run_grok_turn(
                         .with_terminal_reason(TerminalReason::NativeContinuityRequired);
                 }
                 return run_grok_streaming_json_turn(
+                    &mission_store,
                     workspace,
                     work_dir,
                     message,
@@ -623,6 +649,7 @@ pub async fn run_grok_turn(
         }
     }
     run_grok_streaming_json_turn(
+        &mission_store,
         workspace,
         work_dir,
         message,
@@ -644,6 +671,7 @@ pub async fn run_grok_turn(
 /// Kept as the fallback while the ACP path soaks.
 #[allow(clippy::too_many_arguments)]
 async fn run_grok_streaming_json_turn(
+    mission_store: &std::sync::Arc<dyn crate::api::mission_store::MissionStore>,
     workspace: &Workspace,
     work_dir: &std::path::Path,
     message: &str,
@@ -710,6 +738,7 @@ async fn run_grok_streaming_json_turn(
         }
     };
     run_grok_streaming_process(
+        Some(mission_store),
         child,
         model,
         mission_id,
@@ -721,6 +750,7 @@ async fn run_grok_streaming_json_turn(
 }
 
 async fn run_grok_streaming_process(
+    mission_store: Option<&std::sync::Arc<dyn crate::api::mission_store::MissionStore>>,
     mut child: tokio::process::Child,
     model: Option<&str>,
     mission_id: Uuid,
@@ -842,6 +872,12 @@ async fn run_grok_streaming_process(
                             }
                         };
                         if let Some(sid) = grok_event_session_id(&value) {
+                            if let Err(error) = persist_grok_session(mission_store, mission_id, &sid).await {
+                                let _ = child.kill().await;
+                                if let Some(handle) = stderr_handle.take() { handle.abort(); }
+                                return AgentResult::failure(error, 0)
+                                    .with_terminal_reason(TerminalReason::NativeContinuityRequired);
+                            }
                             let _ = events_tx.send(AgentEvent::SessionIdUpdate {
                                 backend: "grok".to_string(),
                                 session_id: sid,
@@ -1212,6 +1248,7 @@ fn grok_acp_update_is_terminal(update: &serde_json::Value) -> bool {
 /// back to the streaming-json path without double-executing the turn.
 #[allow(clippy::too_many_arguments)]
 async fn run_grok_acp_turn(
+    mission_store: &std::sync::Arc<dyn crate::api::mission_store::MissionStore>,
     workspace: &Workspace,
     work_dir: &std::path::Path,
     message: &str,
@@ -1248,6 +1285,7 @@ async fn run_grok_acp_turn(
         .map_err(|e| format!("failed to spawn grok agent stdio: {e}"))?;
 
     run_grok_acp_process(
+        Some(mission_store),
         child,
         &workspace_exec.translate_path_for_container(work_dir),
         message,
@@ -1266,6 +1304,7 @@ async fn run_grok_acp_turn(
 // exercised with a local ACP fixture, without credentials or inference calls.
 #[allow(clippy::too_many_arguments)]
 async fn run_grok_acp_process(
+    mission_store: Option<&std::sync::Arc<dyn crate::api::mission_store::MissionStore>>,
     mut child: tokio::process::Child,
     acp_cwd: &str,
     message: &str,
@@ -1437,6 +1476,8 @@ async fn run_grok_acp_process(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "grok ACP session/new returned no sessionId".to_string())?
                 .to_string();
+            persist_grok_session(mission_store, mission_id, &sid)
+                .await.map_err(|error| format!("{error}; {GROK_ACP_CONTINUITY_REQUIRED}"))?;
             let _ = events_tx.send(AgentEvent::SessionIdUpdate {
                 backend: "grok".to_string(),
                 mission_id,
@@ -1915,6 +1956,157 @@ mod tests {
     use std::fs;
 
     #[tokio::test]
+    async fn grok_session_is_persisted_without_actor_event_delivery() {
+        use crate::api::mission_store::{FileMissionStore, MissionStore, SqliteMissionStore};
+        use std::process::Stdio;
+        use std::sync::Arc;
+        for kind in ["file", "sqlite"] {
+            let root = tempfile::tempdir().unwrap();
+            let store: Arc<dyn MissionStore> = if kind == "file" {
+                Arc::new(
+                    FileMissionStore::new(root.path().to_path_buf(), "ack")
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                Arc::new(
+                    SqliteMissionStore::new(root.path().to_path_buf(), "ack")
+                        .await
+                        .unwrap(),
+                )
+            };
+            let mission = store
+                .create_mission(
+                    Some("session ack"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("grok"),
+                    None,
+                )
+                .await
+                .unwrap();
+            let (events, _unread) = broadcast::channel(64);
+            for _ in 0..2 {
+                let saved = store
+                    .get_mission(mission.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .session_id;
+                let child = tokio::process::Command::new("python3")
+                    .args([
+                        "-u",
+                        "-c",
+                        include_str!("fixtures/grok_acp.py"),
+                        "silent_success",
+                    ])
+                    .current_dir(root.path())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let result = run_grok_acp_process(
+                    Some(&store),
+                    child,
+                    root.path().to_str().unwrap(),
+                    "fixture prompt",
+                    Some("fixture-model"),
+                    mission.id,
+                    events.clone(),
+                    CancellationToken::new(),
+                    saved.as_deref(),
+                    saved.is_some(),
+                    GrokAcpIdlePolicy::default(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("unexpected ACP fallback: {}", error.reason));
+                assert!(result.success);
+                assert_eq!(
+                    store
+                        .get_mission(mission.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .session_id
+                        .as_deref(),
+                    Some("fixture-session")
+                );
+            }
+            assert_eq!(
+                fs::read_to_string(root.path().join("session-methods")).unwrap(),
+                "session/new\nsession/load\n"
+            );
+            assert_eq!(
+                fs::read_to_string(root.path().join("accepted-prompts")).unwrap(),
+                "accepted\naccepted\n"
+            );
+            // A failed store write must stop before accepting any ACP prompt,
+            // and must not authorize fallback into another native session.
+            fs::remove_file(root.path().join("accepted-prompts")).unwrap();
+            let child = tokio::process::Command::new("python3")
+                .args([
+                    "-u",
+                    "-c",
+                    include_str!("fixtures/grok_acp.py"),
+                    "silent_success",
+                ])
+                .current_dir(root.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let error = run_grok_acp_process(
+                Some(&store),
+                child,
+                root.path().to_str().unwrap(),
+                "must not run",
+                Some("fixture-model"),
+                Uuid::new_v4(),
+                events.clone(),
+                CancellationToken::new(),
+                None,
+                false,
+                GrokAcpIdlePolicy::default(),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.continuity_required);
+            assert!(!root.path().join("accepted-prompts").exists());
+
+            let child = tokio::process::Command::new("python3")
+                .args(["-c", "print('{\"session_id\":\"stream-native\",\"type\":\"text\",\"text\":\"done\"}')"])
+                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            let result = run_grok_streaming_process(
+                Some(&store),
+                child,
+                None,
+                mission.id,
+                events.clone(),
+                CancellationToken::new(),
+                false,
+            )
+            .await;
+            assert!(result.success);
+            assert_eq!(
+                store
+                    .get_mission(mission.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .session_id
+                    .as_deref(),
+                Some("stream-native")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn grok_streaming_missing_resume_preserves_continuity() {
         use std::process::Stdio;
         for (is_resume, error, expected) in [
@@ -1940,6 +2132,7 @@ mod tests {
                 .unwrap();
             let (events, _) = broadcast::channel(16);
             let result = run_grok_streaming_process(
+                None,
                 child,
                 None,
                 Uuid::new_v4(),
@@ -2070,6 +2263,7 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             run_grok_acp_process(
+                None,
                 child,
                 root.path().to_str().unwrap(),
                 "fixture prompt",
@@ -2128,6 +2322,7 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             run_grok_acp_process(
+                None,
                 child,
                 root.path().to_str().unwrap(),
                 "must not replay",

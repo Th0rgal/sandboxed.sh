@@ -2700,6 +2700,7 @@ pub struct MissionRunner {
 
     /// Durable generation lease for the currently executing turn.
     pub durable_run: Option<crate::api::mission_store::MissionRun>,
+    session_store: Option<Arc<dyn crate::api::mission_store::MissionStore>>,
 
     /// Once cancellation is requested, this runner must drain its current
     /// handle and be removed without starting queued or automated follow-ups.
@@ -2759,6 +2760,7 @@ impl MissionRunner {
             active_tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             background_tasks: HashMap::new(),
             durable_run: None,
+            session_store: None,
             cancellation_requested: false,
             cancellation_force_clear_deadline: None,
             force_abort_requested: false,
@@ -2790,6 +2792,7 @@ impl MissionRunner {
                 run.run_id, run.generation
             ));
         }
+        self.session_store = Some(mission_store.clone());
         self.durable_run = Some(run);
         Ok(())
     }
@@ -3114,8 +3117,10 @@ impl MissionRunner {
             source: msg_source,
         });
 
+        let session_store = self.session_store.clone();
         let handle = tokio::spawn(async move {
             let result = run_mission_turn(
+                session_store,
                 config,
                 root_agent,
                 mcp,
@@ -3497,6 +3502,7 @@ pub(crate) fn claudecode_resume_current_session_message() -> &'static str {
 /// Execute a single turn for a mission.
 #[allow(clippy::too_many_arguments)]
 async fn run_mission_turn(
+    mission_store: Option<Arc<dyn crate::api::mission_store::MissionStore>>,
     config: Config,
     _root_agent: AgentRef,
     mcp: Arc<McpRegistry>,
@@ -3958,6 +3964,7 @@ async fn run_mission_turn(
             };
             runner
                 .run_turn(super::runners::TurnContext {
+                    mission_store,
                     workspace: &workspace,
                     work_dir: &mission_work_dir,
                     message: &turn_message,

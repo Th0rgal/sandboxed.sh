@@ -148,5 +148,15 @@ from migration. The file/SQLite reopen regression now includes attribution on
 both eligible and ineligible records and verifies that attribution survives.
 Both harness-session tests passed in a bounded debug scope.
 
-The newly reported completion/session-event ordering race remains under repair:
-queued work must not start until the generated native ID is persisted.
+The completion/session-event race is repaired by passing the actor's mission
+store through both launch paths. Grok awaits native-session persistence before
+sending an ACP prompt and before emitting a streaming session notification.
+Broadcast delivery is no longer required for the next turn to read that ID.
+A failed ACP persistence write refuses the prompt and transport fallback.
+
+The subprocess regression leaves actor notifications unread, runs two ACP turns
+through file and SQLite stores, and verifies session/new followed by session/load.
+It also checks streaming persistence and a failed write that accepts no prompt.
+
+Validation: all 22 Grok runner tests passed in a bounded debug scope; all
+library test targets compiled with the main and parallel launch plumbing.

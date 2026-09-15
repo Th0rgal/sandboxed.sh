@@ -35,6 +35,7 @@ use crate::workspace::Workspace;
 /// `convo`, `/goal` passthrough) is the caller's responsibility — by the time
 /// a `TurnContext` exists, `message` is exactly what the harness should see.
 pub(crate) struct TurnContext<'a> {
+    pub mission_store: Option<Arc<dyn super::mission_store::MissionStore>>,
     pub workspace: &'a Workspace,
     pub work_dir: &'a std::path::Path,
     pub message: &'a str,
@@ -222,7 +223,14 @@ impl HarnessRunner for GrokRunner {
         &'a self,
         ctx: TurnContext<'a>,
     ) -> Pin<Box<dyn Future<Output = AgentResult> + Send + 'a>> {
+        let Some(mission_store) = ctx.mission_store else {
+            return Box::pin(async {
+                AgentResult::failure("Grok session persistence store is unavailable", 0)
+                    .with_terminal_reason(crate::agents::TerminalReason::NativeContinuityRequired)
+            });
+        };
         Box::pin(grok::run_grok_turn(
+            mission_store,
             ctx.workspace,
             ctx.work_dir,
             ctx.message,

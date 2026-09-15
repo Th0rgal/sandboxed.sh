@@ -20946,8 +20946,10 @@ async fn control_actor_loop(
                                         continue;
                                     }
                                 };
+                                let turn_mission_store = mission_store.clone();
                                 running = Some(tokio::spawn(async move {
                                     let result = run_single_control_turn(
+                                        turn_mission_store,
                                         cfg,
                                         agent,
                                         mcp_ref,
@@ -22423,8 +22425,10 @@ async fn control_actor_loop(
                                                 continue;
                                             }
                                         };
+                                        let turn_mission_store = mission_store.clone();
                                         running = Some(tokio::spawn(async move {
                                             let result = run_single_control_turn(
+                                                turn_mission_store,
                                                 cfg,
                                                 agent,
                                                 mcp_ref,
@@ -23538,8 +23542,10 @@ async fn control_actor_loop(
                     main_runner_active_tool_calls
                         .store(0, std::sync::atomic::Ordering::Relaxed);
                     let user_id_for_turn = session_user_id.clone();
+                    let turn_mission_store = mission_store.clone();
                     running = Some(tokio::spawn(async move {
                         let result = run_single_control_turn(
+                            turn_mission_store,
                             cfg,
                             agent,
                             mcp_ref,
@@ -24964,6 +24970,7 @@ async fn control_actor_loop(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_single_control_turn(
+    mission_store: Arc<dyn MissionStore>,
     mut config: Config,
     _root_agent: AgentRef,
     mcp: Arc<McpRegistry>,
@@ -25199,6 +25206,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(crate::api::runners::ClaudeCodeRunner.run_turn(
                 crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     message: &user_message,
@@ -25237,6 +25245,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(
                 crate::api::runners::GrokRunner.run_turn(crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     message: &grok_message_owned,
@@ -25284,6 +25293,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(
                 crate::api::runners::CodexRunner.run_turn(crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     message: codex_message,
@@ -25310,6 +25320,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(
                 crate::api::runners::GeminiRunner.run_turn(crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     message: &convo,
@@ -25336,6 +25347,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(
                 crate::api::runners::ChatGptUiRunner.run_turn(crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     // The browser always starts a fresh chat, so include the
@@ -25413,6 +25425,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(crate::api::runners::OpenCodeRunner.run_turn(
                 crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     message: &opencode_message_owned,
