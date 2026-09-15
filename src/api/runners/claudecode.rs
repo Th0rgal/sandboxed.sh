@@ -3007,6 +3007,7 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
                     "Resume transcript exceeds cap; rotating to a fresh session before first attempt"
                 );
                 let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                    backend: "claudecode".to_string(),
                     mission_id,
                     session_id: new_session_id.clone(),
                 });
@@ -3156,6 +3157,7 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
                 );
 
                 let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                    backend: "claudecode".to_string(),
                     mission_id,
                     session_id: new_session_id.clone(),
                 });

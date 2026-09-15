@@ -164,6 +164,7 @@ impl Harness {
             .unwrap();
         let app = axum::Router::new()
             .nest("/remote-build", crate::api::remote_build::routes())
+            .nest("/workspaces", crate::api::workspaces::routes())
             .route("/message", axum::routing::post(post_message))
             .route("/missions", axum::routing::post(create_mission))
             .route("/missions/:id/resume", axum::routing::post(resume_mission))
@@ -405,6 +406,105 @@ async fn track_dispatch_replaces_cancelled_and_acknowledged_owner_without_timer(
 }
 
 #[tokio::test]
+async fn oversized_native_goal_is_rejected_before_mission_dispatch() {
+    let h = Harness::new().await;
+    let response = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&json!({"backend":"codex", "prompt":format!("/goal {}", "x".repeat(4001))}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response.text().await.unwrap().contains("maximum is 4000"));
+    assert!(h.control.assignment_owners.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn host_workspace_creation_is_ready_on_disk_and_rejects_file_roots() {
+    let h = Harness::new().await;
+    let root = h._dir.path().join("new-host/source");
+    let response = h
+        .state
+        .http_client
+        .post(format!("{}/workspaces", h.url))
+        .json(&json!({"name":"new-host", "workspace_type":"host", "path":root}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}: {}",
+        response.status(),
+        response.text().await.unwrap()
+    );
+    assert!(
+        root.is_dir(),
+        "ready host root must exist before admission can stat it"
+    );
+    let invalid = h._dir.path().join("file-root");
+    std::fs::write(&invalid, "existing source").unwrap();
+    let response = h
+        .state
+        .http_client
+        .post(format!("{}/workspaces", h.url))
+        .json(&json!({"name":"invalid-host", "workspace_type":"host", "path":invalid}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(std::fs::read_to_string(invalid).unwrap(), "existing source");
+}
+
+#[tokio::test]
+async fn explicit_cancel_releases_parked_blocked_owner_without_resuming_it() {
+    let h = Harness::new().await;
+    let old = h.writer(MissionStatus::Blocked, None).await;
+    h.control
+        .mission_store
+        .update_mission_status_with_reason(
+            old.id,
+            MissionStatus::Blocked,
+            Some("native_goal_stopped"),
+        )
+        .await
+        .unwrap();
+    let candidate = track_dispatch_candidate(&h).await;
+    assert!(bind_track_dispatch(&h, &candidate).await.is_err());
+
+    for _ in 0..2 {
+        let Json(receipt) = cancel_mission(
+            State(h.state.clone()),
+            Extension(h.user.clone()),
+            Path(old.id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt["ok"], true);
+        let parked = h
+            .control
+            .mission_store
+            .get_mission(old.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parked.status, MissionStatus::Interrupted);
+        assert!(h
+            .control
+            .mission_store
+            .get_active_mission_run(old.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+    bind_track_dispatch(&h, &candidate).await.unwrap();
+    let leases = h.state.projects.live_leases(None).unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].attempt_id, candidate.id.to_string());
+}
+
+#[tokio::test]
 async fn track_dispatch_retains_nonterminal_and_native_goal_owners() {
     for status in [
         MissionStatus::Active,
@@ -553,6 +653,9 @@ fn isolated_track_http_test(test_name: &str) -> bool {
             ])
             .env(CHILD, test_name)
             .env("MISSION_DISK_EMERGENCY_RESERVE_GB", "0")
+            // Fixture project names must not be rewritten by the host's
+            // live controller routes (for example lido -> verity-lido).
+            .env_remove("HERMES_PROJECTS_DIR")
             .output()
             .unwrap();
         assert!(
@@ -703,7 +806,7 @@ async fn track_dispatch_http_creation_reconciles_without_deadlocking_actor_or_pr
         assert_ne!(mission.id, old.id);
         assert_eq!(mission.project.track.as_deref(), Some("trio-reserve1"));
         let leases = h.state.projects.live_leases(None).unwrap();
-        assert_eq!(leases.len(), 1);
+        assert_eq!(leases.len(), 1, "pr={pr:?}, leases={leases:?}");
         assert_eq!(leases[0].attempt_id, mission.id.to_string());
     }
 }
@@ -1086,7 +1189,8 @@ async fn http_actor_same_work_with_exclusions_and_missing_pr_can_queue() {
     let response = h.request(false, m.id, json!({"content":"Continue RESERVE-1 PR 244. Exclude PRs #230/#231 and coordinate with the ALLOC-1 collaborator.", "continue_identity":Harness::assertion(&m)})).await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let after = h
@@ -1259,7 +1363,8 @@ async fn http_actor_resume_reacquires_track_and_preserves_goal_without_prompt() 
         .await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let after = h
@@ -1312,7 +1417,8 @@ async fn http_actor_retask_requires_edit_or_a_trusted_semantic_assertion() {
         .await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     assert_eq!(
@@ -1396,7 +1502,8 @@ async fn accepted_dispatch_cleanup_failure_is_not_reported_as_rejection() {
     let response = h.request(false, m.id, json!({"content":"Different work", "github_pr":"", "track":"new-track", "title":"Different work"})).await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     actor.await.unwrap();
@@ -1444,7 +1551,8 @@ async fn http_actor_custom_resume_delivers_exactly_the_custom_prompt() {
         .await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1512,7 +1620,8 @@ async fn http_actor_resume_dequeue_failure_keeps_accepted_prompt_and_assignment(
     let response = h.request(true, m.id, json!({"content":"durable custom resume", "github_pr":"", "track":"new-track", "title":"Different work"})).await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let after = h
@@ -1597,7 +1706,8 @@ async fn http_actor_title_edit_does_not_deadlock_and_honors_recovery_fence() {
         .unwrap();
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let before = h
@@ -1800,7 +1910,8 @@ async fn http_real_reader_promotion_without_pr_checks_owner_and_persists_writer_
         .unwrap();
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let promoted = h
@@ -1822,7 +1933,8 @@ async fn http_real_reader_promotion_without_pr_checks_owner_and_persists_writer_
         .await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let leases = h.state.projects.live_leases(None).unwrap();
@@ -2533,7 +2645,8 @@ async fn pending_deferred_assignment_refuses_multiple_retags_without_concatenati
     let response = h.request(false, m.id, json!({"content":"Continue old RESERVE-1 with extra evidence", "continue_identity":Harness::assertion(&m)})).await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let deferred = h
@@ -3066,7 +3179,8 @@ async fn remote_poll_loss_and_cancel_ack_retain_ownership_until_terminal_cleanup
         .await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     server.abort();
@@ -3423,7 +3537,8 @@ async fn http_terminal_build_response_retains_cleanup_after_request_and_node_los
         .unwrap();
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let response: Value = response.json().await.unwrap();
@@ -3988,7 +4103,8 @@ async fn adversarial_project_edit_cleanup_retries_after_database_reopen() {
         .unwrap();
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let reopened = ProjectsStore::open(h._dir.path().join("projects.db")).unwrap();
@@ -4461,7 +4577,8 @@ async fn adversarial_internal_tag_between_snapshot_and_identity_write_survives_a
     let response = h.request(false, m.id, json!({"content":"different work", "track":"new-track", "github_pr":"", "title":"different work"})).await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     actor.await.unwrap();

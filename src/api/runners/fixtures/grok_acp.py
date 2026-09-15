@@ -23,6 +23,10 @@ for line in sys.stdin:
     if method == "initialize":
         result = {"protocolVersion": 1}
     elif method in ("session/new", "session/load"):
+        if scenario == "missing_session" and method == "session/load":
+            emit({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message": "No session found"}})
+            break
         result = {"sessionId": "fixture-session"}
     elif method == "session/set_model":
         result = {}

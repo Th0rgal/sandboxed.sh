@@ -519,6 +519,13 @@ CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status);
 CREATE INDEX IF NOT EXISTS idx_missions_status_updated ON missions(status, updated_at);
 
+CREATE TABLE IF NOT EXISTS mission_harness_sessions (
+    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    backend TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    PRIMARY KEY (mission_id, backend)
+);
+
 CREATE TABLE IF NOT EXISTS mission_runs (
     run_id TEXT PRIMARY KEY NOT NULL,
     mission_id TEXT NOT NULL,
@@ -3800,7 +3807,7 @@ impl MissionStore for SqliteMissionStore {
             paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
-            session_id: Some(session_id.clone()),
+            session_id: (backend != "grok").then(|| session_id.clone()),
             terminal_reason: None,
             terminal_evidence: None,
             parent_mission_id,
@@ -4367,7 +4374,29 @@ impl MissionStore for SqliteMissionStore {
         let id_str = id.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+            let mut connection = conn.blocking_lock();
+            let conn = connection.transaction().map_err(|e| e.to_string())?;
+            let (old_backend, old_session): (String, Option<String>) = conn.query_row(
+                "SELECT COALESCE(backend, 'opencode'), session_id FROM missions WHERE id = ?1",
+                params![id_str], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).map_err(|e| e.to_string())?;
+            let target = backend.as_deref().unwrap_or(&old_backend);
+            let selected_session = if target == old_backend {
+                old_session
+            } else {
+                if let Some(previous) = old_session {
+                    conn.execute(
+                        "INSERT INTO mission_harness_sessions (mission_id, backend, session_id) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(mission_id, backend) DO UPDATE SET session_id = excluded.session_id",
+                        params![id_str, old_backend, previous],
+                    ).map_err(|e| e.to_string())?;
+                }
+                conn.query_row(
+                    "SELECT session_id FROM mission_harness_sessions WHERE mission_id = ?1 AND backend = ?2",
+                    params![id_str, target], |row| row.get::<_, String>(0),
+                ).optional().map_err(|e| e.to_string())?
+                    .or_else(|| (target != "grok").then(|| session_id.clone()))
+            };
             let changed = conn
                 .execute(
                     "UPDATE missions
@@ -4378,9 +4407,6 @@ impl MissionStore for SqliteMissionStore {
                          fast_mode = CASE WHEN ?9 THEN ?10 ELSE fast_mode END,
                          config_profile = CASE WHEN ?11 THEN ?12 ELSE config_profile END,
                          session_id = ?13,
-                         resumable = 0,
-                         interrupted_at = NULL,
-                         terminal_reason = NULL,
                          updated_at = ?14
                      WHERE id = ?15",
                     params![
@@ -4396,7 +4422,7 @@ impl MissionStore for SqliteMissionStore {
                         fast_mode,
                         config_profile_set,
                         config_profile,
-                        session_id,
+                        selected_session,
                         now,
                         id_str,
                     ],
@@ -4405,6 +4431,7 @@ impl MissionStore for SqliteMissionStore {
             if changed == 0 {
                 return Err(format!("Mission {} not found", id_str));
             }
+            conn.commit().map_err(|e| e.to_string())?;
             Ok(())
         })
         .await
@@ -4729,22 +4756,39 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
-    async fn update_mission_session_id(&self, id: Uuid, session_id: &str) -> Result<(), String> {
+    async fn update_mission_session_id(
+        &self,
+        id: Uuid,
+        session_id: &str,
+        backend: &str,
+    ) -> Result<(), String> {
+        if backend.is_empty() {
+            return Err("native session update requires harness provenance".into());
+        }
         let conn = self.conn.clone();
         let now = now_string();
         let session_id = session_id.to_string();
-
+        let backend = backend.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            conn.execute(
-                "UPDATE missions SET session_id = ?1, updated_at = ?2 WHERE id = ?3",
-                params![session_id, now, id.to_string()],
-            )
-            .map_err(|e| e.to_string())?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+            let mut connection = conn.blocking_lock();
+            let tx = connection.transaction().map_err(|e| e.to_string())?;
+            let current_backend: String = tx.query_row(
+                "SELECT COALESCE(backend, 'opencode') FROM missions WHERE id = ?1",
+                params![id.to_string()], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO mission_harness_sessions (mission_id, backend, session_id) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(mission_id, backend) DO UPDATE SET session_id = excluded.session_id",
+                params![id.to_string(), backend, session_id],
+            ).map_err(|e| e.to_string())?;
+            if current_backend == backend {
+                tx.execute(
+                    "UPDATE missions SET session_id = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![session_id, now, id.to_string()],
+                ).map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())
+        }).await.map_err(|e| e.to_string())?
     }
 
     async fn update_mission_goal(

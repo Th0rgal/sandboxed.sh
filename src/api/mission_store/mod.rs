@@ -2445,7 +2445,12 @@ pub trait MissionStore: Send + Sync {
     }
 
     /// Update mission session ID (for backends that generate their own IDs).
-    async fn update_mission_session_id(&self, id: Uuid, session_id: &str) -> Result<(), String>;
+    async fn update_mission_session_id(
+        &self,
+        id: Uuid,
+        session_id: &str,
+        backend: &str,
+    ) -> Result<(), String>;
 
     /// Update cached goal-mode metadata for missions started with `/goal`.
     async fn update_mission_goal(
@@ -4539,5 +4544,182 @@ mod admission_restore_tests {
             missions[0].terminal_evidence.as_deref(),
             Some("original observation")
         );
+    }
+}
+
+/// Select the current harness's own session without erasing other harnesses.
+/// Grok allocates native IDs itself: None means first entry, never --continue.
+fn select_harness_session(
+    mission: &Mission,
+    backend: Option<&str>,
+    allocated_id: &str,
+    sessions: &mut HashMap<String, String>,
+) -> Option<String> {
+    let target = backend.unwrap_or(&mission.backend);
+    if target == mission.backend {
+        return mission.session_id.clone();
+    }
+    if let Some(id) = mission.session_id.as_ref() {
+        sessions.insert(mission.backend.clone(), id.clone());
+    }
+    sessions
+        .get(target)
+        .cloned()
+        .or_else(|| (target != "grok").then(|| allocated_id.to_string()))
+}
+
+#[cfg(test)]
+mod harness_session_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn harness_handoffs_preserve_identity_stop_evidence_and_late_updates() {
+        for kind in ["memory", "file", "sqlite"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn MissionStore> = match kind {
+                "file" => Arc::new(
+                    FileMissionStore::new(dir.path().to_path_buf(), "harness-test")
+                        .await
+                        .unwrap(),
+                ),
+                "sqlite" => Arc::new(
+                    SqliteMissionStore::new(dir.path().to_path_buf(), "harness-test")
+                        .await
+                        .unwrap(),
+                ),
+                _ => Arc::new(InMemoryMissionStore::new()),
+            };
+            let mission = store
+                .create_mission(
+                    Some("native handoff"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("codex"),
+                    None,
+                )
+                .await
+                .unwrap();
+            store
+                .update_mission_session_id(mission.id, "codex-native:original", "codex")
+                .await
+                .unwrap();
+            store
+                .update_mission_status_with_reason(
+                    mission.id,
+                    MissionStatus::Blocked,
+                    Some("codex_continuity_required"),
+                )
+                .await
+                .unwrap();
+            let grok = store
+                .update_mission_run_settings(
+                    mission.id,
+                    Some("grok"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "unverified-generated-id",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                grok.session_id, None,
+                "{kind}: first Grok entry is not a native continuation"
+            );
+            assert_eq!(grok.status, MissionStatus::Blocked);
+            assert_eq!(
+                grok.terminal_reason.as_deref(),
+                Some("codex_continuity_required")
+            );
+            // A late old-harness event is retained for that harness, not projected
+            // as the new harness's session while the old turn drains.
+            store
+                .update_mission_session_id(mission.id, "codex-native:late", "codex")
+                .await
+                .unwrap();
+            assert!(store
+                .get_mission(mission.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .session_id
+                .is_none());
+            store
+                .update_mission_session_id(mission.id, "grok-real-native-id", "grok")
+                .await
+                .unwrap();
+            let changed = store
+                .update_mission_run_settings(
+                    mission.id,
+                    None,
+                    None,
+                    Some(Some("model-change")),
+                    None,
+                    None,
+                    None,
+                    "must-not-rotate",
+                )
+                .await
+                .unwrap();
+            assert_eq!(changed.session_id.as_deref(), Some("grok-real-native-id"));
+            let store: Arc<dyn MissionStore> = match kind {
+                "file" => Arc::new(
+                    FileMissionStore::new(dir.path().to_path_buf(), "harness-test")
+                        .await
+                        .unwrap(),
+                ),
+                "sqlite" => Arc::new(
+                    SqliteMissionStore::new(dir.path().to_path_buf(), "harness-test")
+                        .await
+                        .unwrap(),
+                ),
+                _ => store,
+            };
+            let codex = store
+                .update_mission_run_settings(
+                    mission.id,
+                    Some("codex"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "must-not-replace",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                codex.session_id.as_deref(),
+                Some("codex-native:late"),
+                "{kind}"
+            );
+            let grok = store
+                .update_mission_run_settings(
+                    mission.id,
+                    Some("grok"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "must-not-replace",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                grok.session_id.as_deref(),
+                Some("grok-real-native-id"),
+                "{kind}"
+            );
+            assert!(store
+                .update_mission_session_id(mission.id, "unattributed", "")
+                .await
+                .is_err());
+        }
     }
 }

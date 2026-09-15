@@ -202,6 +202,9 @@ pub enum AgentEvent {
     },
     /// Session ID update (for backends that generate their own session IDs)
     SessionIdUpdate {
+        /// Harness that issued this ID; late updates must not replace another harness.
+        #[serde(default)]
+        backend: String,
         /// The new session ID to use for continuation
         session_id: String,
         /// Mission this session ID belongs to

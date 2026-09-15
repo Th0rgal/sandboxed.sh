@@ -130,6 +130,7 @@ fn persisted_terminal_reason(reason: Option<&str>) -> Option<TerminalReason> {
         Some("completed") => Some(TerminalReason::Completed),
         Some("native_goal_stopped") => Some(TerminalReason::NativeGoalStopped),
         Some("codex_continuity_required") => Some(TerminalReason::CodexContinuityRequired),
+        Some("native_continuity_required") => Some(TerminalReason::NativeContinuityRequired),
         Some("cancelled") => Some(TerminalReason::Cancelled),
         Some("server_shutdown") => Some(TerminalReason::ServerShutdown),
         Some("llm_error") => Some(TerminalReason::LlmError),

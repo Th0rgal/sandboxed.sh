@@ -18,6 +18,7 @@ const METADATA_SOURCE_USER: &str = "user";
 #[derive(Clone)]
 pub struct InMemoryMissionStore {
     missions: Arc<RwLock<HashMap<Uuid, Mission>>>,
+    harness_sessions: Arc<RwLock<HashMap<Uuid, HashMap<String, String>>>>,
     trees: Arc<RwLock<HashMap<Uuid, AgentTreeNode>>>,
     board_tasks: Arc<RwLock<HashMap<Uuid, BoardTask>>>,
     /// FLEET-001 scheduling: deferred goals held outside the Mission struct
@@ -33,6 +34,7 @@ impl InMemoryMissionStore {
     pub fn new() -> Self {
         Self {
             missions: Arc::new(RwLock::new(HashMap::new())),
+            harness_sessions: Arc::new(RwLock::new(HashMap::new())),
             trees: Arc::new(RwLock::new(HashMap::new())),
             board_tasks: Arc::new(RwLock::new(HashMap::new())),
             deferred_goals: Arc::new(RwLock::new(HashMap::new())),
@@ -336,7 +338,7 @@ impl MissionStore for InMemoryMissionStore {
             paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
-            session_id: Some(Uuid::new_v4().to_string()),
+            session_id: (backend != Some("grok")).then(|| Uuid::new_v4().to_string()),
             terminal_reason: None,
             terminal_evidence: None,
             parent_mission_id,
@@ -624,6 +626,16 @@ impl MissionStore for InMemoryMissionStore {
             .get_mut(&id)
             .ok_or_else(|| format!("Mission {} not found", id))?;
 
+        let selected_session = {
+            let mut sessions = self.harness_sessions.write().await;
+            super::select_harness_session(
+                mission,
+                backend,
+                session_id,
+                sessions.entry(id).or_default(),
+            )
+        };
+
         if let Some(backend) = backend {
             mission.backend = backend.to_string();
         }
@@ -642,10 +654,7 @@ impl MissionStore for InMemoryMissionStore {
         if let Some(config_profile) = config_profile {
             mission.config_profile = config_profile.map(ToString::to_string);
         }
-        mission.session_id = Some(session_id.to_string());
-        mission.resumable = false;
-        mission.interrupted_at = None;
-        mission.terminal_reason = None;
+        mission.session_id = selected_session;
         mission.updated_at = now_string();
 
         Ok(mission.clone())
@@ -768,13 +777,29 @@ impl MissionStore for InMemoryMissionStore {
         Ok(())
     }
 
-    async fn update_mission_session_id(&self, id: Uuid, session_id: &str) -> Result<(), String> {
+    async fn update_mission_session_id(
+        &self,
+        id: Uuid,
+        session_id: &str,
+        backend: &str,
+    ) -> Result<(), String> {
         let mut missions = self.missions.write().await;
         let mission = missions
             .get_mut(&id)
             .ok_or_else(|| format!("Mission {} not found", id))?;
-        mission.session_id = Some(session_id.to_string());
-        mission.updated_at = now_string();
+        if backend.is_empty() {
+            return Err("native session update requires harness provenance".into());
+        }
+        self.harness_sessions
+            .write()
+            .await
+            .entry(id)
+            .or_default()
+            .insert(backend.to_string(), session_id.to_string());
+        if mission.backend == backend {
+            mission.session_id = Some(session_id.to_string());
+            mission.updated_at = now_string();
+        }
         Ok(())
     }
 
@@ -790,6 +815,7 @@ impl MissionStore for InMemoryMissionStore {
     async fn delete_mission(&self, id: Uuid) -> Result<bool, String> {
         let removed = self.missions.write().await.remove(&id).is_some();
         self.trees.write().await.remove(&id);
+        self.harness_sessions.write().await.remove(&id);
         Ok(removed)
     }
 
@@ -1373,7 +1399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_mission_run_settings_clears_terminal_reason() {
+    async fn update_mission_run_settings_preserves_stop_until_dispatch() {
         let store = InMemoryMissionStore::new();
         let mission = store
             .create_mission(Some("Initial"), None, None, None, None, None, None)
@@ -1403,10 +1429,10 @@ mod tests {
             .await
             .expect("update run settings");
 
-        assert_eq!(updated.terminal_reason, None);
+        assert_eq!(updated.terminal_reason.as_deref(), Some("rate_limited"));
         assert_eq!(updated.session_id.as_deref(), Some("new-session"));
-        assert!(!updated.resumable);
-        assert_eq!(updated.interrupted_at, None);
+        assert!(updated.resumable);
+        assert!(updated.interrupted_at.is_none());
     }
 
     #[tokio::test]

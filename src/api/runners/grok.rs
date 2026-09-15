@@ -459,89 +459,31 @@ pub(crate) fn grok_stdout_line_requests_interactive_login(line: &str) -> bool {
         && grok_line_requests_interactive_login(line)
 }
 
-/// Resolve the env the Grok CLI needs for non-interactive auth: refresh the
-/// xAI OAuth token if stale, materialize/sync the CLI auth file, and export
-/// `XAI_API_KEY` (key > OAuth access token > ambient env). Shared by the
-/// streaming-json and ACP turn paths.
-#[allow(clippy::result_large_err)] // AgentResult carries the terminal mission record.
+/// Resolve API-key authentication separately from native Grok auth files.
+/// OAuth access tokens are not API keys; native authentication and refresh
+/// belong to the CLI that owns the session and its auth-file format.
+#[allow(clippy::result_large_err)]
 async fn prepare_grok_auth_env(
     workspace: &Workspace,
     app_working_dir: &std::path::Path,
     mission_id: Uuid,
 ) -> Result<HashMap<String, String>, AgentResult> {
-    let mut oauth_access_token: Option<String> = None;
-    if let Some(entry) =
-        crate::api::ai_providers::read_oauth_token_entry(crate::ai_providers::ProviderType::Xai)
-    {
-        if crate::api::ai_providers::oauth_token_expired(entry.expires_at) {
-            match crate::api::ai_providers::refresh_oauth_token_with_lock(
-                crate::ai_providers::ProviderType::Xai,
-                entry.expires_at,
-            )
-            .await
-            {
-                Ok((access, _refresh, expires_at)) => {
-                    oauth_access_token = Some(access);
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        expires_at,
-                        "Refreshed xAI OAuth token before starting Grok Build"
-                    );
-                }
-                Err(crate::api::ai_providers::OAuthRefreshError::InvalidGrant(err)) => {
-                    return Err(AgentResult::failure(
-                        format!(
-                            "Grok Build xAI OAuth refresh token is expired or revoked. Reconnect the xAI provider, then retry the mission. {}",
-                            err
-                        ),
-                        0,
-                    )
-                    .with_terminal_reason(TerminalReason::LlmError));
-                }
-                Err(err) => {
-                    return Err(AgentResult::failure(
-                        format!(
-                            "Failed to refresh xAI OAuth before starting Grok Build: {}",
-                            err
-                        ),
-                        0,
-                    )
-                    .with_terminal_reason(TerminalReason::LlmError));
-                }
-            }
-        } else {
-            oauth_access_token = Some(entry.access_token.clone());
-        }
-    }
-
-    // Grok CLI 0.2.93 rejects the legacy `auth_mode: "oauth"` shape older
-    // Sandboxed versions generated. Remove that shape on the host, then copy
-    // the newest host `~/.grok/auth.json` into the workspace HOME. Container
-    // missions otherwise keep a months-old `/root/.grok/auth.json` and 401
-    // even after Settings reconnects the host.
-    if let Err(err) = crate::api::ai_providers::remove_legacy_grok_oauth_auth_entries() {
-        tracing::warn!(
-            mission_id = %mission_id,
-            error = %err,
-            "Failed to remove obsolete Grok OAuth auth entry"
-        );
-    }
-    if let Err(err) = crate::api::ai_providers::sync_host_grok_auth_into_workspace(workspace) {
-        tracing::warn!(
-            mission_id = %mission_id,
-            error = %err,
-            "Failed to sync host Grok auth.json into workspace"
-        );
-    }
-
-    // Authenticate the Grok CLI non-interactively via XAI_API_KEY. Priority:
-    // an explicit xAI API key, then the captured OAuth access token, then any
-    // ambient env key. Setting this is what prevents the interactive-sign-in
-    // hang; the CLI prints "You are using XAI_API_KEY" and goes straight to
-    // api.x.ai.
     let mut env = HashMap::new();
     let xai_api_key = crate::api::ai_providers::get_xai_api_key_for_grok(app_working_dir)
-        .or_else(|| oauth_access_token.clone())
+        .or_else(|| {
+            workspace
+                .env_vars
+                .get("XAI_API_KEY")
+                .filter(|key| !key.trim().is_empty())
+                .cloned()
+        })
+        .or_else(|| {
+            workspace
+                .env_vars
+                .get("GROK_CODE_XAI_API_KEY")
+                .filter(|key| !key.trim().is_empty())
+                .cloned()
+        })
         .or_else(|| {
             std::env::var("XAI_API_KEY")
                 .ok()
@@ -557,6 +499,15 @@ async fn prepare_grok_auth_env(
         // backward compatibility with older builds.
         env.insert("XAI_API_KEY".to_string(), key.clone());
         env.insert("GROK_CODE_XAI_API_KEY".to_string(), key);
+    } else if let Err(error) =
+        crate::api::ai_providers::sync_host_grok_auth_into_workspace(workspace)
+    {
+        tracing::warn!(mission_id = %mission_id, "Grok native authentication preparation failed");
+        return Err(AgentResult::failure(
+            format!("Grok native authentication could not be prepared: {error}"),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError));
     }
 
     Ok(env)
@@ -580,8 +531,12 @@ pub async fn run_grok_turn(
     cancel: CancellationToken,
     app_working_dir: &std::path::Path,
     session_id: Option<&str>,
-    is_continuation: bool,
+    _is_continuation: bool,
 ) -> AgentResult {
+    // Conversation history can belong to another harness. Only a persisted
+    // Grok session identifies a native continuation; a fresh handoff has none.
+    let is_continuation = session_id.is_some();
+
     if workspace.id == crate::workspace::DEFAULT_WORKSPACE_ID && !work_dir.join(".git").exists() {
         let file_count = std::fs::read_dir(work_dir)
             .map(|mut d| {
@@ -643,20 +598,14 @@ pub async fn run_grok_turn(
                 tracing::warn!(
                     mission_id = %mission_id,
                     reason = %fallback.reason,
-                    drop_session_id = fallback.drop_session_id,
+                    continuity_required = fallback.continuity_required,
                     "Grok ACP handshake failed before the prompt was sent; \
                      falling back to streaming-json mode"
                 );
-                // An unloadable session must not be passed as --session-id:
-                // its upsert semantics would create a fresh EMPTY session
-                // under that id. Omitting it makes the legacy path use
-                // --continue, which resumes the last session in this
-                // mission directory and preserves context.
-                let fallback_session_id = if fallback.drop_session_id {
-                    None
-                } else {
-                    session_id
-                };
+                if fallback.continuity_required {
+                    return AgentResult::failure(fallback.reason, 0)
+                        .with_terminal_reason(TerminalReason::NativeContinuityRequired);
+                }
                 return run_grok_streaming_json_turn(
                     workspace,
                     work_dir,
@@ -666,7 +615,7 @@ pub async fn run_grok_turn(
                     events_tx,
                     cancel,
                     app_working_dir,
-                    fallback_session_id,
+                    session_id,
                     is_continuation,
                 )
                 .await;
@@ -720,19 +669,15 @@ async fn run_grok_streaming_json_turn(
     };
 
     let mut args = Vec::new();
-    // Use `-s/--session-id` for both first-turn and continuation when we
-    // already have a session id from the mission store. Per grok headless
-    // docs, `--session-id` has upsert semantics — loads the session if it
-    // exists, creates one with that id otherwise — so it self-heals the
-    // "orphan session" case where the first turn failed before grok could
-    // persist the session and `--resume <sid>` would error with "Session
-    // does not exist". `--resume` is strict-existence-only; we only fall
-    // through to `--continue` when we have no session id at all.
+    // Continuations must load this exact native ID. --session-id is an
+    // upsert and --continue picks an arbitrary latest session; neither proves
+    // that the original native history is being continued.
     if let Some(sid) = session_id {
-        args.push("--session-id".to_string());
+        args.push("--resume".to_string());
         args.push(sid.to_string());
     } else if is_continuation {
-        args.push("--continue".to_string());
+        return AgentResult::failure("Grok continuation has no native session identity", 0)
+            .with_terminal_reason(TerminalReason::NativeContinuityRequired);
     }
     args.push("-p".to_string());
     args.push(message.to_string());
@@ -879,6 +824,7 @@ async fn run_grok_streaming_json_turn(
                         };
                         if let Some(sid) = grok_event_session_id(&value) {
                             let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                                backend: "grok".to_string(),
                                 session_id: sid,
                                 mission_id,
                             });
@@ -1099,27 +1045,22 @@ const GROK_ACP_SESSION_NEW_ID: u64 = 3;
 const GROK_ACP_SET_MODEL_ID: u64 = 4;
 const GROK_ACP_PROMPT_ID: u64 = 5;
 
-/// Marker embedded in handshake errors that mean "the stored session can't
-/// be resumed over ACP — the legacy path must use --continue, not
-/// --session-id". Matched by the dispatcher to set `drop_session_id`.
-const GROK_ACP_DEFER_TO_CONTINUE: &str = "deferring to --continue";
+/// Handshake failures for an exact native session require reconciliation;
+/// neither latest-session continuation nor session-ID upsert is permitted.
+const GROK_ACP_CONTINUITY_REQUIRED: &str = "native session requires reconciliation";
 
 /// Why the ACP path handed the turn back to the streaming-json fallback.
 pub(crate) struct GrokAcpFallback {
     reason: String,
-    /// True when the stored session id is not loadable over ACP: the
-    /// fallback must NOT pass it as `--session-id` (upsert semantics would
-    /// create a fresh empty session under that id) — omitting it makes the
-    /// legacy path use `--continue`, which resumes the CLI's last session
-    /// in the mission directory and preserves context.
-    drop_session_id: bool,
+    /// True when falling back could replace the original native history.
+    continuity_required: bool,
 }
 
 impl From<String> for GrokAcpFallback {
     fn from(reason: String) -> Self {
         Self {
             reason,
-            drop_session_id: false,
+            continuity_required: false,
         }
     }
 }
@@ -1425,13 +1366,11 @@ async fn run_grok_acp_process(
             match await_response(&mut lines, GROK_ACP_SESSION_ID, 60).await {
                 Ok(_) => acp_session_id = Some(sid.to_string()),
                 Err(err) if is_continuation => {
-                    // The stored session holds real prior context we cannot
-                    // reach over ACP. The streaming path's `--continue`
-                    // resumes the CLI's last session in this directory —
-                    // defer to it instead of silently dropping context.
+                    // A missing exact session is not permission to continue
+                    // an arbitrary last session or create an empty replacement.
                     return Err(format!(
                         "stored session {sid} not loadable over ACP on a continuation \
-                         turn ({err}); {GROK_ACP_DEFER_TO_CONTINUE}"
+                         turn ({err}); {GROK_ACP_CONTINUITY_REQUIRED}"
                     ));
                 }
                 Err(err) => {
@@ -1445,10 +1384,9 @@ async fn run_grok_acp_process(
                 }
             }
         } else if is_continuation {
-            // Continuation with no stored session id at all: only the
-            // streaming path's `--continue` can recover the prior session.
+            // An asserted continuation without an exact ID is ambiguous.
             return Err(format!(
-                "continuation turn without a stored session id; {GROK_ACP_DEFER_TO_CONTINUE}"
+                "continuation turn without a stored session id; {GROK_ACP_CONTINUITY_REQUIRED}"
             ));
         }
         if acp_session_id.is_none() {
@@ -1470,6 +1408,7 @@ async fn run_grok_acp_process(
                 .ok_or_else(|| "grok ACP session/new returned no sessionId".to_string())?
                 .to_string();
             let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                backend: "grok".to_string(),
                 mission_id,
                 session_id: sid.clone(),
             });
@@ -1481,15 +1420,15 @@ async fn run_grok_acp_process(
         ))
     }
     .await;
-    let (acp_session_id, session_load_failed) = match handshake {
+    let (acp_session_id, _session_load_failed) = match handshake {
         Ok(pair) => pair,
         Err(err) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            let drop_session_id = err.contains(GROK_ACP_DEFER_TO_CONTINUE);
+            let continuity_required = err.contains(GROK_ACP_CONTINUITY_REQUIRED);
             return Err(GrokAcpFallback {
                 reason: err,
-                drop_session_id,
+                continuity_required,
             });
         }
     };
@@ -1555,16 +1494,13 @@ async fn run_grok_acp_process(
     )
     .await
     {
-        // Prompt never reached the agent — kill the CLI before handing the
-        // turn back to the fallback path (same orphan hazard as handshake).
         let _ = child.kill().await;
         let _ = child.wait().await;
-        // If the stored session already failed to load over ACP, the legacy
-        // path must not upsert an empty session under that id either.
-        return Err(GrokAcpFallback {
-            reason: e,
-            drop_session_id: session_load_failed,
-        });
+        return Ok(AgentResult::failure(
+            format!("Grok prompt delivery outcome is unknown: {e}"),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::NativeContinuityRequired));
     }
 
     let mut thinking_buffer = String::new();
@@ -1860,18 +1796,14 @@ async fn run_grok_acp_process(
         }
     }
 
-    // The CLI doesn't always stamp a terminal status on the last
-    // tool_call_update — flush whatever we have so every ToolCall gets a
-    // matching ToolResult in the UI/history.
-    for (id, call) in tool_calls.iter() {
-        if !call.result_emitted {
-            let _ = events_tx.send(AgentEvent::ToolResult {
-                tool_call_id: id.clone(),
-                name: call.name.clone(),
-                result: call.latest_update.clone(),
-                mission_id: Some(mission_id),
-            });
-        }
+    // Missing terminal tool evidence is unknown, not a synthetic ToolResult.
+    // Retain the unresolved call in the durable event stream and block replay.
+    let pending_tools = tool_calls
+        .values()
+        .filter(|call| !call.result_emitted)
+        .count();
+    if pending_tools > 0 && transport_error.is_none() {
+        transport_error = Some("Grok ended with unknown native tool outcomes".into());
     }
     if !thinking_buffer.is_empty() && !thinking_done_emitted {
         let _ = events_tx.send(thinking_final_event(thinking_buffer.clone(), mission_id));
@@ -1885,7 +1817,11 @@ async fn run_grok_acp_process(
             format!("{err}\nstderr tail:\n{stderr_tail}")
         };
         return Ok(AgentResult::failure(detail.clone(), 0)
-            .with_terminal_reason(TerminalReason::LlmError)
+            .with_terminal_reason(if pending_tools > 0 {
+                TerminalReason::NativeContinuityRequired
+            } else {
+                TerminalReason::LlmError
+            })
             .with_terminal_evidence(detail)
             .with_data(serde_json::json!({
                 "failure_class": if transport_failure_stage == "prompt_error" {
@@ -1895,7 +1831,7 @@ async fn run_grok_acp_process(
                 },
                 "transport_failure_stage": transport_failure_stage,
                 "grok_acp_transport_failure": true,
-                "pending_tools": tool_calls.values().filter(|call| !call.result_emitted).count(),
+                "pending_tools": pending_tools,
                 "idle_seconds": last_event.elapsed().as_secs(),
                 "awaiting_input": awaiting_input,
             }))
@@ -2105,6 +2041,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grok_acp_missing_exact_session_requires_reconciliation_without_prompt() {
+        use std::process::Stdio;
+        let root = tempfile::tempdir().unwrap();
+        let child = tokio::process::Command::new("python3")
+            .arg("-u")
+            .arg("-c")
+            .arg(include_str!("fixtures/grok_acp.py"))
+            .arg("missing_session")
+            .current_dir(root.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (events_tx, mut events_rx) = broadcast::channel(64);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_grok_acp_process(
+                child,
+                root.path().to_str().unwrap(),
+                "must not replay",
+                Some("fixture-model"),
+                Uuid::new_v4(),
+                events_tx,
+                CancellationToken::new(),
+                Some("original-grok-session"),
+                true,
+                GrokAcpIdlePolicy::default(),
+            ),
+        )
+        .await
+        .unwrap();
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(_) => panic!("missing native history must not run"),
+        };
+        assert!(failure.continuity_required);
+        assert!(failure.reason.contains("No session found"));
+        assert!(!root.path().join("accepted-prompts").exists());
+        while let Ok(event) = events_rx.try_recv() {
+            assert!(!matches!(
+                event,
+                AgentEvent::ToolCall { .. } | AgentEvent::SessionIdUpdate { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn grok_acp_silent_inference_survives_diagnostic_deadline() {
         let (result, events, _) = grok_acp_fixture("silent_success", false).await;
         assert!(result.success, "{}", result.output);
@@ -2115,7 +2100,16 @@ mod tests {
     #[tokio::test]
     async fn grok_acp_dead_transport_times_out_with_evidence_and_no_replay() {
         for scenario in ["dead", "junk", "missing_status", "completed_tool_dead"] {
-            let (result, _, elapsed) = grok_acp_fixture(scenario, false).await;
+            let (result, events, elapsed) = grok_acp_fixture(scenario, false).await;
+            if scenario == "missing_status" {
+                assert_eq!(
+                    result.terminal_reason,
+                    Some(TerminalReason::NativeContinuityRequired)
+                );
+                assert!(!events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::ToolResult { .. })));
+            }
             assert!(!result.success, "scenario: {scenario}");
             assert!(elapsed >= std::time::Duration::from_millis(600));
             assert!(
@@ -2148,7 +2142,14 @@ mod tests {
 
     #[tokio::test]
     async fn grok_acp_stale_running_tool_times_out_after_its_deadline() {
-        let (result, _, elapsed) = grok_acp_fixture("expired_tool", false).await;
+        let (result, events, elapsed) = grok_acp_fixture("expired_tool", false).await;
+        assert_eq!(
+            result.terminal_reason,
+            Some(TerminalReason::NativeContinuityRequired)
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolResult { .. })));
         assert!(!result.success);
         assert_eq!(
             result.data.unwrap()["transport_failure_stage"],

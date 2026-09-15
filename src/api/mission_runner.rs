@@ -124,7 +124,8 @@ fn failure_class_for_terminal_reason(reason: TerminalReason) -> FailureClass {
         TerminalReason::Cancelled
         | TerminalReason::ServerShutdown
         | TerminalReason::NativeGoalStopped
-        | TerminalReason::CodexContinuityRequired => FailureClass::AgentError,
+        | TerminalReason::CodexContinuityRequired
+        | TerminalReason::NativeContinuityRequired => FailureClass::AgentError,
         TerminalReason::LlmError => FailureClass::ProviderError,
         TerminalReason::TurnComplete | TerminalReason::Completed => FailureClass::Unknown,
     }
@@ -171,6 +172,7 @@ pub(crate) fn turn_outcome_for_result(
                 | TerminalReason::ServerShutdown
                 | TerminalReason::NativeGoalStopped
                 | TerminalReason::CodexContinuityRequired
+                | TerminalReason::NativeContinuityRequired
         ) {
             interrupted_turn_outcome(reason)
         } else {
@@ -3684,6 +3686,19 @@ async fn run_mission_turn(
 
     // Ensure mission workspace exists and is configured for OpenCode.
     let mut workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
+    // Validate the requested source before config synchronization can create
+    // directories. A missing checkout is not a request for a new workspace.
+    if let Some(requested) = mission_working_directory.as_deref() {
+        if let Err(error) =
+            resolve_mission_working_directory(&workspace.path, workspace.workspace_type, requested)
+        {
+            return AgentResult::failure(
+                format!("explicit working_directory is invalid: {error}"),
+                0,
+            );
+        }
+    }
+
     if let Err(e) =
         workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &workspace).await
     {
@@ -3850,6 +3865,7 @@ async fn run_mission_turn(
 
         // Update session ID and notify via events
         let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+            backend: "claudecode".to_string(),
             mission_id,
             session_id: new_session_id.clone(),
         });

@@ -183,6 +183,22 @@ fn fold_delta_into(buffer: &mut String, delta: &str) {
 // App-server mode driver (Path A)
 // ---------------------------------------------------------------------------
 
+/// Native goal/set rejects objectives over 4,000 Unicode characters. Validate
+/// before allocating a native thread; never truncate the user's objective.
+pub fn validate_goal_message(message: &str) -> Result<(), String> {
+    let Some(rest) = message.trim_start().strip_prefix("/goal") else {
+        return Ok(());
+    };
+    if !rest.starts_with(char::is_whitespace) {
+        return Ok(());
+    }
+    let count = rest.trim().chars().count();
+    if count > 4_000 {
+        return Err(format!("Codex native goal objective is {count} characters; maximum is 4000. Supply a shorter objective before dispatch."));
+    }
+    Ok(())
+}
+
 /// Drives a single mission turn via `codex app-server`. Mirrors the exec-mode
 /// `send_message_streaming` contract: returns a receiver of ExecutionEvents and
 /// a JoinHandle that resolves when the turn (or the goal loop) reaches a
@@ -206,6 +222,14 @@ async fn send_message_streaming_app_server(
         AppServerConfig, AppServerSession, GoalSetParams, InboundMessage, ThreadStartParams,
         TurnStartParams, UserInputItem,
     };
+
+    validate_goal_message(
+        cfg.continuity
+            .as_ref()
+            .map(|c| c.current_message.as_str())
+            .unwrap_or(message),
+    )
+    .map_err(anyhow::Error::msg)?;
 
     // Note: codex app-server does NOT honor `OPENAI_API_KEY`/`OPENAI_OAUTH_TOKEN`
     // env vars (per `app-server/src/lib.rs:646-647`). For ChatGPT OAuth
@@ -2443,5 +2467,22 @@ mod tests {
             .unwrap();
         assert!(!session.id.is_empty());
         assert_eq!(session.directory, "/tmp");
+    }
+}
+
+#[cfg(test)]
+mod goal_admission_tests {
+    use super::validate_goal_message;
+
+    #[test]
+    fn native_goal_limit_preserves_unicode_objectives_and_rejects_oversize() {
+        assert!(validate_goal_message(&format!("/goal {}", "é".repeat(4000))).is_ok());
+        assert!(
+            validate_goal_message(&format!("/goal\n{}", "é".repeat(4001)))
+                .unwrap_err()
+                .contains("4001")
+        );
+        assert!(validate_goal_message(&"x".repeat(4001)).is_ok());
+        assert!(validate_goal_message(&format!("/goals {}", "x".repeat(4001))).is_ok());
     }
 }

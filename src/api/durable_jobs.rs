@@ -240,7 +240,7 @@ async fn authorize_start(
     user: &AuthUser,
     workspace_id: Option<Uuid>,
     mission_id: Option<Uuid>,
-) -> Result<(Uuid, Uuid), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<(Uuid, Uuid, Option<String>), (StatusCode, Json<ErrorResponse>)> {
     let workspace_id = require_workspace_scope(workspace_id)
         .map_err(|message| err(StatusCode::BAD_REQUEST, message))?;
     let mission_id = mission_id.ok_or_else(|| {
@@ -262,7 +262,7 @@ async fn authorize_start(
             "workspace does not belong to the caller mission",
         ));
     }
-    Ok((workspace_id, mission_id))
+    Ok((workspace_id, mission_id, mission.working_directory))
 }
 
 fn explicit_owner_authorized(job: &DurableJob, user_id: &str) -> Option<bool> {
@@ -423,6 +423,7 @@ fn job_lock_file(state: &AppState, id: Uuid) -> PathBuf {
     job_dir(state, id).join("job.lock")
 }
 
+#[cfg(test)]
 fn resolve_cwd(base: &Path, raw: Option<&str>) -> Result<PathBuf, String> {
     let cwd = match raw {
         Some(value) if !value.trim().is_empty() => {
@@ -444,6 +445,39 @@ fn resolve_cwd(base: &Path, raw: Option<&str>) -> Result<PathBuf, String> {
     }
 
     Ok(cwd)
+}
+
+fn resolve_mission_job_cwd(
+    workspace: &crate::workspace::Workspace,
+    mission_id: Uuid,
+    mission_working_directory: Option<&str>,
+    requested: Option<&str>,
+) -> Result<PathBuf, String> {
+    crate::workspace::ensure_persisted_mission_root_is_available(workspace, mission_id)
+        .map_err(|error| error.to_string())?;
+    let generated;
+    let requested = requested.map(str::trim).filter(|cwd| !cwd.is_empty());
+    let cwd = match requested {
+        Some(cwd) => cwd,
+        None => match mission_working_directory {
+            Some(cwd) => cwd,
+            None => {
+                generated =
+                    crate::workspace::mission_workspace_dir_for_workspace(workspace, mission_id);
+                generated.to_str().ok_or("mission directory is not UTF-8")?
+            }
+        },
+    };
+    // Host mission roots may live on a separately registered scratch volume.
+    // Only the persisted mission default can select that root; arbitrary job
+    // cwd overrides retain the workspace boundary.
+    if requested.is_none() && workspace.workspace_type == WorkspaceType::Host {
+        let root = crate::workspace::mission_workspace_root_for_workspace(workspace, mission_id);
+        if Path::new(cwd).starts_with(&root) {
+            return resolve_workspace_cwd(&root, WorkspaceType::Host, Some(cwd));
+        }
+    }
+    resolve_workspace_cwd(&workspace.path, workspace.workspace_type, Some(cwd))
 }
 
 fn resolve_workspace_cwd(
@@ -1045,7 +1079,7 @@ pub async fn start_job(
     if command.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "command is required"));
     }
-    let (workspace_id, started_by_mission_id) =
+    let (workspace_id, started_by_mission_id, mission_working_directory) =
         authorize_start(&state, &user, req.workspace_id, req.started_by_mission_id).await?;
     let idempotency_key = validated_idempotency_key(req.idempotency_key.as_deref())
         .map_err(|message| err(StatusCode::BAD_REQUEST, message))?;
@@ -1057,6 +1091,14 @@ pub async fn start_job(
             format!("workspace not found: {workspace_id}"),
         )
     })?);
+    let cwd = resolve_mission_job_cwd(
+        workspace.as_ref().expect("authorized workspace"),
+        started_by_mission_id,
+        mission_working_directory.as_deref(),
+        req.cwd.as_deref(),
+    )
+    .map_err(|error| err(StatusCode::BAD_REQUEST, error))?;
+
     let caller_env = req.env;
     let mut job_env = caller_env.clone();
     if let Some(workspace) = workspace.as_ref() {
@@ -1079,15 +1121,6 @@ pub async fn start_job(
             job_env.extend(remote_env);
         }
     }
-    let cwd = match workspace.as_ref() {
-        Some(workspace) => resolve_workspace_cwd(
-            &workspace.path,
-            workspace.workspace_type,
-            req.cwd.as_deref(),
-        ),
-        None => resolve_cwd(&state.config.working_dir, req.cwd.as_deref()),
-    }
-    .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
     let timeout_secs = req
         .timeout_secs
@@ -1502,6 +1535,55 @@ mod tests {
             idempotency_key: None,
             request_fingerprint: None,
         }
+    }
+
+    #[test]
+    fn durable_job_defaults_to_mission_cwd_and_refuses_missing_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut workspace = crate::workspace::Workspace::default_host(temp.path().to_path_buf());
+        let mission = Uuid::new_v4();
+        let generated = crate::workspace::mission_workspace_dir_for_workspace(&workspace, mission);
+        std::fs::create_dir_all(&generated).unwrap();
+        assert_eq!(
+            resolve_mission_job_cwd(&workspace, mission, None, None).unwrap(),
+            generated
+        );
+        let source = temp.path().join("verity");
+        std::fs::create_dir(&source).unwrap();
+        assert_eq!(
+            resolve_mission_job_cwd(&workspace, mission, Some("verity"), None).unwrap(),
+            source
+        );
+        workspace.workspace_type = WorkspaceType::Container;
+        assert_eq!(
+            resolve_mission_job_cwd(&workspace, mission, Some("/verity"), None).unwrap(),
+            source
+        );
+        std::fs::remove_dir(&source).unwrap();
+        assert!(resolve_mission_job_cwd(&workspace, mission, Some("/verity"), None).is_err());
+        assert!(!source.exists());
+        assert!(resolve_mission_job_cwd(&workspace, mission, None, Some("../../")).is_err());
+    }
+
+    #[test]
+    fn durable_job_preserves_registered_host_scratch_root_without_arbitrary_escape() {
+        let control = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace::Workspace::default_host(control.path().to_path_buf());
+        let mission = Uuid::new_v4();
+        crate::workspace::persist_mission_workspace_root(&workspace, mission, scratch.path())
+            .unwrap();
+        let generated = crate::workspace::mission_workspace_dir_for_workspace(&workspace, mission);
+        std::fs::create_dir_all(&generated).unwrap();
+        assert_eq!(
+            resolve_mission_job_cwd(&workspace, mission, None, None).unwrap(),
+            generated
+        );
+        assert!(
+            resolve_mission_job_cwd(&workspace, mission, None, scratch.path().to_str()).is_err()
+        );
+        std::fs::remove_dir_all(&generated).unwrap();
+        assert!(resolve_mission_job_cwd(&workspace, mission, None, None).is_err());
     }
 
     #[test]

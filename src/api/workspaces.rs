@@ -552,6 +552,20 @@ async fn create_workspace(
         }
     };
 
+    // Ready is a filesystem promise: admission immediately stats this root.
+    // Only explicit creation may provision it; resuming a missing workspace
+    // must not recreate a config-only replacement for lost source.
+    if workspace.workspace_type == WorkspaceType::Host {
+        tokio::fs::create_dir_all(&workspace.path)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Cannot create host workspace directory: {error}"),
+                )
+            })?;
+    }
+
     let id = state.workspaces.add(workspace.clone()).await;
 
     // Sync skills and tools to workspace if any are specified

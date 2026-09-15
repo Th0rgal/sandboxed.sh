@@ -3198,6 +3198,29 @@ pub async fn sync_agents_to_dir(
     Ok(())
 }
 
+/// A recorded placement belongs to an existing attempt. Losing its mission
+/// directory must not turn resume into provisioning a config-only replacement.
+fn verify_mission_directory_before_preparation(
+    workspace: &Workspace,
+    mission_id: Uuid,
+) -> anyhow::Result<()> {
+    let roots = match read_mission_workspace_roots(workspace) {
+        Ok(roots) => roots,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(record) = roots.get(&mission_id.to_string()) {
+        let (root, _) = validate_mission_workspace_root(record)?;
+        let directory = mission_workspace_dir_for_root(&root, mission_id);
+        anyhow::ensure!(
+            directory.is_dir(),
+            "recorded mission directory is unavailable: {}; restore its source before resume",
+            directory.display()
+        );
+    }
+    Ok(())
+}
+
 async fn prepare_workspace_dir(path: &Path) -> anyhow::Result<PathBuf> {
     tokio::fs::create_dir_all(path.join("output")).await?;
     tokio::fs::create_dir_all(path.join("temp")).await?;
@@ -3360,6 +3383,7 @@ pub async fn prepare_mission_workspace_in(
     // Use a mission-specific directory under the workspace root so multiple missions
     // can run concurrently without clobbering per-workspace config files.
     ensure_persisted_mission_root_is_available(workspace, mission_id)?;
+    verify_mission_directory_before_preparation(workspace, mission_id)?;
     let root = mission_workspace_root_for_workspace(workspace, mission_id);
     persist_mission_workspace_root(workspace, mission_id, &root)?;
     let dir = mission_workspace_dir_for_root(&root, mission_id);
@@ -3688,6 +3712,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     // Mission workspace directory lives under the selected workspace root.
     // This keeps filesystem and config effects scoped to the mission.
     ensure_persisted_mission_root_is_available(workspace, mission_id)?;
+    verify_mission_directory_before_preparation(workspace, mission_id)?;
     let root = mission_workspace_root_for_workspace(workspace, mission_id);
     persist_mission_workspace_root(workspace, mission_id, &root)?;
     let dir = mission_workspace_dir_for_root(&root, mission_id);
@@ -6413,6 +6438,43 @@ WORKING_DIR = "/workspaces/mission-old"
             verify_explicit_mission_working_directory_owner(&workspace, &boss_worktree).unwrap(),
             boss
         );
+    }
+
+    #[tokio::test]
+    async fn lost_host_and_container_mission_directories_are_not_recreated_as_config_only() {
+        for container in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("workspace");
+            std::fs::create_dir_all(&root).unwrap();
+            let mut workspace = if container {
+                Workspace::new_container("test-container".into(), root)
+            } else {
+                Workspace::default_host(root)
+            };
+            if container {
+                stamp_custom_workspace_control_registry(&mut workspace, temp.path());
+                ensure_workspace_root_identity_recorded(&workspace);
+            }
+            let mission = Uuid::new_v4();
+            let mcp = McpRegistry::new(temp.path()).await;
+            let prepared = prepare_mission_workspace_in(&workspace, &mcp, mission)
+                .await
+                .unwrap();
+            std::fs::create_dir(prepared.join("verity")).unwrap();
+            std::fs::write(prepared.join("verity/source.lean"), "original source").unwrap();
+            std::fs::remove_dir_all(&prepared).unwrap();
+            let error = prepare_mission_workspace_in(&workspace, &mcp, mission)
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("recorded mission directory is unavailable"));
+            assert!(
+                !prepared.exists(),
+                "missing source must not become a config-only tree"
+            );
+            assert!(workspace.path.is_dir());
+        }
     }
 
     #[tokio::test]

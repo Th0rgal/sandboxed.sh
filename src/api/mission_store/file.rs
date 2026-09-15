@@ -20,6 +20,8 @@ const METADATA_SOURCE_USER: &str = "user";
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct MissionStoreSnapshot {
     missions: HashMap<Uuid, Mission>,
+    #[serde(default)]
+    harness_sessions: HashMap<Uuid, HashMap<String, String>>,
     trees: HashMap<Uuid, AgentTreeNode>,
     #[serde(default)]
     runs: HashMap<Uuid, MissionRun>,
@@ -33,6 +35,7 @@ struct MissionStoreSnapshot {
 pub struct FileMissionStore {
     path: PathBuf,
     missions: Arc<RwLock<HashMap<Uuid, Mission>>>,
+    harness_sessions: Arc<RwLock<HashMap<Uuid, HashMap<String, String>>>>,
     trees: Arc<RwLock<HashMap<Uuid, AgentTreeNode>>>,
     runs: Arc<RwLock<HashMap<Uuid, MissionRun>>>,
     deferred_goals: Arc<RwLock<HashMap<Uuid, String>>>,
@@ -66,6 +69,7 @@ impl FileMissionStore {
         Ok(Self {
             path,
             missions: Arc::new(RwLock::new(snapshot.missions)),
+            harness_sessions: Arc::new(RwLock::new(snapshot.harness_sessions)),
             trees: Arc::new(RwLock::new(snapshot.trees)),
             runs: Arc::new(RwLock::new(snapshot.runs)),
             deferred_goals: Arc::new(RwLock::new(snapshot.deferred_goals)),
@@ -77,6 +81,7 @@ impl FileMissionStore {
         let _guard = self.persist_lock.lock().await;
         let snapshot = MissionStoreSnapshot {
             missions: self.missions.read().await.clone(),
+            harness_sessions: self.harness_sessions.read().await.clone(),
             trees: self.trees.read().await.clone(),
             runs: self.runs.read().await.clone(),
             deferred_goals: self.deferred_goals.read().await.clone(),
@@ -320,7 +325,7 @@ impl MissionStore for FileMissionStore {
             paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
-            session_id: Some(Uuid::new_v4().to_string()),
+            session_id: (backend != Some("grok")).then(|| Uuid::new_v4().to_string()),
             terminal_reason: None,
             terminal_evidence: None,
             parent_mission_id,
@@ -424,6 +429,7 @@ impl MissionStore for FileMissionStore {
         snapshot.restore(mission);
         let snapshot = MissionStoreSnapshot {
             missions: next.clone(),
+            harness_sessions: self.harness_sessions.read().await.clone(),
             trees: self.trees.read().await.clone(),
             runs: self.runs.read().await.clone(),
             deferred_goals: self.deferred_goals.read().await.clone(),
@@ -639,6 +645,16 @@ impl MissionStore for FileMissionStore {
             .get_mut(&id)
             .ok_or_else(|| format!("Mission {} not found", id))?;
 
+        let selected_session = {
+            let mut sessions = self.harness_sessions.write().await;
+            super::select_harness_session(
+                mission,
+                backend,
+                session_id,
+                sessions.entry(id).or_default(),
+            )
+        };
+
         if let Some(backend) = backend {
             mission.backend = backend.to_string();
         }
@@ -657,10 +673,7 @@ impl MissionStore for FileMissionStore {
         if let Some(config_profile) = config_profile {
             mission.config_profile = config_profile.map(ToString::to_string);
         }
-        mission.session_id = Some(session_id.to_string());
-        mission.resumable = false;
-        mission.interrupted_at = None;
-        mission.terminal_reason = None;
+        mission.session_id = selected_session;
         mission.updated_at = now_string();
         let updated = mission.clone();
         drop(missions);
@@ -760,6 +773,7 @@ impl MissionStore for FileMissionStore {
         }
         let snapshot = MissionStoreSnapshot {
             missions: next.clone(),
+            harness_sessions: self.harness_sessions.read().await.clone(),
             trees: self.trees.read().await.clone(),
             runs: self.runs.read().await.clone(),
             deferred_goals: self.deferred_goals.read().await.clone(),
@@ -806,13 +820,29 @@ impl MissionStore for FileMissionStore {
         self.persist().await
     }
 
-    async fn update_mission_session_id(&self, id: Uuid, session_id: &str) -> Result<(), String> {
+    async fn update_mission_session_id(
+        &self,
+        id: Uuid,
+        session_id: &str,
+        backend: &str,
+    ) -> Result<(), String> {
         let mut missions = self.missions.write().await;
         let mission = missions
             .get_mut(&id)
             .ok_or_else(|| format!("Mission {} not found", id))?;
-        mission.session_id = Some(session_id.to_string());
-        mission.updated_at = now_string();
+        if backend.is_empty() {
+            return Err("native session update requires harness provenance".into());
+        }
+        self.harness_sessions
+            .write()
+            .await
+            .entry(id)
+            .or_default()
+            .insert(backend.to_string(), session_id.to_string());
+        if mission.backend == backend {
+            mission.session_id = Some(session_id.to_string());
+            mission.updated_at = now_string();
+        }
         drop(missions);
         self.persist().await
     }
@@ -829,6 +859,7 @@ impl MissionStore for FileMissionStore {
     async fn delete_mission(&self, id: Uuid) -> Result<bool, String> {
         let removed = self.missions.write().await.remove(&id).is_some();
         self.trees.write().await.remove(&id);
+        self.harness_sessions.write().await.remove(&id);
         self.persist().await?;
         Ok(removed)
     }
@@ -1167,7 +1198,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_mission_run_settings_clears_terminal_reason() {
+    async fn update_mission_run_settings_preserves_stop_until_dispatch() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let store = FileMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
             .await
@@ -1200,10 +1231,10 @@ mod tests {
             .await
             .expect("update run settings");
 
-        assert_eq!(updated.terminal_reason, None);
+        assert_eq!(updated.terminal_reason.as_deref(), Some("rate_limited"));
         assert_eq!(updated.session_id.as_deref(), Some("new-session"));
-        assert!(!updated.resumable);
-        assert_eq!(updated.interrupted_at, None);
+        assert!(updated.resumable);
+        assert!(updated.interrupted_at.is_none());
     }
 
     #[tokio::test]

@@ -564,7 +564,7 @@ async fn codex_continuity_fresh_sqlite_mission_enrolls_and_reloads_same_thread()
         .expect("fresh stored mission emits a real native binding");
     let projected = format!("{}{}", continuity::SESSION_PREFIX, native_id);
     store
-        .update_mission_session_id(mission.id, &projected)
+        .update_mission_session_id(mission.id, &projected, "codex")
         .await
         .unwrap();
     let persisted = store.get_mission(mission.id).await.unwrap().unwrap();

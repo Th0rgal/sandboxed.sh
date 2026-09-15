@@ -76,8 +76,12 @@ pub(crate) fn is_auth_error(message: &str) -> bool {
 }
 
 pub(crate) fn is_rate_limited_error(message: &str) -> bool {
-    const RATE_LIMIT_MARKERS: [&str; 18] = [
+    const RATE_LIMIT_MARKERS: [&str; 22] = [
         "overloaded_error",
+        "weekly quota exhausted",
+        "weekly quota exceeded",
+        "weekly limit reached",
+        "weekly usage limit reached",
         // Claude Code CLI on a subscription whose credits ran out (seen on
         // prod mission 1971a723, 2026-09-03): the CLI exits 0 with a plain
         // assistant message "You're out of usage credits. Switch to another
@@ -264,6 +268,26 @@ mod tests {
         ];
         for msg in negatives {
             assert!(!is_auth_error(msg), "false positive: {msg}");
+        }
+    }
+
+    #[test]
+    fn weekly_exhaustion_is_quota_but_weekly_mentions_are_not() {
+        // Synthetic boundary cases; these do not stand in for a provider receipt.
+        for message in [
+            "Weekly quota exhausted",
+            "Weekly quota exceeded",
+            "Weekly limit reached",
+            "Weekly usage limit reached",
+        ] {
+            assert!(is_rate_limited_error(message));
+        }
+        for message in [
+            "weekly quota remaining: 90%",
+            "show weekly usage",
+            "Fable weekly report",
+        ] {
+            assert!(!is_rate_limited_error(message));
         }
     }
 

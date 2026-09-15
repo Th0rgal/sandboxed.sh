@@ -1902,6 +1902,7 @@ pub async fn run_opencode_turn(
     // (see `AgentEvent::SessionIdUpdate` emission in `run_grok_turn`).
     if let Some(sid) = session_id.as_deref() {
         let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+            backend: "opencode".to_string(),
             mission_id,
             session_id: sid.to_string(),
         });
