@@ -588,3 +588,20 @@ executor, explicit cancellation and concurrent single-writer). Exact CI Clippy
 edits. Format and diff checks passed. Debug compilation used the private mission
 CARGO_HOME in bounded scopes; no release build or CI polling was performed.
 The new threads require independent review of the replacement commit.
+
+
+### Merged environment validation
+
+Reviewer7eb identified a sibling case after the first atomicity patch: checking
+only caller env misses NUL values stored in workspace.env_vars. Validation now
+runs after build_env, before Command construction. The existing no-launch
+regression supplies valid argv and empty caller env with an invalid stored
+workspace value across all three stores. It checks ordinary launch failure,
+released claim/retry eligibility, absence of a child-effect file and absence of
+the value in diagnostics. Generic post-spawn errors remain fenced.
+
+All 26 Grok tests and exact CI Clippy passed for this follow-up, along with
+format/diff checks. Logs: native-claim-merged-env-tests.log and
+native-claim-merged-env-clippy.log in the private mission output directory.
+The unchanged store/executor/cancellation receipts from 15ebc12e remain available;
+this follow-up does not claim a new full CI or deployed-runtime certificate.

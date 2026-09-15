@@ -2185,6 +2185,28 @@ mod tests {
                         grok_streaming_spawn_failure(&store, m.id, None, first, &error).await;
                     assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
                     assert_eq!(grok_session_for_turn(&store, m.id).await.unwrap(), None);
+                    // Stored workspace values must be validated after env merge,
+                    // even when the caller supplied no invalid argv/environment.
+                    let env_claim = claim_grok_prompt(&store, m.id, None).await.unwrap();
+                    let mut workspace = Workspace::default_host(root.path().into());
+                    workspace
+                        .env_vars
+                        .insert("CLAIM_TEST_VALUE".into(), "private-fixture\0value".into());
+                    let error = WorkspaceExec::new(workspace)
+                        .spawn_streaming(
+                            root.path(),
+                            "/bin/sh",
+                            &["-c".into(), "touch must-not-launch".into()],
+                            HashMap::new(),
+                        )
+                        .await
+                        .unwrap_err();
+                    assert!(!error.to_string().contains("private-fixture"));
+                    let result =
+                        grok_streaming_spawn_failure(&store, m.id, None, env_claim, &error).await;
+                    assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+                    assert!(!root.path().join("must-not-launch").exists());
+                    assert_eq!(grok_session_for_turn(&store, m.id).await.unwrap(), None);
                     let second = claim_grok_prompt(&store, m.id, None).await.unwrap();
                     assert_ne!(first, second);
                     let uncertain = grok_streaming_spawn_failure(

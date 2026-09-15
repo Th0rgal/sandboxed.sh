@@ -2188,7 +2188,8 @@ impl WorkspaceExec {
         args: &[String],
         env: HashMap<String, String>,
     ) -> anyhow::Result<Child> {
-        // Validate original inputs: std::process::Command can replace a NUL-
+        let env = self.build_env(env);
+        // Validate merged inputs: std::process::Command can replace a NUL-
         // containing value internally while remembering a deferred spawn error.
         if program.contains('\0')
             || args.iter().any(|v| v.contains('\0'))
@@ -2199,7 +2200,6 @@ impl WorkspaceExec {
         {
             return Err(ConfirmedNoLaunch(anyhow::anyhow!("command contains NUL")).into());
         }
-        let env = self.build_env(env);
         let mut cmd = self
             .build_command(
                 cwd,
