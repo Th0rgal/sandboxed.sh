@@ -96,3 +96,22 @@ isolated harness smoke test should verify exact-session reattachment and native
 authentication in the intended host/container version. Existing protected
 missions must not be used as smoke tests. This PR does not release any live
 production lease or refresh any deployed remote-build wrapper.
+
+## Review follow-up: initial preparation retry
+
+Review identified an ordering gap in both preparation entry points: the root
+registry was committed before creating the mission directory. A failed initial
+mkdir therefore made the next attempt look like source loss. Persist placement
+after directory preparation succeeds, before wrapper/configuration writes.
+Recorded directories that later disappear still fail closed; no registry entries
+are deleted or inferred to be disposable.
+
+The new regression reproduced the failure before the fix. It covers both
+preparation entry points and host/container workspace layouts by forcing initial
+directory creation to fail, removing the obstacle, and retrying preparation.
+This prevents new incomplete entries; an already-recorded missing directory
+still requires source/provisioning evidence before any recovery decision.
+
+Validation: all 57 `workspace::tests::` tests passed in a bounded debug scope,
+including the existing lost-source guard. `cargo fmt --all` and
+`git diff --check` passed.

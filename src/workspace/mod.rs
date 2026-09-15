@@ -3385,9 +3385,12 @@ pub async fn prepare_mission_workspace_in(
     ensure_persisted_mission_root_is_available(workspace, mission_id)?;
     verify_mission_directory_before_preparation(workspace, mission_id)?;
     let root = mission_workspace_root_for_workspace(workspace, mission_id);
-    persist_mission_workspace_root(workspace, mission_id, &root)?;
     let dir = mission_workspace_dir_for_root(&root, mission_id);
     prepare_workspace_dir(&dir).await?;
+    // Record placement only after initial directory creation succeeds. A failed
+    // first preparation must remain retryable, while a recorded directory that
+    // later disappears still fails the source-loss guard above.
+    persist_mission_workspace_root(workspace, mission_id, &root)?;
     install_remote_build_wrapper(workspace, mission_id).await?;
     let mcp_configs = filter_mcp_configs_for_workspace(
         mcp.list_configs().await,
@@ -3714,9 +3717,12 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     ensure_persisted_mission_root_is_available(workspace, mission_id)?;
     verify_mission_directory_before_preparation(workspace, mission_id)?;
     let root = mission_workspace_root_for_workspace(workspace, mission_id);
-    persist_mission_workspace_root(workspace, mission_id, &root)?;
     let dir = mission_workspace_dir_for_root(&root, mission_id);
     prepare_workspace_dir(&dir).await?;
+    // Record placement only after initial directory creation succeeds. A failed
+    // first preparation must remain retryable, while a recorded directory that
+    // later disappears still fails the source-loss guard above.
+    persist_mission_workspace_root(workspace, mission_id, &root)?;
     install_remote_build_wrapper(workspace, mission_id).await?;
     // Reviewers still need authenticated read access to private repositories.
     // The capability boundary is therefore enforced by command guards and
@@ -6438,6 +6444,63 @@ WORKING_DIR = "/workspaces/mission-old"
             verify_explicit_mission_working_directory_owner(&workspace, &boss_worktree).unwrap(),
             boss
         );
+    }
+
+    #[tokio::test]
+    async fn failed_initial_mission_directory_creation_can_be_retried() {
+        for container in [false, true] {
+            for with_skills in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("workspace");
+                std::fs::create_dir_all(&root).unwrap();
+                let mut workspace = if container {
+                    Workspace::new_container("test-container".into(), root)
+                } else {
+                    Workspace::default_host(root)
+                };
+                if container {
+                    stamp_custom_workspace_control_registry(&mut workspace, temp.path());
+                    ensure_workspace_root_identity_recorded(&workspace);
+                }
+                let mission = Uuid::new_v4();
+                let dir = mission_workspace_dir_for_workspace(&workspace, mission);
+                std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+                // A filesystem obstacle prevents the first directory creation.
+                // It is removed before retry, as with a repaired transient error.
+                std::fs::write(&dir, "obstacle").unwrap();
+                let mcp = McpRegistry::new(temp.path()).await;
+                let result = if with_skills {
+                    prepare_mission_workspace_with_skills_backend(
+                        &mut workspace,
+                        &mcp,
+                        None,
+                        mission,
+                        "opencode",
+                        None,
+                        None,
+                        None,
+                        None,
+                        true,
+                    )
+                    .await
+                } else {
+                    prepare_mission_workspace_in(&workspace, &mcp, mission).await
+                };
+                assert!(result.is_err());
+                std::fs::remove_file(&dir).unwrap();
+                verify_mission_directory_before_preparation(&workspace, mission)
+                    .expect("failed first creation must not be recorded as lost source");
+                let prepared = prepare_mission_workspace_in(&workspace, &mcp, mission)
+                    .await
+                    .unwrap();
+                assert_eq!(prepared, dir);
+                assert!(prepared.join("output").is_dir());
+                assert!(prepared.join("temp").is_dir());
+                assert!(read_mission_workspace_roots(&workspace)
+                    .unwrap()
+                    .contains_key(&mission.to_string()));
+            }
+        }
     }
 
     #[tokio::test]
