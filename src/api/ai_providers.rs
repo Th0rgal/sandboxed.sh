@@ -410,12 +410,22 @@ fn newest_usable_grok_auth_file(candidates: &[PathBuf]) -> Option<(PathBuf, Vec<
 }
 
 fn workspace_grok_auth_path(workspace: &crate::workspace::Workspace) -> Result<PathBuf, String> {
+    grok_auth_path_for_execution(
+        workspace,
+        crate::workspace::use_nspawn_for_workspace(workspace),
+    )
+}
+
+fn grok_auth_path_for_execution(
+    workspace: &crate::workspace::Workspace,
+    use_nspawn: bool,
+) -> Result<PathBuf, String> {
     let home = match workspace.env_vars.get("HOME") {
-        None => crate::workspace::resolve_workspace_home_root(
-            &workspace.path,
-            workspace.workspace_type,
-            &workspace.env_vars,
-        ),
+        None if use_nspawn => workspace.path.join("root"),
+        None if workspace.workspace_type == crate::workspace::WorkspaceType::Container => {
+            return Err("Grok container fallback requires an explicit host HOME; refusing an implicit /root credential destination".into());
+        }
+        None => PathBuf::from(home_dir()),
         Some(home) => {
             let home = Path::new(home);
             if !home.is_absolute()
@@ -425,9 +435,7 @@ fn workspace_grok_auth_path(workspace: &crate::workspace::Workspace) -> Result<P
             {
                 return Err("Grok HOME must be an absolute path without parent traversal".into());
             }
-            if workspace.workspace_type == crate::workspace::WorkspaceType::Container
-                && !crate::workspace::container_fallback_from_env(&workspace.env_vars)
-            {
+            if use_nspawn {
                 let resolved = workspace
                     .path
                     .join(home.strip_prefix("/").map_err(|error| error.to_string())?);
@@ -450,7 +458,30 @@ fn workspace_grok_auth_path(workspace: &crate::workspace::Workspace) -> Result<P
             }
         }
     };
-    Ok(home.join(".grok").join("auth.json"))
+    if use_nspawn {
+        let root = workspace
+            .path
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let target = home
+            .canonicalize()
+            .map_err(|error| format!("Grok HOME is unavailable: {error}"))?;
+        if !target.starts_with(root) {
+            return Err("Grok HOME escapes its container root".into());
+        }
+    }
+    let parent = home.join(".grok");
+    if use_nspawn && parent.exists() {
+        let root = workspace
+            .path
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let target = parent.canonicalize().map_err(|error| error.to_string())?;
+        if !target.starts_with(root) {
+            return Err("Grok auth directory escapes its container root".into());
+        }
+    }
+    Ok(parent.join("auth.json"))
 }
 
 /// Copy `bytes` onto `dest` atomically (mode 0600).
@@ -459,15 +490,28 @@ fn install_grok_auth_bytes(dest: &Path, bytes: &[u8]) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
     }
-    let tmp = dest.with_extension("json.tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
+    use std::io::Write;
+    let parent = dest.parent().ok_or("Grok auth destination has no parent")?;
+    let tmp = parent.join(format!(".grok-auth-{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    std::fs::rename(&tmp, dest)
-        .map_err(|e| format!("Failed to install {}: {e}", dest.display()))?;
+    let mut file = options
+        .open(&tmp)
+        .map_err(|error| format!("Failed to create private Grok auth file: {error}"))?;
+    let installed = (|| -> std::io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, dest)
+    })();
+    if let Err(error) = installed {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Failed to install Grok auth: {error}"));
+    }
     Ok(())
 }
 
@@ -894,6 +938,79 @@ mod grok_oauth_tests {
     }
 
     #[test]
+    fn grok_auth_fallback_uses_execution_mode_and_requires_explicit_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut workspace = crate::workspace::Workspace::new_container(
+            "fallback".into(),
+            temp.path().to_path_buf(),
+        );
+        workspace.config = serde_json::json!({"container_fallback": true});
+        assert!(super::workspace_grok_auth_path(&workspace)
+            .unwrap_err()
+            .contains("explicit host HOME"));
+        let home = temp.path().join("host-home");
+        std::fs::create_dir(&home).unwrap();
+        workspace
+            .env_vars
+            .insert("HOME".into(), home.display().to_string());
+        // The execution config selects host fallback, even without the env flag.
+        assert_eq!(
+            super::workspace_grok_auth_path(&workspace).unwrap(),
+            home.join(".grok/auth.json")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_auth_refuses_container_auth_directory_symlink_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let workspace =
+            crate::workspace::Workspace::new_container("guest".into(), root.path().to_path_buf());
+        std::fs::create_dir(root.path().join("root")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("root/.grok")).unwrap();
+        assert!(super::grok_auth_path_for_execution(&workspace, true)
+            .unwrap_err()
+            .contains("auth directory escapes"));
+        assert!(!outside.path().join("auth.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_auth_install_is_private_and_ignores_predictable_temp_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("auth.json");
+        let victim = root.path().join("unrelated");
+        std::fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, dest.with_extension("json.tmp")).unwrap();
+        let workers: Vec<_> = [b"credential-a", b"credential-b"]
+            .into_iter()
+            .map(|bytes| {
+                let dest = dest.clone();
+                std::thread::spawn(move || super::install_grok_auth_bytes(&dest, bytes).unwrap())
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "keep");
+        assert!(matches!(
+            std::fs::read_to_string(&dest).unwrap().as_str(),
+            "credential-a" | "credential-b"
+        ));
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!std::fs::read_dir(root.path()).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".grok-auth-")));
+    }
+
+    #[test]
     fn grok_auth_destination_tracks_explicit_host_and_container_home() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("native-home");
@@ -903,7 +1020,11 @@ mod grok_oauth_tests {
             .env_vars
             .insert("HOME".into(), home.display().to_string());
         assert_eq!(
-            super::workspace_grok_auth_path(&workspace).unwrap(),
+            super::grok_auth_path_for_execution(
+                &workspace,
+                workspace.workspace_type == crate::workspace::WorkspaceType::Container
+            )
+            .unwrap(),
             home.join(".grok/auth.json")
         );
         workspace.workspace_type = crate::workspace::WorkspaceType::Container;
@@ -911,19 +1032,31 @@ mod grok_oauth_tests {
             .env_vars
             .insert("HOME".into(), "/native-home".into());
         assert_eq!(
-            super::workspace_grok_auth_path(&workspace).unwrap(),
+            super::grok_auth_path_for_execution(
+                &workspace,
+                workspace.workspace_type == crate::workspace::WorkspaceType::Container
+            )
+            .unwrap(),
             home.join(".grok/auth.json")
         );
         for invalid in ["relative", "/../escape", "/missing-home"] {
             workspace.env_vars.insert("HOME".into(), invalid.into());
-            assert!(super::workspace_grok_auth_path(&workspace).is_err());
+            assert!(super::grok_auth_path_for_execution(
+                &workspace,
+                workspace.workspace_type == crate::workspace::WorkspaceType::Container
+            )
+            .is_err());
         }
         #[cfg(unix)]
         {
             let outside = tempfile::tempdir().unwrap();
             std::os::unix::fs::symlink(outside.path(), temp.path().join("escape")).unwrap();
             workspace.env_vars.insert("HOME".into(), "/escape".into());
-            assert!(super::workspace_grok_auth_path(&workspace).is_err());
+            assert!(super::grok_auth_path_for_execution(
+                &workspace,
+                workspace.workspace_type == crate::workspace::WorkspaceType::Container
+            )
+            .is_err());
         }
     }
 

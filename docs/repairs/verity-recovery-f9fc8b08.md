@@ -20,7 +20,7 @@ modified. Deployment and merge are outside this repair's authorization.
 | Workspace creation → Ready | Host workspace record is published before its root exists. | Create the host root before storing Ready; refuse a root that is an existing file. |
 | Workspace preparation → source | Missing recorded mission directories can be recreated as configuration-only trees. | Require an existing recorded mission directory before preparation. Validate explicit working directories before configuration synchronization. Existing root-volume identity checks remain in force. |
 | Durable command → cwd | Omitted cwd selects the workspace root (guest `/`), losing mission context. | Default to persisted mission working_directory or generated mission directory. Validate before installing wrappers. Preserve registered host scratch roots; explicit job overrides retain the workspace boundary. |
-| Grok authentication → CLI | OAuth access tokens are exported as API keys, and unrelated OAuth refresh can prevent usable API-key authentication. | Keep API keys and native auth-file credentials separate. Avoid global legacy-auth cleanup during mission launch. Respect explicit HOME for native auth-file placement and reject container escapes/unavailable homes. Preserve workspace credentials when the host has no usable cache. |
+| Grok authentication → CLI | OAuth access tokens are exported as API keys, and unrelated OAuth refresh can prevent usable API-key authentication. | Keep API keys and native auth-file credentials separate. Avoid global legacy-auth cleanup during mission launch. Use the launcher's nspawn/fallback decision for native auth placement, require explicit host HOME for container fallback, and reject container HOME/auth-directory escapes. Install credentials via unique, private-before-write temporary files. Preserve workspace credentials when the host has no usable cache. |
 | Error text → health | Numeric substring matching reads UUID fragment `b522` as HTTP 522. | Match complete numeric tokens. |
 | Weekly exhaustion → classification | Weekly quota phrases lack rate-limit markers. | Add narrow exhaustion/reached phrases with positive and negative synthetic tests. The exact Fable receipt remains unverified. |
 | Raw tool trace → diagnostics | Text, byte arrays, and rawOutput repeat the same output; diagnostics lack the promised result snippets. | Add bounded, deduplicated readable result snippets. Raw persisted events remain unchanged and available through get_mission_events. |
@@ -40,7 +40,10 @@ Final focused run: 125 library tests and all 69 assistant-MCP tests passed
 Codex continuity tests, 13 Grok ACP tests, 17 Grok auth tests, 34 durable-job
 tests, and 22 workspace execution tests. This is a focused suite, not the
 entire repository test suite. A subsequent real API/actor agent-handoff
-regression also passed, bringing distinct Rust coverage to 195 tests.
+regression also passed. The Grok authentication suite subsequently passed all
+20 tests, adding three regressions for execution-mode selection, auth-directory
+symlink escape, and concurrent private credential installation. Distinct Rust
+coverage is now 198 tests.
 
 Commands used, with the installed stable toolchain and a private target directory:
 
