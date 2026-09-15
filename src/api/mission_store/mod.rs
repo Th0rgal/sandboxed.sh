@@ -4562,7 +4562,6 @@ fn is_untouched_grok_placeholder(mission: &Mission) -> bool {
         && mission.paused_at.is_none()
         && mission.terminal_reason.is_none()
         && mission.terminal_evidence.is_none()
-        && mission.origin_session_id.is_none()
         && mission.desktop_sessions.is_empty()
         && mission.session_id.as_deref().is_some_and(|id| {
             Uuid::parse_str(id)
@@ -4617,6 +4616,7 @@ mod harness_session_tests {
             let mut cases = Vec::new();
             for case in [
                 "untouched",
+                "attributed",
                 "native",
                 "history",
                 "run",
@@ -4633,6 +4633,12 @@ mod harness_session_tests {
                 } else {
                     Uuid::new_v4().to_string()
                 };
+                if case != "untouched" {
+                    store
+                        .set_mission_origin(mission.id, "hermes", Some("operator-conversation"))
+                        .await
+                        .unwrap();
+                }
                 match case {
                     "native" => store
                         .update_mission_session_id(mission.id, &session, "grok")
@@ -4711,13 +4717,19 @@ mod harness_session_tests {
                     let mission = reopened.get_mission(*id).await.unwrap().unwrap();
                     assert_eq!(
                         mission.session_id.as_deref(),
-                        if *case == "untouched" {
+                        if matches!(*case, "untouched" | "attributed") {
                             None
                         } else {
                             Some(session.as_str())
                         },
                         "{kind}: {case}"
                     );
+                    if *case != "untouched" {
+                        assert_eq!(
+                            mission.origin_session_id.as_deref(),
+                            Some("operator-conversation")
+                        );
+                    }
                     if *case == "run" {
                         assert!(reopened
                             .get_active_mission_run(*id)

@@ -2479,7 +2479,7 @@ impl SqliteMissionStore {
              WHERE backend = 'grok' AND status = 'pending'
                AND created_at = updated_at AND last_status_change_at = created_at
                AND resumable = 0 AND interrupted_at IS NULL AND paused_at IS NULL
-               AND terminal_reason IS NULL AND origin_session_id IS NULL
+               AND terminal_reason IS NULL
                AND (desktop_sessions IS NULL OR desktop_sessions = '[]')
                AND length(session_id) = 36 AND substr(session_id, 15, 1) = '4'
                AND substr(session_id, 9, 1) = '-' AND substr(session_id, 14, 1) = '-'

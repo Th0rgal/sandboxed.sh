@@ -139,3 +139,14 @@ both stores and two reopens. No lease is released by the migration.
 
 Validation: all 104 mission-store tests passed in a bounded debug scope,
 including legacy migration/reopen and existing lease/storage regressions.
+
+## Review follow-up: Hermes attribution
+
+Hermes origin_session_id is operator-conversation attribution, not a native
+Grok session receipt. It no longer excludes an otherwise untouched placeholder
+from migration. The file/SQLite reopen regression now includes attribution on
+both eligible and ineligible records and verifies that attribution survives.
+Both harness-session tests passed in a bounded debug scope.
+
+The newly reported completion/session-event ordering race remains under repair:
+queued work must not start until the generated native ID is persisted.
