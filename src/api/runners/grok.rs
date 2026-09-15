@@ -582,17 +582,19 @@ async fn claim_grok_prompt(
     store: &Arc<dyn crate::api::mission_store::MissionStore>,
     mission_id: Uuid,
     session_id: Option<&str>,
-) -> Result<(), String> {
+) -> Result<Uuid, String> {
+    let claim_id = Uuid::new_v4();
     if store
         .claim_native_prompt(
             mission_id,
             "grok",
             session_id,
             super::session_update_run().as_ref(),
+            claim_id,
         )
         .await?
     {
-        Ok(())
+        Ok(claim_id)
     } else {
         Err("Grok prompt refused: stale generation, changed binding or prior unbound prompt outcome".into())
     }
@@ -812,10 +814,13 @@ async fn run_grok_streaming_json_turn(
 
     // streaming-json passes the prompt on argv: record uncertainty before
     // spawn, because the first observable output may follow arbitrary tools.
-    if let Err(error) = claim_grok_prompt(mission_store, mission_id, session_id).await {
-        return AgentResult::failure(error, 0)
-            .with_terminal_reason(TerminalReason::NativeContinuityRequired);
-    }
+    let claim_id = match claim_grok_prompt(mission_store, mission_id, session_id).await {
+        Ok(claim_id) => claim_id,
+        Err(error) => {
+            return AgentResult::failure(error, 0)
+                .with_terminal_reason(TerminalReason::NativeContinuityRequired)
+        }
+    };
 
     let child = match workspace_exec
         .spawn_streaming(work_dir, &cli_path, &args, env)
@@ -823,8 +828,14 @@ async fn run_grok_streaming_json_turn(
     {
         Ok(child) => child,
         Err(e) => {
-            return AgentResult::failure(format!("Failed to start Grok Build CLI: {}", e), 0)
-                .with_terminal_reason(TerminalReason::NativeContinuityRequired);
+            return grok_streaming_spawn_failure(
+                mission_store,
+                mission_id,
+                session_id,
+                claim_id,
+                &e,
+            )
+            .await;
         }
     };
     run_grok_streaming_process(
@@ -837,6 +848,54 @@ async fn run_grok_streaming_json_turn(
         session_id.is_some(),
     )
     .await
+}
+
+async fn grok_streaming_spawn_failure(
+    store: &Arc<dyn crate::api::mission_store::MissionStore>,
+    mission_id: Uuid,
+    session_id: Option<&str>,
+    claim_id: Uuid,
+    error: &anyhow::Error,
+) -> AgentResult {
+    if error
+        .downcast_ref::<crate::workspace_exec::ConfirmedNoLaunch>()
+        .is_some()
+    {
+        grok_confirmed_no_launch(store, mission_id, session_id, claim_id, &error.to_string()).await
+    } else {
+        AgentResult::failure(format!("Grok launch outcome is uncertain: {error}"), 0)
+            .with_terminal_reason(TerminalReason::NativeContinuityRequired)
+    }
+}
+
+async fn grok_confirmed_no_launch(
+    store: &Arc<dyn crate::api::mission_store::MissionStore>,
+    mission_id: Uuid,
+    session_id: Option<&str>,
+    claim_id: Uuid,
+    error: &str,
+) -> AgentResult {
+    let released = if session_id.is_none() {
+        store
+            .release_native_prompt_no_launch(
+                mission_id,
+                "grok",
+                super::session_update_run().as_ref(),
+                claim_id,
+            )
+            .await
+    } else {
+        Ok(true)
+    }; // Existing native evidence must never be removed.
+    let reason = match released {
+        Ok(true) => TerminalReason::LlmError,
+        _ => TerminalReason::NativeContinuityRequired,
+    };
+    AgentResult::failure(
+        format!("Failed to start Grok Build CLI (confirmed no launch): {error}"),
+        0,
+    )
+    .with_terminal_reason(reason)
 }
 
 async fn run_grok_streaming_process(
@@ -2076,6 +2135,174 @@ mod tests {
     use super::*;
     use crate::workspace::WorkspaceType;
     use std::fs;
+
+    #[tokio::test]
+    async fn grok_confirmed_no_launch_releases_only_exact_claim() {
+        use crate::api::mission_store::{
+            FileMissionStore, InMemoryMissionStore, MissionStore, SessionUpdateRun,
+            SqliteMissionStore,
+        };
+        for kind in ["memory", "file", "sqlite"] {
+            let root = tempfile::tempdir().unwrap();
+            let store: Arc<dyn MissionStore> = match kind {
+                "file" => Arc::new(
+                    FileMissionStore::new(root.path().into(), "no-launch")
+                        .await
+                        .unwrap(),
+                ),
+                "sqlite" => Arc::new(
+                    SqliteMissionStore::new(root.path().into(), "no-launch")
+                        .await
+                        .unwrap(),
+                ),
+                _ => Arc::new(InMemoryMissionStore::new()),
+            };
+            let m = store
+                .create_mission(
+                    Some("no launch"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("grok"),
+                    None,
+                )
+                .await
+                .unwrap();
+            let run = store.begin_mission_run(m.id, "first", None).await.unwrap();
+            let stamp = SessionUpdateRun::from(&run);
+            super::super::SESSION_UPDATE_RUN
+                .scope(Some(stamp.clone()), async {
+                    let first = claim_grok_prompt(&store, m.id, None).await.unwrap();
+                    // An embedded NUL deterministically fails command construction/OS
+                    // spawn, including wrapped execution: no CLI can receive argv.
+                    let exec = WorkspaceExec::new(Workspace::default_host(root.path().into()));
+                    let error = exec
+                        .spawn_streaming(root.path(), "invalid\0program", &[], HashMap::new())
+                        .await
+                        .unwrap_err();
+                    let result =
+                        grok_streaming_spawn_failure(&store, m.id, None, first, &error).await;
+                    assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+                    assert_eq!(grok_session_for_turn(&store, m.id).await.unwrap(), None);
+                    let second = claim_grok_prompt(&store, m.id, None).await.unwrap();
+                    assert_ne!(first, second);
+                    let uncertain = grok_streaming_spawn_failure(
+                        &store,
+                        m.id,
+                        None,
+                        second,
+                        &anyhow::anyhow!("injected post-spawn registration failure"),
+                    )
+                    .await;
+                    assert_eq!(
+                        uncertain.terminal_reason,
+                        Some(TerminalReason::NativeContinuityRequired)
+                    );
+                    assert!(store.native_prompt_attempted(m.id, "grok").await.unwrap());
+                    // A delayed duplicate rollback in the SAME generation cannot
+                    // erase a new valid claim (generation comparison alone is weak).
+                    assert!(!store
+                        .release_native_prompt_no_launch(m.id, "grok", Some(&stamp), first)
+                        .await
+                        .unwrap());
+                    assert!(grok_session_for_turn(&store, m.id).await.is_err());
+                    assert!(!store
+                        .release_native_prompt_no_launch(m.id, "claude", Some(&stamp), second)
+                        .await
+                        .unwrap());
+                    assert!(store
+                        .release_native_prompt_no_launch(m.id, "grok", Some(&stamp), second)
+                        .await
+                        .unwrap());
+                })
+                .await;
+            // A released marker stays absent after persistent-store reopen.
+            let store: Arc<dyn MissionStore> = match kind {
+                "file" => Arc::new(
+                    FileMissionStore::new(root.path().into(), "no-launch")
+                        .await
+                        .unwrap(),
+                ),
+                "sqlite" => Arc::new(
+                    SqliteMissionStore::new(root.path().into(), "no-launch")
+                        .await
+                        .unwrap(),
+                ),
+                _ => store,
+            };
+            assert!(!store.native_prompt_attempted(m.id, "grok").await.unwrap());
+            let receipt = Uuid::new_v4();
+            assert!(store
+                .claim_native_prompt(m.id, "grok", None, Some(&stamp), receipt)
+                .await
+                .unwrap());
+            store
+                .finish_mission_run(run.run_id, run.generation, Some("unknown"))
+                .await
+                .unwrap();
+            let successor = store
+                .begin_mission_run(m.id, "successor", None)
+                .await
+                .unwrap();
+            assert!(!store
+                .release_native_prompt_no_launch(m.id, "grok", Some(&stamp), receipt)
+                .await
+                .unwrap());
+            assert!(store.native_prompt_attempted(m.id, "grok").await.unwrap());
+            assert!(!store
+                .release_native_prompt_no_launch(
+                    m.id,
+                    "grok",
+                    Some(&SessionUpdateRun::from(&successor)),
+                    receipt
+                )
+                .await
+                .unwrap());
+            assert!(!store
+                .claim_native_prompt(
+                    m.id,
+                    "grok",
+                    None,
+                    Some(&SessionUpdateRun::from(&successor)),
+                    Uuid::new_v4()
+                )
+                .await
+                .unwrap());
+            let successor_stamp = SessionUpdateRun::from(&successor);
+            assert!(store
+                .update_mission_session_id(m.id, "native-real", "grok", Some(&successor_stamp))
+                .await
+                .unwrap());
+            super::super::SESSION_UPDATE_RUN
+                .scope(Some(successor_stamp), async {
+                    let bound_receipt = claim_grok_prompt(&store, m.id, Some("native-real"))
+                        .await
+                        .unwrap();
+                    let error = anyhow::Error::new(crate::workspace_exec::ConfirmedNoLaunch(
+                        anyhow::anyhow!("known pre-launch failure"),
+                    ));
+                    let result = grok_streaming_spawn_failure(
+                        &store,
+                        m.id,
+                        Some("native-real"),
+                        bound_receipt,
+                        &error,
+                    )
+                    .await;
+                    assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+                    assert!(store.native_prompt_attempted(m.id, "grok").await.unwrap());
+                    assert_eq!(
+                        grok_session_for_turn(&store, m.id)
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some("native-real")
+                    );
+                })
+                .await;
+        }
+    }
 
     #[tokio::test]
     async fn grok_native_remote_env_reaches_workspace_children() {

@@ -544,3 +544,47 @@ Exact CI Clippy `cargo clippy --locked --workspace -- -D clippy::all`
 also passed after the final source edits. Logs: `grok-acp-final-tests.log` and
 `grok-acp-final-clippy.log` in the private mission output directory.
 Independent exact-head review of the P1 remains required before merge.
+
+
+## Claim failure and confirmed no-launch recovery
+
+Threads r4017211614 and r4017317368 identify availability defects in the prior
+conservative hold. A failed new FileMissionStore claim previously published its
+marker in memory before the snapshot write. It now holds the persistence and
+mission/run/claim locks, writes a candidate snapshot, and publishes only after
+successful rename. Failed insertion cannot erase or replace old/concurrent
+claims. A failed release similarly retains both marker and receipt. Memory uses
+the same atomic admission predicates; SQLite inserts/deletes marker and receipt
+in a single transaction.
+
+New claims carry a unique receipt plus the captured run ID/generation. Confirmed
+no-launch recovery removes only that exact unbound receipt, with matching current
+backend and latest run. A delayed release cannot remove a new same-generation
+claim or relabel an old receipt with a successor generation. Existing markers
+without receipts remain held. Bound native identities and prior evidence remain.
+The receipt is internal admission evidence, never a native session ID.
+
+Workspace command construction and deterministic invalid argv are explicitly
+marked confirmed-no-launch. On Linux, identified exec-specific errors receive
+the same classification. Generic Tokio spawn errors stay uncertain: Tokio1.51
+can report an error while registering pipes or process monitoring AFTER OS spawn.
+Resource/registration errors and unclassified errors never release intent; a
+returned child that later fails (including a wrapper exit) never releases it.
+The release route is used only for streaming startup; ACP session/new and
+session/prompt write uncertainty retains its existing fences.
+
+Failure injection covers file temporary-write/final-rename failures, retention of
+older evidence, concurrent claims, rejected stale receipts, SQLite failure after
+marker insertion and after receipt deletion, and durable reopen. Executor tests
+distinguish invalid/missing commands from a successfully launched child exiting
+127; the Grok guard test distinguishes confirmed no-launch from injected
+post-spawn uncertainty across all three stores. Receipt backup coverage now
+includes native_prompt_claims (file field / SQLite table). No deployed change or
+release build is included.
+
+Validation: 158 focused tests passed (26 Grok, 107 mission-store, 23 workspace
+executor, explicit cancellation and concurrent single-writer). Exact CI Clippy
+`cargo clippy --locked --workspace -- -D clippy::all` passed after final source
+edits. Format and diff checks passed. Debug compilation used the private mission
+CARGO_HOME in bounded scopes; no release build or CI polling was performed.
+The new threads require independent review of the replacement commit.

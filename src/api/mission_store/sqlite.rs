@@ -524,6 +524,13 @@ CREATE TABLE IF NOT EXISTS mission_native_prompt_attempts (
     backend TEXT NOT NULL,
     PRIMARY KEY (mission_id, backend)
 );
+CREATE TABLE IF NOT EXISTS mission_native_prompt_claims (
+    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    backend TEXT NOT NULL,
+    claim_id TEXT NOT NULL,
+    run_stamp TEXT NOT NULL,
+    PRIMARY KEY(mission_id, backend)
+);
 CREATE TABLE IF NOT EXISTS mission_harness_sessions (
     mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
     backend TEXT NOT NULL,
@@ -4801,10 +4808,12 @@ impl MissionStore for SqliteMissionStore {
         backend: &str,
         session_id: Option<&str>,
         run: Option<&super::SessionUpdateRun>,
+        claim_id: Uuid,
     ) -> Result<bool, String> {
         let conn = self.conn.clone();
         let backend = backend.to_string();
         let session_id = session_id.map(str::to_string);
+        let run_stamp = serde_json::to_string(&run).map_err(|e| e.to_string())?;
         let run = run.map(|r| (r.run_id.to_string(), r.generation));
         tokio::task::spawn_blocking(move || {
             let mut conn = conn.blocking_lock();
@@ -4815,6 +4824,34 @@ impl MissionStore for SqliteMissionStore {
             let prior: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM mission_native_prompt_attempts WHERE mission_id = ?1 AND backend = ?2)", params![id.to_string(), backend], |r| r.get(0)).map_err(|e| e.to_string())?;
             if prior && session_id.is_none() { return Ok(false); }
             tx.execute("INSERT OR IGNORE INTO mission_native_prompt_attempts (mission_id, backend) VALUES (?1, ?2)", params![id.to_string(), backend]).map_err(|e| e.to_string())?;
+            if !prior {
+                tx.execute("INSERT INTO mission_native_prompt_claims (mission_id, backend, claim_id, run_stamp) VALUES (?1, ?2, ?3, ?4)", params![id.to_string(), backend, claim_id.to_string(), run_stamp]).map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(true)
+        }).await.map_err(|e| e.to_string())?
+    }
+
+    async fn release_native_prompt_no_launch(
+        &self,
+        id: Uuid,
+        backend: &str,
+        run: Option<&super::SessionUpdateRun>,
+        claim_id: Uuid,
+    ) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let backend = backend.to_string();
+        let run_stamp = serde_json::to_string(&run).map_err(|e| e.to_string())?;
+        let run = run.map(|r| (r.run_id.to_string(), r.generation));
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let (current_backend, session): (String, Option<String>) = tx.query_row("SELECT COALESCE(backend, 'opencode'), session_id FROM missions WHERE id = ?1", [id.to_string()], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| e.to_string())?;
+            let latest: Option<(String, u64)> = tx.query_row("SELECT run_id, generation FROM mission_runs WHERE mission_id = ?1 ORDER BY generation DESC LIMIT 1", [id.to_string()], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(|e| e.to_string())?;
+            if backend.is_empty() || current_backend != backend || session.is_some() || latest != run { return Ok(false); }
+            let deleted = tx.execute("DELETE FROM mission_native_prompt_claims WHERE mission_id = ?1 AND backend = ?2 AND claim_id = ?3 AND run_stamp = ?4", params![id.to_string(), backend, claim_id.to_string(), run_stamp]).map_err(|e| e.to_string())?;
+            if deleted != 1 { return Ok(false); }
+            tx.execute("DELETE FROM mission_native_prompt_attempts WHERE mission_id = ?1 AND backend = ?2", params![id.to_string(), backend]).map_err(|e| e.to_string())?;
             tx.commit().map_err(|e| e.to_string())?;
             Ok(true)
         }).await.map_err(|e| e.to_string())?
@@ -12365,6 +12402,65 @@ mod tests {
     use rusqlite::params;
     use serde_json::json;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn native_claim_sql_failure_rolls_back_insert_and_release_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteMissionStore::new(dir.path().into(), "claim-failure")
+            .await
+            .unwrap();
+        let m = store
+            .create_mission(Some("claim"), None, None, None, None, Some("grok"), None)
+            .await
+            .unwrap();
+        // Fail AFTER attempt insertion, while writing its rollback receipt.
+        store.conn.lock().await.execute_batch("CREATE TRIGGER fail_claim BEFORE INSERT ON mission_native_prompt_claims BEGIN SELECT RAISE(ABORT, 'injected claim failure'); END;").unwrap();
+        let failed = Uuid::new_v4();
+        assert!(store
+            .claim_native_prompt(m.id, "grok", None, None, failed)
+            .await
+            .is_err());
+        assert!(!store.native_prompt_attempted(m.id, "grok").await.unwrap());
+        store
+            .conn
+            .lock()
+            .await
+            .execute_batch("DROP TRIGGER fail_claim;")
+            .unwrap();
+        let receipt = Uuid::new_v4();
+        assert!(store
+            .claim_native_prompt(m.id, "grok", None, None, receipt)
+            .await
+            .unwrap());
+        assert!(!store
+            .release_native_prompt_no_launch(m.id, "grok", None, failed)
+            .await
+            .unwrap());
+        // Fail AFTER token deletion: transaction rollback must restore both rows.
+        store.conn.lock().await.execute_batch("CREATE TRIGGER fail_release BEFORE DELETE ON mission_native_prompt_attempts BEGIN SELECT RAISE(ABORT, 'injected release failure'); END;").unwrap();
+        assert!(store
+            .release_native_prompt_no_launch(m.id, "grok", None, receipt)
+            .await
+            .is_err());
+        assert!(store.native_prompt_attempted(m.id, "grok").await.unwrap());
+        store
+            .conn
+            .lock()
+            .await
+            .execute_batch("DROP TRIGGER fail_release;")
+            .unwrap();
+        assert!(store
+            .release_native_prompt_no_launch(m.id, "grok", None, receipt)
+            .await
+            .unwrap());
+        let reopened = SqliteMissionStore::new(dir.path().into(), "claim-failure")
+            .await
+            .unwrap();
+        assert!(!reopened
+            .native_prompt_attempted(m.id, "grok")
+            .await
+            .unwrap());
+    }
 
     #[tokio::test]
     async fn codex_fast_mode_round_trips_and_updates() {

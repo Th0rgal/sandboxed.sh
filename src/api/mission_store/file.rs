@@ -24,6 +24,8 @@ struct MissionStoreSnapshot {
     harness_sessions: HashMap<Uuid, HashMap<String, String>>,
     #[serde(default)]
     native_prompts: HashMap<Uuid, std::collections::HashSet<String>>,
+    #[serde(default)]
+    native_prompt_claims: HashMap<Uuid, HashMap<String, super::NativePromptClaim>>,
     trees: HashMap<Uuid, AgentTreeNode>,
     #[serde(default)]
     runs: HashMap<Uuid, MissionRun>,
@@ -39,6 +41,7 @@ pub struct FileMissionStore {
     missions: Arc<RwLock<HashMap<Uuid, Mission>>>,
     harness_sessions: Arc<RwLock<HashMap<Uuid, HashMap<String, String>>>>,
     native_prompts: Arc<RwLock<HashMap<Uuid, std::collections::HashSet<String>>>>,
+    native_prompt_claims: Arc<RwLock<HashMap<Uuid, HashMap<String, super::NativePromptClaim>>>>,
     trees: Arc<RwLock<HashMap<Uuid, AgentTreeNode>>>,
     runs: Arc<RwLock<HashMap<Uuid, MissionRun>>>,
     deferred_goals: Arc<RwLock<HashMap<Uuid, String>>>,
@@ -95,6 +98,7 @@ impl FileMissionStore {
             missions: Arc::new(RwLock::new(snapshot.missions)),
             harness_sessions: Arc::new(RwLock::new(snapshot.harness_sessions)),
             native_prompts: Arc::new(RwLock::new(snapshot.native_prompts)),
+            native_prompt_claims: Arc::new(RwLock::new(snapshot.native_prompt_claims)),
             trees: Arc::new(RwLock::new(snapshot.trees)),
             runs: Arc::new(RwLock::new(snapshot.runs)),
             deferred_goals: Arc::new(RwLock::new(snapshot.deferred_goals)),
@@ -112,11 +116,16 @@ impl FileMissionStore {
             missions: self.missions.read().await.clone(),
             harness_sessions: self.harness_sessions.read().await.clone(),
             native_prompts: self.native_prompts.read().await.clone(),
+            native_prompt_claims: self.native_prompt_claims.read().await.clone(),
             trees: self.trees.read().await.clone(),
             runs: self.runs.read().await.clone(),
             deferred_goals: self.deferred_goals.read().await.clone(),
         };
-        let data = serde_json::to_vec_pretty(&snapshot)
+        self.write_snapshot(&snapshot).await
+    }
+
+    async fn write_snapshot(&self, snapshot: &MissionStoreSnapshot) -> Result<(), String> {
+        let data = serde_json::to_vec_pretty(snapshot)
             .map_err(|e| format!("Failed to serialize mission store: {}", e))?;
         let tmp_path = self.path.with_extension("json.tmp");
         fs::write(&tmp_path, data)
@@ -461,6 +470,7 @@ impl MissionStore for FileMissionStore {
             missions: next.clone(),
             harness_sessions: self.harness_sessions.read().await.clone(),
             native_prompts: self.native_prompts.read().await.clone(),
+            native_prompt_claims: self.native_prompt_claims.read().await.clone(),
             trees: self.trees.read().await.clone(),
             runs: self.runs.read().await.clone(),
             deferred_goals: self.deferred_goals.read().await.clone(),
@@ -806,6 +816,7 @@ impl MissionStore for FileMissionStore {
             missions: next.clone(),
             harness_sessions: self.harness_sessions.read().await.clone(),
             native_prompts: self.native_prompts.read().await.clone(),
+            native_prompt_claims: self.native_prompt_claims.read().await.clone(),
             trees: self.trees.read().await.clone(),
             runs: self.runs.read().await.clone(),
             deferred_goals: self.deferred_goals.read().await.clone(),
@@ -870,7 +881,9 @@ impl MissionStore for FileMissionStore {
         backend: &str,
         session_id: Option<&str>,
         run: Option<&super::SessionUpdateRun>,
+        claim_id: Uuid,
     ) -> Result<bool, String> {
+        let _persist = self.persist_lock.lock().await;
         let missions = self.missions.write().await;
         let mission = missions.get(&id).ok_or("mission not found")?;
         if backend.is_empty() || mission.backend != backend {
@@ -886,15 +899,95 @@ impl MissionStore for FileMissionStore {
             return Ok(false);
         }
         let mut prompts = self.native_prompts.write().await;
-        let attempted = prompts.entry(id).or_default();
-        if session_id.is_none() && attempted.contains(backend) {
-            return Ok(false);
+        let mut claims = self.native_prompt_claims.write().await;
+        let mut next = prompts.clone();
+        let mut next_claims = claims.clone();
+        let attempted = next.entry(id).or_default();
+        if attempted.contains(backend) {
+            // A bound continuation may proceed, but cannot own rollback of old evidence.
+            return Ok(session_id.is_some());
         }
         attempted.insert(backend.to_string());
-        drop(prompts);
-        drop(runs);
-        drop(missions);
-        self.persist().await?;
+        next_claims.entry(id).or_default().insert(
+            backend.to_string(),
+            super::NativePromptClaim {
+                claim_id,
+                run: run.cloned(),
+            },
+        );
+        let snapshot = MissionStoreSnapshot {
+            missions: missions.clone(),
+            harness_sessions: self.harness_sessions.read().await.clone(),
+            native_prompts: next.clone(),
+            native_prompt_claims: next_claims.clone(),
+            trees: self.trees.read().await.clone(),
+            runs: runs.clone(),
+            deferred_goals: self.deferred_goals.read().await.clone(),
+        };
+        self.write_snapshot(&snapshot).await?;
+        *prompts = next;
+        *claims = next_claims;
+        Ok(true)
+    }
+
+    async fn release_native_prompt_no_launch(
+        &self,
+        id: Uuid,
+        backend: &str,
+        run: Option<&super::SessionUpdateRun>,
+        claim_id: Uuid,
+    ) -> Result<bool, String> {
+        let _persist = self.persist_lock.lock().await;
+        let missions = self.missions.write().await;
+        let mission = missions.get(&id).ok_or("mission not found")?;
+        if backend.is_empty() || mission.backend != backend {
+            return Ok(false);
+        }
+        let runs = self.runs.read().await;
+        let latest = runs
+            .values()
+            .filter(|r| r.mission_id == id)
+            .max_by_key(|r| r.generation)
+            .map(super::SessionUpdateRun::from);
+        if latest.as_ref() != run || mission.session_id.is_some() {
+            return Ok(false);
+        }
+        let mut prompts = self.native_prompts.write().await;
+        let mut claims = self.native_prompt_claims.write().await;
+        if claims.get(&id).and_then(|c| c.get(backend))
+            != Some(&super::NativePromptClaim {
+                claim_id,
+                run: run.cloned(),
+            })
+        {
+            return Ok(false);
+        }
+        let mut next = prompts.clone();
+        let mut next_claims = claims.clone();
+        if let Some(p) = next.get_mut(&id) {
+            p.remove(backend);
+            if p.is_empty() {
+                next.remove(&id);
+            }
+        }
+        if let Some(c) = next_claims.get_mut(&id) {
+            c.remove(backend);
+            if c.is_empty() {
+                next_claims.remove(&id);
+            }
+        }
+        let snapshot = MissionStoreSnapshot {
+            missions: missions.clone(),
+            harness_sessions: self.harness_sessions.read().await.clone(),
+            native_prompts: next.clone(),
+            native_prompt_claims: next_claims.clone(),
+            trees: self.trees.read().await.clone(),
+            runs: runs.clone(),
+            deferred_goals: self.deferred_goals.read().await.clone(),
+        };
+        self.write_snapshot(&snapshot).await?;
+        *prompts = next;
+        *claims = next_claims;
         Ok(true)
     }
 
@@ -1090,6 +1183,88 @@ impl MissionStore for FileMissionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_claim_write_failure_is_atomic_and_release_failure_retains_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileMissionStore::new(dir.path().into(), "claims")
+            .await
+            .unwrap();
+        let m = store
+            .create_mission(Some("new"), None, None, None, None, Some("grok"), None)
+            .await
+            .unwrap();
+        let old = store
+            .create_mission(Some("old"), None, None, None, None, Some("grok"), None)
+            .await
+            .unwrap();
+        let old_receipt = Uuid::new_v4();
+        assert!(store
+            .claim_native_prompt(old.id, "grok", None, None, old_receipt)
+            .await
+            .unwrap());
+        let blocker = store.path.with_extension("json.tmp");
+        fs::create_dir(&blocker).await.unwrap();
+        let failed = Uuid::new_v4();
+        assert!(store
+            .claim_native_prompt(m.id, "grok", None, None, failed)
+            .await
+            .is_err());
+        assert!(!store.native_prompt_attempted(m.id, "grok").await.unwrap());
+        assert!(store.native_prompt_attempted(old.id, "grok").await.unwrap());
+        assert!(store
+            .release_native_prompt_no_launch(old.id, "grok", None, old_receipt)
+            .await
+            .is_err());
+        assert!(store.native_prompt_attempted(old.id, "grok").await.unwrap());
+        let reopened = FileMissionStore::new(dir.path().into(), "claims")
+            .await
+            .unwrap();
+        assert!(!reopened
+            .native_prompt_attempted(m.id, "grok")
+            .await
+            .unwrap());
+        assert!(reopened
+            .native_prompt_attempted(old.id, "grok")
+            .await
+            .unwrap());
+        fs::remove_dir(&blocker).await.unwrap();
+        // A final rename failure must also leave the new insertion unpublished.
+        let backup = store.path.with_extension("saved");
+        fs::rename(&store.path, &backup).await.unwrap();
+        fs::create_dir(&store.path).await.unwrap();
+        assert!(store
+            .claim_native_prompt(m.id, "grok", None, None, Uuid::new_v4())
+            .await
+            .is_err());
+        assert!(!store.native_prompt_attempted(m.id, "grok").await.unwrap());
+        assert!(store.native_prompt_attempted(old.id, "grok").await.unwrap());
+        fs::remove_dir(&store.path).await.unwrap();
+        fs::rename(&backup, &store.path).await.unwrap();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let (ra, rb) = tokio::join!(
+            store.claim_native_prompt(m.id, "grok", None, None, a),
+            store.claim_native_prompt(m.id, "grok", None, None, b)
+        );
+        assert_ne!(ra.unwrap(), rb.unwrap());
+        assert!(!store
+            .release_native_prompt_no_launch(m.id, "grok", None, failed)
+            .await
+            .unwrap());
+        assert!(store.native_prompt_attempted(m.id, "grok").await.unwrap());
+        let reopened = FileMissionStore::new(dir.path().into(), "claims")
+            .await
+            .unwrap();
+        assert!(reopened
+            .native_prompt_attempted(m.id, "grok")
+            .await
+            .unwrap());
+        assert!(reopened
+            .native_prompt_attempted(old.id, "grok")
+            .await
+            .unwrap());
+    }
 
     #[tokio::test]
     async fn assignment_write_failure_preserves_memory_and_disk_identity() {

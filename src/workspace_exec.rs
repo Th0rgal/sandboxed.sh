@@ -20,6 +20,36 @@ use crate::nspawn;
 use crate::util::env_var_bool;
 use crate::workspace::{use_nspawn_for_workspace, TailscaleMode, Workspace, WorkspaceType};
 
+/// Evidence that command construction or exec failed before the target could
+/// accept argv. Generic Tokio spawn errors do not provide this guarantee:
+/// registration of an already spawned child's pipes can also fail.
+#[derive(Debug, thiserror::Error)]
+#[error("workspace command was not launched: {0}")]
+pub(crate) struct ConfirmedNoLaunch(pub anyhow::Error);
+
+fn spawn_streaming_command(cmd: &mut Command) -> anyhow::Result<Child> {
+    cmd.spawn().map_err(|error| {
+        // Linux exec-specific failures. Tokio 1.51's post-spawn fcntl,
+        // epoll ADD and signal-registration path cannot emit these errors.
+        // Resource/registration failures and other platforms stay ambiguous.
+        #[cfg(target_os = "linux")]
+        if matches!(
+            error.raw_os_error(),
+            Some(
+                libc::ENOENT
+                    | libc::ENOEXEC
+                    | libc::E2BIG
+                    | libc::ENOTDIR
+                    | libc::ETXTBSY
+                    | libc::ELOOP
+            )
+        ) {
+            return ConfirmedNoLaunch(error.into()).into();
+        }
+        anyhow::Error::new(error).context("Workspace spawn outcome is uncertain")
+    })
+}
+
 const CONTAINER_KEEPALIVE_ENV_KEY: &str = "SANDBOXED_SH_CONTAINER_KEEPALIVE";
 const CONTAINER_KEEPALIVE_ENV_VALUE: &str = "1";
 const ALLOW_TRANSIENT_CONTAINER_NSENTER_ENV: &str =
@@ -625,6 +655,7 @@ fn persistent_nspawn_command(scope_args: Option<&[String]>) -> Command {
 
 #[cfg(test)]
 mod tests {
+    use super::{spawn_streaming_command, ConfirmedNoLaunch};
     use crate::nspawn;
 
     use super::{
@@ -641,6 +672,19 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
     use tokio::process::Command;
+
+    #[tokio::test]
+    async fn streaming_no_launch_evidence_distinguishes_exec_failure_from_child_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut missing = Command::new(dir.path().join("missing-cli"));
+        let error = spawn_streaming_command(&mut missing).unwrap_err();
+        #[cfg(target_os = "linux")]
+        assert!(error.downcast_ref::<ConfirmedNoLaunch>().is_some());
+        let mut launched = Command::new("/bin/sh");
+        launched.args(["-c", "exit 127"]);
+        let mut child = spawn_streaming_command(&mut launched).unwrap();
+        assert_eq!(child.wait().await.unwrap().code(), Some(127));
+    }
 
     #[test]
     fn mission_tag_extracted_from_workspace_cwd() {
@@ -2144,6 +2188,17 @@ impl WorkspaceExec {
         args: &[String],
         env: HashMap<String, String>,
     ) -> anyhow::Result<Child> {
+        // Validate original inputs: std::process::Command can replace a NUL-
+        // containing value internally while remembering a deferred spawn error.
+        if program.contains('\0')
+            || args.iter().any(|v| v.contains('\0'))
+            || env
+                .iter()
+                .any(|(k, v)| k.contains('\0') || v.contains('\0'))
+            || cwd.as_os_str().to_string_lossy().contains('\0')
+        {
+            return Err(ConfirmedNoLaunch(anyhow::anyhow!("command contains NUL")).into());
+        }
         let env = self.build_env(env);
         let mut cmd = self
             .build_command(
@@ -2157,10 +2212,11 @@ impl WorkspaceExec {
                 None,
             )
             .await
-            .context("Failed to build workspace command")?;
+            .map_err(|error| {
+                ConfirmedNoLaunch(error.context("Failed to build workspace command"))
+            })?;
 
-        let child = cmd.spawn().context("Failed to spawn workspace command")?;
-        Ok(child)
+        spawn_streaming_command(&mut cmd)
     }
 
     /// Spawn a workspace-aware command with caller-provided stdio.

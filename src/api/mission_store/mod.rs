@@ -2469,8 +2469,21 @@ pub trait MissionStore: Send + Sync {
         _backend: &str,
         _session_id: Option<&str>,
         _run: Option<&SessionUpdateRun>,
+        _claim_id: Uuid,
     ) -> Result<bool, String> {
         Err("native prompt provenance is unavailable".into())
+    }
+
+    /// Release only this new, unbound claim after definitive proof no process
+    /// accepted the prompt. Never call after a child has been returned.
+    async fn release_native_prompt_no_launch(
+        &self,
+        _id: Uuid,
+        _backend: &str,
+        _run: Option<&SessionUpdateRun>,
+        _claim_id: Uuid,
+    ) -> Result<bool, String> {
+        Err("native prompt rollback is unavailable".into())
     }
 
     /// Update cached goal-mode metadata for missions started with `/goal`.
@@ -4574,6 +4587,13 @@ mod admission_restore_tests {
 pub struct SessionUpdateRun {
     pub run_id: Uuid,
     pub generation: u64,
+}
+
+/// Receipt for a newly inserted native attempt, distinct from native identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct NativePromptClaim {
+    claim_id: Uuid,
+    run: Option<SessionUpdateRun>,
 }
 
 impl From<&MissionRun> for SessionUpdateRun {

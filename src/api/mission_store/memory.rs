@@ -20,6 +20,7 @@ pub struct InMemoryMissionStore {
     missions: Arc<RwLock<HashMap<Uuid, Mission>>>,
     harness_sessions: Arc<RwLock<HashMap<Uuid, HashMap<String, String>>>>,
     native_prompts: Arc<RwLock<HashMap<Uuid, std::collections::HashSet<String>>>>,
+    native_prompt_claims: Arc<RwLock<HashMap<Uuid, HashMap<String, super::NativePromptClaim>>>>,
     trees: Arc<RwLock<HashMap<Uuid, AgentTreeNode>>>,
     board_tasks: Arc<RwLock<HashMap<Uuid, BoardTask>>>,
     /// FLEET-001 scheduling: deferred goals held outside the Mission struct
@@ -37,6 +38,7 @@ impl InMemoryMissionStore {
             missions: Arc::new(RwLock::new(HashMap::new())),
             harness_sessions: Arc::new(RwLock::new(HashMap::new())),
             native_prompts: Arc::new(RwLock::new(HashMap::new())),
+            native_prompt_claims: Arc::new(RwLock::new(HashMap::new())),
             trees: Arc::new(RwLock::new(HashMap::new())),
             board_tasks: Arc::new(RwLock::new(HashMap::new())),
             deferred_goals: Arc::new(RwLock::new(HashMap::new())),
@@ -797,6 +799,7 @@ impl MissionStore for InMemoryMissionStore {
         backend: &str,
         session_id: Option<&str>,
         run: Option<&super::SessionUpdateRun>,
+        claim_id: Uuid,
     ) -> Result<bool, String> {
         let missions = self.missions.write().await;
         let mission = missions.get(&id).ok_or("mission not found")?;
@@ -813,14 +816,74 @@ impl MissionStore for InMemoryMissionStore {
             return Ok(false);
         }
         let mut prompts = self.native_prompts.write().await;
-        let attempted = prompts.entry(id).or_default();
-        if session_id.is_none() && attempted.contains(backend) {
-            return Ok(false);
+        let mut claims = self.native_prompt_claims.write().await;
+        let mut next = prompts.clone();
+        let mut next_claims = claims.clone();
+        let attempted = next.entry(id).or_default();
+        if attempted.contains(backend) {
+            // A bound continuation may proceed, but cannot own rollback of old evidence.
+            return Ok(session_id.is_some());
         }
         attempted.insert(backend.to_string());
-        drop(prompts);
-        drop(runs);
-        drop(missions);
+        next_claims.entry(id).or_default().insert(
+            backend.to_string(),
+            super::NativePromptClaim {
+                claim_id,
+                run: run.cloned(),
+            },
+        );
+        *prompts = next;
+        *claims = next_claims;
+        Ok(true)
+    }
+
+    async fn release_native_prompt_no_launch(
+        &self,
+        id: Uuid,
+        backend: &str,
+        run: Option<&super::SessionUpdateRun>,
+        claim_id: Uuid,
+    ) -> Result<bool, String> {
+        let missions = self.missions.write().await;
+        let mission = missions.get(&id).ok_or("mission not found")?;
+        if backend.is_empty() || mission.backend != backend {
+            return Ok(false);
+        }
+        let runs = self.runs.read().await;
+        let latest = runs
+            .values()
+            .filter(|r| r.mission_id == id)
+            .max_by_key(|r| r.generation)
+            .map(super::SessionUpdateRun::from);
+        if latest.as_ref() != run || mission.session_id.is_some() {
+            return Ok(false);
+        }
+        let mut prompts = self.native_prompts.write().await;
+        let mut claims = self.native_prompt_claims.write().await;
+        if claims.get(&id).and_then(|c| c.get(backend))
+            != Some(&super::NativePromptClaim {
+                claim_id,
+                run: run.cloned(),
+            })
+        {
+            return Ok(false);
+        }
+        let mut next = prompts.clone();
+        let mut next_claims = claims.clone();
+        if let Some(p) = next.get_mut(&id) {
+            p.remove(backend);
+            if p.is_empty() {
+                next.remove(&id);
+            }
+        }
+        if let Some(c) = next_claims.get_mut(&id) {
+            c.remove(backend);
+            if c.is_empty() {
+                next_claims.remove(&id);
+            }
+        }
+        *prompts = next;
+        *claims = next_claims;
         Ok(true)
     }
 
