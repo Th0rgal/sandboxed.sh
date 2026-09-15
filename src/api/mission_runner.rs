@@ -3118,38 +3118,46 @@ impl MissionRunner {
         });
 
         let session_store = self.session_store.clone();
+        let session_update_run = self
+            .durable_run
+            .as_ref()
+            .map(crate::api::mission_store::SessionUpdateRun::from);
         let handle = tokio::spawn(async move {
-            let result = run_mission_turn(
-                session_store,
-                config,
-                root_agent,
-                mcp,
-                workspaces,
-                library,
-                events_tx,
-                tool_hub,
-                status,
-                cancel,
-                hist_snapshot,
-                user_message.clone(),
-                Some(mission_ctrl),
-                tree_ref,
-                progress_ref,
-                mission_id,
-                Some(workspace_id),
-                backend_id,
-                agent_override,
-                model_override,
-                model_effort,
-                fast_mode,
-                secrets,
-                session_id,
-                config_profile,
-                working_directory,
-                user_id,
-                pr_readonly,
-            )
-            .await;
+            let result = crate::api::runners::SESSION_UPDATE_RUN
+                .scope(
+                    session_update_run,
+                    run_mission_turn(
+                        session_store,
+                        config,
+                        root_agent,
+                        mcp,
+                        workspaces,
+                        library,
+                        events_tx,
+                        tool_hub,
+                        status,
+                        cancel,
+                        hist_snapshot,
+                        user_message.clone(),
+                        Some(mission_ctrl),
+                        tree_ref,
+                        progress_ref,
+                        mission_id,
+                        Some(workspace_id),
+                        backend_id,
+                        agent_override,
+                        model_override,
+                        model_effort,
+                        fast_mode,
+                        secrets,
+                        session_id,
+                        config_profile,
+                        working_directory,
+                        user_id,
+                        pr_readonly,
+                    ),
+                )
+                .await;
             (msg_id, user_message, result)
         });
 
@@ -3877,6 +3885,7 @@ async fn run_mission_turn(
 
         // Update session ID and notify via events
         let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+            run: crate::api::runners::session_update_run(),
             backend: "claudecode".to_string(),
             mission_id,
             session_id: new_session_id.clone(),

@@ -849,13 +849,26 @@ impl MissionStore for FileMissionStore {
         id: Uuid,
         session_id: &str,
         backend: &str,
-    ) -> Result<(), String> {
+        run: Option<&super::SessionUpdateRun>,
+    ) -> Result<bool, String> {
         let mut missions = self.missions.write().await;
         let mission = missions
             .get_mut(&id)
             .ok_or_else(|| format!("Mission {} not found", id))?;
         if backend.is_empty() {
             return Err("native session update requires harness provenance".into());
+        }
+        // Same lock order as begin_mission_run: mission before runs.
+        // Keep the run read guard through the identity write so acquisition of
+        // a newer generation cannot race this check.
+        let runs = self.runs.read().await;
+        let latest = runs
+            .values()
+            .filter(|r| r.mission_id == id)
+            .max_by_key(|r| r.generation)
+            .map(super::SessionUpdateRun::from);
+        if latest.as_ref() != run {
+            return Ok(false);
         }
         self.harness_sessions
             .write()
@@ -867,8 +880,10 @@ impl MissionStore for FileMissionStore {
             mission.session_id = Some(session_id.to_string());
             mission.updated_at = now_string();
         }
+        drop(runs);
         drop(missions);
-        self.persist().await
+        self.persist().await?;
+        Ok(true)
     }
 
     async fn update_mission_tree(&self, id: Uuid, tree: &AgentTreeNode) -> Result<(), String> {

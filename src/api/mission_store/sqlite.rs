@@ -4785,12 +4785,14 @@ impl MissionStore for SqliteMissionStore {
         id: Uuid,
         session_id: &str,
         backend: &str,
-    ) -> Result<(), String> {
+        run: Option<&super::SessionUpdateRun>,
+    ) -> Result<bool, String> {
         if backend.is_empty() {
             return Err("native session update requires harness provenance".into());
         }
         let conn = self.conn.clone();
         let now = now_string();
+        let run = run.map(|r| (r.run_id.to_string(), r.generation));
         let session_id = session_id.to_string();
         let backend = backend.to_string();
         tokio::task::spawn_blocking(move || {
@@ -4800,6 +4802,13 @@ impl MissionStore for SqliteMissionStore {
                 "SELECT COALESCE(backend, 'opencode') FROM missions WHERE id = ?1",
                 params![id.to_string()], |row| row.get(0),
             ).map_err(|e| e.to_string())?;
+            let latest: Option<(String, u64)> = tx.query_row(
+                "SELECT run_id, generation FROM mission_runs WHERE mission_id = ?1 ORDER BY generation DESC LIMIT 1",
+                params![id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional().map_err(|e| e.to_string())?;
+            if latest != run {
+                return Ok(false);
+            }
             tx.execute(
                 "INSERT INTO mission_harness_sessions (mission_id, backend, session_id) VALUES (?1, ?2, ?3)
                  ON CONFLICT(mission_id, backend) DO UPDATE SET session_id = excluded.session_id",
@@ -4811,7 +4820,8 @@ impl MissionStore for SqliteMissionStore {
                     params![session_id, now, id.to_string()],
                 ).map_err(|e| e.to_string())?;
             }
-            tx.commit().map_err(|e| e.to_string())
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(true)
         }).await.map_err(|e| e.to_string())?
     }
 

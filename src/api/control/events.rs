@@ -202,6 +202,8 @@ pub enum AgentEvent {
     },
     /// Session ID update (for backends that generate their own session IDs)
     SessionIdUpdate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<crate::api::mission_store::SessionUpdateRun>,
         /// Harness that issued this ID; late updates must not replace another harness.
         #[serde(default)]
         backend: String,

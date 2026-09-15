@@ -20947,8 +20947,9 @@ async fn control_actor_loop(
                                     }
                                 };
                                 let turn_mission_store = mission_store.clone();
+                                let session_update_run = running_run.as_ref().map(crate::api::mission_store::SessionUpdateRun::from);
                                 running = Some(tokio::spawn(async move {
-                                    let result = run_single_control_turn(
+                                    let result = crate::api::runners::SESSION_UPDATE_RUN.scope(session_update_run, run_single_control_turn(
                                         turn_mission_store,
                                         cfg,
                                         agent,
@@ -20976,7 +20977,7 @@ async fn control_actor_loop(
                                         mission_config_profile,
                                         Some(user_id_for_turn),
                                         pr_readonly,
-                                    )
+                                    ))
                                     .await;
                                     (mid, msg, result)
                                 }));
@@ -22426,8 +22427,9 @@ async fn control_actor_loop(
                                             }
                                         };
                                         let turn_mission_store = mission_store.clone();
+                                        let session_update_run = running_run.as_ref().map(crate::api::mission_store::SessionUpdateRun::from);
                                         running = Some(tokio::spawn(async move {
-                                            let result = run_single_control_turn(
+                                            let result = crate::api::runners::SESSION_UPDATE_RUN.scope(session_update_run, run_single_control_turn(
                                                 turn_mission_store,
                                                 cfg,
                                                 agent,
@@ -22455,7 +22457,7 @@ async fn control_actor_loop(
                                                 mission_config_profile,
                                                 Some(user_id_for_turn),
                                                 pr_readonly,
-                                            )
+                                            ))
                                             .await;
                                             (mid, msg, result)
                                         }));
@@ -23543,8 +23545,9 @@ async fn control_actor_loop(
                         .store(0, std::sync::atomic::Ordering::Relaxed);
                     let user_id_for_turn = session_user_id.clone();
                     let turn_mission_store = mission_store.clone();
+                    let session_update_run = running_run.as_ref().map(crate::api::mission_store::SessionUpdateRun::from);
                     running = Some(tokio::spawn(async move {
-                        let result = run_single_control_turn(
+                        let result = crate::api::runners::SESSION_UPDATE_RUN.scope(session_update_run, run_single_control_turn(
                             turn_mission_store,
                             cfg,
                             agent,
@@ -23572,7 +23575,7 @@ async fn control_actor_loop(
                             mission_config_profile,
                             Some(user_id_for_turn),
                             pr_readonly,
-                        )
+                        ))
                         .await;
                         (mid, msg, result)
                     }));
@@ -24893,30 +24896,20 @@ async fn control_actor_loop(
                         }
                     }
 
-                    // Handle session ID updates for backends that generate their own IDs.
-                    if let AgentEvent::SessionIdUpdate { mission_id, session_id, backend } = &event {
-                        if let Err(err) = mission_store
-                            .update_mission_session_id(*mission_id, session_id, backend)
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to update session ID for mission {}: {}",
-                                mission_id,
-                                err
-                            );
-                        } else {
-                            tracing::debug!(
-                                mission_id = %mission_id,
-                                session_id = %session_id,
-                                "Updated mission session ID from backend"
-                            );
-                        }
-                        // Also update the parallel runner's cached session_id so the
-                        // next turn picks up the new value instead of the stale one.
-                        if let Some(runner) = parallel_runners.get_mut(mission_id) {
-                            if runner.backend_id == *backend {
-                                runner.session_id = Some(session_id.clone());
+                    // Only an update from the latest acquired generation may
+                    // mutate durable identity or the parallel runner cache.
+                    if let AgentEvent::SessionIdUpdate { mission_id, session_id, backend, run } = &event {
+                        match mission_store.update_mission_session_id(*mission_id, session_id, backend, run.as_ref()).await {
+                            Ok(true) => {
+                                if let Some(runner) = parallel_runners.get_mut(mission_id) {
+                                    let cached_run = runner.durable_run.as_ref().map(crate::api::mission_store::SessionUpdateRun::from);
+                                    if runner.backend_id == *backend && cached_run == *run {
+                                        runner.session_id = Some(session_id.clone());
+                                    }
+                                }
                             }
+                            Ok(false) => tracing::debug!(mission_id = %mission_id, "Ignored stale or unattributed native session update"),
+                            Err(err) => tracing::warn!(mission_id = %mission_id, %err, "Failed to persist native session update"),
                         }
                     }
 

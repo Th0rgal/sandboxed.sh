@@ -329,3 +329,44 @@ this source fix does not attest a deployed binary or measure Lean performance.
 
 Validation: all 23 Grok runner tests passed in a bounded debug scope.
 `cargo fmt --all` and `git diff --check` passed.
+
+
+## Native session generation fence
+
+Backend attribution alone cannot reject a delayed session notification from an
+older run of the same harness. Each spawned turn now captures its acquired
+run ID and generation. Session notifications and Grok direct persistence carry
+that immutable stamp. Memory, file and SQLite stores atomically compare it with
+the latest acquired run before changing either the per-harness native identity
+or its current-backend projection. Unattributed updates are accepted only for
+records with no run history. The latest generation may drain its final event
+after settlement; acquisition of any successor fences the older generation.
+The actor updates its cached identity only after an accepted store write and a
+matching cached run and backend.
+
+Regressions cover fresh Grok and first Codex-to-Grok handoff with no native ID,
+Grok-to-other-to-Grok restoration, old same-backend notifications, mismatched
+run/generation pairs, and unattributed notifications after run acquisition.
+A native ACP fixture checks that stale direct persistence preserves the
+successor's ID and stops before accepting a prompt, with continuity required.
+Unknown prompt/tool outcomes retain the existing no-replay behavior.
+
+MCP start/resume descriptions and coordinator guidance now state the native
+Codex goal limit of 4000 Unicode characters, including automatic writer
+promotion. Larger instructions belong in referenced artifacts; rejection does
+not truncate the goal.
+
+The saved expanded HTTP fixture failure came from the host's lido-to-verity-lido
+alias splitting lease keys. Its existing subprocess isolation removes
+HERMES_PROJECTS_DIR. The exactly-one-writer and expected-owner assertions remain
+intact; no production alias behavior is changed for the fixture.
+
+Residuals remain: durable project compute requirements must be enforced without
+legacy workspace naming; deployed native Grok remote environment and host auth
+need live receipts; cgroup conclusions require actual harness PID ancestry,
+not only a service-cgroup MCP subprocess. Fleet/submission discovery and deployed
+runner attestation remain separate gaps. No Lean benchmark or isolation slowdown
+is established. Metadata-touched legacy Grok UUIDs still need provenance before
+migration. Hermes canonical enrollment/retry and Lido repair remain with their
+owners. No deployment, merge, protected-mission contact or unknown-tool replay
+was performed.

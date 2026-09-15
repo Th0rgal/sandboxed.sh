@@ -526,8 +526,20 @@ async fn persist_grok_session(
 ) -> Result<(), String> {
     if let Some(store) = store {
         return store
-            .update_mission_session_id(mission_id, session_id, "grok")
+            .update_mission_session_id(
+                mission_id,
+                session_id,
+                "grok",
+                super::session_update_run().as_ref(),
+            )
             .await
+            .and_then(|accepted| {
+                if accepted {
+                    Ok(())
+                } else {
+                    Err("stale or unattributed execution generation".into())
+                }
+            })
             .map_err(|error| format!("Grok native session could not be persisted: {error}"));
     }
     // Protocol-only subprocess fixtures do not own a mission store. Real
@@ -882,6 +894,7 @@ async fn run_grok_streaming_process(
                                     .with_terminal_reason(TerminalReason::NativeContinuityRequired);
                             }
                             let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                                run: crate::api::runners::session_update_run(),
                                 backend: "grok".to_string(),
                                 session_id: sid,
                                 mission_id,
@@ -1482,6 +1495,7 @@ async fn run_grok_acp_process(
             persist_grok_session(mission_store, mission_id, &sid)
                 .await.map_err(|error| format!("{error}; {GROK_ACP_CONTINUITY_REQUIRED}"))?;
             let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                run: crate::api::runners::session_update_run(),
                 backend: "grok".to_string(),
                 mission_id,
                 session_id: sid.clone(),
@@ -2215,6 +2229,76 @@ mod tests {
                     .session_id
                     .as_deref(),
                 Some("stream-native")
+            );
+
+            // A late same-backend response cannot replace the successor's ID
+            // or authorize another ACP prompt.
+            let old = store
+                .begin_mission_run(mission.id, "old", None)
+                .await
+                .unwrap();
+            store
+                .finish_mission_run(old.run_id, old.generation, Some("turn_complete"))
+                .await
+                .unwrap();
+            let newer = store
+                .begin_mission_run(mission.id, "new", None)
+                .await
+                .unwrap();
+            let newer_stamp = crate::api::mission_store::SessionUpdateRun::from(&newer);
+            assert!(store
+                .update_mission_session_id(
+                    mission.id,
+                    "successor-native",
+                    "grok",
+                    Some(&newer_stamp)
+                )
+                .await
+                .unwrap());
+            let child = tokio::process::Command::new("python3")
+                .args([
+                    "-u",
+                    "-c",
+                    include_str!("fixtures/grok_acp.py"),
+                    "silent_success",
+                ])
+                .current_dir(root.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let error = crate::api::runners::SESSION_UPDATE_RUN
+                .scope(
+                    Some(crate::api::mission_store::SessionUpdateRun::from(&old)),
+                    run_grok_acp_process(
+                        Some(&store),
+                        child,
+                        root.path().to_str().unwrap(),
+                        "stale turn must not run",
+                        Some("fixture-model"),
+                        mission.id,
+                        events.clone(),
+                        CancellationToken::new(),
+                        None,
+                        false,
+                        GrokAcpIdlePolicy::default(),
+                    ),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.continuity_required);
+            assert!(!root.path().join("accepted-prompts").exists());
+            assert_eq!(
+                store
+                    .get_mission(mission.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .session_id
+                    .as_deref(),
+                Some("successor-native")
             );
         }
     }

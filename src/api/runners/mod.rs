@@ -28,6 +28,16 @@ use crate::api::control::{AgentEvent, ControlStatus, FrontendToolHub};
 use crate::secrets::SecretsStore;
 use crate::workspace::Workspace;
 
+tokio::task_local! {
+    /// Set inside each spawned turn from its already-acquired lease. Backend
+    /// event producers and direct native persistence share this immutable stamp.
+    pub(crate) static SESSION_UPDATE_RUN: Option<super::mission_store::SessionUpdateRun>;
+}
+
+pub(crate) fn session_update_run() -> Option<super::mission_store::SessionUpdateRun> {
+    SESSION_UPDATE_RUN.try_with(Clone::clone).ok().flatten()
+}
+
 /// Everything a harness needs to run one turn.
 ///
 /// The common fields are identical across all harness backends; backend-specific
@@ -326,6 +336,35 @@ pub(crate) fn effective_mid_turn_kind(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn native_session_stamp_is_captured_per_turn_not_delivery() {
+        use crate::api::mission_store::SessionUpdateRun;
+        let first = SessionUpdateRun {
+            run_id: uuid::Uuid::new_v4(),
+            generation: 1,
+        };
+        let second = SessionUpdateRun {
+            run_id: uuid::Uuid::new_v4(),
+            generation: 2,
+        };
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut tasks = Vec::new();
+        for stamp in [first.clone(), second.clone()] {
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(super::SESSION_UPDATE_RUN.scope(
+                Some(stamp),
+                async move {
+                    barrier.wait().await;
+                    tokio::task::yield_now().await;
+                    super::session_update_run()
+                },
+            )));
+        }
+        assert_eq!(tasks.remove(0).await.unwrap(), Some(first));
+        assert_eq!(tasks.remove(0).await.unwrap(), Some(second));
+        assert_eq!(super::session_update_run(), None);
+    }
+
     use super::*;
 
     #[test]

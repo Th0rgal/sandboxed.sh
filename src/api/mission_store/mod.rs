@@ -2444,13 +2444,16 @@ pub trait MissionStore: Send + Sync {
         Ok(())
     }
 
-    /// Update mission session ID (for backends that generate their own IDs).
+    /// Update native identity only for the latest acquired execution generation.
+    /// Returns false without mutation for stale or unattributed updates. None
+    /// is accepted only before any execution run exists (bootstrap/import).
     async fn update_mission_session_id(
         &self,
         id: Uuid,
         session_id: &str,
         backend: &str,
-    ) -> Result<(), String>;
+        run: Option<&SessionUpdateRun>,
+    ) -> Result<bool, String>;
 
     /// Update cached goal-mode metadata for missions started with `/goal`.
     async fn update_mission_goal(
@@ -4547,6 +4550,23 @@ mod admission_restore_tests {
     }
 }
 
+/// Provenance captured when an execution lease is acquired, never looked up
+/// at event delivery time (which could belong to a newer run).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUpdateRun {
+    pub run_id: Uuid,
+    pub generation: u64,
+}
+
+impl From<&MissionRun> for SessionUpdateRun {
+    fn from(run: &MissionRun) -> Self {
+        Self {
+            run_id: run.run_id,
+            generation: run.generation,
+        }
+    }
+}
+
 /// A deliberately narrow legacy migration predicate. Native identity, runs,
 /// and trees must also be checked by the storage implementation.
 fn is_untouched_grok_placeholder(mission: &Mission) -> bool {
@@ -4601,6 +4621,153 @@ mod harness_session_tests {
     use std::sync::Arc;
 
     #[tokio::test]
+    async fn native_session_updates_reject_old_same_backend_generations() {
+        for kind in ["memory", "file", "sqlite"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn MissionStore> = match kind {
+                "file" => Arc::new(
+                    FileMissionStore::new(dir.path().into(), "generation")
+                        .await
+                        .unwrap(),
+                ),
+                "sqlite" => Arc::new(
+                    SqliteMissionStore::new(dir.path().into(), "generation")
+                        .await
+                        .unwrap(),
+                ),
+                _ => Arc::new(InMemoryMissionStore::new()),
+            };
+            let fresh = store
+                .create_mission(
+                    Some("fresh grok"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("grok"),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(
+                fresh.session_id.is_none(),
+                "{kind}: fresh Grok must not receive a placeholder"
+            );
+            let unchanged = store
+                .update_mission_run_settings(
+                    fresh.id,
+                    Some("grok"),
+                    None,
+                    Some(Some("another-model")),
+                    None,
+                    None,
+                    None,
+                    &Uuid::new_v4().to_string(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                unchanged.session_id.is_none(),
+                "{kind}: settings cannot invent a native ID"
+            );
+            let old = store
+                .begin_mission_run(fresh.id, "old-owner", None)
+                .await
+                .unwrap();
+            let old_stamp = SessionUpdateRun::from(&old);
+            assert!(store
+                .update_mission_session_id(fresh.id, "old-native", "grok", Some(&old_stamp))
+                .await
+                .unwrap());
+            assert!(store
+                .finish_mission_run(old.run_id, old.generation, Some("turn_complete"))
+                .await
+                .unwrap());
+            let new = store
+                .begin_mission_run(fresh.id, "new-owner", None)
+                .await
+                .unwrap();
+            let new_stamp = SessionUpdateRun::from(&new);
+            assert!(new.generation > old.generation);
+            assert!(store
+                .update_mission_session_id(fresh.id, "new-native", "grok", Some(&new_stamp))
+                .await
+                .unwrap());
+            for stale in [
+                Some(old_stamp.clone()),
+                Some(SessionUpdateRun {
+                    run_id: old.run_id,
+                    generation: new.generation,
+                }),
+                Some(SessionUpdateRun {
+                    run_id: new.run_id,
+                    generation: old.generation,
+                }),
+                None,
+            ] {
+                assert!(
+                    !store
+                        .update_mission_session_id(
+                            fresh.id,
+                            "must-not-replace",
+                            "grok",
+                            stale.as_ref()
+                        )
+                        .await
+                        .unwrap(),
+                    "{kind}: stale/unattributed update"
+                );
+            }
+            assert!(store
+                .finish_mission_run(new.run_id, new.generation, Some("turn_complete"))
+                .await
+                .unwrap());
+            // Final notifications can drain after settlement, but only for the
+            // latest acquired generation; older generations remain rejected.
+            assert!(store
+                .update_mission_session_id(fresh.id, "new-native-final", "grok", Some(&new_stamp))
+                .await
+                .unwrap());
+            assert!(!store
+                .update_mission_session_id(fresh.id, "old-native-late", "grok", Some(&old_stamp))
+                .await
+                .unwrap());
+            let returned = store
+                .update_mission_run_settings(
+                    fresh.id,
+                    Some("codex"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "codex-placeholder",
+                )
+                .await
+                .unwrap();
+            assert_ne!(returned.session_id.as_deref(), Some("new-native-final"));
+            let returned = store
+                .update_mission_run_settings(
+                    fresh.id,
+                    Some("grok"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "random-placeholder",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                returned.session_id.as_deref(),
+                Some("new-native-final"),
+                "{kind}: return must preserve the latest Grok native identity"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn legacy_grok_placeholders_migrate_only_without_execution_evidence() {
         for (kind, legacy_activity) in [
             ("file", false),
@@ -4650,10 +4817,12 @@ mod harness_session_tests {
                         .unwrap();
                 }
                 match case {
-                    "native" => store
-                        .update_mission_session_id(mission.id, &session, "grok")
-                        .await
-                        .unwrap(),
+                    "native" => {
+                        assert!(store
+                            .update_mission_session_id(mission.id, &session, "grok", None)
+                            .await
+                            .unwrap());
+                    }
                     "history" => store
                         .update_mission_history(
                             mission.id,
@@ -4788,7 +4957,7 @@ mod harness_session_tests {
                 .await
                 .unwrap();
             store
-                .update_mission_session_id(mission.id, "codex-native:original", "codex")
+                .update_mission_session_id(mission.id, "codex-native:original", "codex", None)
                 .await
                 .unwrap();
             store
@@ -4824,7 +4993,7 @@ mod harness_session_tests {
             // A late old-harness event is retained for that harness, not projected
             // as the new harness's session while the old turn drains.
             store
-                .update_mission_session_id(mission.id, "codex-native:late", "codex")
+                .update_mission_session_id(mission.id, "codex-native:late", "codex", None)
                 .await
                 .unwrap();
             assert!(store
@@ -4835,7 +5004,7 @@ mod harness_session_tests {
                 .session_id
                 .is_none());
             store
-                .update_mission_session_id(mission.id, "grok-real-native-id", "grok")
+                .update_mission_session_id(mission.id, "grok-real-native-id", "grok", None)
                 .await
                 .unwrap();
             let changed = store
@@ -4902,7 +5071,7 @@ mod harness_session_tests {
                 "{kind}"
             );
             assert!(store
-                .update_mission_session_id(mission.id, "unattributed", "")
+                .update_mission_session_id(mission.id, "unattributed", "", None)
                 .await
                 .is_err());
         }

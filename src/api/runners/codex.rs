@@ -1346,6 +1346,7 @@ pub(crate) async fn consume_codex_events(
                     ExecutionEvent::CodexSessionBound { thread_id, goal_mode } => {
                         is_goal_request = goal_mode;
                         let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                            run: crate::api::runners::session_update_run(),
                             backend: "codex".to_string(),
                             mission_id,
                             session_id: format!("{}{thread_id}", continuity::SESSION_PREFIX),
