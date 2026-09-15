@@ -3694,16 +3694,21 @@ async fn run_mission_turn(
     let mut workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
     // Validate the requested source before config synchronization can create
     // directories. A missing checkout is not a request for a new workspace.
-    if let Some(requested) = mission_working_directory.as_deref() {
-        if let Err(error) =
+    let explicit_worktree = match mission_working_directory
+        .as_deref()
+        .map(|requested| {
             resolve_mission_working_directory(&workspace.path, workspace.workspace_type, requested)
-        {
+        })
+        .transpose()
+    {
+        Ok(path) => path,
+        Err(error) => {
             return AgentResult::failure(
                 format!("explicit working_directory is invalid: {error}"),
                 0,
-            );
+            )
         }
-    }
+    };
 
     if let Err(e) =
         workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &workspace).await
@@ -3717,7 +3722,7 @@ async fn run_mission_turn(
     let mission_work_dir_result = {
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
-        workspace::prepare_mission_workspace_with_skills_backend(
+        workspace::prepare_mission_workspace_with_skills_backend_at(
             &mut workspace,
             &mcp,
             lib_ref,
@@ -3728,6 +3733,7 @@ async fn run_mission_turn(
             boss_user_id.as_deref(),
             Some(&config.working_dir),
             !pr_readonly,
+            explicit_worktree.as_deref(),
         )
         .await
     };

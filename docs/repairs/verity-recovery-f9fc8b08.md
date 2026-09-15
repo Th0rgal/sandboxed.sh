@@ -18,7 +18,7 @@ modified. Deployment and merge are outside this repair's authorization.
 | Backend handoff → native agent selection | Settings reset the previous model but retain its agent, allowing OpenCode `build` to become native Claude's `--agent build`. | Clear an omitted agent when the backend changes. Preserve explicit custom-agent selection and same-backend settings. A real API/actor regression covers all three cases without starting execution. |
 | Native recovery → retry | Missing Grok session/load falls back to latest-session continuation; incomplete ACP tools receive fabricated terminal results. | Load the exact session or return `native_continuity_required`. Streaming CLI uses `--resume <id>`, not new-session `--session-id` or unqualified `--continue`. Ambiguous prompt writes and unknown tool outcomes cannot trigger transport fallback; unfinished calls remain unresolved in the raw trace. |
 | Workspace creation → Ready | Host workspace record is published before its root exists. | Create the host root before storing Ready; refuse a root that is an existing file. |
-| Workspace preparation → source | Missing recorded mission directories can be recreated as configuration-only trees. | Require an existing recorded mission directory before preparation. Validate explicit working directories before configuration synchronization. Existing root-volume identity checks remain in force. |
+| Workspace preparation → source | Missing recorded mission directories can be recreated as configuration-only trees. | Require an existing recorded mission directory unless an intact explicit worktree has a verified persisted owner. Validate explicit working directories before configuration synchronization. Existing root-volume identity checks remain in force. |
 | Durable command → cwd | Omitted cwd selects the workspace root (guest `/`), losing mission context. | Default to persisted mission working_directory or generated mission directory. Validate before installing wrappers. Preserve registered host scratch roots; explicit job overrides retain the workspace boundary. |
 | Grok authentication → CLI | OAuth access tokens are exported as API keys, and unrelated OAuth refresh can prevent usable API-key authentication. | Keep API keys and native auth-file credentials separate. Avoid global legacy-auth cleanup during mission launch. Use the launcher's nspawn/fallback decision for native auth placement, require explicit host HOME for container fallback, and reject container HOME/auth-directory escapes. Install credentials via unique, private-before-write temporary files. Preserve workspace credentials when the host has no usable cache. |
 | Error text → health | Numeric substring matching reads UUID fragment `b522` as HTTP 522. | Match complete numeric tokens. |
@@ -160,3 +160,22 @@ It also checks streaming persistence and a failed write that accepts no prompt.
 
 Validation: all 22 Grok runner tests passed in a bounded debug scope; all
 library test targets compiled with the main and parallel launch plumbing.
+
+## Review follow-up: authoritative explicit worktrees
+
+A generated mission directory can be auxiliary configuration when a worker uses
+another mission's verified worktree. Preparation may recreate that auxiliary
+directory only when the explicit source directory still exists and its persisted
+owner/root verifies. Without that evidence, the recorded source-loss fence still
+rejects preparation. The runner passes its already-resolved saved working
+directory to this guarded preparation path.
+
+Durable jobs with omitted cwd now validate a saved host worktree on another
+registered root through its persisted owner. An arbitrary cwd override does not
+gain this exception. Missing worktrees and existing but unregistered paths are
+rejected before wrapper installation or process launch.
+
+Validation: all 58 workspace and 35 durable-job tests passed in bounded debug
+scopes, including host/container auxiliary-directory recovery, missing/unregistered
+source refusal, cross-root saved cwd, and explicit-override rejection. All library
+test targets compiled; cargo fmt --all and git diff --check passed.

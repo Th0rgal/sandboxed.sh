@@ -476,6 +476,18 @@ fn resolve_mission_job_cwd(
         if Path::new(cwd).starts_with(&root) {
             return resolve_workspace_cwd(&root, WorkspaceType::Host, Some(cwd));
         }
+        if mission_working_directory.is_some() && Path::new(cwd).is_absolute() {
+            let owner = crate::workspace::verify_explicit_mission_working_directory_owner(
+                workspace,
+                Path::new(cwd),
+            )
+            .map_err(|error| {
+                format!("stored working_directory owner is unavailable or unverified: {error}")
+            })?;
+            let owner_root =
+                crate::workspace::mission_workspace_root_for_workspace(workspace, owner);
+            return resolve_workspace_cwd(&owner_root, WorkspaceType::Host, Some(cwd));
+        }
     }
     resolve_workspace_cwd(&workspace.path, workspace.workspace_type, Some(cwd))
 }
@@ -1584,6 +1596,35 @@ mod tests {
         );
         std::fs::remove_dir_all(&generated).unwrap();
         assert!(resolve_mission_job_cwd(&workspace, mission, None, None).is_err());
+    }
+
+    #[test]
+    fn durable_job_uses_stored_worktree_on_another_verified_root() {
+        let control = tempfile::tempdir().unwrap();
+        let boss_root = tempfile::tempdir().unwrap();
+        let worker_root = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace::Workspace::default_host(control.path().to_path_buf());
+        let boss = Uuid::new_v4();
+        let worker = Uuid::new_v4();
+        crate::workspace::persist_mission_workspace_root(&workspace, boss, boss_root.path())
+            .unwrap();
+        crate::workspace::persist_mission_workspace_root(&workspace, worker, worker_root.path())
+            .unwrap();
+        let worktree =
+            crate::workspace::mission_workspace_dir_for_workspace(&workspace, boss).join("wk-1");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join("source.lean"), "preserved source").unwrap();
+        assert_eq!(
+            resolve_mission_job_cwd(&workspace, worker, worktree.to_str(), None).unwrap(),
+            worktree
+        );
+        assert!(resolve_mission_job_cwd(&workspace, worker, None, worktree.to_str()).is_err());
+        let unregistered = boss_root.path().join("unregistered");
+        std::fs::create_dir(&unregistered).unwrap();
+        assert!(resolve_mission_job_cwd(&workspace, worker, unregistered.to_str(), None).is_err());
+        std::fs::remove_dir_all(&worktree).unwrap();
+        assert!(resolve_mission_job_cwd(&workspace, worker, worktree.to_str(), None).is_err());
+        assert!(!worktree.exists());
     }
 
     #[test]
