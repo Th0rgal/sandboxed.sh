@@ -7736,7 +7736,8 @@ where
 pub struct UpdateMissionSettingsRequest {
     /// Backend to use on the next turn ("opencode", "claudecode", "codex", etc.).
     pub backend: Option<String>,
-    /// Agent name. Omit to leave unchanged, null/empty string to clear.
+    /// Agent name. Omit to preserve on the same backend, or clear on a backend
+    /// switch. Explicit null/empty string also clears it.
     #[serde(default, deserialize_with = "deserialize_string_patch")]
     pub agent: Option<Option<String>>,
     /// Model override. Omit to leave unchanged, null/empty string to clear.
@@ -12985,7 +12986,13 @@ pub async fn update_mission_settings(
         }
     }
 
-    let agent = normalize_string_patch(req.agent);
+    let mut agent = normalize_string_patch(req.agent);
+    // Agent names belong to a harness just as model IDs do. Do not carry an
+    // OpenCode agent such as `build` into native Claude's --agent option.
+    // Explicit agent choices (including custom native agents) remain intact.
+    if backend_changed && agent.is_none() {
+        agent = Some(None);
+    }
     let mut model_override = normalize_string_patch(req.model_override);
     let mut model_effort = normalize_string_patch(req.model_effort);
     let mut fast_mode = req.fast_mode;

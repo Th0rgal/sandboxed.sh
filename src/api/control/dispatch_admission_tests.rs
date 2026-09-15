@@ -406,6 +406,61 @@ async fn track_dispatch_replaces_cancelled_and_acknowledged_owner_without_timer(
 }
 
 #[tokio::test]
+async fn native_handoff_clears_inherited_agent_but_preserves_explicit_selection() {
+    let h = Harness::new().await;
+    h.state.backend_registry.write().await.register(Arc::new(
+        crate::backend::claudecode::ClaudeCodeBackend::new(),
+    ));
+    for (initial_backend, supplied_agent, expected) in [
+        ("opencode", None, None),
+        (
+            "opencode",
+            Some("custom-native-agent"),
+            Some("custom-native-agent"),
+        ),
+        ("claudecode", None, Some("build")),
+    ] {
+        let mission = h
+            .control
+            .mission_store
+            .create_mission(
+                Some("agent handoff"),
+                None,
+                Some("build"),
+                None,
+                None,
+                Some(initial_backend),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut body = json!({"backend": "claudecode", "resume": false});
+        if let Some(agent) = supplied_agent {
+            body["agent"] = json!(agent);
+        }
+        let Json(updated) = update_mission_settings(
+            State(h.state.clone()),
+            Extension(h.user.clone()),
+            Path(mission.id),
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.get("agent").and_then(Value::as_str), expected);
+        let stored = h
+            .control
+            .mission_store
+            .get_mission(mission.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.agent.as_deref(), expected);
+        assert_eq!(stored.status, MissionStatus::Pending);
+        assert!(h.control.assignment_owners.read().await.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn oversized_native_goal_is_rejected_before_mission_dispatch() {
     let h = Harness::new().await;
     let response = h

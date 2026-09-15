@@ -2219,7 +2219,7 @@ impl AssistantMcp {
                         "model_override": {"type": "string", "description": "Model id. Empty string clears it. When backend changes this is reset unless set explicitly."},
                         "model_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                         "fast_mode": {"type": "boolean", "description": "Enable or disable Codex fast mode for future turns. Only backend=codex with GPT-5.6/5.5/5.4."},
-                        "agent": {"type": "string", "description": "Agent name. Empty string clears it."},
+                        "agent": {"type": "string", "description": "Agent name. Omission preserves it on the same backend and clears it on a backend switch. Empty string clears it."},
                         "config_profile": {"type": "string"}
                     }
                 }),

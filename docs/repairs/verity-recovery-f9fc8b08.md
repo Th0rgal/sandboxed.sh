@@ -15,6 +15,7 @@ modified. Deployment and merge are outside this repair's authorization.
 | --- | --- | --- |
 | Actor cancellation → admission | A parked Blocked mission is considered terminal by the idempotent cancel shortcut, retaining native-goal ownership despite a successful response. | Exclude Blocked from that shortcut. Explicit cancellation takes the existing no-runner interruption path; admission still checks execution generations, remote work, pending admissions, and ownership. |
 | Run settings → native CLI | A backend switch allocates a generic session UUID; Grok interprets transcript history as native continuation. | Store session identity per harness, preserve it across model changes and restarts, and attribute late session updates to the originating harness. First Grok handoff starts without an ID; return to a previous harness restores its ID. Refresh parallel-runner settings and ID together between turns. |
+| Backend handoff → native agent selection | Settings reset the previous model but retain its agent, allowing OpenCode `build` to become native Claude's `--agent build`. | Clear an omitted agent when the backend changes. Preserve explicit custom-agent selection and same-backend settings. A real API/actor regression covers all three cases without starting execution. |
 | Native recovery → retry | Missing Grok session/load falls back to latest-session continuation; incomplete ACP tools receive fabricated terminal results. | Load the exact session or return `native_continuity_required`. Streaming CLI uses `--resume <id>`, not new-session `--session-id` or unqualified `--continue`. Ambiguous prompt writes and unknown tool outcomes cannot trigger transport fallback; unfinished calls remain unresolved in the raw trace. |
 | Workspace creation → Ready | Host workspace record is published before its root exists. | Create the host root before storing Ready; refuse a root that is an existing file. |
 | Workspace preparation → source | Missing recorded mission directories can be recreated as configuration-only trees. | Require an existing recorded mission directory before preparation. Validate explicit working directories before configuration synchronization. Existing root-volume identity checks remain in force. |
@@ -38,7 +39,8 @@ Final focused run: 125 library tests and all 69 assistant-MCP tests passed
 (194 Rust tests total), with no empty filters or failures. This includes 21
 Codex continuity tests, 13 Grok ACP tests, 17 Grok auth tests, 34 durable-job
 tests, and 22 workspace execution tests. This is a focused suite, not the
-entire repository test suite.
+entire repository test suite. A subsequent real API/actor agent-handoff
+regression also passed, bringing distinct Rust coverage to 195 tests.
 
 Commands used, with the installed stable toolchain and a private target directory:
 
@@ -58,9 +60,11 @@ only and --resume as existing-session resume. No provider request was made.
 
 ## Remaining evidence and limits
 
-- The native Claude `build` versus valid `claude` report needs the exact error
-  and field (`agent`, `backend`, or `config_profile`). No speculative alias or
-  profile rewrite is included; custom native agents must remain possible.
+- The inherited-agent handoff bug is fixed and tested. The exact native Claude
+  `build` versus valid `claude` report still needs its error and field (`agent`,
+  `backend`, or `config_profile`) to establish whether it is this bug. No
+  speculative alias/profile rewrite is included; custom native agents remain
+  possible.
 - Fable's exact weekly-quota receipt and provider-specific recovery/reset
   behavior are not certified by synthetic phrase tests.
 - No live Grok authentication comparison against the reported container 0.1.211
