@@ -179,3 +179,23 @@ Validation: all 58 workspace and 35 durable-job tests passed in bounded debug
 scopes, including host/container auxiliary-directory recovery, missing/unregistered
 source refusal, cross-root saved cwd, and explicit-override rejection. All library
 test targets compiled; cargo fmt --all and git diff --check passed.
+
+## Review follow-up: garbage collection and resumability
+
+Both GC phases retain source directories for Failed, Interrupted, Blocked,
+AwaitingUser and Paused missions, regardless of retention age. Those statuses
+still support recovery/replies, so automatic source deletion conflicts with the
+source-loss guard. Same-workspace short-ID collisions now prefer these protected
+statuses over collectible terminal entries. Completed, Acknowledged and NotFeasible
+statuses retain their existing retention-based eligibility.
+
+The legacy long-stop cutoff remains in the configuration/report shape for
+compatibility but no longer authorizes source deletion for resumable/replyable
+missions. This deliberately increases disk retention; operators must settle or
+explicitly handle retained work rather than expect automatic source recreation.
+Previously deleted source still requires restoration or a verified explicit
+worktree; no intentional-deletion bypass is introduced.
+
+All seven GC tests passed in a bounded debug scope, including five protected
+statuses past retention and short-ID collisions. No production GC sweep or
+configuration change was performed.

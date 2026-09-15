@@ -12,10 +12,11 @@
 //! be opened from the dashboard; "Load earlier messages" continues to work.
 //!
 //! Terminal statuses we collect:
-//!     Completed, Acknowledged, Failed, Interrupted, Blocked, NotFeasible
+//!     Completed, Acknowledged, NotFeasible
 //!
-//! We deliberately do NOT collect `AwaitingUser` (still expecting the user
-//! to come back and reply) or anything currently running.
+//! Resumable Failed/Interrupted/Blocked and replyable AwaitingUser/Paused
+//! missions retain their source directories regardless of retention age, as do
+//! running missions. Missing source must never become a config-only resume.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +30,7 @@ use crate::workspace;
 /// Default retention when no value is configured in settings.
 pub const DEFAULT_RETENTION_DAYS: u32 = 1;
 
-/// Default long-stop retention for AwaitingUser/Paused mission dirs.
+/// Legacy long-stop setting retained for configuration compatibility.
 pub const DEFAULT_STOPPED_RETENTION_DAYS: u32 = 7;
 
 /// Page size for `list_missions` pagination — keeps the scan bounded in
@@ -183,7 +184,11 @@ pub struct MissionIndexEntry {
 fn protection_rank(status: &MissionStatus) -> u8 {
     match status {
         MissionStatus::Active | MissionStatus::Pending | MissionStatus::WaitingBackground => 2,
-        MissionStatus::AwaitingUser | MissionStatus::Paused => 1,
+        MissionStatus::AwaitingUser
+        | MissionStatus::Paused
+        | MissionStatus::Failed
+        | MissionStatus::Interrupted
+        | MissionStatus::Blocked => 1,
         _ => 0,
     }
 }
@@ -653,7 +658,7 @@ pub struct SweepReport {
     pub removed: usize,
     /// Dirs matching no mission in any store (hard-deleted / legacy DBs).
     pub orphans_removed: usize,
-    /// AwaitingUser/Paused dirs past the long-stop retention.
+    /// Legacy counter retained for report compatibility; resumable dirs are kept.
     pub stopped_removed: usize,
     pub errors: usize,
     pub bytes_freed: u64,
@@ -666,7 +671,8 @@ pub struct SweepReport {
 pub struct SweepParams {
     /// Terminal missions older than this are collected.
     pub cutoff: DateTime<Utc>,
-    /// AwaitingUser/Paused missions older than this are collected.
+    /// Legacy long-stop cutoff; retained for configuration compatibility.
+    /// Resumable/replyable mission source is no longer collected by age.
     pub stopped_cutoff: DateTime<Utc>,
     /// Whether unmatched `mission-*` dirs are collected.
     pub orphans_enabled: bool,
@@ -726,7 +732,7 @@ fn mission_directory_candidate(
 /// workspace root, reconciled against the mission index) — it catches what
 /// phase 1 structurally cannot: dirs of hard-deleted missions, dirs under a
 /// different-but-existing workspace than the mission's recorded one, and
-/// long-stopped AwaitingUser/Paused missions.
+/// explicitly settled missions; resumable/replyable directories are retained.
 pub async fn run_once(state: &Arc<AppState>, params: &SweepParams) -> SweepReport {
     let cutoff = params.cutoff;
     let mut report = SweepReport::default();
@@ -988,16 +994,8 @@ async fn orphan_sweep(
                         MissionStatus::Active
                         | MissionStatus::Pending
                         | MissionStatus::WaitingBackground => Verdict::Keep("mission running"),
-                        MissionStatus::AwaitingUser | MissionStatus::Paused => {
-                            if e.updated_at < params.stopped_cutoff {
-                                Verdict::Delete(
-                                    "stopped mission past long-stop retention",
-                                    false,
-                                    true,
-                                )
-                            } else {
-                                Verdict::Keep("awaiting user / paused within retention")
-                            }
+                        status if !is_gc_eligible_status(&status) => {
+                            Verdict::Keep("mission remains resumable or replyable")
                         }
                         _ => {
                             if e.updated_at < params.cutoff {
@@ -1097,18 +1095,12 @@ async fn orphan_sweep(
     }
 }
 
-/// Strict terminal-status filter — narrower than
-/// `is_terminal_mission_status` because `AwaitingUser` should keep its
-/// workspace dir alive (user may still come back to reply).
+/// Retain source for every status that supports recovery or a later reply.
+/// Terminal presentation alone does not authorize deleting a resume target.
 fn is_gc_eligible_status(status: &MissionStatus) -> bool {
     matches!(
         status,
-        MissionStatus::Completed
-            | MissionStatus::Acknowledged
-            | MissionStatus::Failed
-            | MissionStatus::Interrupted
-            | MissionStatus::Blocked
-            | MissionStatus::NotFeasible
+        MissionStatus::Completed | MissionStatus::Acknowledged | MissionStatus::NotFeasible
     )
 }
 
@@ -1145,6 +1137,61 @@ async fn directory_size_bytes(path: &std::path::Path) -> u64 {
 mod tests {
     use super::*;
     use crate::api::mission_store::{MissionStore, SqliteMissionStore};
+
+    #[test]
+    fn resumable_mission_sources_survive_retention_and_short_id_collisions() {
+        let workspace_id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let cutoff = now - chrono::Duration::days(7);
+        for status in [
+            MissionStatus::Failed,
+            MissionStatus::Interrupted,
+            MissionStatus::Blocked,
+            MissionStatus::AwaitingUser,
+            MissionStatus::Paused,
+        ] {
+            assert!(
+                !is_gc_eligible_status(&status),
+                "{status:?} must retain source"
+            );
+            let protected = MissionIndexEntry {
+                status,
+                updated_at: now - chrono::Duration::days(365),
+                workspace_id,
+            };
+            assert!(!indexed_mission_directory_is_collectible(
+                std::slice::from_ref(&protected),
+                workspace_id,
+                cutoff,
+                true,
+            ));
+            let entries = vec![
+                protected,
+                MissionIndexEntry {
+                    status: MissionStatus::Completed,
+                    updated_at: now - chrono::Duration::days(40),
+                    workspace_id,
+                },
+            ];
+            assert_eq!(
+                entry_for_workspace(&entries, workspace_id).unwrap().status,
+                status
+            );
+            assert!(!indexed_mission_directory_is_collectible(
+                &entries,
+                workspace_id,
+                cutoff,
+                true
+            ));
+        }
+        for status in [
+            MissionStatus::Completed,
+            MissionStatus::Acknowledged,
+            MissionStatus::NotFeasible,
+        ] {
+            assert!(is_gc_eligible_status(&status));
+        }
+    }
 
     #[test]
     fn short_id_collisions_are_resolved_within_the_actual_workspace() {
