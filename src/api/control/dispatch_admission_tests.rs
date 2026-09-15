@@ -619,7 +619,17 @@ async fn track_dispatch_terminal_presentation_does_not_override_unresolved_execu
                     .unwrap();
             }
             "actor" => {
-                h.control.assignment_owners.write().await.insert(old.id);
+                // Admission consumes a published actor snapshot. Give this
+                // fixture its own snapshot so the idle actor's heartbeat
+                // cannot replace injected ownership while the request runs.
+                let mut published = h.control.clone();
+                published.assignment_owners = Arc::new(RwLock::new(HashSet::from([old.id])));
+                h.state
+                    .control
+                    .sessions
+                    .write()
+                    .await
+                    .insert(h.user.id.clone(), published);
             }
             "remote" => {
                 job_ledger::record(
@@ -651,11 +661,10 @@ async fn track_dispatch_terminal_presentation_does_not_override_unresolved_execu
             _ => unreachable!(),
         }
         let candidate = track_dispatch_candidate(&h).await;
-        assert_eq!(
-            bind_track_dispatch(&h, &candidate).await.unwrap_err().0,
-            StatusCode::CONFLICT,
-            "{evidence}"
-        );
+        let rejection = bind_track_dispatch(&h, &candidate)
+            .await
+            .expect_err(&format!("{evidence} must retain ownership"));
+        assert_eq!(rejection.0, StatusCode::CONFLICT, "{evidence}");
         assert_eq!(
             h.state.projects.live_leases(None).unwrap()[0].attempt_id,
             old.id.to_string()

@@ -12,7 +12,11 @@ state = json.loads(state_path.read_text()) if state_path.exists() else {'starts'
 
 
 def save():
-    state_path.write_text(json.dumps(state))
+    # The driver may stop this process at a native checkpoint. Preserve a
+    # complete snapshot even if that happens during a subsequent write.
+    pending = state_path.with_suffix('.tmp')
+    pending.write_text(json.dumps(state))
+    pending.replace(state_path)
 
 
 def emit(value):

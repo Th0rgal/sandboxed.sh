@@ -199,3 +199,53 @@ worktree; no intentional-deletion bypass is introduced.
 All seven GC tests passed in a bounded debug scope, including five protected
 statuses past retention and short-ID collisions. No production GC sweep or
 configuration change was performed.
+
+## Residual architecture: compute policy and diagnostic attribution
+
+The operator verified that workspace `1ec51105` (legacy `dumbcontracts`, Ubuntu
+profile without Lean) returned `local_allowed` for project `verity-core`.
+`Workspace::compute_policy()` consults explicit workspace configuration and then
+workspace name/path and Lean-related defaults; it does not consult durable
+project requirements. The operator reports that f43 launched heavy local Lean
+on agent-core in `missions.slice`, cancelled it, shallow-updated
+`config.compute_policy=remote_required`, and resumed native Grok preserving edits.
+This repair did not perform those operations.
+
+Unfixed follow-up: resolve and enforce durable project compute requirements at
+admission, including native resume, queued turns and durable jobs. Legacy naming
+or a weaker workspace default must not downgrade a project's remote requirement.
+Acceptance requires policy-source receipts and refusal of local heavy work when
+required remote execution is unavailable. Keep this separate from the current
+cancellation/recovery repair.
+
+Diagnostic `572ed047` observed a host tool subprocess in
+`/system.slice/sandboxed-sh-prod.service` with `memory.max=20GiB`. The historical
+receipt lacks PID/start-time/ancestry evidence identifying the native harness.
+A later read-only cwd scan found no matching process but cannot reconstruct
+historical ancestry. Verify the actual harness PID, start time, ancestors and
+cgroup independently before concluding a harness scope escape. Compute placement
+and cgroup placement are separate: f43's local workload was in `missions.slice`.
+
+The diagnostic host required remote execution and had a wrapper, but exposed no
+fleet/submission MCP discovery. No benchmark ran. Inspected runner source cleans
+outputs; the deployed binary was not attested. Remaining bounded work includes
+host launch-scope coverage, Grok remote-environment propagation, catalog exposure
+under its existing owner, and deployed-binary/job receipts before measurement.
+These are measurement blockers; they do not establish that Lean isolation is slow.
+Detailed evidence and acceptance criteria are saved in
+`output/architecture-572ed047-assessment.md` in this repair workspace. No message
+was sent to protected be5.
+
+## CI fixture follow-up
+
+Run `34968992644` on `cc1f491d` passed 2,285 library tests and failed two. The
+admission fixture injected ownership into a snapshot concurrently replaced by
+the idle actor; it now supplies a separate published snapshot to admission.
+The synthetic Codex process rewrote its JSON state in place and could be stopped
+mid-write at a checkpoint; it now atomically replaces the snapshot. Both tests
+retain their ownership/native-continuity assertions. These changes affect test
+fixtures only; validation of the new head is reported in the PR.
+
+Local validation: all 73 admission tests and 21 Codex continuity tests passed;
+both previously failing tests also passed ten additional runs each.
+`cargo fmt --all` and `git diff --check` passed.
