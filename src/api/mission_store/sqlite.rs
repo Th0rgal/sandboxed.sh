@@ -519,6 +519,11 @@ CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status);
 CREATE INDEX IF NOT EXISTS idx_missions_status_updated ON missions(status, updated_at);
 
+CREATE TABLE IF NOT EXISTS mission_native_prompt_attempts (
+    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    backend TEXT NOT NULL,
+    PRIMARY KEY (mission_id, backend)
+);
 CREATE TABLE IF NOT EXISTS mission_harness_sessions (
     mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
     backend TEXT NOT NULL,
@@ -2488,6 +2493,7 @@ impl SqliteMissionStore {
                AND length(replace(session_id, '-', '')) = 32
                AND lower(replace(session_id, '-', '')) NOT GLOB '*[^0-9a-f]*'
                AND NOT EXISTS (SELECT 1 FROM mission_harness_sessions s WHERE s.mission_id = missions.id)
+               AND NOT EXISTS (SELECT 1 FROM mission_native_prompt_attempts p WHERE p.mission_id = missions.id)
                AND NOT EXISTS (SELECT 1 FROM mission_runs r WHERE r.mission_id = missions.id)
                AND NOT EXISTS (SELECT 1 FROM mission_events e WHERE e.mission_id = missions.id)
                AND NOT EXISTS (SELECT 1 FROM mission_trees t WHERE t.mission_id = missions.id)
@@ -4778,6 +4784,40 @@ impl MissionStore for SqliteMissionStore {
         })
         .await
         .map_err(|e| e.to_string())?
+    }
+
+    async fn native_prompt_attempted(&self, id: Uuid, backend: &str) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let backend = backend.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM mission_native_prompt_attempts WHERE mission_id = ?1 AND backend = ?2)", params![id.to_string(), backend], |r| r.get(0)).map_err(|e| e.to_string())
+        }).await.map_err(|e| e.to_string())?
+    }
+
+    async fn claim_native_prompt(
+        &self,
+        id: Uuid,
+        backend: &str,
+        session_id: Option<&str>,
+        run: Option<&super::SessionUpdateRun>,
+    ) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let backend = backend.to_string();
+        let session_id = session_id.map(str::to_string);
+        let run = run.map(|r| (r.run_id.to_string(), r.generation));
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let (current_backend, current_session): (String, Option<String>) = tx.query_row("SELECT COALESCE(backend, 'opencode'), session_id FROM missions WHERE id = ?1", [id.to_string()], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| e.to_string())?;
+            let latest: Option<(String, u64)> = tx.query_row("SELECT run_id, generation FROM mission_runs WHERE mission_id = ?1 ORDER BY generation DESC LIMIT 1", [id.to_string()], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(|e| e.to_string())?;
+            if backend.is_empty() || current_backend != backend || current_session != session_id || latest != run { return Ok(false); }
+            let prior: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM mission_native_prompt_attempts WHERE mission_id = ?1 AND backend = ?2)", params![id.to_string(), backend], |r| r.get(0)).map_err(|e| e.to_string())?;
+            if prior && session_id.is_none() { return Ok(false); }
+            tx.execute("INSERT OR IGNORE INTO mission_native_prompt_attempts (mission_id, backend) VALUES (?1, ?2)", params![id.to_string(), backend]).map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(true)
+        }).await.map_err(|e| e.to_string())?
     }
 
     async fn update_mission_session_id(

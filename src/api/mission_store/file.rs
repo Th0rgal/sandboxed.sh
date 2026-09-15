@@ -22,6 +22,8 @@ struct MissionStoreSnapshot {
     missions: HashMap<Uuid, Mission>,
     #[serde(default)]
     harness_sessions: HashMap<Uuid, HashMap<String, String>>,
+    #[serde(default)]
+    native_prompts: HashMap<Uuid, std::collections::HashSet<String>>,
     trees: HashMap<Uuid, AgentTreeNode>,
     #[serde(default)]
     runs: HashMap<Uuid, MissionRun>,
@@ -36,6 +38,7 @@ pub struct FileMissionStore {
     path: PathBuf,
     missions: Arc<RwLock<HashMap<Uuid, Mission>>>,
     harness_sessions: Arc<RwLock<HashMap<Uuid, HashMap<String, String>>>>,
+    native_prompts: Arc<RwLock<HashMap<Uuid, std::collections::HashSet<String>>>>,
     trees: Arc<RwLock<HashMap<Uuid, AgentTreeNode>>>,
     runs: Arc<RwLock<HashMap<Uuid, MissionRun>>>,
     deferred_goals: Arc<RwLock<HashMap<Uuid, String>>>,
@@ -80,6 +83,7 @@ impl FileMissionStore {
                     .runs
                     .values()
                     .any(|run| run.mission_id == mission.id)
+                && !snapshot.native_prompts.contains_key(&mission.id)
                 && !snapshot.trees.contains_key(&mission.id)
             {
                 mission.session_id = None;
@@ -90,6 +94,7 @@ impl FileMissionStore {
             path,
             missions: Arc::new(RwLock::new(snapshot.missions)),
             harness_sessions: Arc::new(RwLock::new(snapshot.harness_sessions)),
+            native_prompts: Arc::new(RwLock::new(snapshot.native_prompts)),
             trees: Arc::new(RwLock::new(snapshot.trees)),
             runs: Arc::new(RwLock::new(snapshot.runs)),
             deferred_goals: Arc::new(RwLock::new(snapshot.deferred_goals)),
@@ -106,6 +111,7 @@ impl FileMissionStore {
         let snapshot = MissionStoreSnapshot {
             missions: self.missions.read().await.clone(),
             harness_sessions: self.harness_sessions.read().await.clone(),
+            native_prompts: self.native_prompts.read().await.clone(),
             trees: self.trees.read().await.clone(),
             runs: self.runs.read().await.clone(),
             deferred_goals: self.deferred_goals.read().await.clone(),
@@ -454,6 +460,7 @@ impl MissionStore for FileMissionStore {
         let snapshot = MissionStoreSnapshot {
             missions: next.clone(),
             harness_sessions: self.harness_sessions.read().await.clone(),
+            native_prompts: self.native_prompts.read().await.clone(),
             trees: self.trees.read().await.clone(),
             runs: self.runs.read().await.clone(),
             deferred_goals: self.deferred_goals.read().await.clone(),
@@ -798,6 +805,7 @@ impl MissionStore for FileMissionStore {
         let snapshot = MissionStoreSnapshot {
             missions: next.clone(),
             harness_sessions: self.harness_sessions.read().await.clone(),
+            native_prompts: self.native_prompts.read().await.clone(),
             trees: self.trees.read().await.clone(),
             runs: self.runs.read().await.clone(),
             deferred_goals: self.deferred_goals.read().await.clone(),
@@ -842,6 +850,52 @@ impl MissionStore for FileMissionStore {
         mission.origin_session_id = origin_session_id.map(ToString::to_string);
         drop(missions);
         self.persist().await
+    }
+
+    async fn native_prompt_attempted(&self, id: Uuid, backend: &str) -> Result<bool, String> {
+        if !self.missions.read().await.contains_key(&id) {
+            return Err("mission not found".into());
+        }
+        Ok(self
+            .native_prompts
+            .read()
+            .await
+            .get(&id)
+            .is_some_and(|p| p.contains(backend)))
+    }
+
+    async fn claim_native_prompt(
+        &self,
+        id: Uuid,
+        backend: &str,
+        session_id: Option<&str>,
+        run: Option<&super::SessionUpdateRun>,
+    ) -> Result<bool, String> {
+        let missions = self.missions.write().await;
+        let mission = missions.get(&id).ok_or("mission not found")?;
+        if backend.is_empty() || mission.backend != backend {
+            return Ok(false);
+        }
+        let runs = self.runs.read().await;
+        let latest = runs
+            .values()
+            .filter(|r| r.mission_id == id)
+            .max_by_key(|r| r.generation)
+            .map(super::SessionUpdateRun::from);
+        if latest.as_ref() != run || mission.session_id.as_deref() != session_id {
+            return Ok(false);
+        }
+        let mut prompts = self.native_prompts.write().await;
+        let attempted = prompts.entry(id).or_default();
+        if session_id.is_none() && attempted.contains(backend) {
+            return Ok(false);
+        }
+        attempted.insert(backend.to_string());
+        drop(prompts);
+        drop(runs);
+        drop(missions);
+        self.persist().await?;
+        Ok(true)
     }
 
     async fn update_mission_session_id(

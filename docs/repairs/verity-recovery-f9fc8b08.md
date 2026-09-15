@@ -461,3 +461,59 @@ and formatting/diff checks passed. The 14 addressed technical threads were
 resolved after reviewer7eb's CLEAN verdict; F1 remains an accepted fail-closed
 limitation, not a completed automatic migration. Root's running 7c0f91be bin
 build was not duplicated; the new source requires a matching later artifact.
+
+
+## P1: unbound Grok prompt outcomes
+
+A first streaming process receives its prompt through argv and may execute tools
+before emitting a session ID. Previously, a death or failed ID write left None;
+the next attempt treated that as a fresh handoff and could duplicate effects.
+The fix records durable per-mission/per-harness prompt-attempt provenance before
+streaming spawn, or before ACP session/prompt. This is separate from native
+identity: it never invents an ID. MissionStore uses the existing acquired run ID
+and generation to atomically validate ownership/current binding and claim the
+prompt; the file snapshot gains native_prompts and SQLite gains the small
+mission_native_prompt_attempts table. Backups must retain both binding and
+prompt-provenance state.
+
+A known prior prompt plus absent native ID now requires reconciliation before
+any new process/prompt; the record survives reload, backend switches and terminal
+run settlement. A second unbound claim is rejected even in the same generation.
+Missing/failed provenance persistence prevents launch. Streaming termination
+without a durable ID is NativeContinuityRequired even if exit status is zero;
+failed ID persistence remains fenced. A spawn error after the durable claim is
+conservatively fenced too. There is no automatic claim erasure/retry, fake ID,
+unknown-result synthesis or account/latest-session fallback.
+
+ACP may create and persist a session before a later pre-prompt failure. The
+streaming fallback now reloads that exact canonical ID. Failed ACP pipe capture
+and model-write paths kill/reap the first child before returning fallback; any
+supplied exact ID that cannot load remains continuity-required regardless of a
+caller continuation flag. A supplied ID disagreeing with the canonical store
+also fails closed. Existing unknown prompt-write/tool-outcome guards remain.
+
+The regression starts from a Codex-to-Grok first handoff, records the production
+claim, and executes a local subprocess that accepts one prompt and writes one
+tool-effect receipt. Death, zero exit without ID, and a stale-generation ID-write
+failure must all park. Across memory/file/SQLite (including durable reopen), the
+retry's production entry guard prevents a second prompt and backend switching
+cannot remove the hold. Counterexamples reject a bad generation without marking
+an attempt and reject a second unbound claim within the same run. Existing real
+ACP fixture new/load checks and exact-resume tests cover valid bound continuation.
+The fixtures do not contact a provider or attest a deployed binary.
+
+This establishes provenance for prompts admitted by the new code. It does not
+reconstruct missing pre-upgrade native history or clear ambiguous legacy IDs;
+those still need independent reconciliation evidence. Root owns deployment and
+matching-artifact validation. No protected mission, release build or service was
+changed by this repair.
+
+
+Validation for this P1 batch: all 24 Grok runner tests, 105 mission-store tests,
+and the explicit-cancellation and concurrent-single-writer regressions passed
+(131 targeted tests). Exact CI Clippy arguments
+`cargo clippy --locked --workspace -- -D clippy::all` passed in 1m02s.
+`cargo fmt --all` and `git diff --check` passed. All local commands used the
+private mission CARGO_HOME and bounded debug scopes. These are source/fixture
+receipts; the new P1 thread remains for independent exact-head review, and a
+release artifact must be rebuilt from the selected fixed source.

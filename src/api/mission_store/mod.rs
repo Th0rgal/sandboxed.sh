@@ -2455,6 +2455,23 @@ pub trait MissionStore: Send + Sync {
         run: Option<&SessionUpdateRun>,
     ) -> Result<bool, String>;
 
+    /// Durable evidence that this harness may have accepted a prompt. Never a native ID.
+    async fn native_prompt_attempted(&self, _id: Uuid, _backend: &str) -> Result<bool, String> {
+        Err("native prompt provenance is unavailable".into())
+    }
+
+    /// Atomically fence the generation and record intent before launching/sending.
+    /// A second unbound attempt is forbidden even within the same generation.
+    async fn claim_native_prompt(
+        &self,
+        _id: Uuid,
+        _backend: &str,
+        _session_id: Option<&str>,
+        _run: Option<&SessionUpdateRun>,
+    ) -> Result<bool, String> {
+        Err("native prompt provenance is unavailable".into())
+    }
+
     /// Update cached goal-mode metadata for missions started with `/goal`.
     async fn update_mission_goal(
         &self,

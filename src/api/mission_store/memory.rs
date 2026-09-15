@@ -19,6 +19,7 @@ const METADATA_SOURCE_USER: &str = "user";
 pub struct InMemoryMissionStore {
     missions: Arc<RwLock<HashMap<Uuid, Mission>>>,
     harness_sessions: Arc<RwLock<HashMap<Uuid, HashMap<String, String>>>>,
+    native_prompts: Arc<RwLock<HashMap<Uuid, std::collections::HashSet<String>>>>,
     trees: Arc<RwLock<HashMap<Uuid, AgentTreeNode>>>,
     board_tasks: Arc<RwLock<HashMap<Uuid, BoardTask>>>,
     /// FLEET-001 scheduling: deferred goals held outside the Mission struct
@@ -35,6 +36,7 @@ impl InMemoryMissionStore {
         Self {
             missions: Arc::new(RwLock::new(HashMap::new())),
             harness_sessions: Arc::new(RwLock::new(HashMap::new())),
+            native_prompts: Arc::new(RwLock::new(HashMap::new())),
             trees: Arc::new(RwLock::new(HashMap::new())),
             board_tasks: Arc::new(RwLock::new(HashMap::new())),
             deferred_goals: Arc::new(RwLock::new(HashMap::new())),
@@ -775,6 +777,51 @@ impl MissionStore for InMemoryMissionStore {
         mission.origin = Some(origin.to_string());
         mission.origin_session_id = origin_session_id.map(ToString::to_string);
         Ok(())
+    }
+
+    async fn native_prompt_attempted(&self, id: Uuid, backend: &str) -> Result<bool, String> {
+        if !self.missions.read().await.contains_key(&id) {
+            return Err("mission not found".into());
+        }
+        Ok(self
+            .native_prompts
+            .read()
+            .await
+            .get(&id)
+            .is_some_and(|p| p.contains(backend)))
+    }
+
+    async fn claim_native_prompt(
+        &self,
+        id: Uuid,
+        backend: &str,
+        session_id: Option<&str>,
+        run: Option<&super::SessionUpdateRun>,
+    ) -> Result<bool, String> {
+        let missions = self.missions.write().await;
+        let mission = missions.get(&id).ok_or("mission not found")?;
+        if backend.is_empty() || mission.backend != backend {
+            return Ok(false);
+        }
+        let runs = self.runs.read().await;
+        let latest = runs
+            .values()
+            .filter(|r| r.mission_id == id)
+            .max_by_key(|r| r.generation)
+            .map(super::SessionUpdateRun::from);
+        if latest.as_ref() != run || mission.session_id.as_deref() != session_id {
+            return Ok(false);
+        }
+        let mut prompts = self.native_prompts.write().await;
+        let attempted = prompts.entry(id).or_default();
+        if session_id.is_none() && attempted.contains(backend) {
+            return Ok(false);
+        }
+        attempted.insert(backend.to_string());
+        drop(prompts);
+        drop(runs);
+        drop(missions);
+        Ok(true)
     }
 
     async fn update_mission_session_id(
