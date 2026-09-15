@@ -2455,7 +2455,8 @@ pub trait MissionStore: Send + Sync {
         run: Option<&SessionUpdateRun>,
     ) -> Result<bool, String>;
 
-    /// Durable evidence that this harness may have accepted a prompt. Never a native ID.
+    /// Durable native-attempt intent (session creation or prompt). Never a native ID
+    /// or proof that a user prompt actually executed.
     async fn native_prompt_attempted(&self, _id: Uuid, _backend: &str) -> Result<bool, String> {
         Err("native prompt provenance is unavailable".into())
     }

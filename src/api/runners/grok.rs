@@ -573,7 +573,7 @@ async fn grok_session_for_turn(
         return Err("Grok native identity is empty; reconciliation required".into());
     }
     if mission.session_id.is_none() && store.native_prompt_attempted(mission_id, "grok").await? {
-        return Err("Prior Grok prompt may have executed without a durable native identity; reconciliation required".into());
+        return Err("Prior Grok native attempt has no durable identity; session creation or prompt outcome requires reconciliation".into());
     }
     Ok(mission.session_id)
 }
@@ -604,7 +604,7 @@ async fn claim_grok_prompt(
 /// only mode that surfaces tool calls and works for thinking on every model.
 /// Set `SANDBOXED_SH_GROK_ACP=0` to force the legacy `--output-format
 /// streaming-json` path; the dispatcher also falls back to it automatically
-/// when the ACP handshake fails before the prompt is sent.
+/// when ACP fails before prompt delivery and native continuity permits fallback.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_grok_turn(
     mission_store: std::sync::Arc<dyn crate::api::mission_store::MissionStore>,
@@ -701,8 +701,7 @@ pub async fn run_grok_turn(
                     mission_id = %mission_id,
                     reason = %fallback.reason,
                     continuity_required = fallback.continuity_required,
-                    "Grok ACP handshake failed before the prompt was sent; \
-                     falling back to streaming-json mode"
+                    "Grok ACP setup failed; evaluating native continuity before transport fallback"
                 );
                 if fallback.continuity_required {
                     return AgentResult::failure(fallback.reason, 0)
@@ -1353,9 +1352,9 @@ fn grok_acp_update_is_terminal(update: &serde_json::Value) -> bool {
 
 /// Execute a turn over `grok agent stdio` (ACP JSON-RPC).
 ///
-/// Returns `Err(reason)` only for failures BEFORE the prompt is sent
-/// (spawn, initialize, session setup) so the dispatcher can safely fall
-/// back to the streaming-json path without double-executing the turn.
+/// Pre-prompt failures return a fallback decision. Uncertain native creation
+/// or identity requires reconciliation; only safe failures may fall back to
+/// streaming after reloading the canonical binding and claiming durable intent.
 #[allow(clippy::too_many_arguments)]
 async fn run_grok_acp_turn(
     mission_store: &std::sync::Arc<dyn crate::api::mission_store::MissionStore>,
@@ -1509,6 +1508,7 @@ async fn run_grok_acp_process(
     // Wrapped so every early error kills the spawned CLI first — a dropped
     // tokio Child keeps running (no kill_on_drop), and the fallback path
     // would spawn a second CLI for the same turn.
+    let mut session_creation_attempted = false;
     let handshake: Result<(String, bool), String> = async {
         let session_load_failed = false;
         send(
@@ -1558,6 +1558,13 @@ async fn run_grok_acp_process(
             ));
         }
         if acp_session_id.is_none() {
+            // session/new itself creates native state. Record intent before
+            // the RPC so a lost response cannot authorize another fresh entry.
+            if let Some(store) = mission_store {
+                claim_grok_prompt(store, mission_id, None).await
+                    .map_err(|error| format!("{error}; {GROK_ACP_CONTINUITY_REQUIRED}"))?;
+            }
+            session_creation_attempted = true;
             send(
                 &mut stdin,
                 serde_json::json!({
@@ -1596,7 +1603,8 @@ async fn run_grok_acp_process(
         Err(err) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            let continuity_required = err.contains(GROK_ACP_CONTINUITY_REQUIRED);
+            let continuity_required =
+                session_creation_attempted || err.contains(GROK_ACP_CONTINUITY_REQUIRED);
             return Err(GrokAcpFallback {
                 reason: err,
                 continuity_required,
@@ -2380,6 +2388,150 @@ sys.exit(0 if sys.argv[1]=='success_without_id' else 1)
                 assert!(
                     grok_session_for_turn(&store, mission.id).await.is_err(),
                     "handoff must not erase uncertainty"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_acp_unknown_session_creation_is_durable_without_claiming_prompt_execution() {
+        use crate::api::mission_store::{
+            FileMissionStore, InMemoryMissionStore, MissionStore, SessionUpdateRun,
+            SqliteMissionStore,
+        };
+        use std::process::Stdio;
+        for kind in ["memory", "file", "sqlite"] {
+            for scenario in ["initialize_eof", "new_eof", "new_missing_id"] {
+                let root = tempfile::tempdir().unwrap();
+                let mut store: Arc<dyn MissionStore> = match kind {
+                    "file" => Arc::new(
+                        FileMissionStore::new(root.path().into(), "creation")
+                            .await
+                            .unwrap(),
+                    ),
+                    "sqlite" => Arc::new(
+                        SqliteMissionStore::new(root.path().into(), "creation")
+                            .await
+                            .unwrap(),
+                    ),
+                    _ => Arc::new(InMemoryMissionStore::new()),
+                };
+                let mission = store
+                    .create_mission(
+                        Some("unknown creation"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some("grok"),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let run = store
+                    .begin_mission_run(mission.id, "first", None)
+                    .await
+                    .unwrap();
+                let child = tokio::process::Command::new("python3")
+                    .args(["-u", "-c", include_str!("fixtures/grok_acp.py"), scenario])
+                    .current_dir(root.path())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let (events, _) = broadcast::channel(16);
+                let error = crate::api::runners::SESSION_UPDATE_RUN
+                    .scope(
+                        Some(SessionUpdateRun::from(&run)),
+                        run_grok_acp_process(
+                            Some(&store),
+                            child,
+                            root.path().to_str().unwrap(),
+                            "must not reach prompt",
+                            None,
+                            mission.id,
+                            events,
+                            CancellationToken::new(),
+                            None,
+                            false,
+                            GrokAcpIdlePolicy::default(),
+                        ),
+                    )
+                    .await
+                    .unwrap_err();
+                if scenario == "initialize_eof" {
+                    assert!(!error.continuity_required, "{kind}/{scenario}");
+                    assert!(!root.path().join("session-methods").exists());
+                    assert!(!root.path().join("accepted-prompts").exists());
+                    assert!(!store
+                        .native_prompt_attempted(mission.id, "grok")
+                        .await
+                        .unwrap());
+                    assert_eq!(
+                        grok_session_for_turn(&store, mission.id).await.unwrap(),
+                        None
+                    );
+                    assert!(crate::api::runners::SESSION_UPDATE_RUN
+                        .scope(
+                            Some(SessionUpdateRun::from(&run)),
+                            claim_grok_prompt(&store, mission.id, None)
+                        )
+                        .await
+                        .is_ok());
+                    continue;
+                }
+                assert!(error.continuity_required, "{kind}/{scenario}");
+                assert!(!root.path().join("accepted-prompts").exists());
+                assert_eq!(
+                    std::fs::read_to_string(root.path().join("session-methods")).unwrap(),
+                    "session/new\n"
+                );
+                store = match kind {
+                    "file" => Arc::new(
+                        FileMissionStore::new(root.path().into(), "creation")
+                            .await
+                            .unwrap(),
+                    ),
+                    "sqlite" => Arc::new(
+                        SqliteMissionStore::new(root.path().into(), "creation")
+                            .await
+                            .unwrap(),
+                    ),
+                    _ => store,
+                };
+                assert!(store
+                    .native_prompt_attempted(mission.id, "grok")
+                    .await
+                    .unwrap());
+                assert!(store
+                    .get_mission(mission.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .session_id
+                    .is_none());
+                assert!(grok_session_for_turn(&store, mission.id).await.is_err());
+                assert!(store
+                    .finish_mission_run(run.run_id, run.generation, Some("unknown_creation"))
+                    .await
+                    .unwrap());
+                let retry = store
+                    .begin_mission_run(mission.id, "retry", None)
+                    .await
+                    .unwrap();
+                assert!(crate::api::runners::SESSION_UPDATE_RUN
+                    .scope(
+                        Some(SessionUpdateRun::from(&retry)),
+                        claim_grok_prompt(&store, mission.id, None)
+                    )
+                    .await
+                    .is_err());
+                assert!(!root.path().join("accepted-prompts").exists());
+                assert_eq!(
+                    std::fs::read_to_string(root.path().join("session-methods")).unwrap(),
+                    "session/new\n"
                 );
             }
         }

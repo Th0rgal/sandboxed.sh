@@ -517,3 +517,30 @@ and the explicit-cancellation and concurrent-single-writer regressions passed
 private mission CARGO_HOME and bounded debug scopes. These are source/fixture
 receipts; the new P1 thread remains for independent exact-head review, and a
 release artifact must be rebuilt from the selected fixed source.
+
+
+### ACP session-creation uncertainty
+
+Reviewer7eb's pathway matrix additionally requires preservation of uncertain
+session creation before prompt delivery. The same durable intent marker is now
+claimed before session/new, not only session/prompt. A lost response, missing ID
+or failed identity write therefore refuses streaming fallback and later fresh
+entry. Marker presence is evidence of a native attempt, not proof that a user
+prompt ran; its historical native_prompts/table names cover both stages.
+Successful creation persists the real ID and permits the bound prompt claim.
+An initialize failure before session creation may still use the guarded streaming
+path. New subprocess cases cover EOF and missing sessionId after session/new on
+all three stores, including durable reopen and successor generation: exactly one
+creation request and zero user prompts are observed, and retry stays fenced.
+The initialize-EOF counterexample observes no creation or prompt and permits
+the subsequent generation-checked streaming claim on all three stores.
+
+Final focused Grok suite: 25 tests passed, including nine store/stage cases
+in the ACP creation regression and the earlier nine unbound streaming cases.
+The only source adjustment after that test compile clarified the fallback log
+and API documentation; it does not alter control flow.
+
+Exact CI Clippy `cargo clippy --locked --workspace -- -D clippy::all`
+also passed after the final source edits. Logs: `grok-acp-final-tests.log` and
+`grok-acp-final-clippy.log` in the private mission output directory.
+Independent exact-head review of the P1 remains required before merge.
