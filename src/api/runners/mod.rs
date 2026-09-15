@@ -46,7 +46,7 @@ pub(crate) async fn persist_and_publish_native_session(
     backend: &str,
     session_id: &str,
     events: &broadcast::Sender<AgentEvent>,
-) -> Result<(), AgentResult> {
+) -> Result<(), Box<AgentResult>> {
     let run = session_update_run();
     let accepted = match store {
         Some(store) => {
@@ -70,11 +70,13 @@ pub(crate) async fn persist_and_publish_native_session(
             let reason = result
                 .err()
                 .unwrap_or_else(|| "stale or unattributed execution generation".to_string());
-            Err(AgentResult::failure(
-                format!("{backend} native session persistence failed: {reason}"),
-                0,
-            )
-            .with_terminal_reason(crate::agents::TerminalReason::NativeContinuityRequired))
+            Err(Box::new(
+                AgentResult::failure(
+                    format!("{backend} native session persistence failed: {reason}"),
+                    0,
+                )
+                .with_terminal_reason(crate::agents::TerminalReason::NativeContinuityRequired),
+            ))
         }
     }
 }

@@ -3016,7 +3016,7 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
                 )
                 .await
                 {
-                    return failure;
+                    return *failure;
                 }
                 let session_marker = work_dir.join(".claude-session-initiated");
                 if session_marker.exists() {
@@ -3172,7 +3172,7 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
                 )
                 .await
                 {
-                    return failure;
+                    return *failure;
                 }
 
                 let session_marker = work_dir.join(".claude-session-initiated");

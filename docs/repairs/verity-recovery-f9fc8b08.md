@@ -447,3 +447,17 @@ admission tests). The debug build completed in 3m03s under the private 12 GiB,
 build61d0ba97 exit 0 on ed3d0e55 is a receipt for the preceding head, not this
 source change. This checkpoint awaits independent exact-head review; no repeated
 CI polling, merge, restart or deployment was performed.
+
+
+## F3 Clippy follow-up
+
+CI job 104426469726 flagged the acknowledgement helper's large AgentResult error
+variant. The helper now returns Box<AgentResult>; four callers unwrap it without
+changing persistence ordering or failure classification. No lint is suppressed.
+Exact CI arguments `cargo clippy --locked --workspace -- -D clippy::all` passed
+locally in 2m06s. The delayed-delivery acknowledgement regression passed again
+after a 1m14s debug test build. Both used the explicit private mission CARGO_HOME,
+and formatting/diff checks passed. The 14 addressed technical threads were
+resolved after reviewer7eb's CLEAN verdict; F1 remains an accepted fail-closed
+limitation, not a completed automatic migration. Root's running 7c0f91be bin
+build was not duplicated; the new source requires a matching later artifact.

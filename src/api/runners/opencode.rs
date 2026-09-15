@@ -1910,7 +1910,7 @@ pub async fn run_opencode_turn(
         )
         .await
         {
-            return failure;
+            return *failure;
         }
     }
     let stored_message = session_id

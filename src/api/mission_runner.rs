@@ -3893,7 +3893,7 @@ async fn run_mission_turn(
         )
         .await
         {
-            return failure;
+            return *failure;
         }
 
         session_id = Some(new_session_id.clone());
