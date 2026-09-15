@@ -4553,7 +4553,11 @@ fn is_untouched_grok_placeholder(mission: &Mission) -> bool {
     mission.backend == "grok"
         && mission.status == MissionStatus::Pending
         && mission.created_at == mission.updated_at
-        && mission.activity.last_status_change_at.as_deref() == Some(&mission.created_at)
+        && mission
+            .activity
+            .last_status_change_at
+            .as_deref()
+            .is_none_or(|changed| changed == mission.created_at)
         && mission.activity.last_agent_event_at.is_none()
         && mission.activity.last_output_at.is_none()
         && mission.history.is_empty()
@@ -4598,7 +4602,12 @@ mod harness_session_tests {
 
     #[tokio::test]
     async fn legacy_grok_placeholders_migrate_only_without_execution_evidence() {
-        for kind in ["file", "sqlite"] {
+        for (kind, legacy_activity) in [
+            ("file", false),
+            ("sqlite", false),
+            ("file", true),
+            ("sqlite", true),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let store: Arc<dyn MissionStore> = if kind == "file" {
                 Arc::new(
@@ -4622,6 +4631,7 @@ mod harness_session_tests {
                 "run",
                 "blocked",
                 "touched",
+                "status_touched",
                 "opaque",
             ] {
                 let mission = store
@@ -4683,15 +4693,21 @@ mod harness_session_tests {
                     } else {
                         m["created_at"].clone()
                     };
-                    m["activity"]["last_status_change_at"] = m["created_at"].clone();
+                    if *case == "status_touched" {
+                        m["last_status_change_at"] = serde_json::json!("2026-09-16T00:00:00Z");
+                    } else if legacy_activity {
+                        m.as_object_mut().unwrap().remove("last_status_change_at");
+                    } else {
+                        m["last_status_change_at"] = m["created_at"].clone();
+                    }
                 }
                 std::fs::write(path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
             } else {
                 let conn =
                     rusqlite::Connection::open(dir.path().join("missions-legacy-grok.db")).unwrap();
                 for (case, id, session) in &cases {
-                    conn.execute("UPDATE missions SET session_id = ?1, updated_at = CASE WHEN ?2 = 'touched' THEN '2026-09-16T00:00:00Z' ELSE created_at END, last_status_change_at = created_at WHERE id = ?3",
-                        rusqlite::params![session, case, id.to_string()]).unwrap();
+                    conn.execute("UPDATE missions SET session_id = ?1, updated_at = CASE WHEN ?2 = 'touched' THEN '2026-09-16T00:00:00Z' ELSE created_at END, last_status_change_at = CASE WHEN ?2 = 'status_touched' THEN '2026-09-16T00:00:00Z' WHEN ?4 THEN NULL ELSE created_at END WHERE id = ?3",
+                        rusqlite::params![session, case, id.to_string(), legacy_activity]).unwrap();
                     if *case == "history" {
                         // SQLite history is derived from persisted events;
                         // update_mission_history only touches updated_at.
@@ -4722,7 +4738,7 @@ mod harness_session_tests {
                         } else {
                             Some(session.as_str())
                         },
-                        "{kind}: {case}"
+                        "{kind}: {case}, legacy_activity={legacy_activity}"
                     );
                     if *case != "untouched" {
                         assert_eq!(

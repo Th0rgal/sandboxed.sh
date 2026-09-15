@@ -279,3 +279,17 @@ reported live Grok 401 or replace the outstanding isolated provider smoke test.
 
 All 21 Grok auth tests passed locally in a bounded debug scope.
 `cargo fmt --all` and `git diff --check` passed.
+
+## Review follow-up: pre-activity legacy Grok records
+
+Unused-placeholder migration accepts a missing legacy last_status_change_at
+(file omission or SQLite NULL) when every other untouched/execution-evidence
+check passes. A present changed status timestamp still blocks migration. The
+file/SQLite regression now runs the complete positive/negative matrix both with
+and without the activity timestamp, through two store reopens. Native mappings,
+prior history/events, runs, blocked/touched records and opaque IDs remain fenced;
+Hermes origin attribution remains preserved.
+
+The file fixture now writes the actual flattened activity field. All 104
+mission-store tests passed in a bounded debug scope; formatting and diff checks
+passed.
