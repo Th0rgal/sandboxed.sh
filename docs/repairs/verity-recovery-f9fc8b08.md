@@ -125,5 +125,17 @@ First-session and authentication failures retain their existing classification.
 A real subprocess regression exercises both missing-session messages and those
 negative cases; all 21 Grok runner tests passed in a bounded debug scope.
 
-A separate review finding about legacy preallocated Grok IDs is still under
-investigation. Empty history alone must not authorize discarding native identity.
+Legacy file/SQLite stores now clear preallocated UUID-v4 Grok IDs only for
+untouched pending records: creation/update/status timestamps must agree, with no
+resume/terminal evidence, native-session mapping, history, run or tree. SQLite
+also checks the complete event table, not the bounded history projection. The
+file migration is persisted before returning the store; SQLite uses a single
+conditional UPDATE. Ambiguous or previously executed records retain their IDs
+and require reconciliation. No live mission is migrated by this repair work.
+
+Reopen regressions cover an untouched placeholder plus confirmed native IDs,
+history, durable runs, blocked status, changed timestamps and opaque IDs, across
+both stores and two reopens. No lease is released by the migration.
+
+Validation: all 104 mission-store tests passed in a bounded debug scope,
+including legacy migration/reopen and existing lease/storage regressions.

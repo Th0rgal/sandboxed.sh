@@ -49,7 +49,7 @@ impl FileMissionStore {
             .map_err(|e| format!("Failed to create mission store dir: {}", e))?;
         let filename = format!("missions-{}.json", sanitize_filename(user_id));
         let path = base_dir.join(filename);
-        let snapshot = match fs::read(&path).await {
+        let mut snapshot = match fs::read(&path).await {
             Ok(bytes) => match serde_json::from_slice::<MissionStoreSnapshot>(&bytes) {
                 Ok(snapshot) => snapshot,
                 Err(e) => {
@@ -66,7 +66,27 @@ impl FileMissionStore {
             }
         };
 
-        Ok(Self {
+        // Old stores preallocated a random ID even before Grok ever ran.
+        // Only untouched pending records without execution/native-ID evidence
+        // can discard that placeholder. Empty transcript alone is insufficient.
+        let mut migrated = false;
+        for mission in snapshot.missions.values_mut() {
+            if super::is_untouched_grok_placeholder(mission)
+                && snapshot
+                    .harness_sessions
+                    .get(&mission.id)
+                    .is_none_or(|s| s.is_empty())
+                && !snapshot
+                    .runs
+                    .values()
+                    .any(|run| run.mission_id == mission.id)
+                && !snapshot.trees.contains_key(&mission.id)
+            {
+                mission.session_id = None;
+                migrated = true;
+            }
+        }
+        let store = Self {
             path,
             missions: Arc::new(RwLock::new(snapshot.missions)),
             harness_sessions: Arc::new(RwLock::new(snapshot.harness_sessions)),
@@ -74,7 +94,11 @@ impl FileMissionStore {
             runs: Arc::new(RwLock::new(snapshot.runs)),
             deferred_goals: Arc::new(RwLock::new(snapshot.deferred_goals)),
             persist_lock: Arc::new(Mutex::new(())),
-        })
+        };
+        if migrated {
+            store.persist().await?;
+        }
+        Ok(store)
     }
 
     async fn persist(&self) -> Result<(), String> {

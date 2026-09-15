@@ -4547,6 +4547,30 @@ mod admission_restore_tests {
     }
 }
 
+/// A deliberately narrow legacy migration predicate. Native identity, runs,
+/// and trees must also be checked by the storage implementation.
+fn is_untouched_grok_placeholder(mission: &Mission) -> bool {
+    mission.backend == "grok"
+        && mission.status == MissionStatus::Pending
+        && mission.created_at == mission.updated_at
+        && mission.activity.last_status_change_at.as_deref() == Some(&mission.created_at)
+        && mission.activity.last_agent_event_at.is_none()
+        && mission.activity.last_output_at.is_none()
+        && mission.history.is_empty()
+        && !mission.resumable
+        && mission.interrupted_at.is_none()
+        && mission.paused_at.is_none()
+        && mission.terminal_reason.is_none()
+        && mission.terminal_evidence.is_none()
+        && mission.origin_session_id.is_none()
+        && mission.desktop_sessions.is_empty()
+        && mission.session_id.as_deref().is_some_and(|id| {
+            Uuid::parse_str(id)
+                .ok()
+                .is_some_and(|id| id.get_version_num() == 4)
+        })
+}
+
 /// Select the current harness's own session without erasing other harnesses.
 /// Grok allocates native IDs itself: None means first entry, never --continue.
 fn select_harness_session(
@@ -4572,6 +4596,139 @@ fn select_harness_session(
 mod harness_session_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn legacy_grok_placeholders_migrate_only_without_execution_evidence() {
+        for kind in ["file", "sqlite"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn MissionStore> = if kind == "file" {
+                Arc::new(
+                    FileMissionStore::new(dir.path().to_path_buf(), "legacy-grok")
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                Arc::new(
+                    SqliteMissionStore::new(dir.path().to_path_buf(), "legacy-grok")
+                        .await
+                        .unwrap(),
+                )
+            };
+            let mut cases = Vec::new();
+            for case in [
+                "untouched",
+                "native",
+                "history",
+                "run",
+                "blocked",
+                "touched",
+                "opaque",
+            ] {
+                let mission = store
+                    .create_mission(Some(case), None, None, None, None, Some("grok"), None)
+                    .await
+                    .unwrap();
+                let session = if case == "opaque" {
+                    "native-opaque-id".to_string()
+                } else {
+                    Uuid::new_v4().to_string()
+                };
+                match case {
+                    "native" => store
+                        .update_mission_session_id(mission.id, &session, "grok")
+                        .await
+                        .unwrap(),
+                    "history" => store
+                        .update_mission_history(
+                            mission.id,
+                            &[MissionHistoryEntry {
+                                role: "assistant".into(),
+                                content: "prior effect".into(),
+                            }],
+                        )
+                        .await
+                        .unwrap(),
+                    "run" => {
+                        store
+                            .begin_mission_run(mission.id, "fixture", None)
+                            .await
+                            .unwrap();
+                    }
+                    "blocked" => store
+                        .update_mission_status(mission.id, MissionStatus::Blocked)
+                        .await
+                        .unwrap(),
+                    _ => {}
+                }
+                cases.push((case, mission.id, session));
+            }
+            drop(store);
+            // Model pre-upgrade allocation on disk. Reset timestamps even for
+            // the negative cases so each evidence fence is independently tested.
+            if kind == "file" {
+                let path = dir.path().join("missions-legacy-grok.json");
+                let mut snapshot: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                for (case, id, session) in &cases {
+                    let m = &mut snapshot["missions"][id.to_string()];
+                    m["session_id"] = serde_json::json!(session);
+                    m["updated_at"] = if *case == "touched" {
+                        serde_json::json!("2026-09-16T00:00:00Z")
+                    } else {
+                        m["created_at"].clone()
+                    };
+                    m["activity"]["last_status_change_at"] = m["created_at"].clone();
+                }
+                std::fs::write(path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+            } else {
+                let conn =
+                    rusqlite::Connection::open(dir.path().join("missions-legacy-grok.db")).unwrap();
+                for (case, id, session) in &cases {
+                    conn.execute("UPDATE missions SET session_id = ?1, updated_at = CASE WHEN ?2 = 'touched' THEN '2026-09-16T00:00:00Z' ELSE created_at END, last_status_change_at = created_at WHERE id = ?3",
+                        rusqlite::params![session, case, id.to_string()]).unwrap();
+                    if *case == "history" {
+                        // SQLite history is derived from persisted events;
+                        // update_mission_history only touches updated_at.
+                        conn.execute("INSERT INTO mission_events (mission_id, sequence, event_type, timestamp, content) VALUES (?1, 1, 'assistant_message', '2026-09-15T00:00:00Z', 'prior effect')", [id.to_string()]).unwrap();
+                    }
+                }
+            }
+            for _ in 0..2 {
+                let reopened: Arc<dyn MissionStore> = if kind == "file" {
+                    Arc::new(
+                        FileMissionStore::new(dir.path().to_path_buf(), "legacy-grok")
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    Arc::new(
+                        SqliteMissionStore::new(dir.path().to_path_buf(), "legacy-grok")
+                            .await
+                            .unwrap(),
+                    )
+                };
+                for (case, id, session) in &cases {
+                    let mission = reopened.get_mission(*id).await.unwrap().unwrap();
+                    assert_eq!(
+                        mission.session_id.as_deref(),
+                        if *case == "untouched" {
+                            None
+                        } else {
+                            Some(session.as_str())
+                        },
+                        "{kind}: {case}"
+                    );
+                    if *case == "run" {
+                        assert!(reopened
+                            .get_active_mission_run(*id)
+                            .await
+                            .unwrap()
+                            .is_some());
+                    }
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn harness_handoffs_preserve_identity_stop_evidence_and_late_updates() {

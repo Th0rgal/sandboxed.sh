@@ -2471,6 +2471,29 @@ impl SqliteMissionStore {
             tracing::warn!("creating mission_terminal_evidence skipped: {}", e);
         }
 
+        // Match the conservative file-store migration: an untouched pending
+        // Grok mission with no native/session or execution evidence. Use one
+        // conditional UPDATE so a concurrent writer cannot race a read/clear.
+        conn.execute(
+            "UPDATE missions SET session_id = NULL
+             WHERE backend = 'grok' AND status = 'pending'
+               AND created_at = updated_at AND last_status_change_at = created_at
+               AND resumable = 0 AND interrupted_at IS NULL AND paused_at IS NULL
+               AND terminal_reason IS NULL AND origin_session_id IS NULL
+               AND (desktop_sessions IS NULL OR desktop_sessions = '[]')
+               AND length(session_id) = 36 AND substr(session_id, 15, 1) = '4'
+               AND substr(session_id, 9, 1) = '-' AND substr(session_id, 14, 1) = '-'
+               AND substr(session_id, 19, 1) = '-' AND substr(session_id, 24, 1) = '-'
+               AND length(replace(session_id, '-', '')) = 32
+               AND lower(replace(session_id, '-', '')) NOT GLOB '*[^0-9a-f]*'
+               AND NOT EXISTS (SELECT 1 FROM mission_harness_sessions s WHERE s.mission_id = missions.id)
+               AND NOT EXISTS (SELECT 1 FROM mission_runs r WHERE r.mission_id = missions.id)
+               AND NOT EXISTS (SELECT 1 FROM mission_events e WHERE e.mission_id = missions.id)
+               AND NOT EXISTS (SELECT 1 FROM mission_trees t WHERE t.mission_id = missions.id)
+               AND NOT EXISTS (SELECT 1 FROM mission_terminal_evidence e WHERE e.mission_id = missions.id)",
+            [],
+        ).map_err(|e| format!("Failed to migrate unused Grok session placeholders: {e}"))?;
+
         Ok(())
     }
 
