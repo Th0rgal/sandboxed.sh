@@ -370,3 +370,18 @@ is established. Metadata-touched legacy Grok UUIDs still need provenance before
 migration. Hermes canonical enrollment/retry and Lido repair remain with their
 owners. No deployment, merge, protected-mission contact or unknown-tool replay
 was performed.
+
+
+## Streaming Grok missing-session wording
+
+Review 4016240180 identified `Session does not exist` as another native CLI
+missing-session diagnostic. The installed Grok binary contains that literal
+(read-only byte inspection, no native launch or provider request). Streaming
+resume now classifies it as NativeContinuityRequired, alongside the existing
+missing-session forms. The subprocess regression checks that exact message on
+resume and confirms that a fresh-session failure remains an ordinary LlmError.
+This changes classification only; it neither substitutes a new session nor
+replays unknown tool outcomes.
+
+Validation: all 23 Grok runner tests passed in the bounded debug scope;
+`cargo fmt --all` and `git diff --check` passed.

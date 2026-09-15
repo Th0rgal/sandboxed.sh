@@ -1072,7 +1072,9 @@ async fn run_grok_streaming_process(
         let stderr = stderr_capture.lock().await;
         [&*stderr, &final_result].iter().any(|text| {
             let lower = text.to_ascii_lowercase();
-            lower.contains("no session found") || lower.contains("session not found")
+            lower.contains("no session found")
+                || lower.contains("session not found")
+                || lower.contains("session does not exist")
         })
     };
     let success = exit_status.map(|status| status.success()).unwrap_or(false) && !had_error;
@@ -2317,6 +2319,12 @@ mod tests {
                 "Session not found: saved-id",
                 TerminalReason::NativeContinuityRequired,
             ),
+            (
+                true,
+                "Session does not exist",
+                TerminalReason::NativeContinuityRequired,
+            ),
+            (false, "Session does not exist", TerminalReason::LlmError),
             (false, "No session found", TerminalReason::LlmError),
             (true, "401 invalid credentials", TerminalReason::LlmError),
         ] {
