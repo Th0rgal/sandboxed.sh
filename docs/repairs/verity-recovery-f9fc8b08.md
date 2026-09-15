@@ -277,5 +277,5 @@ workspace credential and verifies that no global credential is imported. No live
 credential was read or modified by the regression. This does not certify the
 reported live Grok 401 or replace the outstanding isolated provider smoke test.
 
-All 18 Grok auth tests passed locally in a bounded debug scope.
+All 21 Grok auth tests passed locally in a bounded debug scope.
 `cargo fmt --all` and `git diff --check` passed.
