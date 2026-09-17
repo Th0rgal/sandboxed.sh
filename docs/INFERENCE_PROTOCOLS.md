@@ -90,8 +90,9 @@ A client should select a protocol in this order:
 
 ## Stateful affinity and fail-closed behavior
 
-Response IDs, tool-call IDs, and signed thinking blocks are upstream-context
-bound. A stateful continuation is accepted only when routing resolves to:
+Only `previous_response_id` references upstream server-side state: the response
+object lives on the provider account that produced it. A request carrying it is
+accepted only when routing resolves to:
 
 - one chain entry;
 - one configured account;
@@ -100,6 +101,14 @@ bound. A stateful continuation is accepted only when routing resolves to:
 If affinity cannot be guaranteed, the proxy returns
 `stateful_affinity_required` rather than replaying state against a different
 provider or account.
+
+Everything else a client sends is client-side replay and is **not** gated:
+`function_call_output` and reasoning items in `input`, signed `thinking` /
+`redacted_thinking` blocks, and `tool_result` blocks all travel with the
+request, so the ordered chain failover serves them like a fresh turn. A
+multi-entry chain such as `builtin/assistant` therefore keeps working across
+tool turns. Provider-bound items replayed to a different provider fail upstream
+as an ordinary error for that entry, not as a proxy-level conflict.
 
 A Chat fallback is a **new session**. It must not be presented as continuation of
 a native Responses or Messages session.
