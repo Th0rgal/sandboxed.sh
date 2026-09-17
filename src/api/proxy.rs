@@ -1114,44 +1114,20 @@ fn body_has_previous_response_id(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-fn native_request_has_continuation(protocol: NativeProtocol, body: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return false;
-    };
+/// True only when the request depends on upstream server-side state.
+///
+/// `previous_response_id` refers to a response object that lives on one
+/// provider account, so it can only be honored by the exact account that
+/// produced it. Everything else a client can send — `function_call_output`
+/// items, reasoning items in `input`, signed `thinking` blocks, `tool_result`
+/// blocks — is client-side replay: the full transcript travels with the
+/// request, and the ordered chain failover can serve it like a fresh turn.
+/// Gating those on singleton affinity turned every tool turn on a multi-entry
+/// chain (for example `builtin/assistant`) into a hard 409.
+fn native_request_requires_server_state(protocol: NativeProtocol, body: &[u8]) -> bool {
     match protocol {
-        NativeProtocol::Responses => {
-            value
-                .get("previous_response_id")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|id| !id.is_empty())
-                || value
-                    .get("input")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|items| {
-                        items.iter().any(|item| {
-                            item.get("type").and_then(serde_json::Value::as_str)
-                                == Some("function_call_output")
-                        })
-                    })
-        }
-        NativeProtocol::AnthropicMessages => value
-            .get("messages")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|messages| {
-                messages.iter().any(|message| {
-                    message
-                        .get("content")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|blocks| {
-                            blocks.iter().any(|block| {
-                                matches!(
-                                    block.get("type").and_then(serde_json::Value::as_str),
-                                    Some("thinking" | "redacted_thinking" | "tool_result")
-                                )
-                            })
-                        })
-                })
-            }),
+        NativeProtocol::Responses => body_has_previous_response_id(body),
+        NativeProtocol::AnthropicMessages => false,
     }
 }
 
@@ -1250,7 +1226,7 @@ async fn native_protocol_proxy(
         return unavailable_chain_response(&chain_id, cooling);
     }
 
-    if native_request_has_continuation(protocol, &body) {
+    if native_request_requires_server_state(protocol, &body) {
         let candidate_ids = state
             .chain_store
             .configured_account_ids(&chain_entries, &state.ai_providers, &standard_accounts)
@@ -6392,22 +6368,28 @@ mod tests {
     }
 
     #[test]
-    fn native_continuation_detection_covers_stateful_protocol_items() {
-        assert!(native_request_has_continuation(
+    fn only_previous_response_id_requires_server_state_affinity() {
+        assert!(native_request_requires_server_state(
             NativeProtocol::Responses,
             br#"{"model":"x","previous_response_id":"resp_1","input":[]}"#
         ));
-        assert!(native_request_has_continuation(
+        // Tool-result replay carries the whole transcript: stateless.
+        assert!(!native_request_requires_server_state(
             NativeProtocol::Responses,
             br#"{"model":"x","input":[{"type":"function_call_output","call_id":"c","output":"ok"}]}"#
         ));
-        assert!(native_request_has_continuation(
+        assert!(!native_request_requires_server_state(
+            NativeProtocol::Responses,
+            br#"{"model":"x","previous_response_id":"","input":"hello"}"#
+        ));
+        // Messages continuity is client-side block replay, never server state.
+        assert!(!native_request_requires_server_state(
             NativeProtocol::AnthropicMessages,
             br#"{"model":"x","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"ok"}]}]}"#
         ));
-        assert!(!native_request_has_continuation(
-            NativeProtocol::Responses,
-            br#"{"model":"x","input":"hello"}"#
+        assert!(!native_request_requires_server_state(
+            NativeProtocol::AnthropicMessages,
+            br#"{"model":"x","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"s"}]}]}"#
         ));
     }
 
