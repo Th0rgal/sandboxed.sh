@@ -1399,7 +1399,17 @@ impl ModelChainStore {
                 // `api.openai.com/v1/chat/completions`; those accounts keep
                 // `api_key = None, has_oauth = true` and route through the
                 // CLI-proxy adapter instead.
-                let fresh_oauth_token = if oauth_is_fresh {
+                // A CLIProxyAPI-owned Anthropic OAuth record never routes its
+                // own access token: it resolves as an OAuth-only entry, which
+                // the proxy layer sends through CLIProxyAPI with the proxy key.
+                let anthropic_oauth_cli_proxy_routable =
+                    matches!(provider_type, crate::ai_providers::ProviderType::Anthropic)
+                        && account.api_key.is_none()
+                        && account.oauth.is_some()
+                        && crate::api::oauth_owner::cli_proxy_owns(
+                            crate::ai_providers::ProviderType::Anthropic,
+                        );
+                let fresh_oauth_token = if oauth_is_fresh && !anthropic_oauth_cli_proxy_routable {
                     account
                         .oauth
                         .as_ref()
@@ -1441,6 +1451,7 @@ impl ModelChainStore {
                     && !google_oauth_routable
                     && !kimi_oauth_routable
                     && !xai_oauth_cli_proxy_routable
+                    && !anthropic_oauth_cli_proxy_routable
                 {
                     tracing::debug!(
                         account_id = %account.id,
@@ -1493,6 +1504,7 @@ impl ModelChainStore {
                 let entry_has_oauth = credential_is_oauth_token
                     || google_oauth_routable
                     || xai_oauth_cli_proxy_routable
+                    || anthropic_oauth_cli_proxy_routable
                     || (kimi_oauth_routable && routed_api_key.is_none());
                 let entry_has_api_key = routed_api_key.is_some();
                 resolved.push(ResolvedEntry {

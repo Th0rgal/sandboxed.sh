@@ -206,8 +206,17 @@ pub async fn run_opencode_turn(
         None
     };
 
+    // Providers whose OAuth is owned by CLIProxyAPI are reachable through the
+    // proxy with the proxy key; never enter the local refresh path for them.
+    let anthropic_via_proxy =
+        crate::api::oauth_owner::cli_proxy_owns(crate::ai_providers::ProviderType::Anthropic);
+    let openai_via_proxy =
+        crate::api::oauth_owner::cli_proxy_owns(crate::ai_providers::ProviderType::OpenAI);
+
     let refresh_provider = provider_hint.as_deref().or(fallback_provider);
     let refresh_result = match refresh_provider {
+        Some("anthropic") | Some("claude") if anthropic_via_proxy => Ok(()),
+        Some("openai") | Some("codex") if openai_via_proxy => Ok(()),
         Some("anthropic") | Some("claude") => ensure_anthropic_oauth_token_valid().await,
         Some("openai") | Some("codex") => ensure_openai_oauth_token_valid().await,
         Some("google") | Some("gemini") => ensure_google_oauth_token_valid().await,
@@ -347,7 +356,7 @@ pub async fn run_opencode_turn(
         )
         .await;
     }
-    if has_anthropic {
+    if has_anthropic && !anthropic_via_proxy {
         // OpenCode 1.17 does not load its Anthropic OAuth transport merely
         // because auth.json contains an OAuth credential. Without the plugin,
         // the provider is absent from the model catalog (or the plain AI SDK
@@ -363,7 +372,7 @@ pub async fn run_opencode_turn(
         )
         .await;
     }
-    if has_openai {
+    if has_openai && !openai_via_proxy {
         let openai_plugin = "opencode-openai-codex-auth@latest";
         ensure_opencode_plugin_specs(&opencode_config_dir_host, &[openai_plugin]);
         ensure_opencode_plugin_installed(

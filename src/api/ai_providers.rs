@@ -288,6 +288,12 @@ pub async fn ensure_openai_api_key_for_codex(working_dir: &Path) -> Result<(), S
     if get_openai_api_key_for_codex_default(working_dir).is_some() {
         return Ok(());
     }
+    if crate::api::oauth_owner::skip_refresh_if_owned(
+        ProviderType::OpenAI,
+        "ensure_openai_api_key_for_codex",
+    ) {
+        return Ok(());
+    }
 
     let Some(entry) = read_oauth_token_entry(ProviderType::OpenAI) else {
         return Ok(());
@@ -1761,8 +1767,17 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
             // or the chain resolver will route to an endpoint that can never
             // succeed; leave OpenAI OAuth accounts without an `api_key` so
             // `has_routable_credentials` excludes them from the pool.
+            //
+            // When CLIProxyAPI owns the Anthropic credential the access token
+            // is never forwarded: the record is left keyless (and therefore
+            // unroutable here) so the synthetic `anthropic-cli-proxy` account
+            // below carries all Anthropic traffic through the proxy.
             let mut oauth_expires_at: Option<i64> = None;
-            if api_key.is_none() && account_has_oauth && provider_type == ProviderType::Anthropic {
+            if api_key.is_none()
+                && account_has_oauth
+                && provider_type == ProviderType::Anthropic
+                && !crate::api::oauth_owner::cli_proxy_owns(ProviderType::Anthropic)
+            {
                 api_key = value
                     .get("access")
                     .or_else(|| value.get("access_token"))
@@ -1916,6 +1931,19 @@ pub(crate) fn anthropic_cli_proxy_account_available() -> bool {
 
 fn has_fresh_cli_proxy_claude_account() -> bool {
     has_fresh_cli_proxy_account_of_type("claude-", "claude")
+}
+
+/// True when CLIProxyAPI holds a Claude credential it can refresh (access +
+/// refresh token, not disabled), regardless of current expiry. Used by the
+/// credential-owner policy: an expired-but-refreshable proxy file is still
+/// the proxy's to refresh.
+pub(crate) fn has_refreshable_cli_proxy_claude_account() -> bool {
+    has_refreshable_cli_proxy_account_of_type("claude-", "claude")
+}
+
+/// Codex counterpart of [`has_refreshable_cli_proxy_claude_account`].
+pub(crate) fn has_refreshable_cli_proxy_codex_account() -> bool {
+    has_refreshable_cli_proxy_account_of_type("codex-", "codex")
 }
 
 /// True when the CLI Proxy API has at least one fresh Codex (ChatGPT
@@ -2425,6 +2453,12 @@ pub fn get_anthropic_auth_from_host_with_expiry() -> Option<ClaudeCodeAuthWithEx
 pub async fn refresh_workspace_anthropic_auth(
     workspace_root: &std::path::Path,
 ) -> Result<ClaudeCodeAuthWithExpiry, String> {
+    if crate::api::oauth_owner::skip_refresh_if_owned(
+        ProviderType::Anthropic,
+        "refresh_workspace_anthropic_auth",
+    ) {
+        return Err("Anthropic OAuth is owned by CLIProxyAPI; workspace auth not refreshed".into());
+    }
     let auth_path = get_workspace_auth_path(workspace_root);
     if !auth_path.exists() {
         return Err("No workspace auth file found".to_string());
@@ -3678,6 +3712,12 @@ pub async fn prepare_codex_oauth_account_for_launch(
     working_dir: &Path,
     selected: &CodexOAuthAccount,
 ) -> Result<CodexOAuthAccount, String> {
+    if crate::api::oauth_owner::skip_refresh_if_owned(
+        ProviderType::OpenAI,
+        "prepare_codex_oauth_account_for_launch",
+    ) {
+        return Ok(selected.clone());
+    }
     let lock = codex_oauth_refresh_lock(&selected.chatgpt_account_id);
     let _guard = lock.lock().await;
     let _process_guard = acquire_codex_oauth_cross_process_lock().await?;
@@ -3759,6 +3799,19 @@ pub async fn refresh_codex_oauth_account_for_app_server(
         .filter(|id| !id.trim().is_empty())
         .or(fallback_account_id)
         .ok_or_else(|| "Codex requested OAuth refresh without an account id".to_string())?;
+
+    if crate::api::oauth_owner::skip_refresh_if_owned(
+        ProviderType::OpenAI,
+        "refresh_codex_oauth_account_for_app_server",
+    ) {
+        return find_openai_oauth_account_by_chatgpt_account_id(working_dir, account_id)
+            .ok_or_else(|| {
+                format!(
+                    "No OpenAI OAuth account found for ChatGPT account {} (owned by CLIProxyAPI)",
+                    account_id
+                )
+            });
+    }
 
     let lock = codex_oauth_refresh_lock(account_id);
     let _guard = lock.lock().await;
@@ -3860,6 +3913,9 @@ pub async fn refresh_codex_oauth_account_for_app_server(
 pub enum CodexCredentialOverride<'a> {
     ApiKey(&'a str),
     OAuth(&'a CodexOAuthAccount),
+    /// Authenticate to CLIProxyAPI with its key; the proxy owns the ChatGPT
+    /// OAuth credential and speaks Codex `/v1/responses` upstream.
+    CliProxy(&'a crate::api::oauth_owner::CliProxyEndpoint),
 }
 
 /// Enumerate all enabled OpenAI ChatGPT-OAuth accounts in `ai_providers.json`,
@@ -3998,14 +4054,41 @@ pub fn write_codex_credentials_for_workspace(
         }
     };
 
+    let proxy_owned = crate::api::oauth_owner::codex_via_cli_proxy();
+
     // Pull any locally-rotated tokens back into the central store before we
     // overwrite this workspace's auth.json. Codex CLIs refresh in-place inside
     // their container; without this back-sync the host store keeps the stale
     // refresh_token forever and the next mission hits `refresh_token_reused`.
-    back_propagate_codex_workspace_auth(&codex_dir, working_dir);
+    // Not when CLIProxyAPI owns the credential: no OAuth file is ever written
+    // for Codex then, so there is nothing to pull back.
+    if proxy_owned.is_none() {
+        back_propagate_codex_workspace_auth(&codex_dir, working_dir);
+    }
+
+    // Priority 0: CLIProxyAPI owns the credential. Codex authenticates to the
+    // proxy with the proxy key (apikey mode) and `config.toml` points its
+    // model provider at the proxy's `/v1` (see `write_codex_config`).
+    let proxy_endpoint = match (override_credential, proxy_owned.as_ref()) {
+        (Some(CodexCredentialOverride::CliProxy(endpoint)), _) => Some(*endpoint),
+        (None, Some(endpoint)) => Some(endpoint),
+        _ => None,
+    };
+    if let Some(endpoint) = proxy_endpoint {
+        write_codex_auth_json_apikey(&codex_dir, &endpoint.api_key)?;
+        log_codex_auth_status(workspace, &codex_dir, "cli_proxy");
+        tracing::info!(
+            workspace_id = %workspace.id,
+            workspace_type = ?workspace.workspace_type,
+            base_url = %endpoint.base_url,
+            "Wrote Codex auth.json for workspace (CLIProxyAPI key)"
+        );
+        return Ok(());
+    }
 
     // Priority 0a: Explicit override (rotation path).
     match override_credential {
+        Some(CodexCredentialOverride::CliProxy(_)) => unreachable!("handled above"),
         Some(CodexCredentialOverride::ApiKey(key)) => {
             write_codex_auth_json_apikey(&codex_dir, key)?;
             log_codex_auth_status(workspace, &codex_dir, "api_key_override");
@@ -4504,8 +4587,18 @@ async fn sync_store_to_opencode(
                 tracing::error!("Failed to sync API key to OpenCode during sync: {}", e);
             }
         }
+        // Never write OAuth tokens for a CLIProxyAPI-owned provider into
+        // OpenCode's auth.json: that would arm a second refresher on the same
+        // rotating token family. Missions get a proxy-key overlay at launch
+        // instead (see `cli_proxy_opencode_auth_overlay`).
+        let oauth_owned_by_cli_proxy = crate::api::oauth_owner::cli_proxy_owns(provider_type);
         if let Some(ref oauth) = provider.oauth {
-            if let Err(e) = sync_to_opencode_auth(
+            if oauth_owned_by_cli_proxy {
+                tracing::debug!(
+                    provider = provider_type.id(),
+                    "Skipping OAuth sync to OpenCode auth.json: owned by CLIProxyAPI"
+                );
+            } else if let Err(e) = sync_to_opencode_auth(
                 provider_type,
                 &oauth.refresh_token,
                 &oauth.access_token,
@@ -5472,6 +5565,12 @@ pub async fn refresh_anthropic_oauth_token() -> Result<(), String> {
 }
 
 async fn refresh_anthropic_oauth_token_inner(force: bool) -> Result<(), String> {
+    if crate::api::oauth_owner::skip_refresh_if_owned(
+        ProviderType::Anthropic,
+        "refresh_anthropic_oauth_token",
+    ) {
+        return Ok(());
+    }
     // Acquire exclusive lock to prevent race conditions
     let _lock = match acquire_oauth_refresh_lock(ProviderType::Anthropic) {
         Ok(lock) => lock,
@@ -5688,6 +5787,12 @@ pub async fn exchange_anthropic_refresh_token(
 /// Ensure the Anthropic OAuth token is valid, refreshing if needed.
 /// This should be called before starting a mission that uses Claude Code.
 pub async fn ensure_anthropic_oauth_token_valid() -> Result<(), String> {
+    if crate::api::oauth_owner::skip_refresh_if_owned(
+        ProviderType::Anthropic,
+        "ensure_anthropic_oauth_token_valid",
+    ) {
+        return Ok(());
+    }
     if !is_anthropic_oauth_token_expired() {
         return Ok(());
     }
@@ -5700,6 +5805,12 @@ pub async fn ensure_anthropic_oauth_token_valid() -> Result<(), String> {
 /// Used when the API rejects a token that hasn't locally expired yet
 /// (e.g., token was revoked server-side or rotated by another process).
 pub async fn force_refresh_anthropic_oauth_token() -> Result<(), String> {
+    if crate::api::oauth_owner::skip_refresh_if_owned(
+        ProviderType::Anthropic,
+        "force_refresh_anthropic_oauth_token",
+    ) {
+        return Ok(());
+    }
     tracing::info!("Force-refreshing Anthropic OAuth token (server-side revocation suspected)");
     refresh_anthropic_oauth_token_inner(true).await
 }
@@ -5708,6 +5819,12 @@ pub async fn force_refresh_anthropic_oauth_token() -> Result<(), String> {
 /// Updates auth.json with the new access token and expiry.
 /// Uses file-based locking to prevent concurrent refresh attempts.
 pub async fn refresh_openai_oauth_token() -> Result<(), String> {
+    if crate::api::oauth_owner::skip_refresh_if_owned(
+        ProviderType::OpenAI,
+        "refresh_openai_oauth_token",
+    ) {
+        return Ok(());
+    }
     // Acquire exclusive lock to prevent race conditions
     let _lock = match acquire_oauth_refresh_lock(ProviderType::OpenAI) {
         Ok(lock) => lock,
@@ -5847,6 +5964,12 @@ pub async fn refresh_openai_oauth_token() -> Result<(), String> {
 
 /// Ensure the OpenAI OAuth token is valid, refreshing if needed.
 pub async fn ensure_openai_oauth_token_valid() -> Result<(), String> {
+    if crate::api::oauth_owner::skip_refresh_if_owned(
+        ProviderType::OpenAI,
+        "ensure_openai_oauth_token_valid",
+    ) {
+        return Ok(());
+    }
     if !is_oauth_token_expired(ProviderType::OpenAI) {
         return Ok(());
     }
@@ -11255,6 +11378,8 @@ pub enum OAuthRefreshError {
     InvalidGrant(String),
     /// Other refresh errors (network, server errors, etc.)
     Other(String),
+    /// The credential is owned by CLIProxyAPI; sandboxed.sh must not refresh it.
+    OwnedByCliProxy,
 }
 
 impl std::fmt::Display for OAuthRefreshError {
@@ -11262,6 +11387,9 @@ impl std::fmt::Display for OAuthRefreshError {
         match self {
             OAuthRefreshError::InvalidGrant(msg) => write!(f, "Invalid grant: {}", msg),
             OAuthRefreshError::Other(msg) => write!(f, "{}", msg),
+            OAuthRefreshError::OwnedByCliProxy => {
+                write!(f, "OAuth credential is owned by CLIProxyAPI; not refreshed")
+            }
         }
     }
 }
@@ -11570,6 +11698,12 @@ pub async fn refresh_oauth_token_with_lock(
     provider_type: ProviderType,
     known_expires_at: i64,
 ) -> Result<(String, String, i64), OAuthRefreshError> {
+    if crate::api::oauth_owner::skip_refresh_if_owned(
+        provider_type,
+        "refresh_oauth_token_with_lock",
+    ) {
+        return Err(OAuthRefreshError::OwnedByCliProxy);
+    }
     // Acquire exclusive lock — prevents concurrent refreshes from racing on
     // the same rotating refresh token.
     let _lock = match acquire_oauth_refresh_lock(provider_type) {
@@ -11764,6 +11898,9 @@ pub async fn refresh_due_store_oauth(
     provider_type: ProviderType,
     refresh_threshold_ms: i64,
 ) -> (u32, u32) {
+    if crate::api::oauth_owner::skip_refresh_if_owned(provider_type, "refresh_due_store_oauth") {
+        return (0, 0);
+    }
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut found = 0u32;
     let mut refreshed = if provider_type == ProviderType::Anthropic {
@@ -11838,6 +11975,12 @@ pub async fn refresh_store_account_oauth_locked(
     provider_type: ProviderType,
     fallback_refresh_token: &str,
 ) -> Result<(String, String, i64), OAuthRefreshError> {
+    if crate::api::oauth_owner::skip_refresh_if_owned(
+        provider_type,
+        "refresh_store_account_oauth_locked",
+    ) {
+        return Err(OAuthRefreshError::OwnedByCliProxy);
+    }
     // Serialize in-process refreshes for this provider type FIRST. The file
     // lock below is a non-blocking `try_lock` (cross-process only), so without
     // this async gate concurrent in-process refreshes race and each consumes the

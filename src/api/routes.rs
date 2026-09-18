@@ -3069,6 +3069,9 @@ async fn oauth_token_refresher_loop(
         let mut store_found = 0u32;
         let mut store_refreshed = 0u32;
         for &store_type in &store_oauth_types {
+            if crate::api::oauth_owner::cli_proxy_owns(store_type) {
+                continue;
+            }
             let (f, r) = ai_providers_api::refresh_due_store_oauth(
                 &ai_providers,
                 store_type,
@@ -3085,6 +3088,16 @@ async fn oauth_token_refresher_loop(
         let mut refreshed_count = 0u32;
 
         for &provider_type in &oauth_capable_types {
+            // CLIProxyAPI-owned credentials are never refreshed here: the
+            // proxy refreshes its own auth files, and a second refresher on
+            // the same rotating token family produces invalid_grant.
+            if crate::api::oauth_owner::cli_proxy_owns(provider_type) {
+                tracing::debug!(
+                    provider_type = ?provider_type,
+                    "Skipping proactive OAuth refresh: owned by CLIProxyAPI"
+                );
+                continue;
+            }
             let entry = match ai_providers_api::read_oauth_token_entry(provider_type) {
                 Some(e) => e,
                 None => continue,
@@ -3177,6 +3190,7 @@ async fn oauth_token_refresher_loop(
                             "Failed to refresh OAuth token"
                         );
                     }
+                    ai_providers_api::OAuthRefreshError::OwnedByCliProxy => {}
                 },
             }
         }

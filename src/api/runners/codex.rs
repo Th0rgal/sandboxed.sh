@@ -41,6 +41,9 @@ fn credential_identity(
         crate::api::ai_providers::CodexCredentialOverride::ApiKey(key) => {
             continuity::account_fingerprint("apikey", key)
         }
+        crate::api::ai_providers::CodexCredentialOverride::CliProxy(endpoint) => {
+            continuity::account_fingerprint("cliproxy", &endpoint.base_url)
+        }
     }
 }
 
@@ -1028,10 +1031,18 @@ async fn run_codex_turn(
     // ChatGPT OAuth account. Minting an API key refreshes/rotates the same
     // refresh token, then the selected credential can become stale before it
     // is written into Codex auth.json.
-    let should_try_mint_api_key = !matches!(
-        override_credential,
-        Some(crate::api::ai_providers::CodexCredentialOverride::OAuth(_))
-    );
+    let codex_proxy = match override_credential {
+        Some(crate::api::ai_providers::CodexCredentialOverride::CliProxy(endpoint)) => {
+            Some((*endpoint).clone())
+        }
+        Some(_) => None,
+        None => crate::api::oauth_owner::codex_via_cli_proxy(),
+    };
+    let should_try_mint_api_key = codex_proxy.is_none()
+        && !matches!(
+            override_credential,
+            Some(crate::api::ai_providers::CodexCredentialOverride::OAuth(_))
+        );
     if should_try_mint_api_key {
         if let Err(e) =
             crate::api::ai_providers::ensure_openai_api_key_for_codex(app_working_dir).await
@@ -1047,7 +1058,9 @@ async fn run_codex_turn(
         Some(crate::api::ai_providers::CodexCredentialOverride::OAuth(account)) => {
             Some((*account).clone())
         }
-        Some(crate::api::ai_providers::CodexCredentialOverride::ApiKey(_)) => None,
+        Some(crate::api::ai_providers::CodexCredentialOverride::ApiKey(_))
+        | Some(crate::api::ai_providers::CodexCredentialOverride::CliProxy(_)) => None,
+        None if codex_proxy.is_some() => None,
         None => {
             if crate::api::ai_providers::get_openai_api_key_for_codex_default(app_working_dir)
                 .is_none()
@@ -1084,7 +1097,13 @@ async fn run_codex_turn(
     let prepared_override = prepared_oauth_account
         .as_ref()
         .map(crate::api::ai_providers::CodexCredentialOverride::OAuth);
-    let workspace_override = prepared_override.as_ref().or(override_credential);
+    let proxy_override = codex_proxy
+        .as_ref()
+        .map(crate::api::ai_providers::CodexCredentialOverride::CliProxy);
+    let workspace_override = prepared_override
+        .as_ref()
+        .or(proxy_override.as_ref())
+        .or(override_credential);
 
     // Ensure Codex auth.json is present in the workspace context (host or container).
     if let Err(e) = crate::api::ai_providers::write_codex_credentials_for_workspace(
@@ -1132,6 +1151,16 @@ async fn run_codex_turn(
         extra_env.insert(
             "CODEX_HOME".into(),
             workspace_exec.translate_path_for_container(&mission_work_dir.join(".codex")),
+        );
+    }
+    if let Some(endpoint) = codex_proxy.as_ref() {
+        // `config.toml` declares `[model_providers.cliproxy]` with
+        // `env_key = "OPENAI_API_KEY"`; Codex resolves it from the process env.
+        extra_env.insert("OPENAI_API_KEY".into(), endpoint.api_key.clone());
+        tracing::info!(
+            mission_id = %mission_id,
+            base_url = %endpoint.base_url,
+            "Codex routed through CLIProxyAPI (ChatGPT OAuth owned by the proxy)"
         );
     }
 

@@ -380,6 +380,32 @@ pub fn run_claudecode_turn<'a>(
         // host credentials into the mission directory if needed.
         let mission_creds_path = work_dir.join(".claude").join(".credentials.json");
         let using_override_auth = override_auth.is_some();
+        // Credential-owner policy: when CLIProxyAPI owns the Anthropic
+        // credential, this harness talks to the proxy with the proxy key and
+        // never receives an OAuth file. Any mission-local `.credentials.json`
+        // is removed so Claude Code cannot prefer it over
+        // ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY, and the host tiers are neither
+        // read, copied nor back-synced (they are not the owner any more).
+        let proxy_owned = !using_override_auth
+            && crate::api::oauth_owner::cli_proxy_owns(
+                crate::ai_providers::ProviderType::Anthropic,
+            )
+            && claudecode_cli_proxy_config().is_some();
+        if proxy_owned && mission_creds_path.exists() {
+            match std::fs::remove_file(&mission_creds_path) {
+                Ok(_) => tracing::info!(
+                    mission_id = %mission_id,
+                    path = %mission_creds_path.display(),
+                    "Removed mission Claude CLI credentials: Anthropic OAuth is owned by CLIProxyAPI"
+                ),
+                Err(e) => tracing::warn!(
+                    mission_id = %mission_id,
+                    path = %mission_creds_path.display(),
+                    error = %e,
+                    "Failed to remove mission Claude CLI credentials (proxy-owned mode)"
+                ),
+            }
+        }
         if using_override_auth && mission_creds_path.exists() {
             match std::fs::remove_file(&mission_creds_path) {
                 Ok(_) => {
@@ -406,7 +432,7 @@ pub fn run_claudecode_turn<'a>(
         // still holds the old (now-invalid) refresh_token. Without this back-sync
         // the next backend refresh — or any sibling mission that copies host
         // creds — would hit "refresh_token already used" / invalid_grant.
-        if !using_override_auth {
+        if !using_override_auth && !proxy_owned {
             if let (Some(host_path), Some((m_access, m_expires, m_refresh, m_has_refresh))) = (
                 find_host_claude_cli_credentials(),
                 read_claude_cli_credentials(&mission_creds_path),
@@ -470,7 +496,7 @@ pub fn run_claudecode_turn<'a>(
         }
 
         // Copy host credentials if missing OR if the existing ones are expired/near-expiry.
-        let needs_copy = if using_override_auth {
+        let needs_copy = if using_override_auth || proxy_owned {
             false
         } else if !looks_like_claude_cli_credentials(&mission_creds_path) {
             true
@@ -557,8 +583,9 @@ pub fn run_claudecode_turn<'a>(
                 }
             }
         }
-        let mut has_cli_creds =
-            !using_override_auth && looks_like_claude_cli_credentials(&mission_creds_path);
+        let mut has_cli_creds = !using_override_auth
+            && !proxy_owned
+            && looks_like_claude_cli_credentials(&mission_creds_path);
         if let Some((expires_at, has_refresh)) = claude_cli_credentials_info(&mission_creds_path) {
             let now_ms = chrono::Utc::now().timestamp_millis();
             let is_expired = expires_at < now_ms;
@@ -606,7 +633,8 @@ pub fn run_claudecode_turn<'a>(
                 tracing::info!(
                     mission_id = %mission_id,
                     base_url = %proxy.base_url,
-                    "Using Claude Code via CLI Proxy API fallback"
+                    proxy_owned,
+                    "Using Claude Code via CLI Proxy API"
                 );
             }
             config
@@ -3232,37 +3260,102 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
     // detect "auth error" in the output, preemptively refresh credentials so
     // the transport recovery retry (above) uses fresh tokens. This is cheap
     // (just a token validity check) and prevents cascading auth failures.
+    //
+    // When CLIProxyAPI owns the Anthropic credential there is no local token
+    // to refresh — the mission never received one. Re-probe the proxy instead
+    // so the logs show whether the proxy/upstream is the failure point.
+    let anthropic_owned_by_cli_proxy =
+        crate::api::oauth_owner::cli_proxy_owns(crate::ai_providers::ProviderType::Anthropic);
     if !cancel.is_cancelled()
         && result.terminal_reason == Some(TerminalReason::LlmError)
         && result.output.contains("signal: Some(\"Killed\")")
     {
-        tracing::info!(
-            mission_id = %mission_id,
-            "SIGKILL detected — preemptively refreshing OAuth credentials"
-        );
-        let mission_creds = work_dir.join(".claude").join(".credentials.json");
-        if mission_creds.exists() {
-            let _ = std::fs::remove_file(&mission_creds);
-        }
-        if let Err(e) = crate::api::ai_providers::force_refresh_anthropic_oauth_token().await {
-            tracing::debug!(
-                "Preemptive OAuth refresh after SIGKILL failed (non-fatal): {}",
-                e
+        if anthropic_owned_by_cli_proxy {
+            tracing::info!(
+                mission_id = %mission_id,
+                "SIGKILL detected with CLIProxyAPI-owned Anthropic auth — probing proxy health"
             );
+            if let Some(endpoint) = crate::api::oauth_owner::cli_proxy_endpoint() {
+                let probe_exec = WorkspaceExec::new(workspace.clone());
+                if let Err(err) = check_claudecode_proxy_health(
+                    &probe_exec,
+                    work_dir,
+                    &endpoint.base_url,
+                    &endpoint.api_key,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        "{}",
+                        err
+                    );
+                }
+            }
+        } else {
+            tracing::info!(
+                mission_id = %mission_id,
+                "SIGKILL detected — preemptively refreshing OAuth credentials"
+            );
+            let mission_creds = work_dir.join(".claude").join(".credentials.json");
+            if mission_creds.exists() {
+                let _ = std::fs::remove_file(&mission_creds);
+            }
+            if let Err(e) = crate::api::ai_providers::force_refresh_anthropic_oauth_token().await {
+                tracing::debug!(
+                    "Preemptive OAuth refresh after SIGKILL failed (non-fatal): {}",
+                    e
+                );
+            }
         }
     }
 
     // Auth error recovery: if the token was revoked server-side but the
     // local expiry hadn't passed yet, invalidate stale credentials, force
     // an OAuth refresh, and retry once.
+    //
+    // When CLIProxyAPI owns the credential an auth error came *from the
+    // proxy*: do not invalidate host files or force-refresh (that would touch
+    // a token family sandboxed.sh no longer owns). Re-probe proxy health and
+    // retry the turn once; if the proxy itself is down the probe surfaces it.
+    // Cooling down the synthetic `anthropic-cli-proxy` account on persistent
+    // failure is a 3D item (it needs the shared provider health tracker).
     if result.terminal_reason == Some(TerminalReason::AuthError) && !cancel.is_cancelled() {
         tracing::warn!(
             mission_id = %mission_id,
+            anthropic_owned_by_cli_proxy,
             "Auth error detected — invalidating stale credentials and retrying"
         );
 
-        refresh_claude_credentials_after_auth_error(work_dir, "mission_runner_initial_auth_error")
+        if anthropic_owned_by_cli_proxy {
+            if let Some(endpoint) = crate::api::oauth_owner::cli_proxy_endpoint() {
+                let probe_exec = WorkspaceExec::new(workspace.clone());
+                match check_claudecode_proxy_health(
+                    &probe_exec,
+                    work_dir,
+                    &endpoint.base_url,
+                    &endpoint.api_key,
+                )
+                .await
+                {
+                    Ok(()) => tracing::info!(
+                        mission_id = %mission_id,
+                        "CLIProxyAPI is healthy; retrying the turn once through the proxy"
+                    ),
+                    Err(err) => tracing::warn!(
+                        mission_id = %mission_id,
+                        "{}",
+                        err
+                    ),
+                }
+            }
+        } else {
+            refresh_claude_credentials_after_auth_error(
+                work_dir,
+                "mission_runner_initial_auth_error",
+            )
             .await;
+        }
 
         // Retry with fresh credentials (override_auth=None forces re-resolution)
         result = run_claudecode_turn(
