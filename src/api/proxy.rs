@@ -5087,6 +5087,7 @@ fn anthropic_tools_from_openai(tools: Option<&serde_json::Value>) -> Option<serd
             function
                 .get("parameters")
                 .cloned()
+                .map(|schema| strip_json_schema_meta_keys(schema))
                 .unwrap_or_else(|| serde_json::json!({ "type": "object" })),
         );
         out.push(serde_json::Value::Object(converted));
@@ -5095,6 +5096,26 @@ fn anthropic_tools_from_openai(tools: Option<&serde_json::Value>) -> Option<serd
         None
     } else {
         Some(serde_json::Value::Array(out))
+    }
+}
+
+/// Anthropic's `input_schema` accepts a JSON Schema object but rejects
+/// meta-schema keys (the Claude Code / opencode harnesses annotate every tool
+/// with `"$schema": "https://json-schema.org/draft/2020-12/schema"`, which the
+/// Messages API answers with a 400). Strip them recursively.
+fn strip_json_schema_meta_keys(value: serde_json::Value) -> serde_json::Value {
+    const META_KEYS: [&str; 3] = ["$schema", "$id", "$comment"];
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .filter(|(k, _)| !META_KEYS.contains(&k.as_str()))
+                .map(|(k, v)| (k, strip_json_schema_meta_keys(v)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(strip_json_schema_meta_keys).collect())
+        }
+        other => other,
     }
 }
 
@@ -7539,6 +7560,48 @@ mod tests {
                 "name": "echo"
             })
         );
+    }
+
+    #[test]
+    fn build_anthropic_request_strips_json_schema_meta_keys_from_tools() {
+        let body = serde_json::json!({
+            "model": "haiku",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "$comment": "primary",
+                                "type": "string",
+                                "items": { "$id": "x", "type": "string" }
+                            }
+                        }
+                    }
+                }
+            }],
+            "max_tokens": 16
+        });
+
+        let payload_bytes = build_anthropic_upstream_request(
+            serde_json::to_vec(&body).unwrap().as_slice(),
+            "claude-haiku-4-5",
+            false,
+            false,
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(payload_bytes.as_ref()).unwrap();
+        let schema = &payload["tools"][0]["input_schema"];
+        assert!(schema.get("$schema").is_none());
+        assert!(schema["properties"]["command"].get("$comment").is_none());
+        assert!(schema["properties"]["command"]["items"]
+            .get("$id")
+            .is_none());
+        assert_eq!(schema["properties"]["command"]["type"], "string");
     }
 
     #[test]
