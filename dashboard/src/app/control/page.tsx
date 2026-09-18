@@ -1,5 +1,5 @@
 import { Suspense } from "react";
-import ConversationRouter from "./conversation-router";
+import ControlClient from "./control-client";
 
 export default function ControlPage() {
   // No visible Suspense fallback: AuthGate's full-screen ring covers the cold
@@ -8,7 +8,7 @@ export default function ControlPage() {
   // hundred ms between the two and reads as an extra unrelated spinner.
   return (
     <Suspense fallback={null}>
-      <ConversationRouter />
+      <ControlClient />
     </Suspense>
   );
 }
