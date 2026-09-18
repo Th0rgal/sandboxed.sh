@@ -5,7 +5,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   getBackendConfig,
   getClaudeCodeConfig,
-  getHermesAssistantStatus,
   getSandboxedConfig,
   getVisibleAgents,
   listBackendAgents,
@@ -33,22 +32,6 @@ vi.mock('@/lib/api', () => ({
     hidden_agents: [],
     default_model: null,
     default_agent: null,
-  }),
-  getHermesAssistantStatus: vi.fn().mockResolvedValue({
-    service_name: 'hermes',
-    service_active: false,
-    model: null,
-    env_path: '',
-    config_path: '',
-    env_present: false,
-    config_present: false,
-    token_present: false,
-    telegram_ok: null,
-    telegram_bot_username: null,
-    telegram_webhook_configured: null,
-    telegram_pending_update_count: null,
-    telegram_last_error: null,
-    notes: [],
   }),
   listBackendModelOptions: vi.fn().mockResolvedValue({ backends: {} }),
   listProviders: vi.fn().mockResolvedValue({ providers: [] }),
@@ -85,22 +68,6 @@ describe('NewMissionDialog', () => {
       hidden_agents: [],
       default_model: null,
       default_agent: null,
-    });
-    vi.mocked(getHermesAssistantStatus).mockResolvedValue({
-      service_name: 'hermes',
-      service_active: false,
-      model: null,
-      env_path: '',
-      config_path: '',
-      env_present: false,
-      config_present: false,
-      token_present: false,
-      telegram_ok: null,
-      telegram_bot_username: null,
-      telegram_webhook_configured: null,
-      telegram_pending_update_count: null,
-      telegram_last_error: null,
-      notes: [],
     });
     vi.mocked(listBackendModelOptions).mockResolvedValue({ backends: {} });
     vi.mocked(listProviders).mockResolvedValue({ providers: [] });

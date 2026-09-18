@@ -258,31 +258,6 @@ export {
   applyHermesRemote,
 } from "./assistant";
 
-export {
-  type HermesSession,
-  type HermesMessage,
-  type HermesChatHandlers,
-  type HermesToolEvent,
-  type AlertDelivery,
-  type AlertMissionSummary,
-  type AlertFeedEntry,
-  type AlertsFeedResponse,
-  type HermesMissionControl,
-  type HermesMissionCard,
-  type HermesRuntimeSummary,
-  type HermesSessionRollup,
-  type HermesFailureRollup,
-  type HermesRemoteNodeOverview,
-  listHermesSessions,
-  createHermesSession,
-  getHermesSessionMessages,
-  renameHermesSession,
-  deleteHermesSession,
-  hermesChatStream,
-  listAlerts,
-  getHermesMissionControl,
-} from "./hermes";
-
 // Remote runner nodes (fleet + cordons)
 export {
   type RemoteNodeView,
