@@ -16,6 +16,7 @@ def update(value):
 
 
 scenario = sys.argv[1]
+authenticated = False
 for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
@@ -24,9 +25,35 @@ for line in sys.stdin:
         if scenario == "initialize_eof":
             break
         result = {"protocolVersion": 1}
+        if scenario == "auth_required":
+            # Grok CLI >= 1.0 shape: cached login advertised, session/new
+            # rejected until `authenticate` is sent.
+            result["authMethods"] = [{"id": "cached_token", "name": "cached_token"},
+                                     {"id": "grok.com", "name": "Grok"}]
+            result["_meta"] = {"defaultAuthMethodId": "cached_token"}
+        elif scenario == "auth_unavailable":
+            # No cached login: only the browser sign-in is advertised.
+            result["authMethods"] = [{"id": "grok.com", "name": "Grok"}]
+        # "auth_lazy_load": nothing advertised at initialize, yet session/load
+        # demands `authenticate` and then accepts `cached_token`.
+    elif method == "authenticate":
+        with open("session-methods", "a", encoding="utf-8") as receipt:
+            receipt.write("authenticate:" + str(request.get("params", {}).get("methodId")) + "\n")
+        if scenario == "auth_unavailable":
+            emit({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message": "Authentication required",
+                            "data": "no cached token"}})
+            continue
+        authenticated = True
+        result = {"_meta": {"auth_mode": "Oidc"}}
     elif method in ("session/new", "session/load"):
         with open("session-methods", "a", encoding="utf-8") as receipt:
             receipt.write(method + "\n")
+        if scenario in ("auth_required", "auth_unavailable", "auth_lazy_load") and not authenticated:
+            emit({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message": "Authentication required",
+                            "data": "no auth method id provided"}})
+            continue
         if scenario == "missing_session" and method == "session/load":
             emit({"jsonrpc": "2.0", "id": request_id,
                   "error": {"code": -32000, "message": "No session found"}})
