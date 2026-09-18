@@ -1,4 +1,4 @@
-import { For, Show, Switch, Match, createMemo, createSignal, onCleanup, onMount, batch } from "solid-js";
+import { For, Show, Switch, Match, createMemo, createSignal, createEffect, onCleanup, onMount, batch } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import type { JSX } from "solid-js";
 import { projects as seed, LOREM_REPLY, type Agent, type Block, type Turn } from "./data";
@@ -9,6 +9,19 @@ import { Providers } from "./Providers";
 import { Dialog, Field } from "./Dialog";
 import { MenuList, PopupMenu, type MenuEntry } from "./Menu";
 import { MdSource, MdView } from "./Markdown";
+import {
+  buildRemoteAgentCommand,
+  ensureNodeAgentKey,
+  createMission,
+  getMission,
+  getRemoteNodes,
+  isConnected,
+  listMissions,
+  cancelMission,
+  sendMissionMessage,
+  type Mission,
+  type RemoteNodeView,
+} from "./api";
 
 const PAGES = new Set(["settings", "machines", "providers"]);
 
@@ -104,7 +117,7 @@ function AgentTurn(p: { turn: Extract<Turn, { role: "agent" }>; streaming?: bool
   );
 }
 
-function StatusGlyph(p: { agent: Agent; busy: boolean }) {
+function StatusGlyph(p: { agent: { status: Agent["status"] }; busy: boolean }) {
   return (
     <Switch fallback={<span class="dot" />}>
       <Match when={p.busy || p.agent.status === "running"}>
@@ -271,6 +284,46 @@ export default function App() {
     for (const p of projects) for (const a of p.agents) if (a.id === id) return a;
     return null;
   });
+
+  const [missions, setMissions] = createSignal<Mission[]>([]);
+  const [fleetNodes, setFleetNodes] = createSignal<RemoteNodeView[]>([]);
+  const refreshMissions = async () => {
+    try {
+      setMissions(await listMissions());
+    } catch {
+      /* keep last good list */
+    }
+  };
+  const refreshFleet = async () => {
+    try {
+      setFleetNodes((await getRemoteNodes()).nodes);
+    } catch {
+      /* keep last good list */
+    }
+  };
+  const currentMissionId = createMemo(() => {
+    const id = selected();
+    return id && id.startsWith("m:") ? id.slice(2) : null;
+  });
+  const missionGlyph = (s: string): Agent["status"] =>
+    s === "active" || s === "running" ? "running" : s === "failed" || s === "not_feasible" ? "pr-closed" : "idle";
+  const sortedNodes = () => [...fleetNodes()].sort((a, b) => Number(b.status === "online") - Number(a.status === "online"));
+  const machineLabel = () => {
+    if (isConnected()) {
+      if (newMachine() === "core") return "Core (agent-core)";
+      return fleetNodes().find((n) => n.id === newMachine())?.id ?? "Core (agent-core)";
+    }
+    return MACHINES.find((m) => m.id === newMachine())?.name;
+  };
+  createEffect(() => {
+    if (isConnected()) {
+      void refreshMissions();
+      void refreshFleet();
+      if (newMachine() !== "core" && !fleetNodes().some((n) => n.id === newMachine())) setNewMachine("core");
+    } else if (newMachine() === "core" || fleetNodes().some((n) => n.id === newMachine())) {
+      setNewMachine(MACHINES[0].id);
+    }
+  });
   const currentFile = createMemo(() => {
     const id = selected();
     if (!id?.startsWith("f:")) return null;
@@ -385,7 +438,23 @@ export default function App() {
     stream(c.id);
   };
 
-  const create = (text: string) => {
+  const create = async (text: string) => {
+    if (isConnected()) {
+      const title = text.length > 42 ? text.slice(0, 42) : text;
+      const node = fleetNodes().find((n) => n.id === newMachine());
+      try {
+        const m = await createMission(
+          node
+            ? { title, prompt: text, remote_node_id: node.id, remote_command: buildRemoteAgentCommand(text, await ensureNodeAgentKey()) }
+            : { title, prompt: text },
+        );
+        await refreshMissions();
+        open(`m:${m.id}`);
+      } catch {
+        /* surfaced by the next missions poll */
+      }
+      return;
+    }
     const id = "n" + Date.now();
     const title = text.length > 42 ? text.slice(0, 42) : text;
     const extra = attached()
@@ -501,6 +570,16 @@ export default function App() {
     };
     window.addEventListener("pointerdown", closePlus);
     onCleanup(() => window.removeEventListener("pointerdown", closePlus));
+    const missionsTimer = window.setInterval(() => {
+      if (isConnected()) void refreshMissions();
+    }, 5000);
+    const fleetTimer = window.setInterval(() => {
+      if (isConnected()) void refreshFleet();
+    }, 15000);
+    onCleanup(() => {
+      clearInterval(missionsTimer);
+      clearInterval(fleetTimer);
+    });
     toBottom();
   });
   onCleanup(() => {
@@ -747,6 +826,26 @@ export default function App() {
                     );
                   }}
                 </For>
+
+                <Show when={isConnected()}>
+                  <div class="section">Sandboxed</div>
+                  <For each={missions()}>
+                    {(m) => (
+                      <button
+                        class={`row agent ${selected() === `m:${m.id}` ? "active" : ""}`}
+                        onClick={() => open(`m:${m.id}`)}
+                      >
+                        <span class="glyph">
+                          <StatusGlyph agent={{ status: missionGlyph(m.status) }} busy={false} />
+                        </span>
+                        <span class="row-label">{m.title ?? m.id}</span>
+                      </button>
+                    )}
+                  </For>
+                  <Show when={missions().length === 0}>
+                    <div class="s-lead" style={{ padding: "2px 10px", margin: 0 }}>No missions yet.</div>
+                  </Show>
+                </Show>
               </>
             }
           >
@@ -803,6 +902,14 @@ export default function App() {
             <Match when={selected() === "providers"}>
               <span>Providers</span>
             </Match>
+            <Match when={currentMissionId()}>
+              {(id) => (
+                <>
+                  <span>{missions().find((m) => m.id === id())?.title ?? "Mission"}</span>
+                  <Ic.CloudIcon class="dim" />
+                </>
+              )}
+            </Match>
             <Match when={currentFile()}>
               {(f) => (
                 <>
@@ -838,6 +945,13 @@ export default function App() {
           </Match>
           <Match when={selected() === "providers"}>
             <Providers />
+          </Match>
+          <Match when={currentMissionId()}>
+            {(id) => (
+              <Show when={id()} keyed>
+                {(mid) => <MissionView id={mid} />}
+              </Show>
+            )}
           </Match>
           <Match when={currentFile()}>
             {(f) => {
@@ -899,47 +1013,93 @@ export default function App() {
                       <Show when={newMachine() !== "local"} fallback={<Ic.LaptopIcon size={14} />}>
                         <Ic.MachinesIcon size={14} />
                       </Show>
-                      {MACHINES.find((m) => m.id === newMachine())?.name}
+                      {machineLabel()}
                       <Ic.ChevronDown size={12} />
                     </button>
                     <Show when={envOpen() === "machine"}>
                       <div class="menu na-menu">
-                        <For each={MACHINES.filter((m) => m.id === "local")}>
-                          {(m) => (
-                            <button
-                              class={`menu-item ${m.id === newMachine() ? "on" : ""}`}
-                              onClick={() => {
-                                setNewMachine(m.id);
-                                setEnvOpen(null);
-                              }}
-                            >
-                              <span class="menu-ico">
-                                <Ic.LaptopIcon />
-                              </span>
-                              {m.name}
-                            </button>
-                          )}
-                        </For>
-                        <div class="menu-sep" />
-                        <For each={MACHINES.filter((m) => m.id !== "local")}>
-                          {(m) => (
-                            <button
-                              class={`menu-item ${m.id === newMachine() ? "on" : ""}`}
-                              onClick={() => {
-                                setNewMachine(m.id);
-                                setEnvOpen(null);
-                              }}
-                            >
-                              <span class="menu-ico">
-                                <Ic.MachinesIcon />
-                              </span>
-                              <span class="menu-col">
-                                {m.name}
-                                <span class="menu-sub">{m.user}@{m.host}</span>
-                              </span>
-                            </button>
-                          )}
-                        </For>
+                        <Show
+                          when={isConnected()}
+                          fallback={
+                            <>
+                              <For each={MACHINES.filter((m) => m.id === "local")}>
+                                {(m) => (
+                                  <button
+                                    class={`menu-item ${m.id === newMachine() ? "on" : ""}`}
+                                    onClick={() => {
+                                      setNewMachine(m.id);
+                                      setEnvOpen(null);
+                                    }}
+                                  >
+                                    <span class="menu-ico">
+                                      <Ic.LaptopIcon />
+                                    </span>
+                                    {m.name}
+                                  </button>
+                                )}
+                              </For>
+                              <div class="menu-sep" />
+                              <For each={MACHINES.filter((m) => m.id !== "local")}>
+                                {(m) => (
+                                  <button
+                                    class={`menu-item ${m.id === newMachine() ? "on" : ""}`}
+                                    onClick={() => {
+                                      setNewMachine(m.id);
+                                      setEnvOpen(null);
+                                    }}
+                                  >
+                                    <span class="menu-ico">
+                                      <Ic.MachinesIcon />
+                                    </span>
+                                    <span class="menu-col">
+                                      {m.name}
+                                      <span class="menu-sub">{m.user}@{m.host}</span>
+                                    </span>
+                                  </button>
+                                )}
+                              </For>
+                            </>
+                          }
+                        >
+                          <button
+                            class={`menu-item ${newMachine() === "core" ? "on" : ""}`}
+                            onClick={() => {
+                              setNewMachine("core");
+                              setEnvOpen(null);
+                            }}
+                          >
+                            <span class="menu-ico">
+                              <Ic.MachinesIcon />
+                            </span>
+                            <span class="menu-col">
+                              Core (agent-core)
+                              <span class="menu-sub">Backend host workspace</span>
+                            </span>
+                          </button>
+                          <div class="menu-sep" />
+                          <For each={sortedNodes()}>
+                            {(n) => (
+                              <button
+                                class={`menu-item ${n.id === newMachine() ? "on" : ""}`}
+                                onClick={() => {
+                                  setNewMachine(n.id);
+                                  setEnvOpen(null);
+                                }}
+                              >
+                                <span class="menu-ico">
+                                  <Ic.MachinesIcon />
+                                </span>
+                                <span class="menu-col">
+                                  {n.id}
+                                  <span class="menu-sub">
+                                    {n.status}
+                                    {n.cordoned ? " · cordoned" : ""}
+                                  </span>
+                                </span>
+                              </button>
+                            )}
+                          </For>
+                        </Show>
                         <div class="menu-sep" />
                         <button
                           class="menu-item"
@@ -1076,5 +1236,78 @@ export default function App() {
         )}
       </Show>
     </div>
+  );
+}
+
+function MissionView(p: { id: string }) {
+  const [mission, setMission] = createSignal<Mission | null>(null);
+  const [error, setError] = createSignal<string | null>(null);
+  let scroller: HTMLDivElement | undefined;
+
+  const refresh = async () => {
+    try {
+      setMission(await getMission(p.id));
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  onMount(() => {
+    void refresh().then(() => scroller?.scrollTo({ top: scroller.scrollHeight }));
+    const t = window.setInterval(() => void refresh(), 3000);
+    onCleanup(() => clearInterval(t));
+  });
+
+  const busy = () => {
+    const s = mission()?.status;
+    return s === "active" || s === "running";
+  };
+
+  const turns = (): Turn[] =>
+    (mission()?.history ?? []).map((h): Turn =>
+      h.role === "user"
+        ? { role: "user", text: h.content }
+        : { role: "agent", worked: "", blocks: [{ kind: "p", text: h.content }] },
+    );
+
+  const sendMsg = (text: string) => {
+    void sendMissionMessage(p.id, text)
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      .then(() => refresh());
+  };
+
+  const stopM = () => {
+    void cancelMission(p.id)
+      .catch(() => {})
+      .then(() => refresh());
+  };
+
+  return (
+    <>
+      <div class="scroll" ref={scroller}>
+        <div class="col">
+          <For each={turns()}>
+            {(turn, i) =>
+              turn.role === "user" ? (
+                <div class="user">
+                  <span>{turn.text}</span>
+                </div>
+              ) : (
+                <AgentTurn turn={turn} streaming={busy() && i() === turns().length - 1} />
+              )
+            }
+          </For>
+          <Show when={error()}>
+            <p class="s-lead">{error()}</p>
+          </Show>
+        </div>
+      </div>
+      <div class="dock">
+        <div class="col">
+          <Composer placeholder="Send follow-up" busy={busy()} onSend={sendMsg} onStop={stopM} />
+        </div>
+      </div>
+    </>
   );
 }

@@ -1,7 +1,9 @@
 import { For, Show, createSignal, type JSX } from "solid-js";
 import * as Ic from "./icons";
+import { clearConnection, getApiUrl, isConnected, login, setApiUrl } from "./api";
 
 export const SETTINGS_TABS = [
+  { id: "backend", label: "Backend", icon: Ic.SlidersIcon },
   { id: "general", label: "General", icon: Ic.GearIcon },
   { id: "appearance", label: "Appearance", icon: Ic.AppearanceIcon },
   { id: "agents", label: "Agents", icon: Ic.NewAgentIcon },
@@ -89,10 +91,86 @@ function Card(p: { title?: string; children: JSX.Element }) {
   );
 }
 
+function BackendTab() {
+  const [url, setUrl] = createSignal(getApiUrl());
+  const [password, setPassword] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+
+  const connect = async () => {
+    if (busy()) return;
+    setApiUrl(url());
+    setBusy(true);
+    setError(null);
+    try {
+      await login(password());
+      setPassword("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <h2>Backend</h2>
+      <Card title="Sandboxed.sh core">
+        <Row title="API URL" desc="Base URL of the sandboxed.sh core backend.">
+          <input
+            class="s-input"
+            value={url()}
+            placeholder="https://agent-backend.thomas.md"
+            onInput={(e) => {
+              setUrl(e.currentTarget.value);
+              setApiUrl(e.currentTarget.value);
+            }}
+          />
+        </Row>
+        <Show when={!isConnected()}>
+          <Row title="Password" desc="Dashboard password. The returned JWT is stored in localStorage.">
+            <input
+              class="s-input"
+              type="password"
+              value={password()}
+              onInput={(e) => setPassword(e.currentTarget.value)}
+              onKeyDown={(e) => e.key === "Enter" && void connect()}
+            />
+          </Row>
+        </Show>
+        <Row
+          title={isConnected() ? "Connected" : "Not connected"}
+          desc={isConnected() ? `Signed in to ${getApiUrl()}.` : "Connect to enable live Machines, Providers and missions."}
+        >
+          <Show
+            when={isConnected()}
+            fallback={
+              <button class="s-btn primary" disabled={busy() || !password()} onClick={() => void connect()}>
+                {busy() ? "Connecting…" : "Connect"}
+              </button>
+            }
+          >
+            <button class="s-btn" onClick={() => clearConnection()}>
+              Disconnect
+            </button>
+          </Show>
+        </Row>
+      </Card>
+      <Show when={error()}>
+        <div class="p-toast">{error()}</div>
+      </Show>
+    </>
+  );
+}
+
 export function Settings(p: { tab: SettingsTab }) {
   return (
     <div class="s-body">
       <div class="s-inner">
+        <Show when={p.tab === "backend"}>
+          <BackendTab />
+        </Show>
+
         <Show when={p.tab === "general"}>
           <h2>General</h2>
           <Card title="Notifications">

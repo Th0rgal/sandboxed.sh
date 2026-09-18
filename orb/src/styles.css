@@ -489,3 +489,17 @@ textarea::placeholder { color: #676767; }
 .m-note { font-size: 12px; color: var(--fg-3); margin-top: 1px; }
 .m-del { opacity: 0; }
 .m-row:hover .m-del { opacity: 1; }
+
+.m-dot.warn { background: #c9a227; }
+.m-dot.off { background: var(--red); }
+.m-row.cordoned { opacity: .55; }
+.m-tag {
+  margin-left: 8px; font-size: 10.5px; color: var(--fg-3);
+  border: 1px solid var(--stroke); border-radius: 4px; padding: 0 5px;
+}
+.s-input {
+  height: 28px; padding: 0 10px; border-radius: 6px;
+  border: 1px solid var(--stroke); background: #1e1e1e; color: var(--fg);
+  font: 12.5px var(--sans); min-width: 220px;
+}
+.s-input:focus { outline: 0; border-color: #555; }

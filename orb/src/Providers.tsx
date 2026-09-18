@@ -1,8 +1,9 @@
-import { For, Show, createMemo, createSignal } from "solid-js";
+import { For, Show, createMemo, createSignal, onMount } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import * as Ic from "./icons";
 import { Dialog, Field } from "./Dialog";
 import { Toggle } from "./Settings";
+import { isConnected, listProviders, type AIProvider } from "./api";
 
 type AuthKind = "oauth" | "api";
 type Owner = "cliproxy" | "sandboxed" | "gemini";
@@ -174,7 +175,18 @@ const SEED: Account[] = [
 
 export function Providers() {
   const [list, setList] = createStore<Account[]>(SEED.map((a) => ({ ...a })));
+  const [remote, setRemote] = createSignal<AIProvider[] | null>(null);
   const [add, setAdd] = createSignal(false);
+
+  onMount(() => {
+    if (isConnected()) {
+      listProviders()
+        .then(setRemote)
+        .catch(() => {});
+    }
+  });
+
+  const live = () => (isConnected() ? remote() : null);
   const [step, setStep] = createSignal<"type" | "method" | "details">("type");
   const [kindId, setKindId] = createSignal<string | null>(null);
   const [methodI, setMethodI] = createSignal(0);
@@ -232,6 +244,7 @@ export function Providers() {
   };
 
   return (
+    <Show when={!live()} fallback={<LiveProviders list={live() ?? []} />}>
     <div class="page">
       <div class="page-head">
         <h2>Providers</h2>
@@ -374,6 +387,73 @@ export function Providers() {
           </Show>
         </Dialog>
       </Show>
+    </div>
+    </Show>
+  );
+}
+
+function LiveProviders(p: { list: AIProvider[] }) {
+  const oauth = () => p.list.filter((x) => x.uses_oauth);
+  const keys = () => p.list.filter((x) => !x.uses_oauth);
+  return (
+    <div class="page">
+      <div class="page-head">
+        <h2>Providers</h2>
+      </div>
+      <p class="s-lead">Configured providers from the connected sandboxed.sh backend. Manage them in the dashboard.</p>
+
+      <section class="s-sec">
+        <h3>Subscriptions (OAuth)</h3>
+        <div class="s-card">
+          <For each={oauth()}>{(a) => <LiveRow a={a} />}</For>
+          <Show when={oauth().length === 0}>
+            <div class="s-row"><div class="s-row-desc">No OAuth providers configured.</div></div>
+          </Show>
+        </div>
+      </section>
+
+      <section class="s-sec">
+        <h3>API keys</h3>
+        <div class="s-card">
+          <For each={keys()}>{(a) => <LiveRow a={a} />}</For>
+          <Show when={keys().length === 0}>
+            <div class="s-row"><div class="s-row-desc">No API key providers configured.</div></div>
+          </Show>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function LiveRow(p: { a: AIProvider }) {
+  const a = p.a;
+  const stClass = () =>
+    a.status.type === "connected" ? "connected" : a.status.type === "needs_reauth" || a.status.type === "error" ? "needs_reauth" : "not_configured";
+  const stLabel = () =>
+    a.status.type === "connected"
+      ? "Connected"
+      : a.status.type === "needs_reauth"
+        ? "Reconnect"
+        : a.status.type === "needs_auth"
+          ? "Needs auth"
+          : a.status.type === "error"
+            ? "Error"
+            : "Unknown";
+  return (
+    <div class="s-row p-acc">
+      <div class="s-row-text">
+        <div class="s-row-title">
+          {a.name}
+          <span class="p-chip">{a.provider_type}</span>
+        </div>
+        <div class="s-row-desc">
+          <span class={`p-st ${stClass()}`}>{stLabel()}</span>
+          <Show when={a.account_email}>
+            <span class="p-dot">·</span>
+            {a.account_email}
+          </Show>
+        </div>
+      </div>
     </div>
   );
 }

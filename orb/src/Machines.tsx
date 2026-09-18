@@ -1,8 +1,9 @@
-import { For, Show, createSignal, onMount } from "solid-js";
+import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import * as Ic from "./icons";
 import { Dialog, Field } from "./Dialog";
 import { readPalomaPub } from "./pubKey";
+import { getRemoteNodes, isConnected, type RemoteNodeView } from "./api";
 
 export type Machine = {
   id: string;
@@ -11,6 +12,7 @@ export type Machine = {
   user: string;
   port: number;
   locked?: boolean;
+  custom?: boolean;
   note: string;
 };
 
@@ -25,9 +27,34 @@ export const MACHINES: Machine[] = [
   { id: "dgx-spark", name: "dgx-spark", host: "100.77.4.93", user: "th0rgal", port: 22, note: "spark-de79 · Tailscale · GPU" },
 ];
 
+const CUSTOM_KEY = "orb.customMachines";
+
+function loadCustom(): Machine[] {
+  try {
+    const raw = localStorage.getItem(CUSTOM_KEY);
+    const v: unknown = raw ? JSON.parse(raw) : [];
+    return Array.isArray(v) ? (v as Machine[]).map((m) => ({ ...m, custom: true })) : [];
+  } catch {
+    return [];
+  }
+}
+
 function target(m: Machine) {
   if (m.id === "local") return "local";
   return m.port !== 22 ? `${m.user}@${m.host}:${m.port}` : `${m.user}@${m.host}`;
+}
+
+function dotClass(status: string) {
+  if (status === "online") return "m-dot on";
+  if (status === "offline") return "m-dot off";
+  return "m-dot warn";
+}
+
+function nodeNote(n: RemoteNodeView) {
+  const parts = [...n.labels];
+  if (n.version) parts.push(n.version);
+  if (n.capacity_available != null && n.capacity_total != null) parts.push(`${n.capacity_available}/${n.capacity_total}`);
+  return parts.join(" · ");
 }
 
 type Draft = { id?: string; name: string; host: string; user: string; port: string; note: string };
@@ -35,13 +62,30 @@ type Draft = { id?: string; name: string; host: string; user: string; port: stri
 const empty = (): Draft => ({ name: "", host: "", user: "ubuntu", port: "22", note: "" });
 
 export function Machines() {
-  const [list, setList] = createStore<Machine[]>(MACHINES.map((m) => ({ ...m })));
+  const [list, setList] = createStore<Machine[]>([...MACHINES.map((m) => ({ ...m })), ...loadCustom()]);
   const [draft, setDraft] = createSignal<Draft | null>(null);
   const [pub, setPub] = createSignal("");
   const [copied, setCopied] = createSignal(false);
+  const [nodes, setNodes] = createSignal<RemoteNodeView[] | null>(null);
+
+  const persist = () => localStorage.setItem(CUSTOM_KEY, JSON.stringify(list.filter((m) => m.custom)));
+
+  const refresh = async () => {
+    try {
+      const r = await getRemoteNodes();
+      setNodes(r.nodes);
+    } catch {
+      /* keep last good snapshot */
+    }
+  };
 
   onMount(() => {
     void readPalomaPub().then(setPub);
+    if (isConnected()) void refresh();
+    const t = window.setInterval(() => {
+      if (isConnected()) void refresh();
+    }, 15000);
+    onCleanup(() => clearInterval(t));
   });
 
   const save = () => {
@@ -63,9 +107,11 @@ export function Machines() {
         host,
         user: d.user.trim() || "ubuntu",
         port,
+        custom: true,
         note: d.note.trim() || "SSH",
       });
     }
+    persist();
     setDraft(null);
   };
 
@@ -77,6 +123,8 @@ export function Machines() {
     setTimeout(() => setCopied(false), 1400);
   };
 
+  const editable = () => (isConnected() ? list.filter((m) => m.custom) : list.slice(1));
+
   return (
     <div class="page">
       <div class="page-head">
@@ -85,34 +133,77 @@ export function Machines() {
           <Ic.PlusIcon size={14} /> Add
         </button>
       </div>
-      <p class="s-lead">New Agent runs on one of these over Paloma SSH. Nothing is dispatched to sandboxed.sh yet.</p>
+      <p class="s-lead">
+        {isConnected()
+          ? "Live sandboxed.sh fleet, refreshed every 15s."
+          : "New Agent runs on one of these over Paloma SSH. Connect a backend in Settings to see the live fleet."}
+      </p>
 
       <div class="m-list">
-        <For each={list}>
-          {(m, i) => (
-            <div class="m-row" onClick={() => !m.locked && setDraft({ id: m.id, name: m.name, host: m.host, user: m.user, port: String(m.port), note: m.note })}>
-              <span class="m-dot on" title="Paloma SSH" />
-              <div class="m-text">
-                <div class="m-name">{m.name}</div>
-                <div class="m-meta">{target(m)}</div>
-                <Show when={m.note}>
-                  <div class="m-note">{m.note}</div>
-                </Show>
+        <div class="m-row">
+          <span class="m-dot on" title="This computer" />
+          <div class="m-text">
+            <div class="m-name">{MACHINES[0].name}</div>
+            <div class="m-meta">{target(MACHINES[0])}</div>
+            <div class="m-note">{MACHINES[0].note}</div>
+          </div>
+        </div>
+
+        <Show when={isConnected()}>
+          <For each={nodes() ?? []}>
+            {(n) => (
+              <div class={`m-row ${n.cordoned ? "cordoned" : ""}`}>
+                <span class={dotClass(n.status)} title={n.status} />
+                <div class="m-text">
+                  <div class="m-name">
+                    {n.id}
+                    <Show when={n.cordoned}>
+                      <span class="m-tag">cordoned</span>
+                    </Show>
+                  </div>
+                  <div class="m-meta">{n.base_url}</div>
+                  <Show when={nodeNote(n)}>
+                    <div class="m-note">{nodeNote(n)}</div>
+                  </Show>
+                </div>
               </div>
-              <Show when={!m.locked}>
+            )}
+          </For>
+          <Show when={nodes()?.length === 0}>
+            <div class="m-note" style={{ padding: "6px 8px" }}>No remote nodes registered.</div>
+          </Show>
+        </Show>
+
+        <For each={editable()}>
+          {(m) => {
+            const index = () => list.findIndex((x) => x.id === m.id);
+            return (
+              <div class="m-row" onClick={() => setDraft({ id: m.id, name: m.name, host: m.host, user: m.user, port: String(m.port), note: m.note })}>
+                <span class="m-dot on" title="Paloma SSH" />
+                <div class="m-text">
+                  <div class="m-name">{m.name}</div>
+                  <div class="m-meta">{target(m)}</div>
+                  <Show when={m.note}>
+                    <div class="m-note">{m.note}</div>
+                  </Show>
+                </div>
                 <button
                   class="icon-btn m-del"
                   title="Remove"
                   onClick={(e) => {
                     e.stopPropagation();
-                    setList(produce((ls) => { ls.splice(i(), 1); }));
+                    const i = index();
+                    if (i >= 0) {
+                      setList(produce((ls) => { ls.splice(i, 1); }));
+                      persist();
+                    }
                   }}
                 >
                   <Ic.CloseIcon size={14} />
                 </button>
-              </Show>
-            </div>
-          )}
+              </div>
+            );
+          }}
         </For>
       </div>
 
@@ -138,6 +229,7 @@ export function Machines() {
                       const i = ls.findIndex((m) => m.id === d().id);
                       if (i >= 0) ls.splice(i, 1);
                     }));
+                    persist();
                     setDraft(null);
                   }}
                 >
