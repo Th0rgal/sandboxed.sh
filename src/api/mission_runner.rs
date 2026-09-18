@@ -5570,6 +5570,49 @@ pub(crate) fn ensure_opencode_provider_for_model(
                 "options": options
             }))
         }
+        "kimi" => {
+            // OpenCode's kimi provider otherwise talks to api.kimi.com with
+            // the workspace OAuth token. Empty assistant turns then 400
+            // (`must not be empty`) and the mission dies with llm_error.
+            // Route through the host proxy so rewrite_model_for_kimi can
+            // fill those turns; the adapter still strips `kimi/`, so the
+            // proxy accepts bare catalog ids (`k3-256k`).
+            let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+            let proxy_key = std::env::var("SANDBOXED_PROXY_SECRET")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| {
+                    tracing::error!("SANDBOXED_PROXY_SECRET not set; kimi proxy auth will fail");
+                    String::new()
+                });
+            let mut options = serde_json::json!({
+                "baseURL": format!("http://{}:{}/v1", host_ip, port),
+                "apiKey": proxy_key
+            });
+            if let Some(mid) = mission_id {
+                options["headers"] = serde_json::json!({
+                    crate::api::proxy_liveness::MISSION_ID_HEADER: mid
+                });
+            }
+            let kimi_model = if model_id.starts_with("k3") {
+                serde_json::json!({
+                    "name": model_id,
+                    "capabilities": {
+                        "interleaved": { "field": "reasoning_content" }
+                    }
+                })
+            } else {
+                serde_json::json!({ "name": model_id })
+            };
+            Some(serde_json::json!({
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Kimi",
+                "models": {
+                    model_id: kimi_model
+                },
+                "options": options
+            }))
+        }
         _ => custom_opencode_provider_definition(app_working_dir, provider_id),
     };
 
@@ -5593,9 +5636,10 @@ pub(crate) fn ensure_opencode_provider_for_model(
         None => return,
     };
 
-    if provider_id == "builtin" {
-        // Always overwrite the builtin provider definition — the proxy secret
-        // (options.apiKey) changes on every server restart.
+    if provider_id == "builtin" || provider_id == "kimi" {
+        // Always overwrite proxy-backed providers — the proxy secret
+        // (options.apiKey) changes on every server restart, and Kimi must
+        // not keep a stale api.kimi.com block from workspace config.
         providers_map.insert(provider_id.to_string(), provider_def);
     } else if let Some(existing) = providers_map.get_mut(provider_id) {
         // Provider already exists – make sure the model is listed.
@@ -11296,6 +11340,52 @@ mod tests {
         let data_home2 = temp2.path().join(".local/share");
         fs::create_dir_all(data_home2.join("opencode/storage/message/ses_xyz")).unwrap();
         assert!(opencode_session_exists_in_data_home(&data_home2, "ses_xyz"));
+    }
+
+    #[test]
+    fn ensure_opencode_provider_kimi_routes_through_host_proxy() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp.path().join("ws");
+        let app_dir = temp.path().join("app");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+
+        // Workspace config would have written api.kimi.com; the runner must
+        // overwrite it so empty-assistant sanitization in the proxy applies.
+        fs::write(
+            config_dir.join("opencode.json"),
+            r#"{"provider":{"kimi":{"npm":"@ai-sdk/openai-compatible","name":"Kimi","options":{"baseURL":"https://api.kimi.com/coding/v1","apiKey":"stale"}}}}"#,
+        )
+        .unwrap();
+
+        ensure_opencode_provider_for_model(
+            &config_dir,
+            &app_dir,
+            "kimi/k3-256k",
+            "10.88.0.1",
+            Some("00000000-0000-0000-0000-000000000123"),
+        );
+
+        let opencode_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config_dir.join("opencode.json")).expect("opencode.json"),
+        )
+        .expect("parse opencode.json");
+        let provider = &opencode_json["provider"]["kimi"];
+        let base_url = provider["options"]["baseURL"].as_str().expect("baseURL");
+        assert!(
+            base_url.starts_with("http://10.88.0.1:"),
+            "expected host proxy baseURL, got {base_url}"
+        );
+        assert_ne!(base_url, "https://api.kimi.com/coding/v1");
+        assert_eq!(
+            provider["options"]["headers"][crate::api::proxy_liveness::MISSION_ID_HEADER],
+            "00000000-0000-0000-0000-000000000123"
+        );
+        assert_eq!(provider["models"]["k3-256k"]["name"], "k3-256k");
+        assert_eq!(
+            provider["models"]["k3-256k"]["capabilities"]["interleaved"]["field"],
+            "reasoning_content"
+        );
     }
 
     #[test]
