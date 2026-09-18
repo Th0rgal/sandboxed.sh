@@ -865,6 +865,9 @@ pub(crate) fn codex_cooldown_for_reason(reason: &TerminalReason) -> Option<std::
 pub(crate) enum CodexCredential {
     ApiKey(String),
     OAuth(crate::api::ai_providers::CodexOAuthAccount),
+    /// CLIProxyAPI owns the ChatGPT OAuth accounts and rotates across them
+    /// itself; sandboxed.sh sees a single proxy credential.
+    CliProxy(crate::api::oauth_owner::CliProxyEndpoint),
 }
 
 impl CodexCredential {
@@ -876,6 +879,7 @@ impl CodexCredential {
         match self {
             CodexCredential::ApiKey(k) => format!("apikey:{}", k),
             CodexCredential::OAuth(acc) => format!("oauth:{}", acc.chatgpt_account_id),
+            CodexCredential::CliProxy(endpoint) => format!("cliproxy:{}", endpoint.base_url),
         }
     }
 
@@ -883,12 +887,16 @@ impl CodexCredential {
         match self {
             CodexCredential::ApiKey(_) => CODEX_ACCOUNT_CONCURRENCY_LIMIT,
             CodexCredential::OAuth(_) => CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT,
+            // The proxy multiplexes every Codex account it holds; cap like an
+            // API key rather than a single subscription.
+            CodexCredential::CliProxy(_) => CODEX_ACCOUNT_CONCURRENCY_LIMIT,
         }
     }
 
     pub(crate) fn label_for_logs(&self) -> String {
         match self {
             CodexCredential::ApiKey(k) => codex_key_fingerprint(k),
+            CodexCredential::CliProxy(endpoint) => format!("cliproxy:{}", endpoint.base_url),
             CodexCredential::OAuth(acc) => {
                 // Truncate by char count, not byte index — `chatgpt_account_id`
                 // is an ASCII UUID in practice, but a stray multi-byte char
@@ -909,6 +917,9 @@ impl CodexCredential {
             }
             CodexCredential::OAuth(acc) => {
                 crate::api::ai_providers::CodexCredentialOverride::OAuth(acc)
+            }
+            CodexCredential::CliProxy(endpoint) => {
+                crate::api::ai_providers::CodexCredentialOverride::CliProxy(endpoint)
             }
         }
     }
@@ -1339,6 +1350,19 @@ pub(crate) fn collect_codex_credentials(working_dir: &std::path::Path) -> Vec<Co
             .into_iter()
             .map(CodexCredential::ApiKey)
             .collect();
+    // When CLIProxyAPI owns the ChatGPT OAuth accounts, sandboxed.sh never
+    // hands Codex an OAuth token: the proxy is the one (and only) OAuth
+    // credential, tried before any platform API key.
+    if let Some(endpoint) = super::oauth_owner::codex_via_cli_proxy() {
+        tracing::debug!(
+            working_dir = %working_dir.display(),
+            api_keys = api_keys.len(),
+            "collect_codex_credentials: ChatGPT OAuth owned by CLIProxyAPI"
+        );
+        let mut creds = vec![CodexCredential::CliProxy(endpoint)];
+        creds.extend(api_keys);
+        return creds;
+    }
     let oauths: Vec<CodexCredential> =
         super::ai_providers::get_all_openai_oauth_accounts(working_dir)
             .into_iter()
@@ -4539,6 +4563,17 @@ pub(crate) async fn refresh_claude_credentials_after_auth_error(
         );
     }
 
+    // When CLIProxyAPI owns the credential the host tiers are not in play:
+    // an auth error came from the proxy, so leave the host files alone and
+    // let the caller retry through the proxy.
+    if super::oauth_owner::cli_proxy_owns(crate::ai_providers::ProviderType::Anthropic) {
+        tracing::info!(
+            context = log_context,
+            "Anthropic OAuth is owned by CLIProxyAPI; skipping host credential invalidation"
+        );
+        return;
+    }
+
     for host_path in &[
         std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
         std::path::PathBuf::from("/root/.claude/.credentials.json"),
@@ -5032,6 +5067,16 @@ pub(crate) fn detect_opencode_provider_auth(
             configured_providers.insert("anthropic".to_string());
         }
     }
+    // CLIProxyAPI-owned credentials are reachable through the proxy even when
+    // no OAuth file exists on the host any more.
+    if super::oauth_owner::cli_proxy_owns(crate::ai_providers::ProviderType::OpenAI) {
+        has_openai = true;
+        configured_providers.insert("openai".to_string());
+    }
+    if super::oauth_owner::cli_proxy_owns(crate::ai_providers::ProviderType::Anthropic) {
+        has_anthropic = true;
+        configured_providers.insert("anthropic".to_string());
+    }
     if let Ok(value) = std::env::var("GOOGLE_GENERATIVE_AI_API_KEY") {
         if !value.trim().is_empty() {
             has_google = true;
@@ -5394,6 +5439,59 @@ fn sanitize_custom_opencode_provider_id(name: &str) -> String {
         .replace('-', "_")
 }
 
+/// OpenCode provider block routing a native AI-SDK adapter through
+/// CLIProxyAPI, or `None` when the proxy does not own that provider.
+fn cli_proxy_opencode_provider_definition(
+    provider: crate::ai_providers::ProviderType,
+    npm: &str,
+    name: &str,
+    model_id: &str,
+) -> Option<serde_json::Value> {
+    let endpoint = super::oauth_owner::harness_via_cli_proxy(provider)?;
+    Some(serde_json::json!({
+        "npm": npm,
+        "name": name,
+        "models": {
+            model_id: { "name": model_id }
+        },
+        "options": {
+            "baseURL": endpoint.openai_v1_url(),
+            "apiKey": endpoint.api_key
+        }
+    }))
+}
+
+/// `auth.json` entries that replace host OAuth records for providers owned by
+/// CLIProxyAPI: OpenCode authenticates to the proxy with its key instead.
+fn cli_proxy_opencode_auth_overlay() -> Option<serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    for (provider, keys) in [
+        (
+            crate::ai_providers::ProviderType::Anthropic,
+            &["anthropic", "claude"][..],
+        ),
+        (
+            crate::ai_providers::ProviderType::OpenAI,
+            &["openai", "codex"][..],
+        ),
+    ] {
+        let Some(endpoint) = super::oauth_owner::harness_via_cli_proxy(provider) else {
+            continue;
+        };
+        for key in keys {
+            map.insert(
+                (*key).to_string(),
+                serde_json::json!({ "type": "api", "key": endpoint.api_key }),
+            );
+        }
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(map))
+    }
+}
+
 fn custom_opencode_provider_definition(
     app_working_dir: &std::path::Path,
     provider_id: &str,
@@ -5493,6 +5591,23 @@ pub(crate) fn ensure_opencode_provider_for_model(
     // OpenAI, Anthropic, Google are natively supported by OpenCode and their
     // OAuth plugins are installed by the runner when credentials are present.
     let provider_def: Option<serde_json::Value> = match provider_id {
+        // Anthropic / OpenAI through CLIProxyAPI when it owns the OAuth
+        // credential: the native AI-SDK adapters keep their protocol
+        // (Messages / Responses) and only the base URL and key change. Without
+        // ownership these stay `None` so OpenCode's built-in providers and
+        // OAuth plugins keep handling them.
+        "anthropic" | "claude" => cli_proxy_opencode_provider_definition(
+            crate::ai_providers::ProviderType::Anthropic,
+            "@ai-sdk/anthropic",
+            "Anthropic",
+            model_id,
+        ),
+        "openai" | "codex" => cli_proxy_opencode_provider_definition(
+            crate::ai_providers::ProviderType::OpenAI,
+            "@ai-sdk/openai",
+            "OpenAI",
+            model_id,
+        ),
         "zai" => {
             let base_url = std::env::var("ZAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.z.ai/api/coding/paas/v4".to_string());
@@ -5636,10 +5751,13 @@ pub(crate) fn ensure_opencode_provider_for_model(
         None => return,
     };
 
-    if provider_id == "builtin" || provider_id == "kimi" {
+    let cli_proxy_owned_provider =
+        matches!(provider_id, "anthropic" | "claude" | "openai" | "codex");
+    if provider_id == "builtin" || provider_id == "kimi" || cli_proxy_owned_provider {
         // Always overwrite proxy-backed providers — the proxy secret
-        // (options.apiKey) changes on every server restart, and Kimi must
-        // not keep a stale api.kimi.com block from workspace config.
+        // (options.apiKey) changes on every server restart, Kimi must not
+        // keep a stale api.kimi.com block from workspace config, and a
+        // CLIProxyAPI-owned Anthropic/OpenAI block must track the proxy URL.
         providers_map.insert(provider_id.to_string(), provider_def);
     } else if let Some(existing) = providers_map.get_mut(provider_id) {
         // Provider already exists – make sure the model is listed.
@@ -6026,8 +6144,18 @@ pub(crate) fn sync_opencode_auth_to_workspace(
         }
     }
 
-    if let Some(managed_auth) = build_opencode_auth_from_ai_providers(app_working_dir) {
-        overlay_opencode_auth(&mut auth_json, managed_auth);
+    let managed_auth = build_opencode_auth_from_ai_providers(app_working_dir);
+    let owner_overlay = cli_proxy_opencode_auth_overlay();
+    if managed_auth.is_some() || owner_overlay.is_some() {
+        if let Some(managed_auth) = managed_auth {
+            overlay_opencode_auth(&mut auth_json, managed_auth);
+        }
+        // Applied last: a CLIProxyAPI-owned provider must never reach OpenCode
+        // as an OAuth record (stale copies would be refreshed by the plugin
+        // and revoke the proxy's token family).
+        if let Some(owner_overlay) = owner_overlay {
+            overlay_opencode_auth(&mut auth_json, owner_overlay);
+        }
         if let (Some(value), Some(dest_path)) = (auth_json.as_ref(), auth_path.as_ref()) {
             if let Err(e) = write_json_file(dest_path, value) {
                 tracing::warn!(
@@ -7125,6 +7253,23 @@ pub(crate) async fn check_opencode_connectivity(
 ) -> Result<(), String> {
     // First check basic internet connectivity
     check_basic_internet_connectivity(workspace_exec, cwd).await?;
+
+    // Providers owned by CLIProxyAPI are reached on the loopback proxy, not
+    // the vendor API; the direct egress may even be blocked. Probe the proxy.
+    if (has_openai && super::oauth_owner::cli_proxy_owns(crate::ai_providers::ProviderType::OpenAI))
+        || (has_anthropic
+            && super::oauth_owner::cli_proxy_owns(crate::ai_providers::ProviderType::Anthropic))
+    {
+        if let Some(endpoint) = super::oauth_owner::cli_proxy_endpoint() {
+            return check_api_reachability(
+                workspace_exec,
+                cwd,
+                "CLIProxyAPI",
+                &format!("{}/v1/models", endpoint.base_url),
+            )
+            .await;
+        }
+    }
 
     // Determine which API to check based on configured providers
     // Priority: OpenAI > Anthropic > Google > Z.AI > Minimax (most common first)

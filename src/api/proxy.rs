@@ -1751,12 +1751,13 @@ pub(crate) async fn chat_completions_inner(
             None
         };
 
-        // The synthetic "anthropic-cli-proxy" account is the only Anthropic
-        // entry without an api_key — `read_standard_accounts` hoists the
-        // access_token into `api_key` for real Anthropic OAuth records so we
-        // can forward it as a Bearer credential. Gate the CLI-proxy adapter on
-        // that distinction, otherwise direct Anthropic OAuth accounts get sent
-        // through the local CLI proxy with no credential and fail.
+        // Anthropic OAuth entries reach the CLI-proxy adapter in two shapes:
+        // the synthetic "anthropic-cli-proxy" account (always keyless), and —
+        // once CLIProxyAPI owns the credential — any store-backed Anthropic
+        // OAuth record, because `read_standard_accounts` no longer hoists the
+        // access_token into `api_key` for those. In legacy owner mode the
+        // hoisting still applies, so only the synthetic account (or an
+        // account with an unusable token) lands here.
         let use_anthropic_oauth_cli_proxy_adapter =
             provider_type == ProviderType::Anthropic && entry.has_oauth && entry.api_key.is_none();
         let use_anthropic_adapter =

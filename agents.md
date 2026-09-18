@@ -74,8 +74,10 @@ execution context:
   - `.claude/settings.local.json` (MCP servers + permissions)
   - `.claude/skills/<name>/SKILL.md` (native skills with YAML frontmatter)
   - `CLAUDE.md` (general workspace context)
-- For OAuth auth, credentials are written to `$HOME/.claude/.credentials.json`
-  (or `/root/.claude/.credentials.json` in containers) to enable token refresh.
+- Auth: when CLIProxyAPI holds a Claude login, the harness is pointed at the
+  proxy (`ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY`) and no OAuth file is
+  written. Otherwise (legacy mode) credentials are copied to the mission's
+  `.claude/.credentials.json`. See `docs/CREDENTIAL_OWNERSHIP.md`.
 - Built-in `Bash` is **enabled** in the permissions allowlist.
 
 ### Codex

@@ -41,6 +41,9 @@ fn credential_identity(
         crate::api::ai_providers::CodexCredentialOverride::ApiKey(key) => {
             continuity::account_fingerprint("apikey", key)
         }
+        crate::api::ai_providers::CodexCredentialOverride::CliProxy(endpoint) => {
+            continuity::account_fingerprint("cliproxy", &endpoint.base_url)
+        }
     }
 }
 
@@ -1028,10 +1031,18 @@ async fn run_codex_turn(
     // ChatGPT OAuth account. Minting an API key refreshes/rotates the same
     // refresh token, then the selected credential can become stale before it
     // is written into Codex auth.json.
-    let should_try_mint_api_key = !matches!(
-        override_credential,
-        Some(crate::api::ai_providers::CodexCredentialOverride::OAuth(_))
-    );
+    let codex_proxy = match override_credential {
+        Some(crate::api::ai_providers::CodexCredentialOverride::CliProxy(endpoint)) => {
+            Some((*endpoint).clone())
+        }
+        Some(_) => None,
+        None => crate::api::oauth_owner::codex_via_cli_proxy(),
+    };
+    let should_try_mint_api_key = codex_proxy.is_none()
+        && !matches!(
+            override_credential,
+            Some(crate::api::ai_providers::CodexCredentialOverride::OAuth(_))
+        );
     if should_try_mint_api_key {
         if let Err(e) =
             crate::api::ai_providers::ensure_openai_api_key_for_codex(app_working_dir).await
@@ -1047,7 +1058,9 @@ async fn run_codex_turn(
         Some(crate::api::ai_providers::CodexCredentialOverride::OAuth(account)) => {
             Some((*account).clone())
         }
-        Some(crate::api::ai_providers::CodexCredentialOverride::ApiKey(_)) => None,
+        Some(crate::api::ai_providers::CodexCredentialOverride::ApiKey(_))
+        | Some(crate::api::ai_providers::CodexCredentialOverride::CliProxy(_)) => None,
+        None if codex_proxy.is_some() => None,
         None => {
             if crate::api::ai_providers::get_openai_api_key_for_codex_default(app_working_dir)
                 .is_none()
@@ -1084,7 +1097,13 @@ async fn run_codex_turn(
     let prepared_override = prepared_oauth_account
         .as_ref()
         .map(crate::api::ai_providers::CodexCredentialOverride::OAuth);
-    let workspace_override = prepared_override.as_ref().or(override_credential);
+    let proxy_override = codex_proxy
+        .as_ref()
+        .map(crate::api::ai_providers::CodexCredentialOverride::CliProxy);
+    let workspace_override = prepared_override
+        .as_ref()
+        .or(proxy_override.as_ref())
+        .or(override_credential);
 
     // Ensure Codex auth.json is present in the workspace context (host or container).
     if let Err(e) = crate::api::ai_providers::write_codex_credentials_for_workspace(
@@ -1098,6 +1117,35 @@ async fn run_codex_turn(
             0,
         )
         .with_terminal_reason(TerminalReason::LlmError);
+    }
+
+    // A non-proxy attempt (explicit rotation override, or no CLIProxyAPI
+    // ownership at all) must not inherit the `model_provider = "cliproxy"`
+    // stanza baked into the mission config at prepare time: its
+    // `env_key = "OPENAI_API_KEY"` would resolve against a missing env var
+    // and the fallback attempt would fail instead of authenticating with
+    // its own credential. Strip only our own stanza; an operator-set
+    // provider is left untouched.
+    if codex_proxy.is_none() {
+        let config_path = mission_work_dir.join(".codex").join("config.toml");
+        if let Ok(existing) = std::fs::read_to_string(&config_path) {
+            let stripped = crate::workspace::config::strip_codex_cli_proxy_provider(&existing);
+            if stripped != existing {
+                if let Err(e) = std::fs::write(&config_path, &stripped) {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        path = %config_path.display(),
+                        error = %e,
+                        "Failed to strip CLIProxyAPI model provider from Codex config for non-proxy attempt"
+                    );
+                } else {
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        "Stripped CLIProxyAPI model provider from Codex config for non-proxy attempt"
+                    );
+                }
+            }
+        }
     }
 
     let workspace_exec = WorkspaceExec::new(workspace.clone());
@@ -1132,6 +1180,16 @@ async fn run_codex_turn(
         extra_env.insert(
             "CODEX_HOME".into(),
             workspace_exec.translate_path_for_container(&mission_work_dir.join(".codex")),
+        );
+    }
+    if let Some(endpoint) = codex_proxy.as_ref() {
+        // `config.toml` declares `[model_providers.cliproxy]` with
+        // `env_key = "OPENAI_API_KEY"`; Codex resolves it from the process env.
+        extra_env.insert("OPENAI_API_KEY".into(), endpoint.api_key.clone());
+        tracing::info!(
+            mission_id = %mission_id,
+            base_url = %endpoint.base_url,
+            "Codex routed through CLIProxyAPI (ChatGPT OAuth owned by the proxy)"
         );
     }
 
