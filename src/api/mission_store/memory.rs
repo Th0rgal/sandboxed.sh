@@ -27,6 +27,10 @@ pub struct InMemoryMissionStore {
     tool_executions: Arc<RwLock<HashMap<(Uuid, String), MissionToolExecution>>>,
     task_attempts: Arc<RwLock<HashMap<(Uuid, u32), TaskAttempt>>>,
     board_outbox: Arc<RwLock<HashMap<String, BoardOutboxItem>>>,
+    /// Test-only: make `list_active_tool_executions` fail, to exercise the
+    /// callers that must not confuse a failed scan with "no tool row".
+    #[cfg(test)]
+    fail_tool_scans: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl InMemoryMissionStore {
@@ -40,7 +44,16 @@ impl InMemoryMissionStore {
             tool_executions: Arc::new(RwLock::new(HashMap::new())),
             task_attempts: Arc::new(RwLock::new(HashMap::new())),
             board_outbox: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            fail_tool_scans: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Test-only: every subsequent `list_active_tool_executions` returns `Err`.
+    #[cfg(test)]
+    pub(crate) fn test_fail_tool_scans(&self) {
+        self.fail_tool_scans
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Test-only: backdate `updated_at` so `get_stale_active_missions` can
@@ -260,6 +273,13 @@ impl MissionStore for InMemoryMissionStore {
         &self,
         run_id: Uuid,
     ) -> Result<Vec<MissionToolExecution>, String> {
+        #[cfg(test)]
+        if self
+            .fail_tool_scans
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err("database is locked".to_string());
+        }
         Ok(self
             .tool_executions
             .read()

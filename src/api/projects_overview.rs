@@ -655,22 +655,7 @@ pub async fn get_project(
     };
     let grant = state.projects.get_grant(&slug).map_err(store_err)?;
     let tracks = collect_family_tracks(&state.projects, &slug).map_err(store_err)?;
-    let decisions = {
-        let mut all = state.projects.open_decisions(&slug).map_err(store_err)?;
-        let mut seen: std::collections::HashSet<String> =
-            all.iter().map(|d| d.at.clone()).collect();
-        for key in project_tag_keys(&slug) {
-            if key == slug {
-                continue;
-            }
-            for d in state.projects.open_decisions(&key).map_err(store_err)? {
-                if seen.insert(d.at.clone()) {
-                    all.push(d);
-                }
-            }
-        }
-        all
-    };
+    let decisions = open_family_decisions(&state.projects, &slug).map_err(store_err)?;
     let recent = state
         .projects
         .recent_activity(&slug, 20)
@@ -700,8 +685,7 @@ pub async fn get_project(
     ) {
         project.next_action = Some(derived);
     }
-    let (waiting_user_waits, waits_complete) =
-        state.control.collect_waiting_user_waits().await;
+    let (waiting_user_waits, waits_complete) = state.control.collect_waiting_user_waits().await;
     let effective_missions = if missions_available && waits_complete {
         Some(missions.as_slice())
     } else {
@@ -724,6 +708,28 @@ pub async fn get_project(
         "recent_decisions": recent,
         "conversation": conversation,
     })))
+}
+
+/// Open decisions for a project and every alias that folds onto it, so a
+/// decision recorded under an alias is visible (and answerable) from the
+/// canonical slug.
+fn open_family_decisions(
+    store: &super::projects_store::ProjectsStore,
+    slug: &str,
+) -> Result<Vec<super::projects_store::ProjectDecision>, String> {
+    let mut all = store.open_decisions(slug)?;
+    let mut seen: std::collections::HashSet<String> = all.iter().map(|d| d.at.clone()).collect();
+    for key in project_tag_keys(slug) {
+        if key == slug || !is_plain_key(&key) {
+            continue;
+        }
+        for d in store.open_decisions(&key)? {
+            if seen.insert(d.at.clone()) {
+                all.push(d);
+            }
+        }
+    }
+    Ok(all)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1857,17 +1863,35 @@ pub async fn answer_project_decision(
     if req.answer.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "answer is required".to_string()));
     }
-    let answered = state
+    // `get_project` aggregates decisions across the project family, so a
+    // decision returned under the canonical slug may live under an alias.
+    // Try the exact slug first, then every key that folds onto it.
+    let mut answered = state
         .projects
         .answer_decision(&slug, &req.at, req.answer.trim())
         .map_err(store_err)?;
+    if !answered {
+        for key in project_tag_keys(&slug) {
+            if key == slug || !is_plain_key(&key) {
+                continue;
+            }
+            if state
+                .projects
+                .answer_decision(&key, &req.at, req.answer.trim())
+                .map_err(store_err)?
+            {
+                answered = true;
+                break;
+            }
+        }
+    }
     if !answered {
         return Err((
             StatusCode::NOT_FOUND,
             format!("no pending decision at '{}' for '{slug}'", req.at),
         ));
     }
-    let open = state.projects.open_decisions(&slug).map_err(store_err)?;
+    let open = open_family_decisions(&state.projects, &slug).map_err(store_err)?;
     Ok(Json(
         serde_json::json!({ "ok": true, "open_decisions": open }),
     ))
@@ -2378,8 +2402,11 @@ pub async fn projects_overview(
         .collect_project_missions(chrono::Duration::hours(TERMINAL_MISSION_HORIZON_HOURS))
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let (waiting_user_waits, _waits_complete) =
-        state.control.collect_waiting_user_waits().await;
+    // The mission scan above is fail-closed; the wait scan is best-effort.
+    // When it is incomplete, an Active mission parked in AskUserQuestion may
+    // look like ordinary live work, so rows must not derive mode from
+    // mission evidence (same rule as the detail projection).
+    let (waiting_user_waits, waits_complete) = state.control.collect_waiting_user_waits().await;
 
     // Delivery-derived facts come from the projects store, which the
     // background ingestor keeps current — the overview never scans the Hermes
@@ -2679,6 +2706,7 @@ pub async fn projects_overview(
             let binding = project_tag_keys_with(&aliases, &builder.slug)
                 .into_iter()
                 .find_map(|key| bindings.get(&key).cloned());
+            builder.mission_evidence_complete = waits_complete;
             builder.finish(&archived, forced.as_deref(), binding, &now)
         })
         .collect();
@@ -2959,6 +2987,10 @@ struct ProjectRowBuilder {
     /// builder was never consulted, rendered as source-unavailable.
     summary: Option<super::situation::TrackSummary>,
     done_keys: std::collections::BTreeSet<String>,
+    /// False when the live wait scan failed for some store: the chips may
+    /// misreport an AskUserQuestion wait as plain live work, so mission
+    /// evidence must not override or clear the stored mode.
+    mission_evidence_complete: bool,
 }
 
 impl ProjectRowBuilder {
@@ -2982,6 +3014,7 @@ impl ProjectRowBuilder {
             pending_decisions: 0,
             summary: None,
             done_keys: std::collections::BTreeSet::new(),
+            mission_evidence_complete: true,
         }
     }
 
@@ -3077,14 +3110,29 @@ impl ProjectRowBuilder {
             })
         };
         let was_decision = is_decision_block(stored_mode, stored_blocker);
-        self.mode = honest_controller_mode(
-            stored_mode,
-            stored_blocker,
-            has_live_mission,
-            awaiting_user > 0,
-            self.pending_decisions,
-        );
-        if was_decision && self.mode.as_deref() != Some("blocked:decision") {
+        self.mode = if self.mission_evidence_complete {
+            honest_controller_mode(
+                stored_mode,
+                stored_blocker,
+                has_live_mission,
+                awaiting_user > 0,
+                self.pending_decisions,
+            )
+        } else {
+            // Unknown evidence, not an empty roster: keep the stored mode
+            // (a ledger decision still wins) and never clear a blocker.
+            project_mode_from_missions(
+                stored_mode,
+                stored_blocker,
+                None,
+                &HashMap::new(),
+                self.pending_decisions,
+            )
+        };
+        if self.mission_evidence_complete
+            && was_decision
+            && self.mode.as_deref() != Some("blocked:decision")
+        {
             self.mode_blocker = None;
             if let Some(update) = self.latest_update.as_mut() {
                 if is_decision_block(update.mode.as_deref(), update.blocker.as_deref()) {
@@ -7291,8 +7339,7 @@ mod tests {
 
     #[test]
     fn incomplete_wait_inventory_preserves_stored_decision_mode() {
-        let store =
-            super::super::projects_store::ProjectsStore::open_in_memory().unwrap();
+        let store = super::super::projects_store::ProjectsStore::open_in_memory().unwrap();
         store
             .upsert_project("verity", None, None, None, None)
             .unwrap();
@@ -7302,7 +7349,10 @@ mod tests {
         let record = store.get_project("verity").unwrap().unwrap();
         let mut with_complete = record.clone();
         project_mode_projection(&mut with_complete, Some(&[]), &HashMap::new(), 0);
-        assert_eq!(with_complete.mode, None, "complete empty roster clears decision");
+        assert_eq!(
+            with_complete.mode, None,
+            "complete empty roster clears decision"
+        );
 
         let mut with_incomplete = record.clone();
         project_mode_projection(&mut with_incomplete, None, &HashMap::new(), 0);
@@ -7316,8 +7366,7 @@ mod tests {
 
     #[test]
     fn alias_decisions_aggregate_across_tag_keys() {
-        let store =
-            super::super::projects_store::ProjectsStore::open_in_memory().unwrap();
+        let store = super::super::projects_store::ProjectsStore::open_in_memory().unwrap();
         store
             .upsert_project("verity", None, None, None, None)
             .unwrap();
@@ -7341,5 +7390,78 @@ mod tests {
         let alias_only = store.open_decisions("verity-lido").unwrap();
         assert!(canonical_only.is_empty());
         assert_eq!(alias_only.len(), 1);
+    }
+
+    #[test]
+    fn incomplete_wait_scan_keeps_board_row_from_projecting_active_or_clearing_decision() {
+        let now = chrono::Utc::now().to_rfc3339();
+        // An Active mission that is really parked in AskUserQuestion, but the
+        // wait scan failed so it carries no wait entry.
+        let mission: Mission = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(), "status": "active",
+            "history": [], "created_at": now, "updated_at": now,
+            "last_status_change_at": now,
+        }))
+        .unwrap();
+
+        let mut complete = ProjectRowBuilder::new("verity".into());
+        complete.mode = Some("blocked".into());
+        complete.mode_blocker = Some("decision".into());
+        complete.missions.push(mission_chip(&mission, false, None));
+        let row = complete.finish(&[], None, None, &now);
+        assert_eq!(
+            row.mode.as_deref(),
+            Some("active"),
+            "complete scan: live work wins"
+        );
+
+        let mut incomplete = ProjectRowBuilder::new("verity".into());
+        incomplete.mode = Some("blocked".into());
+        incomplete.mode_blocker = Some("decision".into());
+        incomplete
+            .missions
+            .push(mission_chip(&mission, false, None));
+        incomplete.mission_evidence_complete = false;
+        let row = incomplete.finish(&[], None, None, &now);
+        assert_eq!(
+            row.mode.as_deref(),
+            Some("blocked"),
+            "incomplete scan must not project active from unverified live work"
+        );
+
+        // A ledger decision still wins over the stored mode when evidence is unknown.
+        let mut ledger = ProjectRowBuilder::new("verity".into());
+        ledger.mode = Some("active".into());
+        ledger.pending_decisions = 1;
+        ledger.missions.push(mission_chip(&mission, false, None));
+        ledger.mission_evidence_complete = false;
+        let row = ledger.finish(&[], None, None, &now);
+        assert_eq!(row.mode.as_deref(), Some("blocked:decision"));
+    }
+
+    #[test]
+    fn family_decisions_are_visible_from_the_canonical_slug() {
+        let store = super::super::projects_store::ProjectsStore::open_in_memory().unwrap();
+        store
+            .upsert_project("verity", None, None, None, None)
+            .unwrap();
+        store
+            .record_decision(
+                "verity",
+                &super::super::projects_store::NewDecision {
+                    question: "merge core PR?".into(),
+                    rationale: None,
+                    kind: None,
+                    authority: "escalation".into(),
+                    status: "pending_user".into(),
+                    evidence: None,
+                },
+            )
+            .unwrap();
+        // With no alias map the family is just the slug itself; the helper
+        // must still return the canonical decisions exactly once.
+        let open = open_family_decisions(&store, "verity").unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].question, "merge core PR?");
     }
 }

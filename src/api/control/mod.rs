@@ -4438,9 +4438,7 @@ impl ControlHub {
     ///
     /// Returns `(waits, complete)`. When `complete` is false at least one store
     /// or page failed — the map is a best-effort subset, not negative evidence.
-    pub(crate) async fn collect_waiting_user_waits(
-        &self,
-    ) -> (HashMap<Uuid, Option<String>>, bool) {
+    pub(crate) async fn collect_waiting_user_waits(&self) -> (HashMap<Uuid, Option<String>>, bool) {
         let mut waits = HashMap::new();
         let Ok(inventory) = self.mission_store_inventory().await else {
             return (waits, false);
@@ -4451,7 +4449,9 @@ impl ControlHub {
                 complete = false;
                 continue;
             };
-            let store_waits = user_wait_starts_for_runs(store.as_ref(), &runs).await;
+            let (store_waits, store_complete) =
+                user_wait_starts_for_runs_checked(store.as_ref(), &runs).await;
+            complete &= store_complete;
             waits.extend(store_waits);
         }
         (waits, complete)
@@ -5582,33 +5582,71 @@ fn is_user_wait_tool(tool_kind: &str) -> bool {
     matches!(tool_kind, "request_user_input" | "frontend_tool") || is_interactive_ui_tool(tool_kind)
 }
 
+/// Grace clock for a `WaitingUser` run. `Ok(None)` means the user-wait tool
+/// row is not registered yet (treated as just started); `Err` means the tool
+/// scan itself failed, which callers must not confuse with "just started".
+pub(crate) async fn user_wait_tool_started_at_checked(
+    store: &dyn MissionStore,
+    run: &MissionRun,
+) -> Result<Option<String>, String> {
+    if run.execution_state != MissionExecutionState::WaitingUser {
+        return Ok(None);
+    }
+    let tools = store.list_active_tool_executions(run.run_id).await?;
+    Ok(tools
+        .into_iter()
+        .filter(|tool| is_user_wait_tool(&tool.tool_kind))
+        .map(|tool| tool.started_at)
+        .min())
+}
+
+/// Best-effort variant for surfaces that only render the clock.
 pub(crate) async fn user_wait_tool_started_at(
     store: &dyn MissionStore,
     run: &MissionRun,
 ) -> Option<String> {
-    if run.execution_state != MissionExecutionState::WaitingUser {
-        return None;
+    user_wait_tool_started_at_checked(store, run)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Returns `(waits, complete)`. `complete` is false when any tool scan
+/// failed: the run still appears in the map (it *is* waiting), but its
+/// clock is unknown, so the map must not be used as negative evidence.
+pub(crate) async fn user_wait_starts_for_runs_checked(
+    store: &dyn MissionStore,
+    runs: impl IntoIterator<Item = &MissionRun>,
+) -> (HashMap<Uuid, Option<String>>, bool) {
+    let mut waits = HashMap::new();
+    let mut complete = true;
+    for run in runs {
+        if run.execution_state != MissionExecutionState::WaitingUser {
+            continue;
+        }
+        let started = match user_wait_tool_started_at_checked(store, run).await {
+            Ok(started) => started,
+            Err(error) => {
+                tracing::warn!(
+                    mission_id = %run.mission_id,
+                    run_id = %run.run_id,
+                    %error,
+                    "user-wait tool scan failed; wait inventory is incomplete"
+                );
+                complete = false;
+                None
+            }
+        };
+        waits.insert(run.mission_id, started);
     }
-    let tools = store.list_active_tool_executions(run.run_id).await.ok()?;
-    tools
-        .into_iter()
-        .filter(|tool| is_user_wait_tool(&tool.tool_kind))
-        .map(|tool| tool.started_at)
-        .min()
+    (waits, complete)
 }
 
 pub(crate) async fn user_wait_starts_for_runs(
     store: &dyn MissionStore,
     runs: impl IntoIterator<Item = &MissionRun>,
 ) -> HashMap<Uuid, Option<String>> {
-    let mut waits = HashMap::new();
-    for run in runs {
-        if run.execution_state != MissionExecutionState::WaitingUser {
-            continue;
-        }
-        waits.insert(run.mission_id, user_wait_tool_started_at(store, run).await);
-    }
-    waits
+    user_wait_starts_for_runs_checked(store, runs).await.0
 }
 
 const PROVISIONAL_TOOL_DEADLINE_SECS: i64 = 120;
@@ -35083,5 +35121,56 @@ Investigate <service/> failures.
             None,
         );
         assert_eq!(entry.timestamp, "2026-08-16T12:05:00Z");
+    }
+
+    #[tokio::test]
+    async fn failed_tool_scan_marks_user_wait_inventory_incomplete() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let waiting = MissionRun {
+            run_id: Uuid::new_v4(),
+            mission_id: Uuid::new_v4(),
+            generation: 1,
+            execution_state: MissionExecutionState::WaitingUser,
+            owner_actor_id: "actor".into(),
+            scope_unit: None,
+            started_at: now.clone(),
+            heartbeat_at: now.clone(),
+            stopping_at: None,
+            ended_at: None,
+            terminal_reason: None,
+        };
+        let running = MissionRun {
+            run_id: Uuid::new_v4(),
+            mission_id: Uuid::new_v4(),
+            execution_state: MissionExecutionState::Running,
+            ..waiting.clone()
+        };
+        let store = mission_store::InMemoryMissionStore::new();
+        store.test_fail_tool_scans();
+
+        assert!(
+            user_wait_tool_started_at_checked(&store, &waiting)
+                .await
+                .is_err(),
+            "a failed scan is an error, not a missing tool row"
+        );
+        assert_eq!(
+            user_wait_tool_started_at_checked(&store, &running).await,
+            Ok(None),
+            "non-waiting runs never touch the tool table"
+        );
+
+        let (waits, complete) =
+            user_wait_starts_for_runs_checked(&store, [&waiting, &running]).await;
+        assert!(
+            !complete,
+            "a failed scan must not report a complete inventory"
+        );
+        assert!(
+            waits.contains_key(&waiting.mission_id),
+            "the run is still known to be waiting even without a clock"
+        );
+        assert_eq!(waits.get(&waiting.mission_id), Some(&None));
+        assert!(!waits.contains_key(&running.mission_id));
     }
 }
