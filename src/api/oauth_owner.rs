@@ -55,18 +55,22 @@ pub(crate) fn provider_is_cli_proxy_capable(provider: ProviderType) -> bool {
     )
 }
 
-/// Whether CLIProxyAPI currently holds a refreshable credential for `provider`.
+/// Whether CLIProxyAPI currently holds a *live* credential for `provider`.
 ///
-/// "Refreshable" (access + refresh token present, not disabled) rather than
-/// "fresh": a momentarily expired proxy file is still the proxy's to refresh,
-/// and must not hand ownership back to sandboxed.sh.
+/// Live means: not disabled, access + refresh token present, and not expired
+/// for longer than `ai_providers::CLI_PROXY_OWNERSHIP_GRACE`. A momentarily
+/// expired file is still the proxy's to refresh; a file the proxy has failed
+/// to refresh for a day (dead refresh token) must not take ownership away
+/// from sandboxed.sh's own working credentials, otherwise every request for
+/// that provider would be sent to a proxy that can only answer 503.
 fn cli_proxy_holds_credential(provider: ProviderType) -> bool {
+    if crate::util::env_var_bool("CLAUDE_CODE_DISABLE_CLI_PROXY", false) {
+        return false;
+    }
     match provider {
-        ProviderType::Anthropic => {
-            crate::api::ai_providers::has_refreshable_cli_proxy_claude_account()
-        }
-        ProviderType::OpenAI => crate::api::ai_providers::has_refreshable_cli_proxy_codex_account(),
-        ProviderType::Xai => crate::api::ai_providers::xai_cli_proxy_account_available(),
+        ProviderType::Anthropic => crate::api::ai_providers::has_live_cli_proxy_claude_account(),
+        ProviderType::OpenAI => crate::api::ai_providers::has_live_cli_proxy_codex_account(),
+        ProviderType::Xai => crate::api::ai_providers::has_live_cli_proxy_xai_account(),
         _ => false,
     }
 }

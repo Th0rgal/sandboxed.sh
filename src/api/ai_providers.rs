@@ -801,7 +801,7 @@ mod oauth_deadletter_tests {
 mod grok_oauth_tests {
     use super::{
         build_response_from_store, collapse_duplicate_xai_oauth_accounts, get_xai_api_key_for_grok,
-        grok_auth_expires_at_millis, grok_cli_reconcile_due,
+        grok_auth_expires_at_millis, grok_cli_reconcile_due, has_live_cli_proxy_account_in_dirs,
         has_refreshable_cli_proxy_account_in_dirs, is_legacy_grok_build_oauth_label,
         oauth_refresh_clear_dead, oauth_refresh_mark_token_dead, oauth_refresh_token_fingerprint,
         parse_grok_device_auth_line, remove_legacy_grok_oauth_entry, sync_grok_auth_files,
@@ -1169,6 +1169,62 @@ mod grok_oauth_tests {
         .expect("write providers");
 
         assert_eq!(get_xai_api_key_for_grok(temp.path()), None);
+    }
+
+    #[test]
+    fn cli_proxy_ownership_requires_a_live_auth_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("auth");
+        std::fs::create_dir_all(&dir).expect("auth dir");
+        let now = chrono::Utc::now();
+        let grace = chrono::Duration::hours(24);
+        let write = |name: &str, expired: chrono::DateTime<chrono::Utc>, disabled: bool| {
+            std::fs::write(
+                dir.join(name),
+                serde_json::json!({
+                    "type": "claude",
+                    "access_token": "a",
+                    "refresh_token": "r",
+                    "expired": expired.to_rfc3339(),
+                    "disabled": disabled,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        let dirs = vec![dir.clone()];
+
+        // Dead for 17 days: the proxy could not refresh it → no ownership.
+        write("claude-dead.json", now - chrono::Duration::days(17), false);
+        assert!(!has_live_cli_proxy_account_in_dirs(
+            &dirs, "claude-", "claude", now, grace
+        ));
+
+        // Expired an hour ago: still the proxy's to refresh → ownership.
+        write(
+            "claude-recent.json",
+            now - chrono::Duration::hours(1),
+            false,
+        );
+        assert!(has_live_cli_proxy_account_in_dirs(
+            &dirs, "claude-", "claude", now, grace
+        ));
+        std::fs::remove_file(dir.join("claude-recent.json")).unwrap();
+
+        // Fresh but disabled → no ownership.
+        write("claude-off.json", now + chrono::Duration::hours(5), true);
+        assert!(!has_live_cli_proxy_account_in_dirs(
+            &dirs, "claude-", "claude", now, grace
+        ));
+
+        // Fresh and enabled → ownership; type tag must match.
+        write("claude-live.json", now + chrono::Duration::hours(5), false);
+        assert!(has_live_cli_proxy_account_in_dirs(
+            &dirs, "claude-", "claude", now, grace
+        ));
+        assert!(!has_live_cli_proxy_account_in_dirs(
+            &dirs, "claude-", "codex", now, grace
+        ));
     }
 
     #[test]
@@ -1933,17 +1989,113 @@ fn has_fresh_cli_proxy_claude_account() -> bool {
     has_fresh_cli_proxy_account_of_type("claude-", "claude")
 }
 
-/// True when CLIProxyAPI holds a Claude credential it can refresh (access +
-/// refresh token, not disabled), regardless of current expiry. Used by the
-/// credential-owner policy: an expired-but-refreshable proxy file is still
-/// the proxy's to refresh.
-pub(crate) fn has_refreshable_cli_proxy_claude_account() -> bool {
-    has_refreshable_cli_proxy_account_of_type("claude-", "claude")
+/// How long past its access-token expiry a CLIProxyAPI auth file still counts
+/// as *live* for the credential-owner policy. CLIProxyAPI refreshes a file
+/// when it serves a request, so a file that has sat expired for longer than
+/// this is one the proxy could not refresh (dead refresh token, revoked
+/// login). Such a file must not seize ownership from sandboxed.sh's own
+/// working credentials.
+pub(crate) const CLI_PROXY_OWNERSHIP_GRACE: chrono::Duration = chrono::Duration::hours(24);
+
+/// True when CLIProxyAPI holds a *live* Claude credential: not disabled,
+/// access + refresh token present, and expired no longer than
+/// [`CLI_PROXY_OWNERSHIP_GRACE`] ago. Used by the credential-owner policy.
+pub(crate) fn has_live_cli_proxy_claude_account() -> bool {
+    has_live_cli_proxy_account_of_type("claude-", "claude")
 }
 
-/// Codex counterpart of [`has_refreshable_cli_proxy_claude_account`].
-pub(crate) fn has_refreshable_cli_proxy_codex_account() -> bool {
-    has_refreshable_cli_proxy_account_of_type("codex-", "codex")
+/// Codex counterpart of [`has_live_cli_proxy_claude_account`].
+pub(crate) fn has_live_cli_proxy_codex_account() -> bool {
+    has_live_cli_proxy_account_of_type("codex-", "codex")
+}
+
+/// xAI counterpart of [`has_live_cli_proxy_claude_account`].
+pub(crate) fn has_live_cli_proxy_xai_account() -> bool {
+    has_live_cli_proxy_account_of_type("xai-", "xai")
+}
+
+fn cli_proxy_auth_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(dir) = std::env::var("CLI_PROXY_AUTH_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            dirs.push(std::path::PathBuf::from(trimmed));
+        }
+    }
+    dirs.push(std::path::PathBuf::from("/root/.cli-proxy-api"));
+    dirs
+}
+
+fn has_live_cli_proxy_account_of_type(file_prefix: &str, type_tag: &str) -> bool {
+    has_live_cli_proxy_account_in_dirs(
+        &cli_proxy_auth_dirs(),
+        file_prefix,
+        type_tag,
+        chrono::Utc::now(),
+        CLI_PROXY_OWNERSHIP_GRACE,
+    )
+}
+
+pub(crate) fn has_live_cli_proxy_account_in_dirs(
+    dirs: &[std::path::PathBuf],
+    file_prefix: &str,
+    type_tag: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    grace: chrono::Duration,
+) -> bool {
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !(name.starts_with(file_prefix) && name.ends_with(".json")) {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+                continue;
+            };
+            if value
+                .get("disabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || value.get("type").and_then(|v| v.as_str()) != Some(type_tag)
+            {
+                continue;
+            }
+            let has = |key: &str| {
+                value
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.trim().is_empty())
+            };
+            if !(has("access_token") && has("refresh_token")) {
+                continue;
+            }
+            let expiry = value
+                .get("expired")
+                .or_else(|| value.get("expires"))
+                .or_else(|| value.get("expires_at"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&chrono::Utc));
+            // Unparseable expiry: we cannot tell whether the proxy can refresh
+            // this file, so it does not grant ownership.
+            let Some(expires_at) = expiry else {
+                continue;
+            };
+            if expires_at + grace > now {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// True when the CLI Proxy API has at least one fresh Codex (ChatGPT
