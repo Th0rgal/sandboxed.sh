@@ -1700,7 +1700,36 @@ async fn run_grok_acp_process(
                 }),
             )
             .await?;
-            match await_response(&mut lines, GROK_ACP_SESSION_ID, 60).await {
+            let load_result = match await_response(&mut lines, GROK_ACP_SESSION_ID, 60).await {
+                Err(err) if grok_acp_error_requires_auth(&err) => {
+                    // Same shape as session/new below: a stale-but-refreshable
+                    // login may advertise no headless method at initialize and
+                    // still accept `cached_token` once asked explicitly.
+                    let method = auth_method
+                        .clone()
+                        .unwrap_or_else(|| GROK_ACP_CACHED_TOKEN_METHOD.to_string());
+                    match authenticate(&mut stdin, &mut lines, &method).await {
+                        Ok(()) => {
+                            send(
+                                &mut stdin,
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": GROK_ACP_SESSION_ID,
+                                    "method": "session/load",
+                                    "params": { "sessionId": sid, "cwd": acp_cwd, "mcpServers": [] }
+                                }),
+                            )
+                            .await?;
+                            await_response(&mut lines, GROK_ACP_SESSION_ID, 60).await
+                        }
+                        Err(auth_err) => Err(format!(
+                            "{auth_err}; {GROK_ACP_LOGIN_REQUIRED} (ACP authMethods={advertised_methods})"
+                        )),
+                    }
+                }
+                other => other,
+            };
+            match load_result {
                 Ok(_) => acp_session_id = Some(sid.to_string()),
                 Err(err) => {
                     // A missing exact session is not permission to continue
@@ -2969,6 +2998,68 @@ sys.exit(0 if sys.argv[1]=='success_without_id' else 1)
         assert!(
             methods.starts_with("authenticate:cached_token\nsession/new\n"),
             "authenticate must precede session/new, got: {methods:?}"
+        );
+        assert!(root.path().join("accepted-prompts").exists());
+    }
+
+    #[tokio::test]
+    async fn grok_acp_authenticates_and_retries_session_load_on_auth_error() {
+        use crate::api::mission_store::{InMemoryMissionStore, MissionStore};
+        use std::process::Stdio;
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(
+                Some("acp lazy auth"),
+                None,
+                None,
+                None,
+                None,
+                Some("grok"),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .update_mission_session_id(mission.id, "fixture-session", "grok", None)
+            .await
+            .unwrap();
+        let (events, _unread) = broadcast::channel(64);
+        let child = tokio::process::Command::new("python3")
+            .args([
+                "-u",
+                "-c",
+                include_str!("fixtures/grok_acp.py"),
+                "auth_lazy_load",
+            ])
+            .current_dir(root.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let result = run_grok_acp_process(
+            Some(&store),
+            child,
+            root.path().to_str().unwrap(),
+            "continuation prompt",
+            None,
+            mission.id,
+            events,
+            CancellationToken::new(),
+            Some("fixture-session"),
+            true,
+            GrokAcpIdlePolicy::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("unexpected ACP fallback: {}", error.reason));
+        assert!(result.success);
+        let methods = std::fs::read_to_string(root.path().join("session-methods")).unwrap();
+        assert_eq!(
+            methods, "session/load\nauthenticate:cached_token\nsession/load\n",
+            "session/load must be retried once after authenticate"
         );
         assert!(root.path().join("accepted-prompts").exists());
     }

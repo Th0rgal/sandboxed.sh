@@ -34,6 +34,8 @@ for line in sys.stdin:
         elif scenario == "auth_unavailable":
             # No cached login: only the browser sign-in is advertised.
             result["authMethods"] = [{"id": "grok.com", "name": "Grok"}]
+        # "auth_lazy_load": nothing advertised at initialize, yet session/load
+        # demands `authenticate` and then accepts `cached_token`.
     elif method == "authenticate":
         with open("session-methods", "a", encoding="utf-8") as receipt:
             receipt.write("authenticate:" + str(request.get("params", {}).get("methodId")) + "\n")
@@ -47,7 +49,7 @@ for line in sys.stdin:
     elif method in ("session/new", "session/load"):
         with open("session-methods", "a", encoding="utf-8") as receipt:
             receipt.write(method + "\n")
-        if scenario in ("auth_required", "auth_unavailable") and not authenticated:
+        if scenario in ("auth_required", "auth_unavailable", "auth_lazy_load") and not authenticated:
             emit({"jsonrpc": "2.0", "id": request_id,
                   "error": {"code": -32000, "message": "Authentication required",
                             "data": "no auth method id provided"}})
