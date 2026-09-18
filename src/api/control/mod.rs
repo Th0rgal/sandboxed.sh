@@ -4441,19 +4441,26 @@ impl ControlHub {
     /// Live AskUserQuestion waits: mission id → user-wait tool `started_at`.
     /// Presence means `WaitingUser`; the value is the grace clock (None if the
     /// tool row is not registered yet — treated as just started).
-    pub(crate) async fn collect_waiting_user_waits(&self) -> HashMap<Uuid, Option<String>> {
+    ///
+    /// Returns `(waits, complete)`. When `complete` is false at least one store
+    /// or page failed — the map is a best-effort subset, not negative evidence.
+    pub(crate) async fn collect_waiting_user_waits(&self) -> (HashMap<Uuid, Option<String>>, bool) {
         let mut waits = HashMap::new();
         let Ok(inventory) = self.mission_store_inventory().await else {
-            return waits;
+            return (waits, false);
         };
+        let mut complete = true;
         for store in inventory.live {
             let Ok(runs) = store.list_active_mission_runs().await else {
+                complete = false;
                 continue;
             };
-            let store_waits = user_wait_starts_for_runs(store.as_ref(), &runs).await;
+            let (store_waits, store_complete) =
+                user_wait_starts_for_runs_checked(store.as_ref(), &runs).await;
+            complete &= store_complete;
             waits.extend(store_waits);
         }
-        waits
+        (waits, complete)
     }
 
     /// Board tasks across every store whose boss mission belongs to this
@@ -4502,103 +4509,68 @@ impl ControlHub {
         &self,
         project: &str,
     ) -> Result<Vec<Mission>, String> {
-        const PAGE_SIZE: usize = 200;
         let keys = super::projects_overview::project_tag_keys(project);
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let inventory = self.mission_store_inventory().await?;
+        Self::collect_attention_inventory(self.mission_store_inventory().await?, &keys).await
+    }
+
+    /// A roster is usable as negative evidence only when every store and page
+    /// was read successfully. Never turn a skipped store into an empty result.
+    async fn collect_attention_inventory(
+        inventory: MissionStoreInventory,
+        keys: &[String],
+    ) -> Result<Vec<Mission>, String> {
+        const PAGE_SIZE: usize = 200;
         let mut collected = Vec::new();
-        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-        let mut push = |mission: Mission| {
-            if seen.insert(mission.id) {
-                collected.push(mission);
-            }
-        };
-        for store in inventory.live {
-            for key in &keys {
-                let filter = mission_store::MissionFilter {
-                    project: Some(key.clone()),
-                    attention_only: true,
-                    ..Default::default()
-                };
-                let mut offset = 0;
-                loop {
-                    let page = match store
-                        .list_missions_filtered(&filter, PAGE_SIZE, offset)
-                        .await
-                    {
-                        Ok(page) => page,
-                        Err(error) => {
-                            tracing::warn!(
-                                project = %key,
-                                %error,
-                                "attention collect: live store list failed"
-                            );
-                            break;
-                        }
-                    };
-                    let page_len = page.len();
-                    for mission in page {
-                        push(mission);
-                    }
-                    if page_len < PAGE_SIZE {
-                        break;
-                    }
-                    offset += page_len;
-                }
-            }
-        }
+        let mut seen = std::collections::HashSet::new();
+        let mut stores = inventory.live;
         for user in inventory.offline_file_users {
-            let store =
-                match mission_store::FileMissionStore::new(inventory.base_dir.clone(), &user).await
-                {
-                    Ok(store) => store,
-                    Err(error) => {
-                        tracing::warn!(%user, %error, "attention collect: file store skipped");
-                        continue;
-                    }
-                };
-            for key in &keys {
-                let filter = mission_store::MissionFilter {
-                    project: Some(key.clone()),
-                    attention_only: true,
-                    ..Default::default()
-                };
-                if let Ok(page) = store.list_missions_filtered(&filter, PAGE_SIZE, 0).await {
-                    for mission in page {
-                        push(mission);
+            stores.push(Arc::new(
+                mission_store::FileMissionStore::new(inventory.base_dir.clone(), &user).await?,
+            ));
+        }
+        let filters: Vec<_> = keys
+            .iter()
+            .map(|key| mission_store::MissionFilter {
+                project: Some(key.clone()),
+                attention_only: true,
+                ..Default::default()
+            })
+            .collect();
+        for store in stores {
+            let mut offset = 0;
+            loop {
+                // The trait's filtered-list fallback stops after 5000 raw
+                // rows. Scan raw pages once so old waits cannot disappear.
+                let page = store.list_missions(PAGE_SIZE, offset).await?;
+                let page_len = page.len();
+                for mission in page {
+                    if filters.iter().any(|filter| filter.matches(&mission))
+                        && seen.insert(mission.id)
+                    {
+                        collected.push(mission);
                     }
                 }
+                if page_len < PAGE_SIZE {
+                    break;
+                }
+                offset += page_len;
             }
         }
         for path in inventory.offline_sqlite {
-            for key in keys.clone() {
-                let path_for_scan = path.clone();
-                let path_label = path.display().to_string();
-                match tokio::task::spawn_blocking(move || {
-                    collect_attention_missions_from_sqlite(&path_for_scan, &key)
+            for key in keys {
+                let path = path.clone();
+                let key = key.clone();
+                let rows = tokio::task::spawn_blocking(move || {
+                    collect_attention_missions_from_sqlite(&path, &key)
                 })
                 .await
-                {
-                    Ok(Ok(rows)) => {
-                        for mission in rows {
-                            push(mission);
-                        }
-                    }
-                    Ok(Err(error)) => {
-                        tracing::warn!(
-                            path = %path_label,
-                            %error,
-                            "attention collect: offline sqlite skipped"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            path = %path_label,
-                            %error,
-                            "attention collect: offline sqlite join failed"
-                        );
+                .map_err(|error| error.to_string())??;
+                for mission in rows {
+                    if seen.insert(mission.id) {
+                        collected.push(mission);
                     }
                 }
             }
@@ -5624,33 +5596,71 @@ fn is_user_wait_tool(tool_kind: &str) -> bool {
     matches!(tool_kind, "request_user_input" | "frontend_tool") || is_interactive_ui_tool(tool_kind)
 }
 
+/// Grace clock for a `WaitingUser` run. `Ok(None)` means the user-wait tool
+/// row is not registered yet (treated as just started); `Err` means the tool
+/// scan itself failed, which callers must not confuse with "just started".
+pub(crate) async fn user_wait_tool_started_at_checked(
+    store: &dyn MissionStore,
+    run: &MissionRun,
+) -> Result<Option<String>, String> {
+    if run.execution_state != MissionExecutionState::WaitingUser {
+        return Ok(None);
+    }
+    let tools = store.list_active_tool_executions(run.run_id).await?;
+    Ok(tools
+        .into_iter()
+        .filter(|tool| is_user_wait_tool(&tool.tool_kind))
+        .map(|tool| tool.started_at)
+        .min())
+}
+
+/// Best-effort variant for surfaces that only render the clock.
 pub(crate) async fn user_wait_tool_started_at(
     store: &dyn MissionStore,
     run: &MissionRun,
 ) -> Option<String> {
-    if run.execution_state != MissionExecutionState::WaitingUser {
-        return None;
+    user_wait_tool_started_at_checked(store, run)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Returns `(waits, complete)`. `complete` is false when any tool scan
+/// failed: the run still appears in the map (it *is* waiting), but its
+/// clock is unknown, so the map must not be used as negative evidence.
+pub(crate) async fn user_wait_starts_for_runs_checked(
+    store: &dyn MissionStore,
+    runs: impl IntoIterator<Item = &MissionRun>,
+) -> (HashMap<Uuid, Option<String>>, bool) {
+    let mut waits = HashMap::new();
+    let mut complete = true;
+    for run in runs {
+        if run.execution_state != MissionExecutionState::WaitingUser {
+            continue;
+        }
+        let started = match user_wait_tool_started_at_checked(store, run).await {
+            Ok(started) => started,
+            Err(error) => {
+                tracing::warn!(
+                    mission_id = %run.mission_id,
+                    run_id = %run.run_id,
+                    %error,
+                    "user-wait tool scan failed; wait inventory is incomplete"
+                );
+                complete = false;
+                None
+            }
+        };
+        waits.insert(run.mission_id, started);
     }
-    let tools = store.list_active_tool_executions(run.run_id).await.ok()?;
-    tools
-        .into_iter()
-        .filter(|tool| is_user_wait_tool(&tool.tool_kind))
-        .map(|tool| tool.started_at)
-        .min()
+    (waits, complete)
 }
 
 pub(crate) async fn user_wait_starts_for_runs(
     store: &dyn MissionStore,
     runs: impl IntoIterator<Item = &MissionRun>,
 ) -> HashMap<Uuid, Option<String>> {
-    let mut waits = HashMap::new();
-    for run in runs {
-        if run.execution_state != MissionExecutionState::WaitingUser {
-            continue;
-        }
-        waits.insert(run.mission_id, user_wait_tool_started_at(store, run).await);
-    }
-    waits
+    user_wait_starts_for_runs_checked(store, runs).await.0
 }
 
 const PROVISIONAL_TOOL_DEADLINE_SECS: i64 = 120;
@@ -7269,56 +7279,73 @@ fn collect_attention_missions_from_sqlite(
     if !columns.contains("project") {
         return Ok(Vec::new());
     }
-    let has_tags = columns.contains("tags");
-    let sql = if has_tags {
-        "SELECT id, status, title, workspace_id, backend, created_at, updated_at, \
-         project, track, intent, github_pr, tags \
-         FROM missions WHERE project = ?1 AND status NOT IN ('acknowledged', 'completed')"
-    } else {
-        "SELECT id, status, title, workspace_id, backend, created_at, updated_at, \
-         project, track, intent, github_pr, NULL \
-         FROM missions WHERE project = ?1 AND status NOT IN ('acknowledged', 'completed')"
+    let optional = |name: &str| {
+        if columns.contains(name) {
+            name.to_string()
+        } else {
+            "NULL".into()
+        }
     };
-    let mut statement = connection.prepare(sql).map_err(|error| error.to_string())?;
+    let sql = format!(
+        "SELECT id, status, title, workspace_id, backend, created_at, updated_at, \
+         project, track, intent, github_pr, {}, {}, {}, {} \
+         FROM missions WHERE project = ?1 AND status NOT IN ('acknowledged', 'completed')",
+        optional("tags"),
+        optional("awaiting_kind"),
+        optional("origin_session_id"),
+        optional("last_status_change_at")
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([project], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<String>>(10)?,
-                row.get::<_, Option<String>>(11)?,
-            ))
+            let mut fields = Vec::new();
+            for index in 0..15 {
+                fields.push(row.get::<_, Option<String>>(index)?);
+            }
+            Ok(fields)
         })
         .map_err(|error| error.to_string())?;
     let mut collected = Vec::new();
     for row in rows {
-        let (
-            id,
-            status,
-            title,
-            workspace_id,
-            backend,
-            created_at,
-            updated_at,
-            project,
-            track,
-            intent,
-            github_pr,
-            tags_raw,
-        ) = row.map_err(|error| error.to_string())?;
-        let Ok(id) = Uuid::parse_str(&id) else {
-            continue;
-        };
-        let status = serde_json::from_value::<MissionStatus>(serde_json::Value::String(status))
-            .unwrap_or(MissionStatus::Active);
+        let fields = row.map_err(|error| error.to_string())?;
+        let mut fields = fields.into_iter();
+        let id = fields.next().flatten().ok_or("missing mission id")?;
+        let status_raw = fields.next().flatten().ok_or("missing mission status")?;
+        let title = fields.next().flatten();
+        let workspace_id = fields.next().flatten();
+        let backend = fields.next().flatten();
+        let created_at = fields.next().flatten();
+        let updated_at = fields.next().flatten();
+        let project = fields.next().flatten();
+        let track = fields.next().flatten();
+        let intent = fields.next().flatten();
+        let github_pr = fields.next().flatten();
+        let tags_raw = fields.next().flatten();
+        let awaiting_kind_raw = fields.next().flatten();
+        let origin_session_id = fields.next().flatten();
+        let last_status_change_at = fields.next().flatten();
+        let id = Uuid::parse_str(&id).map_err(|error| error.to_string())?;
+        let status = serde_json::from_value::<MissionStatus>(serde_json::Value::String(status_raw))
+            .map_err(|error| error.to_string())?;
+        let awaiting_kind = awaiting_kind_raw
+            .map(|raw| {
+                serde_json::from_value::<AwaitingKind>(serde_json::Value::String(raw))
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        // A present-but-unparseable kind is a real inventory error (above).
+        // A NULL kind is the legacy pre-`awaiting_kind` shape, which the live
+        // store also carries as `None` and which operator attention treats as
+        // an unqualified page. Erroring here would make the whole project's
+        // evidence permanently unavailable for one old row.
+        if status == MissionStatus::AwaitingUser && awaiting_kind.is_none() {
+            tracing::debug!(
+                mission_id = %id,
+                "offline awaiting_user mission has no awaiting kind; treating as legacy"
+            );
+        }
         let tags: Vec<String> = tags_raw
             .as_deref()
             .and_then(|raw| serde_json::from_str(raw).ok())
@@ -7342,6 +7369,9 @@ fn collect_attention_missions_from_sqlite(
         mission.project.intent = intent;
         mission.project.github_pr = github_pr;
         mission.project.tags = tags;
+        mission.awaiting_kind = awaiting_kind;
+        mission.origin_session_id = origin_session_id;
+        mission.activity.last_status_change_at = last_status_change_at;
         if crate::api::mission_store::default_attention_keeps(&mission) {
             collected.push(mission);
         }
@@ -29506,6 +29536,97 @@ mod tests {
             .unwrap());
     }
 
+    #[tokio::test]
+    async fn attention_inventory_rejects_partial_store_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("visible worker"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .update_mission_project(
+                mission.id,
+                MissionProjectPatch {
+                    project: Some(Some("eip-8282".into())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        for _ in 0..5001 {
+            store
+                .create_mission(
+                    Some("unrelated newer work"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let keys = vec!["eip-8282".to_string()];
+        let inventory = |paths| MissionStoreInventory {
+            live: vec![store.clone()],
+            offline_sqlite: paths,
+            offline_file_users: vec![],
+            base_dir: dir.path().to_path_buf(),
+        };
+        let complete = ControlHub::collect_attention_inventory(inventory(vec![]), &keys)
+            .await
+            .unwrap();
+        assert_eq!(complete.len(), 1);
+        let unavailable = dir.path().join("missing.db");
+        let partial =
+            ControlHub::collect_attention_inventory(inventory(vec![unavailable]), &keys).await;
+        assert!(
+            partial.is_err(),
+            "successful live rows cannot hide an unavailable offline store"
+        );
+    }
+
+    #[test]
+    fn offline_attention_preserves_decision_and_grace_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missions.db");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE missions (id TEXT, status TEXT, title TEXT, workspace_id TEXT, backend TEXT, created_at TEXT, updated_at TEXT, project TEXT, track TEXT, intent TEXT, github_pr TEXT, awaiting_kind TEXT, origin_session_id TEXT, last_status_change_at TEXT);").unwrap();
+        let id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now();
+        let recent = now.to_rfc3339();
+        let expired = (now - chrono::Duration::hours(1)).to_rfc3339();
+        db.execute("INSERT INTO missions(id,status,project,awaiting_kind,origin_session_id,last_status_change_at,updated_at) VALUES (?1,'awaiting_user','eip-8282','decision','hermes-session',?2,?3)", rusqlite::params![id,recent,expired]).unwrap();
+        let rows = collect_attention_missions_from_sqlite(&path, "eip-8282").unwrap();
+        assert_eq!(rows[0].awaiting_kind, Some(AwaitingKind::Decision));
+        assert_eq!(rows[0].origin_session_id.as_deref(), Some("hermes-session"));
+        assert!(!crate::api::operator_attention::mission_needs_operator(
+            &rows[0], false, None, now
+        ));
+        db.execute("UPDATE missions SET last_status_change_at=?1", [&expired])
+            .unwrap();
+        let rows = collect_attention_missions_from_sqlite(&path, "eip-8282").unwrap();
+        assert!(crate::api::operator_attention::mission_needs_operator(
+            &rows[0], false, None, now
+        ));
+        // Legacy rows predate `awaiting_kind`: they are kept (as the live
+        // store keeps `None`), not treated as an inventory failure.
+        db.execute("UPDATE missions SET awaiting_kind=NULL", [])
+            .unwrap();
+        let rows = collect_attention_missions_from_sqlite(&path, "eip-8282").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].awaiting_kind, None);
+        assert!(!crate::api::operator_attention::mission_needs_operator(
+            &rows[0], false, None, now
+        ));
+        // A present but unknown kind is still an error.
+        db.execute("UPDATE missions SET awaiting_kind='bogus'", [])
+            .unwrap();
+        assert!(collect_attention_missions_from_sqlite(&path, "eip-8282").is_err());
+    }
+
     #[test]
     fn offline_sqlite_writer_scan_reads_deferred_goal_without_migrations() {
         let dir = tempfile::tempdir().unwrap();
@@ -36093,5 +36214,56 @@ Investigate <service/> failures.
             None,
         );
         assert_eq!(entry.timestamp, "2026-08-16T12:05:00Z");
+    }
+
+    #[tokio::test]
+    async fn failed_tool_scan_marks_user_wait_inventory_incomplete() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let waiting = MissionRun {
+            run_id: Uuid::new_v4(),
+            mission_id: Uuid::new_v4(),
+            generation: 1,
+            execution_state: MissionExecutionState::WaitingUser,
+            owner_actor_id: "actor".into(),
+            scope_unit: None,
+            started_at: now.clone(),
+            heartbeat_at: now.clone(),
+            stopping_at: None,
+            ended_at: None,
+            terminal_reason: None,
+        };
+        let running = MissionRun {
+            run_id: Uuid::new_v4(),
+            mission_id: Uuid::new_v4(),
+            execution_state: MissionExecutionState::Running,
+            ..waiting.clone()
+        };
+        let store = mission_store::InMemoryMissionStore::new();
+        store.test_fail_tool_scans();
+
+        assert!(
+            user_wait_tool_started_at_checked(&store, &waiting)
+                .await
+                .is_err(),
+            "a failed scan is an error, not a missing tool row"
+        );
+        assert_eq!(
+            user_wait_tool_started_at_checked(&store, &running).await,
+            Ok(None),
+            "non-waiting runs never touch the tool table"
+        );
+
+        let (waits, complete) =
+            user_wait_starts_for_runs_checked(&store, [&waiting, &running]).await;
+        assert!(
+            !complete,
+            "a failed scan must not report a complete inventory"
+        );
+        assert!(
+            waits.contains_key(&waiting.mission_id),
+            "the run is still known to be waiting even without a clock"
+        );
+        assert_eq!(waits.get(&waiting.mission_id), Some(&None));
+        assert!(!waits.contains_key(&running.mission_id));
     }
 }
