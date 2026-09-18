@@ -1,0 +1,16 @@
+[package]
+name = "orb"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+
+[profile.release]
+lto = true
+opt-level = "s"
+codegen-units = 1
+strip = true
