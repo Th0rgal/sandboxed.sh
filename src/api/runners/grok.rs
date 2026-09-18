@@ -494,20 +494,33 @@ async fn prepare_grok_env(
                 .ok()
                 .filter(|k| !k.trim().is_empty())
         });
+    let has_api_key = xai_api_key.is_some();
     if let Some(key) = xai_api_key {
         // Newer Grok CLIs read XAI_API_KEY; keep GROK_CODE_XAI_API_KEY for
         // backward compatibility with older builds.
         env.insert("XAI_API_KEY".to_string(), key.clone());
         env.insert("GROK_CODE_XAI_API_KEY".to_string(), key);
-    } else if let Err(error) =
-        crate::api::ai_providers::sync_host_grok_auth_into_workspace(workspace)
-    {
-        tracing::warn!(mission_id = %mission_id, "Grok native authentication preparation failed");
-        return Err(AgentResult::failure(
-            format!("Grok native authentication could not be prepared: {error}"),
-            0,
-        )
-        .with_terminal_reason(TerminalReason::LlmError));
+    }
+    // Grok CLI >= 1.0 `agent stdio` (ACP) authenticates only through the
+    // CLI's own cached login (`~/.grok/auth.json`, ACP method
+    // `cached_token`); XAI_API_KEY is not an ACP auth method. Sync the host
+    // login into the workspace HOME even when an API key is configured, so
+    // the ACP path works and the API key only serves the legacy transport.
+    if let Err(error) = crate::api::ai_providers::sync_host_grok_auth_into_workspace(workspace) {
+        if has_api_key {
+            tracing::warn!(
+                mission_id = %mission_id,
+                error = %error,
+                "Grok native login sync failed; continuing with XAI_API_KEY only"
+            );
+        } else {
+            tracing::warn!(mission_id = %mission_id, "Grok native authentication preparation failed");
+            return Err(AgentResult::failure(
+                format!("Grok native authentication could not be prepared: {error}"),
+                0,
+            )
+            .with_terminal_reason(TerminalReason::LlmError));
+        }
     }
 
     // Both native transports must inherit the same server-owned policy,
@@ -1278,6 +1291,49 @@ const GROK_ACP_SESSION_ID: u64 = 2;
 const GROK_ACP_SESSION_NEW_ID: u64 = 3;
 const GROK_ACP_SET_MODEL_ID: u64 = 4;
 const GROK_ACP_PROMPT_ID: u64 = 5;
+const GROK_ACP_AUTH_ID: u64 = 6;
+
+/// ACP auth method the CLI advertises for a cached login (`~/.grok/auth.json`).
+const GROK_ACP_CACHED_TOKEN_METHOD: &str = "cached_token";
+
+/// Pick the ACP `authenticate` method to use from an `initialize` result:
+/// the CLI's `_meta.defaultAuthMethodId` when advertised, else `cached_token`
+/// when listed. Browser sign-in methods (`grok.com`) are never usable
+/// headlessly and are skipped.
+pub(crate) fn grok_acp_auth_method(init_result: &serde_json::Value) -> Option<String> {
+    let methods: Vec<String> = init_result
+        .get("authMethods")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(default) = init_result
+        .get("_meta")
+        .and_then(|m| m.get("defaultAuthMethodId"))
+        .and_then(|v| v.as_str())
+    {
+        if methods.iter().any(|m| m == default) && default != "grok.com" {
+            return Some(default.to_string());
+        }
+    }
+    methods
+        .iter()
+        .find(|m| m.as_str() == GROK_ACP_CACHED_TOKEN_METHOD)
+        .cloned()
+}
+
+/// Whether an ACP error is the CLI asking for `authenticate` first.
+pub(crate) fn grok_acp_error_requires_auth(err: &str) -> bool {
+    err.contains("Authentication required") || err.contains("no auth method id provided")
+}
+
+/// Operator guidance when no cached login can satisfy ACP authentication.
+const GROK_ACP_LOGIN_REQUIRED: &str = "Grok CLI has no usable cached login in the workspace HOME; \
+XAI_API_KEY cannot authenticate `grok agent stdio`. Run `grok login --device-auth` on the \
+control-plane host as root so /root/.grok/auth.json is synced into workspaces, then retry";
 
 /// Handshake failures for an exact native session require reconciliation;
 /// neither latest-session continuation nor session-ID upsert is permitted.
@@ -1583,7 +1639,53 @@ async fn run_grok_acp_process(
             }),
         )
         .await?;
-        let _ = await_response(&mut lines, GROK_ACP_INIT_ID, 30).await?;
+        let (init_response, _) = await_response(&mut lines, GROK_ACP_INIT_ID, 30).await?;
+        let init_result = init_response
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let auth_method = grok_acp_auth_method(&init_result);
+        let advertised_methods = init_result
+            .get("authMethods")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        // Grok CLI >= 1.0 requires an explicit `authenticate` before
+        // `session/new`/`session/load`, even with a valid cached login on
+        // disk. Authenticate up front when a headless method is advertised;
+        // a stale-but-refreshable login may advertise nothing and still
+        // accept `cached_token`, so the session calls below retry once with
+        // it on an auth error.
+        async fn authenticate(
+            stdin: &mut (impl tokio::io::AsyncWrite + Unpin),
+            lines: &mut tokio::io::Lines<impl tokio::io::AsyncBufRead + Unpin>,
+            method: &str,
+        ) -> Result<(), String> {
+            send(
+                stdin,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": GROK_ACP_AUTH_ID,
+                    "method": "authenticate",
+                    "params": { "methodId": method }
+                }),
+            )
+            .await?;
+            match await_response(lines, GROK_ACP_AUTH_ID, 20).await {
+                Ok(_) => Ok(()),
+                Err(err) if err.contains("timed out") => {
+                    // Some CLI builds refresh the login without answering.
+                    tracing::debug!(error = %err, "grok ACP authenticate produced no response");
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            }
+        }
+        if let Some(method) = auth_method.as_deref() {
+            if let Err(err) = authenticate(&mut stdin, &mut lines, method).await {
+                tracing::warn!(error = %err, method, "grok ACP authenticate failed; continuing");
+            }
+        }
 
         let mut acp_session_id: Option<String> = None;
         if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
@@ -1634,7 +1736,42 @@ async fn run_grok_acp_process(
                 }),
             )
             .await?;
-            let (resp, _) = await_response(&mut lines, GROK_ACP_SESSION_NEW_ID, 60).await?;
+            let resp = match await_response(&mut lines, GROK_ACP_SESSION_NEW_ID, 60).await {
+                Ok((resp, _)) => resp,
+                Err(err) if grok_acp_error_requires_auth(&err) => {
+                    let method = auth_method
+                        .clone()
+                        .unwrap_or_else(|| GROK_ACP_CACHED_TOKEN_METHOD.to_string());
+                    let auth = authenticate(&mut stdin, &mut lines, &method).await;
+                    let retry = match auth {
+                        Ok(()) => {
+                            send(
+                                &mut stdin,
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": GROK_ACP_SESSION_NEW_ID,
+                                    "method": "session/new",
+                                    "params": { "cwd": acp_cwd, "mcpServers": [] }
+                                }),
+                            )
+                            .await?;
+                            await_response(&mut lines, GROK_ACP_SESSION_NEW_ID, 60)
+                                .await
+                                .map(|(resp, _)| resp)
+                        }
+                        Err(auth_err) => Err(auth_err),
+                    };
+                    match retry {
+                        Ok(resp) => resp,
+                        Err(retry_err) => {
+                            return Err(format!(
+                                "{retry_err}; {GROK_ACP_LOGIN_REQUIRED} (ACP authMethods={advertised_methods})"
+                            ));
+                        }
+                    }
+                }
+                Err(err) => return Err(err),
+            };
             let sid = resp
                 .get("result")
                 .and_then(|r| r.get("sessionId"))
@@ -2784,6 +2921,142 @@ sys.exit(0 if sys.argv[1]=='success_without_id' else 1)
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn grok_acp_authenticates_before_session_new_on_cli_1x() {
+        use crate::api::mission_store::{InMemoryMissionStore, MissionStore};
+        use std::process::Stdio;
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("acp auth"), None, None, None, None, Some("grok"), None)
+            .await
+            .unwrap();
+        let (events, _unread) = broadcast::channel(64);
+        let child = tokio::process::Command::new("python3")
+            .args([
+                "-u",
+                "-c",
+                include_str!("fixtures/grok_acp.py"),
+                "auth_required",
+            ])
+            .current_dir(root.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let result = run_grok_acp_process(
+            Some(&store),
+            child,
+            root.path().to_str().unwrap(),
+            "fixture prompt",
+            Some("fixture-model"),
+            mission.id,
+            events,
+            CancellationToken::new(),
+            None,
+            false,
+            GrokAcpIdlePolicy::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("unexpected ACP fallback: {}", error.reason));
+        assert!(result.success);
+        let methods = std::fs::read_to_string(root.path().join("session-methods")).unwrap();
+        assert!(
+            methods.starts_with("authenticate:cached_token\nsession/new\n"),
+            "authenticate must precede session/new, got: {methods:?}"
+        );
+        assert!(root.path().join("accepted-prompts").exists());
+    }
+
+    #[tokio::test]
+    async fn grok_acp_reports_missing_login_when_only_browser_auth_is_offered() {
+        use crate::api::mission_store::{InMemoryMissionStore, MissionStore};
+        use std::process::Stdio;
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(
+                Some("acp no login"),
+                None,
+                None,
+                None,
+                None,
+                Some("grok"),
+                None,
+            )
+            .await
+            .unwrap();
+        let (events, _unread) = broadcast::channel(64);
+        let child = tokio::process::Command::new("python3")
+            .args([
+                "-u",
+                "-c",
+                include_str!("fixtures/grok_acp.py"),
+                "auth_unavailable",
+            ])
+            .current_dir(root.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let error = run_grok_acp_process(
+            Some(&store),
+            child,
+            root.path().to_str().unwrap(),
+            "must not reach prompt",
+            None,
+            mission.id,
+            events,
+            CancellationToken::new(),
+            None,
+            false,
+            GrokAcpIdlePolicy::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.reason.contains("grok login --device-auth"),
+            "operator guidance missing: {}",
+            error.reason
+        );
+        assert!(error.reason.contains("authMethods="), "{}", error.reason);
+        assert!(!root.path().join("accepted-prompts").exists());
+        let methods = std::fs::read_to_string(root.path().join("session-methods")).unwrap();
+        assert_eq!(methods, "session/new\nauthenticate:cached_token\n");
+    }
+
+    #[test]
+    fn grok_acp_auth_method_prefers_default_then_cached_token() {
+        let init = serde_json::json!({
+            "authMethods": [{"id": "cached_token"}, {"id": "grok.com"}],
+            "_meta": {"defaultAuthMethodId": "cached_token"}
+        });
+        assert_eq!(grok_acp_auth_method(&init).as_deref(), Some("cached_token"));
+        let browser_only = serde_json::json!({"authMethods": [{"id": "grok.com"}]});
+        assert_eq!(grok_acp_auth_method(&browser_only), None);
+        let browser_default = serde_json::json!({
+            "authMethods": [{"id": "grok.com"}, {"id": "cached_token"}],
+            "_meta": {"defaultAuthMethodId": "grok.com"}
+        });
+        assert_eq!(
+            grok_acp_auth_method(&browser_default).as_deref(),
+            Some("cached_token")
+        );
+        assert_eq!(grok_acp_auth_method(&serde_json::json!({})), None);
+        assert!(grok_acp_error_requires_auth(
+            "grok ACP request 3 failed: {\"code\":-32000,\"data\":\"no auth method id provided\",\"message\":\"Authentication required\"}"
+        ));
+        assert!(!grok_acp_error_requires_auth(
+            "grok ACP timed out waiting for response id 3"
+        ));
     }
 
     #[tokio::test]
