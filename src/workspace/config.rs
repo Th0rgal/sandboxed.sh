@@ -1218,13 +1218,7 @@ pub(crate) fn ensure_codex_model_provider(config: &str, base_url: &str) -> Strin
         .lines()
         .take_while(|line| !line.trim_start().starts_with('['))
     {
-        let mut parts = line.splitn(2, '=');
-        let is_model_provider = parts
-            .next()
-            .map(|key| key.trim() == "model_provider")
-            .unwrap_or(false);
-        if is_model_provider {
-            let value = parts.next().unwrap_or("").trim();
+        if let Some(value) = parse_top_level_model_provider(line) {
             if value != our_provider_line {
                 operator_set_provider = true;
             }
@@ -1236,7 +1230,50 @@ pub(crate) fn ensure_codex_model_provider(config: &str, base_url: &str) -> Strin
 
     // Drop any previous cliproxy section and our own top-level line so the
     // URL is always current and the key never appears twice.
+    let stripped = strip_codex_cli_proxy_provider(config);
     let section_header = format!("[model_providers.{CODEX_CLI_PROXY_PROVIDER_ID}]");
+    let mut body = stripped.trim_end().to_string();
+    if !body.is_empty() {
+        body.push_str("\n\n");
+    }
+    format!(
+        "model_provider = \"{CODEX_CLI_PROXY_PROVIDER_ID}\"\n\n{body}{section_header}\nname = \"CLIProxyAPI\"\nbase_url = \"{base_url}\"\nwire_api = \"responses\"\nenv_key = \"OPENAI_API_KEY\"\n"
+    )
+}
+
+/// Parse a top-level `model_provider = "<value>"` line, returning the quoted
+/// value. Only meaningful before the first `[section]` header.
+fn parse_top_level_model_provider(line: &str) -> Option<String> {
+    let mut parts = line.trim().splitn(2, '=');
+    if parts.next().map(|key| key.trim() == "model_provider") != Some(true) {
+        return None;
+    }
+    Some(parts.next().unwrap_or("").trim().to_string())
+}
+
+/// Remove the `model_provider = "cliproxy"` top-level line and the
+/// `[model_providers.cliproxy]` section written by `ensure_codex_model_provider`.
+///
+/// Used when a Codex attempt runs on a non-proxy credential (rotation fell
+/// back from the CLIProxyAPI entry to an API key or a direct OAuth account):
+/// leaving the stanza would route requests at the proxy with no
+/// `OPENAI_API_KEY` in the process env, and the fallback attempt would fail
+/// on the missing env key instead of authenticating with its own credential.
+/// Operator-set providers and unrelated sections are preserved.
+pub(crate) fn strip_codex_cli_proxy_provider(config: &str) -> String {
+    let our_provider_line = format!("\"{CODEX_CLI_PROXY_PROVIDER_ID}\"");
+    let section_header = format!("[model_providers.{CODEX_CLI_PROXY_PROVIDER_ID}]");
+    let has_ours = config.contains(&section_header)
+        || config
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .any(|line| {
+                parse_top_level_model_provider(line).as_deref() == Some(&our_provider_line)
+            });
+    if !has_ours {
+        return config.to_string();
+    }
+
     let mut kept: Vec<&str> = Vec::new();
     let mut skipping = false;
     let mut past_top_level = false;
@@ -1246,27 +1283,20 @@ pub(crate) fn ensure_codex_model_provider(config: &str, base_url: &str) -> Strin
             past_top_level = true;
             skipping = trimmed == section_header;
         }
-        if !past_top_level {
-            let mut parts = trimmed.splitn(2, '=');
-            let is_model_provider = parts
-                .next()
-                .map(|key| key.trim() == "model_provider")
-                .unwrap_or(false);
-            if is_model_provider && parts.next().unwrap_or("").trim() == our_provider_line {
-                continue;
-            }
+        if !past_top_level
+            && parse_top_level_model_provider(line).as_deref() == Some(&our_provider_line)
+        {
+            continue;
         }
         if !skipping {
             kept.push(line);
         }
     }
-    let mut body = kept.join("\n").trim_end().to_string();
-    if !body.is_empty() {
-        body.push_str("\n\n");
+    let mut out = kept.join("\n").trim_end().to_string();
+    if !out.is_empty() {
+        out.push('\n');
     }
-    format!(
-        "model_provider = \"{CODEX_CLI_PROXY_PROVIDER_ID}\"\n\n{body}{section_header}\nname = \"CLIProxyAPI\"\nbase_url = \"{base_url}\"\nwire_api = \"responses\"\nenv_key = \"OPENAI_API_KEY\"\n"
-    )
+    out
 }
 
 pub(crate) fn update_codex_mcp_config(existing: &str, entries: &[CodexMcpEntry]) -> String {
@@ -1536,6 +1566,30 @@ mod tests {
         // An operator-set provider wins untouched.
         let operator = "model_provider = \"openai\"\n\n[mcp_servers.x]\ncommand = \"x\"\n";
         assert_eq!(ensure_codex_model_provider(operator, base), operator);
+    }
+
+    #[test]
+    fn strip_codex_cli_proxy_provider_removes_only_our_stanza() {
+        let base = "http://127.0.0.1:8317/v1";
+        let with_proxy = ensure_codex_model_provider(
+            "model_reasoning_summary = \"detailed\"\n\n[mcp_servers.x]\ncommand = \"x\"\n",
+            base,
+        );
+        let stripped = strip_codex_cli_proxy_provider(&with_proxy);
+        assert!(!stripped.contains("cliproxy"));
+        assert!(stripped.contains("model_reasoning_summary = \"detailed\""));
+        assert!(stripped.contains("[mcp_servers.x]"));
+
+        // A later proxy-owned attempt can re-add the stanza cleanly.
+        let readded = ensure_codex_model_provider(&stripped, base);
+        assert_eq!(readded.matches("[model_providers.cliproxy]").count(), 1);
+        assert_eq!(readded.matches("model_provider = \"cliproxy\"").count(), 1);
+
+        // Configs that never had our stanza are returned unchanged.
+        let operator = "model_provider = \"openai\"\n\n[mcp_servers.x]\ncommand = \"x\"\n";
+        assert_eq!(strip_codex_cli_proxy_provider(operator), operator);
+        let plain = "model_reasoning_summary = \"detailed\"\n";
+        assert_eq!(strip_codex_cli_proxy_provider(plain), plain);
     }
 
     #[tokio::test]

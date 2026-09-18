@@ -1119,6 +1119,35 @@ async fn run_codex_turn(
         .with_terminal_reason(TerminalReason::LlmError);
     }
 
+    // A non-proxy attempt (explicit rotation override, or no CLIProxyAPI
+    // ownership at all) must not inherit the `model_provider = "cliproxy"`
+    // stanza baked into the mission config at prepare time: its
+    // `env_key = "OPENAI_API_KEY"` would resolve against a missing env var
+    // and the fallback attempt would fail instead of authenticating with
+    // its own credential. Strip only our own stanza; an operator-set
+    // provider is left untouched.
+    if codex_proxy.is_none() {
+        let config_path = mission_work_dir.join(".codex").join("config.toml");
+        if let Ok(existing) = std::fs::read_to_string(&config_path) {
+            let stripped = crate::workspace::config::strip_codex_cli_proxy_provider(&existing);
+            if stripped != existing {
+                if let Err(e) = std::fs::write(&config_path, &stripped) {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        path = %config_path.display(),
+                        error = %e,
+                        "Failed to strip CLIProxyAPI model provider from Codex config for non-proxy attempt"
+                    );
+                } else {
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        "Stripped CLIProxyAPI model provider from Codex config for non-proxy attempt"
+                    );
+                }
+            }
+        }
+    }
+
     let workspace_exec = WorkspaceExec::new(workspace.clone());
     let cli_path = get_backend_string_setting("codex", "cli_path")
         .or_else(|| std::env::var("CODEX_CLI_PATH").ok())
