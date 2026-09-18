@@ -3611,6 +3611,12 @@ pub struct ControlMessageRequest {
 pub struct ControlMessageResponse {
     pub id: Uuid,
     pub queued: bool,
+    pub message_accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<Uuid>,
+    /// Only populated for an accepted idle wake, not an active queued steer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_execution: Option<MessagePreviousExecution>,
     /// Non-fatal request problems (e.g. unrecognized fields that were
     /// ignored). Empty on clean requests; omitted from the JSON then.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -4933,13 +4939,14 @@ pub async fn post_message(
     if let Some(mission_id) = target_mission_id {
         dispatch_admission_tests::notify_wait(mission_id, "enqueued");
     }
-    let queued = match queued_rx.await {
-        // The wire response keeps its historical bool shape: `queued` is true
-        // only when the message is waiting for the next turn boundary.
-        // Dropped messages surface as an `AgentEvent::Error` on the stream.
-        Ok(UserMessageAck::Queued) => true,
-        Ok(UserMessageAck::Delivered) => false,
-        Ok(UserMessageAck::Dropped) => false,
+    let (queued, message_accepted, previous_execution) = match queued_rx.await {
+        Ok(UserMessageAck::Queued) => (true, true, None),
+        Ok(UserMessageAck::Delivered) => (false, true, None),
+        Ok(UserMessageAck::Continued {
+            queued,
+            previous_execution,
+        }) => (queued, true, Some(previous_execution)),
+        Ok(UserMessageAck::Dropped) => (false, false, None),
         Ok(UserMessageAck::Rejected(reason)) => {
             return Err((StatusCode::CONFLICT, reason));
         }
@@ -4948,6 +4955,9 @@ pub async fn post_message(
     Ok(Json(ControlMessageResponse {
         id,
         queued,
+        message_accepted,
+        mission_id: target_mission_id,
+        previous_execution,
         warnings,
     }))
 }
@@ -5525,7 +5535,9 @@ fn mission_execution_projection(run: &MissionRun, status: MissionStatus) -> serd
                 .max(0) as u64
         })
         .unwrap_or(u64::MAX);
-    let conflict = if status == MissionStatus::Acknowledged || status.is_terminal() {
+    let conflict = if run.execution_state.is_terminal() {
+        None
+    } else if status == MissionStatus::Acknowledged || status.is_terminal() {
         Some(format!("status_{status}_with_non_terminal_run"))
     } else if heartbeat_age > 60 && run.execution_state != MissionExecutionState::WaitingUser {
         Some(format!("run_heartbeat_stale_{heartbeat_age}s"))
@@ -5539,6 +5551,8 @@ fn mission_execution_projection(run: &MissionRun, status: MissionStatus) -> serd
         "health": if conflict.is_some() { "reconciling" } else { "healthy" },
         "heartbeat_at": run.heartbeat_at,
         "scope_unit": run.scope_unit,
+        "ended_at": run.ended_at,
+        "terminal_reason": run.terminal_reason,
         "status_conflict": conflict,
     })
 }
@@ -7491,19 +7505,19 @@ pub async fn get_mission_digest(
             }
         }
     }
-    let active_run = control
+    let latest_run = control
         .mission_store
-        .get_active_mission_run(mission.id)
+        .get_latest_mission_run(mission.id)
         .await
         .map_err(internal_error)?;
-    let waiting_for_user_tool = active_run
+    let waiting_for_user_tool = latest_run
         .as_ref()
         .is_some_and(|run| run.execution_state == MissionExecutionState::WaitingUser);
-    let wait_started_at = match active_run.as_ref() {
+    let wait_started_at = match latest_run.as_ref() {
         Some(run) => user_wait_tool_started_at(control.mission_store.as_ref(), run).await,
         None => None,
     };
-    let execution = active_run
+    let execution = latest_run
         .as_ref()
         .map(|run| mission_execution_projection(run, mission.status));
 
@@ -7752,7 +7766,8 @@ where
 pub struct UpdateMissionSettingsRequest {
     /// Backend to use on the next turn ("opencode", "claudecode", "codex", etc.).
     pub backend: Option<String>,
-    /// Agent name. Omit to leave unchanged, null/empty string to clear.
+    /// Agent name. Omit to preserve on the same backend, or clear on a backend
+    /// switch. Explicit null/empty string also clears it.
     #[serde(default, deserialize_with = "deserialize_string_patch")]
     pub agent: Option<Option<String>>,
     /// Model override. Omit to leave unchanged, null/empty string to clear.
@@ -8742,7 +8757,13 @@ fn normalize_mission_tags(tags: Option<&[String]>) -> Option<Vec<String>> {
 }
 
 pub(crate) fn native_goal_holds_ownership(status: MissionStatus, reason: Option<&str>) -> bool {
-    status == MissionStatus::Blocked && reason == Some("native_goal_stopped")
+    status == MissionStatus::Blocked
+        && matches!(
+            reason,
+            Some(
+                "native_goal_stopped" | "codex_continuity_required" | "native_continuity_required"
+            )
+        )
 }
 
 fn status_holds_pr_writer_lease(status: MissionStatus, reason: Option<&str>) -> bool {
@@ -9289,6 +9310,8 @@ async fn activate_mission_for_message(
                     .await?;
                 store.set_deferred_goal(mission.id, None).await?;
                 let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                    completion: None,
+                    execution: None,
                     mission_id: mission.id,
                     status: MissionStatus::Interrupted,
                     summary: Some(format!("{reason}: {error}")),
@@ -9309,6 +9332,8 @@ async fn activate_mission_for_message(
         // after the next failure.
         let _ = store.set_deferred_goal(mission.id, None).await;
         let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+            completion: None,
+            execution: None,
             mission_id: mission.id,
             status: MissionStatus::Active,
             summary: None,
@@ -9343,6 +9368,8 @@ async fn restore_mission_after_failed_run_acquisition(
         )
         .await?;
     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+        completion: None,
+        execution: None,
         mission_id: mission.id,
         status: mission.status,
         summary: Some("Run acquisition failed; prior mission status restored".to_string()),
@@ -9715,9 +9742,12 @@ async fn bind_mission_to_track(
     }
     let request =
         track_leases::lease_request(project, &outcome.key, &mission_id, mode, idempotency_key);
-    match state.projects.acquire_track_lease(&request) {
+    match track_leases::acquire_locked(state, &request).await {
         Ok(_) => Ok(outcome.key),
-        Err(super::projects_store::LeaseError::Store(error)) => Err(internal_error(error)),
+        Err(super::projects_store::LeaseError::Store(error)) => {
+            interrupt_new_mission(control, mission.id, "track_lease_unavailable").await;
+            Err(internal_error(error))
+        }
         Err(super::projects_store::LeaseError::NotFound) => Err(internal_error(format!(
             "track '{}' of '{project}' vanished between absorption and lease",
             outcome.key
@@ -9743,6 +9773,8 @@ async fn interrupt_new_mission(control: &ControlState, mission_id: Uuid, reason:
         tracing::warn!(mission_id = %mission_id, %error, reason, "could not interrupt rejected mission");
     }
     let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        completion: None,
+        execution: None,
         mission_id,
         status: MissionStatus::Interrupted,
         summary: Some(reason.to_string()),
@@ -10152,6 +10184,13 @@ pub async fn create_mission(
         backend = Some(registry.default_id().to_string());
     }
 
+    if backend.as_deref() == Some("codex") {
+        if let Some(prompt) = req.prompt.as_deref() {
+            crate::backend::codex::validate_goal_message(prompt)
+                .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        }
+    }
+
     // Model effort is supported for Codex and Claude Code missions.
     if !matches!(backend.as_deref(), Some("codex") | Some("claudecode")) {
         model_effort = None;
@@ -10529,6 +10568,49 @@ pub async fn create_mission(
         }
     };
 
+    // Match actor/sweep lock order before taking the PR-writer lock. The track
+    // conflict path may reconcile a terminal predecessor, so admission must
+    // remain serialized until the new lease and assignment are both persisted.
+    let admission_guard = DISPATCH_ADMISSION.lock().await;
+    let admission_file_guard = match dispatch_admission::durable_lock(&state.config).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            // The actor already persisted this candidate and its scratch
+            // reservation. It has received no prompt or writer assignment.
+            // Compensate directly: an actor roundtrip under admission can
+            // deadlock, and the durable admission file itself is unavailable.
+            let cleanup: Result<(), String> = async {
+                let reason = "dispatch_admission_unavailable";
+                control
+                    .mission_store
+                    .update_mission_status_with_reason(
+                        mission.id,
+                        MissionStatus::Interrupted,
+                        Some(reason),
+                    )
+                    .await?;
+                let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                    completion: None,
+                    execution: None,
+                    mission_id: mission.id,
+                    status: MissionStatus::Interrupted,
+                    summary: Some(reason.to_string()),
+                });
+                release_local_mission_disk(&state.config, mission.id).await
+            }
+            .await;
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({
+                    "error": "dispatch_admission_unavailable",
+                    "mission_id": mission.id,
+                    "detail": error,
+                    "cleanup_error": cleanup.err(),
+                })
+                .to_string(),
+            ));
+        }
+    };
     // Close the preflight-to-create race under the store-only mutex. Exactly
     // one concurrent creator wins; a loser is durably interrupted before it
     // can receive a goal or become a writer.
@@ -10558,6 +10640,8 @@ pub async fn create_mission(
                 .await
                 .map_err(internal_error)?;
             let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                completion: None,
+                execution: None,
                 mission_id: mission.id,
                 status: MissionStatus::Interrupted,
                 summary: Some(reason.to_string()),
@@ -10665,10 +10749,14 @@ pub async fn create_mission(
             }
         }
     }
-    if req
-        .github_pr
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
+    // Explicit capability governs track admission and harness permissions even
+    // without PR metadata. Persist it before deferred dispatch can re-infer
+    // authority from an initial prompt such as "verity-integration-b".
+    if req.writer.is_some()
+        || req
+            .github_pr
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
     {
         let capability = if request_is_writer {
             Some("pr-writer")
@@ -10769,6 +10857,8 @@ pub async fn create_mission(
         }
     }
     drop(pr_writer_guard);
+    drop(admission_file_guard);
+    drop(admission_guard);
 
     // Creation origin ("hermes" + owning session id). Written once here so
     // clients can group foreign-origin missions under their conversation.
@@ -10878,6 +10968,8 @@ pub async fn create_mission(
                     )
                     .await;
                 let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                    completion: None,
+                    execution: None,
                     mission_id: mission.id,
                     status: MissionStatus::Failed,
                     summary: Some(message.clone()),
@@ -10945,6 +11037,8 @@ async fn dispatch_remote_mission_mvp(
         .update_mission_status(mission.id, MissionStatus::Active)
         .await?;
     let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        completion: None,
+        execution: None,
         mission_id: mission.id,
         status: MissionStatus::Active,
         summary: Some(format!("Dispatching to remote node '{}'", node.id)),
@@ -11116,6 +11210,8 @@ pub(crate) async fn ensure_remote_build_wait(
             .update_mission_status(mission_id, MissionStatus::Active)
             .await?;
         owner.send(AgentEvent::MissionStatusChanged {
+            completion: None,
+            execution: None,
             mission_id,
             status: MissionStatus::Active,
             summary: Some(format!(
@@ -11397,7 +11493,11 @@ async fn deliver_remote_build_terminal_wake(
             .await
             .map_err(|_| "remote-build terminal control session unavailable".to_string())?;
         return match tokio::time::timeout(std::time::Duration::from_secs(10), response).await {
-            Ok(Ok(UserMessageAck::Queued | UserMessageAck::Delivered)) => Ok(true),
+            Ok(Ok(
+                UserMessageAck::Queued
+                | UserMessageAck::Delivered
+                | UserMessageAck::Continued { .. },
+            )) => Ok(true),
             Ok(Ok(UserMessageAck::Rejected(error))) => Err(error),
             Ok(Ok(UserMessageAck::Dropped)) => Ok(false),
             Ok(Err(_)) => Ok(false),
@@ -11563,6 +11663,8 @@ async fn finalize_remote_mission(
         .update_mission_status_with_reason(mission_id, status, Some(status_reason))
         .await?;
     owner.send(AgentEvent::MissionStatusChanged {
+        completion: None,
+        execution: None,
         mission_id,
         status,
         summary: Some(format!("Remote node '{node_id}' finished")),
@@ -11748,6 +11850,8 @@ async fn dispatch_remote_job(
         return Err(err);
     }
     let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        completion: None,
+        execution: None,
         mission_id: mission.id,
         status: MissionStatus::Active,
         summary: Some(format!(
@@ -12912,7 +13016,13 @@ pub async fn update_mission_settings(
         }
     }
 
-    let agent = normalize_string_patch(req.agent);
+    let mut agent = normalize_string_patch(req.agent);
+    // Agent names belong to a harness just as model IDs do. Do not carry an
+    // OpenCode agent such as `build` into native Claude's --agent option.
+    // Explicit agent choices (including custom native agents) remain intact.
+    if backend_changed && agent.is_none() {
+        agent = Some(None);
+    }
     let mut model_override = normalize_string_patch(req.model_override);
     let mut model_effort = normalize_string_patch(req.model_effort);
     let mut fast_mode = req.fast_mode;
@@ -13138,6 +13248,8 @@ pub async fn mark_mission_opened(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Mission {} not found", id)))?;
     if newly_set.is_some() {
         let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+            completion: None,
+            execution: None,
             mission_id: id,
             status: mission.status,
             summary: None,
@@ -14326,7 +14438,7 @@ pub async fn get_mission_snapshot(
         .find(|info| info.mission_id == mission_id);
     let execution = control
         .mission_store
-        .get_active_mission_run(mission_id)
+        .get_latest_mission_run(mission_id)
         .await
         .map_err(internal_error)?
         .as_ref()
@@ -15291,6 +15403,16 @@ fn stored_event_to_agent_event(event: &mission_store::StoredEvent) -> Option<Age
                 .and_then(|v| v.as_str())
                 .and_then(|s| serde_json::from_value::<MissionStatus>(serde_json::json!(s)).ok())?;
             Some(AgentEvent::MissionStatusChanged {
+                completion: event
+                    .metadata
+                    .get("completion")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok()),
+                execution: event
+                    .metadata
+                    .get("execution")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok()),
                 mission_id: event.mission_id,
                 status,
                 summary: None,
@@ -15852,6 +15974,120 @@ fn webhook_forwardable_status(status: MissionStatus) -> bool {
     )
 }
 
+async fn current_callback_snapshot(
+    store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    status: MissionStatus,
+) -> Option<(Option<MissionRun>, MissionCompletionSnapshot)> {
+    let before = store.get_mission(mission_id).await.ok().flatten()?;
+    if before.status != status {
+        return None;
+    }
+    let run = store.get_latest_mission_run(mission_id).await.ok()?;
+    let events = store
+        .get_events_before(
+            mission_id,
+            i64::MAX,
+            Some(&["mission_status_changed"]),
+            Some(16),
+        )
+        .await
+        .ok()?;
+    let event = events.into_iter().rev().find(|event| {
+        event
+            .metadata
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some(status.to_string().as_str())
+            && before
+                .activity
+                .last_status_change_at
+                .as_ref()
+                .is_none_or(|changed| event.timestamp >= *changed)
+    });
+    let (captured, completion) = match (run.as_ref(), event) {
+        (Some(run), Some(event)) => {
+            let captured: Option<MissionRun> = event
+                .metadata
+                .get("execution")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            let completion: Option<MissionCompletionSnapshot> = event
+                .metadata
+                .get("completion")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            match (captured, completion) {
+                (Some(captured), Some(completion))
+                    if captured.run_id == run.run_id && captured.generation == run.generation =>
+                {
+                    (Some(captured), completion)
+                }
+                (None, None) => (
+                    None,
+                    MissionCompletionSnapshot {
+                        result_summary: (!event.content.trim().is_empty()).then_some(event.content),
+                        terminal_reason: before.terminal_reason.clone(),
+                        terminal_evidence: before.terminal_evidence.clone(),
+                    },
+                ),
+                _ => return None,
+            }
+        }
+        (Some(_), None) if before.terminal_reason.as_deref() == Some("server_shutdown") => (
+            None,
+            MissionCompletionSnapshot {
+                // Startup/drain intentionally persist this status without a
+                // terminal event. Preserve its unbound outage notification.
+                result_summary: None,
+                terminal_reason: before.terminal_reason.clone(),
+                terminal_evidence: before.terminal_evidence.clone(),
+            },
+        ),
+        (Some(_), None) => return None, // exact event may still be in the logger queue
+        (None, event) => (
+            None,
+            MissionCompletionSnapshot {
+                result_summary: event
+                    .and_then(|event| (!event.content.trim().is_empty()).then_some(event.content)),
+                terminal_reason: before.terminal_reason.clone(),
+                terminal_evidence: before.terminal_evidence.clone(),
+            },
+        ),
+    };
+    let after = store.get_mission(mission_id).await.ok().flatten()?;
+    let checked_run = store.get_latest_mission_run(mission_id).await.ok()?;
+    if before.updated_at != after.updated_at
+        || after.status != status
+        || run.as_ref().map(|r| (r.run_id, r.generation))
+            != checked_run.as_ref().map(|r| (r.run_id, r.generation))
+        || run
+            .as_ref()
+            .is_some_and(|run| run.started_at > before.updated_at)
+    {
+        return None;
+    }
+    Some((captured, completion))
+}
+
+async fn callback_snapshot(
+    store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    status: MissionStatus,
+    execution: Option<MissionRun>,
+    completion: Option<MissionCompletionSnapshot>,
+    reconcile_current: bool,
+) -> (Option<MissionRun>, Option<MissionCompletionSnapshot>) {
+    if reconcile_current {
+        match current_callback_snapshot(store, mission_id, status).await {
+            Some((run, completion)) => (run, Some(completion)),
+            None => (None, None),
+        }
+    } else {
+        (execution, completion)
+    }
+}
+
 async fn paloma_webhook_forwarder_loop(
     mut events_rx: broadcast::Receiver<AgentEvent>,
     mission_store: Arc<dyn MissionStore>,
@@ -15928,7 +16164,10 @@ async fn paloma_webhook_forwarder_loop(
     let in_flight_c = Arc::clone(&in_flight);
     let forward = move |mission_id: Uuid,
                         status: MissionStatus,
-                        old_status: Option<MissionStatus>| {
+                        old_status: Option<MissionStatus>,
+                        event_execution: Option<MissionRun>,
+                        event_completion: Option<MissionCompletionSnapshot>,
+                        reconcile_current: bool| {
         let http = http_c.clone();
         let url = url_c.clone();
         let secret = secret_c.clone();
@@ -15954,11 +16193,23 @@ async fn paloma_webhook_forwarder_loop(
                 .and_then(|mission| mission.title.clone())
                 .unwrap_or_else(|| mission_id.to_string());
             let project = mission.as_ref().map(|m| &m.project);
-            let run = mission_store
-                .get_active_mission_run(mission_id)
-                .await
-                .ok()
-                .flatten();
+            // Live events can only carry producer-captured identity. In
+            // particular, an unbound historical event must not adopt a later
+            // generation just because that generation reached the same status.
+            let (run, completion) = callback_snapshot(
+                &mission_store,
+                mission_id,
+                status,
+                event_execution,
+                event_completion,
+                reconcile_current,
+            )
+            .await;
+            if reconcile_current && completion.is_none() {
+                // Keep the marker pending until the precise event is persisted.
+                in_flight.lock().await.remove(&(mission_id, status));
+                return;
+            }
             let mut remote_jobs = crate::remote_node::job_ledger::load(&working_dir)
                 .await
                 .unwrap_or_default()
@@ -15999,12 +16250,30 @@ async fn paloma_webhook_forwarder_loop(
                     })
                 }),
             );
-            let terminal_reason = mission
-                .as_ref()
-                .and_then(|mission| mission.terminal_reason.as_deref());
+            let terminal_reason = if completion.is_some() || run.is_some() {
+                completion
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.terminal_reason.as_deref())
+            } else {
+                mission
+                    .as_ref()
+                    .and_then(|mission| mission.terminal_reason.as_deref())
+            };
+            let terminal_evidence = if completion.is_some() || run.is_some() {
+                completion
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.terminal_evidence.as_deref())
+            } else {
+                mission
+                    .as_ref()
+                    .and_then(|mission| mission.terminal_evidence.as_deref())
+            };
             let recommended_action = match terminal_reason {
                 Some("server_shutdown" | "orphan_no_runner") => "resume_once",
                 Some("native_goal_stopped") => "resolve_stop_then_resume",
+                Some("codex_continuity_required" | "native_continuity_required") => {
+                    "reconcile_native_session_before_resume"
+                }
                 Some("auth_error") => "disable_provider_and_reroute",
                 Some("rate_limited" | "capacity_limited") => "reroute_or_queue",
                 Some("watchdog_stalled" | "cancelled") => "inspect_artifacts",
@@ -16026,7 +16295,11 @@ async fn paloma_webhook_forwarder_loop(
             // a mission-backed delegation returns a real work product to the
             // delegating Hermes agent (the fold prefers `result_summary`).
             // Fetched only for terminal (forwardable) transitions; best-effort.
-            let result_summary: Option<String> = if webhook_forwardable_status(status) {
+            let result_summary: Option<String> = if completion.is_some() || run.is_some() {
+                completion
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.result_summary.clone())
+            } else if webhook_forwardable_status(status) {
                 mission_store
                     .latest_assistant_text(mission_id)
                     .await
@@ -16065,9 +16338,7 @@ async fn paloma_webhook_forwarder_loop(
                 // What the terminating guard OBSERVED. Without it, consumers
                 // invent causes: "transport bug", "GitHub is disabled",
                 // "pool needs re-provisioning" — all measured this week.
-                "terminal_evidence": mission
-                    .as_ref()
-                    .and_then(|mission| mission.terminal_evidence.as_deref()),
+                "terminal_evidence": terminal_evidence,
                 "resumable": matches!(status, MissionStatus::Interrupted | MissionStatus::Failed | MissionStatus::Blocked),
                 "recommended_action": recommended_action,
                 "execution": run.as_ref().map(|run| serde_json::json!({
@@ -16244,13 +16515,17 @@ async fn paloma_webhook_forwarder_loop(
                     "webhook reconcile: forwarding a status transition the \
                      broadcast never delivered"
                 );
-                forward(mission.id, status, prior);
+                forward(mission.id, status, prior, None, None, true);
             }
             continue;
         };
         match result {
             Ok(AgentEvent::MissionStatusChanged {
-                mission_id, status, ..
+                mission_id,
+                status,
+                execution,
+                completion,
+                ..
             }) => {
                 let old_status = markers.lock().await.get(mission_id);
                 if old_status == Some(status) {
@@ -16263,7 +16538,7 @@ async fn paloma_webhook_forwarder_loop(
                 if !in_flight.lock().await.insert((mission_id, status)) {
                     continue;
                 }
-                forward(mission_id, status, old_status);
+                forward(mission_id, status, old_status, execution, completion, false);
             }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(dropped)) => {
@@ -17661,6 +17936,12 @@ fn mission_status_for_terminal_reason(
         TerminalReason::TurnComplete => None,
         TerminalReason::Completed => Some((MissionStatus::Completed, "completed")),
         TerminalReason::NativeGoalStopped => Some((MissionStatus::Blocked, "native_goal_stopped")),
+        TerminalReason::CodexContinuityRequired => {
+            Some((MissionStatus::Blocked, "codex_continuity_required"))
+        }
+        TerminalReason::NativeContinuityRequired => {
+            Some((MissionStatus::Blocked, "native_continuity_required"))
+        }
         TerminalReason::Cancelled => Some((MissionStatus::Interrupted, "cancelled")),
         TerminalReason::ServerShutdown => Some((MissionStatus::Interrupted, "server_shutdown")),
         TerminalReason::MaxIterations => Some((MissionStatus::Blocked, "max_iterations")),
@@ -17739,6 +18020,12 @@ fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<
         TerminalReason::MaxIterations => Some("Reached iteration limit".to_string()),
         TerminalReason::NativeGoalStopped => {
             Some("Native goal stopped — resume after external steering".to_string())
+        }
+        TerminalReason::CodexContinuityRequired => {
+            Some("Native Codex history requires reconciliation before resume".into())
+        }
+        TerminalReason::NativeContinuityRequired => {
+            Some("Native session requires reconciliation before resume".into())
         }
         TerminalReason::Cancelled => Some("Cancelled by user".to_string()),
         TerminalReason::ServerShutdown => {
@@ -17950,6 +18237,104 @@ fn is_transport_failure_evidence(evidence: &crate::agents::CompletionEvidence) -
         evidence.failure_class,
         Some(crate::agents::FailureClass::TransportError)
     )
+}
+
+fn is_grok_acp_transport_failure(result: &crate::agents::AgentResult) -> bool {
+    result
+        .data
+        .as_ref()
+        .and_then(|data| data.get("grok_acp_transport_failure"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+const GROK_TRANSPORT_RECOVERY_RESERVED: &str = "Grok ACP transport recovery reserved (1/1 for this mission). Reconcile the existing checkout and jobs before continuing; automatic recovery will not repeat.";
+
+async fn grok_transport_recovery_was_reserved(
+    store: &dyn MissionStore,
+    mission_id: Uuid,
+) -> Result<bool, String> {
+    // Page only messages/errors, not a bounded tail that could forget an old
+    // attempt. Include legacy recovery messages when upgrading an actor.
+    let mut offset = 0;
+    loop {
+        let events = store
+            .get_events(
+                mission_id,
+                Some(&["user_message", "error"]),
+                Some(100),
+                Some(offset),
+            )
+            .await?;
+        if events.iter().any(|event| {
+            (event.event_type == "error" && event.content == GROK_TRANSPORT_RECOVERY_RESERVED)
+                || (event.event_type == "user_message"
+                    && event.metadata.get("source").and_then(|v| v.as_str())
+                        == Some("transport_auto_resume"))
+        }) {
+            return Ok(true);
+        }
+        if events.len() < 100 {
+            return Ok(false);
+        }
+        offset += events.len();
+    }
+}
+
+/// Shared by the serial and parallel completion paths in the single control
+/// actor. Grok gets one recovery per mission, deliberately stricter than a
+/// budget reset at each new checkpoint. Persist the reservation before queueing
+/// so an actor restart (or a crash between reservation and queueing) cannot
+/// replay the same incident. Other backends retain their existing three tries.
+async fn reserve_transport_auto_resume(
+    store: &dyn MissionStore,
+    attempts: &mut HashMap<Uuid, u8>,
+    mission_id: Uuid,
+    grok_acp: bool,
+    cancellation_requested: bool,
+) -> bool {
+    if cancellation_requested {
+        return false;
+    }
+    let count = attempts.entry(mission_id).or_insert(0);
+    if *count >= if grok_acp { 1 } else { 3 } {
+        return false;
+    }
+    *count += 1;
+    if !grok_acp {
+        return true;
+    }
+
+    let reserve = async {
+        if grok_transport_recovery_was_reserved(store, mission_id).await? {
+            return Ok(false);
+        }
+        // Queued UserMessage events intentionally are not persisted. Record
+        // the reservation as an error diagnostic instead of falsely claiming
+        // that a recovery message has already started executing.
+        store
+            .log_event(
+                mission_id,
+                &AgentEvent::Error {
+                    message: GROK_TRANSPORT_RECOVERY_RESERVED.to_string(),
+                    mission_id: Some(mission_id),
+                    resumable: true,
+                },
+            )
+            .await?;
+        if !grok_transport_recovery_was_reserved(store, mission_id).await? {
+            return Err("mission store did not persist the Grok recovery reservation".to_string());
+        }
+        Ok(true)
+    }
+    .await;
+    match reserve {
+        Ok(reserved) => reserved,
+        Err(error) => {
+            tracing::warn!(%mission_id, %error, "Grok transport recovery withheld: durable budget unavailable");
+            false
+        }
+    }
 }
 
 const TRANSPORT_AUTO_RESUME_PROMPT: &str = "The previous turn ended because its provider transport disconnected. Reconcile the current workspace, remote jobs, and repository head, then resume the same task. Do not duplicate an accepted job or create a replacement writer.";
@@ -18249,6 +18634,11 @@ async fn maybe_finalize_terminal_mission(
                     tracing::warn!(mission_id = %mission_id, "failed to record terminal evidence: {e}");
                 }
             }
+            let execution = mission_store
+                .get_latest_mission_run(mission_id)
+                .await
+                .ok()
+                .flatten();
             if let Err(e) = mission_store
                 .update_mission_status_with_reason(
                     mission_id,
@@ -18288,6 +18678,12 @@ async fn maybe_finalize_terminal_mission(
                     new_status,
                 );
                 let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                    completion: Some(MissionCompletionSnapshot {
+                        result_summary: final_output.map(str::to_owned),
+                        terminal_reason: Some(terminal_reason_str.to_owned()),
+                        terminal_evidence: terminal_evidence.map(str::to_owned),
+                    }),
+                    execution,
                     mission_id,
                     status: new_status,
                     summary: mission_status_summary_for_terminal_reason(reason),
@@ -18802,7 +19198,6 @@ async fn control_actor_loop(
     // quota/capacity, source failures, stalls, and loops are deliberately not
     // eligible. Writer leases are re-acquired by the normal start path.
     let mut transport_auto_resumed_missions: HashMap<Uuid, u8> = HashMap::new();
-    const TRANSPORT_AUTO_RESUME_MAX: u8 = 3;
     // Track subtasks for the main runner
     let mut main_runner_subtasks: Vec<super::mission_runner::SubtaskInfo> = Vec::new();
     // Track number of in-flight tool calls on the main runner so the stall
@@ -19912,6 +20307,8 @@ async fn control_actor_loop(
                                                 } else {
                                                     let _ = events_tx.send(
                                                         AgentEvent::MissionStatusChanged {
+                                                            completion: None,
+                                                            execution: None,
                                                             mission_id: tid,
                                                             status: MissionStatus::Pending,
                                                             summary: Some(
@@ -20579,8 +20976,11 @@ async fn control_actor_loop(
                                         continue;
                                     }
                                 };
+                                let turn_mission_store = mission_store.clone();
+                                let session_update_run = running_run.as_ref().map(crate::api::mission_store::SessionUpdateRun::from);
                                 running = Some(tokio::spawn(async move {
-                                    let result = run_single_control_turn(
+                                    let result = crate::api::runners::SESSION_UPDATE_RUN.scope(session_update_run, run_single_control_turn(
+                                        turn_mission_store,
                                         cfg,
                                         agent,
                                         mcp_ref,
@@ -20607,7 +21007,7 @@ async fn control_actor_loop(
                                         mission_config_profile,
                                         Some(user_id_for_turn),
                                         pr_readonly,
-                                    )
+                                    ))
                                     .await;
                                     (mid, msg, result)
                                 }));
@@ -20910,6 +21310,8 @@ async fn control_actor_loop(
                                 new_status,
                             );
                             let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                completion: None,
+                                execution: None,
                                 mission_id: id,
                                 status: new_status,
                                 summary: None,
@@ -20973,10 +21375,9 @@ async fn control_actor_loop(
                         // handoff context below when the backend changed).
                         // Long-lived missions (orchestrators, /goal loops)
                         // rarely stop, so the previous hard refusal made them
-                        // effectively unswitchable. The fresh session id this
-                        // writes is also fine mid-run: every backend falls
-                        // back to a fresh/continued session when the stored id
-                        // is not loadable.
+                        // effectively unswitchable. Session identities are
+                        // retained per backend; failed native resume requires
+                        // recovery rather than silently creating a new session.
                         if main_running || parallel_running {
                             tracing::info!(
                                 mission_id = %id,
@@ -21267,6 +21668,8 @@ async fn control_actor_loop(
                                     tracing::warn!("Failed to cancel child mission {}: {}", child.id, e);
                                 } else {
                                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        completion: None,
+                                        execution: None,
                                         mission_id: child.id,
                                         status: MissionStatus::Interrupted,
                                         summary: None,
@@ -21364,9 +21767,14 @@ async fn control_actor_loop(
                                 // success so cleanup loops do not trip their
                                 // circuit breaker by cancelling twice.
                                 match mission_store.get_mission(mission_id).await {
-                                    Ok(Some(mission)) if mission.status == MissionStatus::Interrupted
-                                        || mission.status.is_terminal()
-                                        || mission.status == MissionStatus::Acknowledged =>
+                                    // Blocked is terminal for scheduling, but a
+                                    // parked native goal still owns its track.
+                                    // Explicit cancellation must transition it
+                                    // through the no-runner cancellation path.
+                                    Ok(Some(mission)) if matches!(mission.status,
+                                        MissionStatus::Completed | MissionStatus::Failed
+                                        | MissionStatus::Interrupted | MissionStatus::NotFeasible
+                                        | MissionStatus::Acknowledged) =>
                                     {
                                         if let Err(error) = finish_detached_run_for_cancel(
                                             &mission_store,
@@ -21408,6 +21816,8 @@ async fn control_actor_loop(
                                             .await;
                                         let _ = events_tx.send(
                                             AgentEvent::MissionStatusChanged {
+                                                completion: None,
+                                                execution: None,
                                                 mission_id,
                                                 status: MissionStatus::Interrupted,
                                                 summary: None,
@@ -21510,6 +21920,8 @@ async fn control_actor_loop(
                                     )
                                     .await;
                                 let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                    completion: None,
+                                    execution: None,
                                     mission_id,
                                     status: MissionStatus::Paused,
                                     summary: None,
@@ -21701,6 +22113,8 @@ async fn control_actor_loop(
                                                 .await;
                                             let _ = events_tx.send(
                                                 AgentEvent::MissionStatusChanged {
+                                                    completion: None,
+                                                    execution: None,
                                                     mission_id,
                                                     status: MissionStatus::Interrupted,
                                                     summary: None,
@@ -21810,6 +22224,8 @@ async fn control_actor_loop(
                                         MissionStatus::Active,
                                     );
                                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        completion: None,
+                                        execution: None,
                                         mission_id,
                                         status: MissionStatus::Active,
                                         summary: None,
@@ -21885,6 +22301,8 @@ async fn control_actor_loop(
                                     );
                                     // Send status changed event so UI updates
                                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        completion: None,
+                                        execution: None,
                                         mission_id,
                                         status: MissionStatus::Active,
                                         summary: None,
@@ -22038,8 +22456,11 @@ async fn control_actor_loop(
                                                 continue;
                                             }
                                         };
+                                        let turn_mission_store = mission_store.clone();
+                                        let session_update_run = running_run.as_ref().map(crate::api::mission_store::SessionUpdateRun::from);
                                         running = Some(tokio::spawn(async move {
-                                            let result = run_single_control_turn(
+                                            let result = crate::api::runners::SESSION_UPDATE_RUN.scope(session_update_run, run_single_control_turn(
+                                                turn_mission_store,
                                                 cfg,
                                                 agent,
                                                 mcp_ref,
@@ -22066,7 +22487,7 @@ async fn control_actor_loop(
                                                 mission_config_profile,
                                                 Some(user_id_for_turn),
                                                 pr_readonly,
-                                            )
+                                            ))
                                             .await;
                                             (mid, msg, result)
                                         }));
@@ -22414,6 +22835,9 @@ async fn control_actor_loop(
                                 }
                             }
 
+                            // Capture the actor-owned generation before any status-write await.
+                            let execution = running_run.as_ref().filter(|run| run.mission_id == id).cloned()
+                                .or_else(|| parallel_runners.get(&id).and_then(|runner| runner.durable_run.clone()));
                             if mission_store
                                 .update_mission_status(id, new_status)
                                 .await
@@ -22446,6 +22870,12 @@ async fn control_actor_loop(
                                 }
 
                                 let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                    completion: Some(MissionCompletionSnapshot {
+                                        result_summary: summary.clone(),
+                                        terminal_reason: None,
+                                        terminal_evidence: None,
+                                    }),
+                                    execution,
                                     mission_id: id,
                                     status: new_status,
                                     summary,
@@ -22466,6 +22896,9 @@ async fn control_actor_loop(
                     // Save the running mission ID before clearing it - we need it for persist and auto-complete
                     // (current_mission can change if user clicks "New Mission" while task was running)
                     let completed_mission_id = running_mission_id;
+                    let completed_cancellation_requested = running_cancel
+                        .as_ref()
+                        .is_some_and(CancellationToken::is_cancelled);
                     running = None;
                     running_cancel = None;
                     if let Some(mid) = running_mission_id {
@@ -22483,6 +22916,7 @@ async fn control_actor_loop(
                     let mut completed_terminal_evidence = None;
                     let mut completed_completion_confidence = None;
                     let mut completed_transport_failure = false;
+                    let mut completed_grok_acp_transport_failure = false;
                     let mut completed_waiting_remote_job = false;
                     // Captured for the post-turn `grok_goal` sentinel hook (see
                     // `post_turn_handle_grok_goal`), which runs after this
@@ -22500,6 +22934,8 @@ async fn control_actor_loop(
                                 Some(completion_evidence.completion_confidence);
                             completed_transport_failure =
                                 is_transport_failure_evidence(&completion_evidence);
+                            completed_grok_acp_transport_failure =
+                                is_grok_acp_transport_failure(&agent_result);
                             completed_agent_output = agent_result.output.clone();
                             if let Some(run) = running_run.take() {
                                 completed_waiting_remote_job =
@@ -22546,6 +22982,8 @@ async fn control_actor_loop(
                                         tracing::warn!(mission_id = %run.mission_id, %error, "Failed to keep remote-wait mission active");
                                     } else {
                                         let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                            completion: None,
+                                            execution: None,
                                             mission_id: run.mission_id,
                                             status: MissionStatus::Active,
                                             summary: Some("Waiting for durable remote validation".to_string()),
@@ -22776,6 +23214,8 @@ async fn control_actor_loop(
                                         MissionStatus::Failed,
                                     );
                                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        completion: None,
+                                        execution: None,
                                         mission_id,
                                         status: MissionStatus::Failed,
                                         summary: Some("Task execution failed unexpectedly".to_string()),
@@ -22799,16 +23239,14 @@ async fn control_actor_loop(
                     if !completed_waiting_remote_job {
                         if let Some(mission_id) = completed_mission_id {
                         if completed_transport_failure
-                            && {
-                                let count = transport_auto_resumed_missions
-                                    .entry(mission_id)
-                                    .or_insert(0);
-                                *count < TRANSPORT_AUTO_RESUME_MAX && {
-                                    *count += 1;
-                                    true
-                                }
-                            }
                             && !queue_has_pending_target_mission(&queue, mission_id)
+                            && reserve_transport_auto_resume(
+                                mission_store.as_ref(),
+                                &mut transport_auto_resumed_missions,
+                                mission_id,
+                                completed_grok_acp_transport_failure,
+                                completed_cancellation_requested,
+                            ).await
                         {
                             let resume_message = transport_auto_resume_message_for_mission(
                                 mission_store.as_ref(),
@@ -22854,7 +23292,7 @@ async fn control_actor_loop(
                         }
                         let suppress_finished_automation = matches!(
                             completed_terminal_reason,
-                            Some(TerminalReason::NativeGoalStopped)
+                            Some(TerminalReason::NativeGoalStopped | TerminalReason::CodexContinuityRequired | TerminalReason::NativeContinuityRequired)
                                 | Some(TerminalReason::AuthError)
                                 | Some(TerminalReason::RateLimited)
                                 | Some(TerminalReason::CapacityLimited)
@@ -23136,8 +23574,11 @@ async fn control_actor_loop(
                     main_runner_active_tool_calls
                         .store(0, std::sync::atomic::Ordering::Relaxed);
                     let user_id_for_turn = session_user_id.clone();
+                    let turn_mission_store = mission_store.clone();
+                    let session_update_run = running_run.as_ref().map(crate::api::mission_store::SessionUpdateRun::from);
                     running = Some(tokio::spawn(async move {
-                        let result = run_single_control_turn(
+                        let result = crate::api::runners::SESSION_UPDATE_RUN.scope(session_update_run, run_single_control_turn(
+                            turn_mission_store,
                             cfg,
                             agent,
                             mcp_ref,
@@ -23164,7 +23605,7 @@ async fn control_actor_loop(
                             mission_config_profile,
                             Some(user_id_for_turn),
                             pr_readonly,
-                        )
+                        ))
                         .await;
                         (mid, msg, result)
                     }));
@@ -23209,6 +23650,8 @@ async fn control_actor_loop(
                                 MissionStatus::Interrupted,
                             );
                             let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                completion: None,
+                                execution: None,
                                 mission_id: *mission_id,
                                 status: MissionStatus::Interrupted,
                                 summary: Some(
@@ -23269,6 +23712,8 @@ async fn control_actor_loop(
                                     tracing::warn!(mission_id = %mission_id, %error, "Failed to keep parallel remote-wait mission active");
                                 } else {
                                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        completion: None,
+                                        execution: None,
                                         mission_id: *mission_id,
                                         status: MissionStatus::Active,
                                         summary: Some("Waiting for durable remote validation".to_string()),
@@ -23398,7 +23843,7 @@ async fn control_actor_loop(
                             // capacity) to avoid noisy retry loops.
                             let suppress_finished_automation = matches!(
                                 result.terminal_reason,
-                                Some(TerminalReason::NativeGoalStopped)
+                                Some(TerminalReason::NativeGoalStopped | TerminalReason::CodexContinuityRequired | TerminalReason::NativeContinuityRequired)
                                     | Some(TerminalReason::AuthError)
                                     | Some(TerminalReason::RateLimited)
                                     | Some(TerminalReason::CapacityLimited)
@@ -23409,15 +23854,13 @@ async fn control_actor_loop(
                                 && is_transport_failure_evidence(&completion_evidence)
                                 && !cancellation_requested
                                 && was_queue_empty
-                                && {
-                                    let count = transport_auto_resumed_missions
-                                        .entry(*mission_id)
-                                        .or_insert(0);
-                                    *count < TRANSPORT_AUTO_RESUME_MAX && {
-                                        *count += 1;
-                                        true
-                                    }
-                                }
+                                && reserve_transport_auto_resume(
+                                    mission_store.as_ref(),
+                                    &mut transport_auto_resumed_missions,
+                                    *mission_id,
+                                    is_grok_acp_transport_failure(&result),
+                                    cancellation_requested,
+                                ).await
                             {
                                 tracing::info!(
                                     mission_id = %mission_id,
@@ -23484,10 +23927,16 @@ async fn control_actor_loop(
 
                             // Always try to start next queued message (if any)
                             if !runner.is_running() {
-                                // Refresh session_id from the store in case a
-                                // SessionIdUpdate event hasn't been processed yet
-                                // (race between the events_rx and sleep poll arms).
+                                // Refresh settings together with their backend-specific
+                                // session identity before the next turn. The in-flight
+                                // turn retains its original settings.
                                 if let Ok(Some(m)) = mission_store.get_mission(*mission_id).await {
+                                    runner.backend_id = m.backend;
+                                    runner.agent_override = m.agent;
+                                    runner.model_override = m.model_override;
+                                    runner.model_effort = m.model_effort;
+                                    runner.fast_mode = m.fast_mode;
+                                    runner.config_profile = m.config_profile;
                                     if m.session_id != runner.session_id {
                                         tracing::debug!(
                                             mission_id = %mission_id,
@@ -23695,6 +24144,8 @@ async fn control_actor_loop(
                                             MissionStatus::Failed,
                                         );
                                         let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                            completion: None,
+                                            execution: None,
                                             mission_id: m.id,
                                             status: MissionStatus::Failed,
                                             summary: Some(
@@ -23869,6 +24320,8 @@ async fn control_actor_loop(
                             MissionStatus::Interrupted,
                         );
                         let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                            completion: None,
+                            execution: None,
                             mission_id: mid,
                             status: MissionStatus::Interrupted,
                             summary: Some(
@@ -24473,28 +24926,20 @@ async fn control_actor_loop(
                         }
                     }
 
-                    // Handle session ID updates for backends that generate their own IDs.
-                    if let AgentEvent::SessionIdUpdate { mission_id, session_id } = &event {
-                        if let Err(err) = mission_store
-                            .update_mission_session_id(*mission_id, session_id)
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to update session ID for mission {}: {}",
-                                mission_id,
-                                err
-                            );
-                        } else {
-                            tracing::debug!(
-                                mission_id = %mission_id,
-                                session_id = %session_id,
-                                "Updated mission session ID from backend"
-                            );
-                        }
-                        // Also update the parallel runner's cached session_id so the
-                        // next turn picks up the new value instead of the stale one.
-                        if let Some(runner) = parallel_runners.get_mut(mission_id) {
-                            runner.session_id = Some(session_id.clone());
+                    // Only an update from the latest acquired generation may
+                    // mutate durable identity or the parallel runner cache.
+                    if let AgentEvent::SessionIdUpdate { mission_id, session_id, backend, run } = &event {
+                        match mission_store.update_mission_session_id(*mission_id, session_id, backend, run.as_ref()).await {
+                            Ok(true) => {
+                                if let Some(runner) = parallel_runners.get_mut(mission_id) {
+                                    let cached_run = runner.durable_run.as_ref().map(crate::api::mission_store::SessionUpdateRun::from);
+                                    if runner.backend_id == *backend && cached_run == *run {
+                                        runner.session_id = Some(session_id.clone());
+                                    }
+                                }
+                            }
+                            Ok(false) => tracing::debug!(mission_id = %mission_id, "Ignored stale or unattributed native session update"),
+                            Err(err) => tracing::warn!(mission_id = %mission_id, %err, "Failed to persist native session update"),
                         }
                     }
 
@@ -24548,6 +24993,7 @@ async fn control_actor_loop(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_single_control_turn(
+    mission_store: Arc<dyn MissionStore>,
     mut config: Config,
     _root_agent: AgentRef,
     mcp: Arc<McpRegistry>,
@@ -24783,6 +25229,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(crate::api::runners::ClaudeCodeRunner.run_turn(
                 crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     message: &user_message,
@@ -24821,6 +25268,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(
                 crate::api::runners::GrokRunner.run_turn(crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     message: &grok_message_owned,
@@ -24868,6 +25316,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(
                 crate::api::runners::CodexRunner.run_turn(crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     message: codex_message,
@@ -24894,6 +25343,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(
                 crate::api::runners::GeminiRunner.run_turn(crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     message: &convo,
@@ -24920,6 +25370,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(
                 crate::api::runners::ChatGptUiRunner.run_turn(crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     // The browser always starts a fresh chat, so include the
@@ -24997,6 +25448,7 @@ async fn run_single_control_turn(
             use crate::api::runners::HarnessRunner as _;
             Box::pin(crate::api::runners::OpenCodeRunner.run_turn(
                 crate::api::runners::TurnContext {
+                    mission_store: Some(mission_store.clone()),
                     workspace: exec_workspace,
                     work_dir: &ctx.working_dir,
                     message: &opencode_message_owned,
@@ -33975,6 +34427,462 @@ Investigate <service/> failures.
     }
 
     #[tokio::test]
+    async fn terminal_callback_identity_never_infers_unbound_live_event_from_same_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn MissionStore> = Arc::new(
+            mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "unbound")
+                .await
+                .unwrap(),
+        );
+        let mission = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            store
+                .update_mission_status(mission.id, MissionStatus::Active)
+                .await
+                .unwrap();
+            let run = store
+                .begin_mission_run(mission.id, "test", None)
+                .await
+                .unwrap();
+            store
+                .finish_mission_run(run.run_id, run.generation, None)
+                .await
+                .unwrap();
+            store
+                .update_mission_status_with_reason(
+                    mission.id,
+                    MissionStatus::Blocked,
+                    Some("second reason"),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .update_mission_history(
+                mission.id,
+                &[MissionHistoryEntry {
+                    role: "assistant".into(),
+                    content: "second result".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        let (execution, completion) = callback_snapshot(
+            &store,
+            mission.id,
+            MissionStatus::Blocked,
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert!(execution.is_none());
+        assert!(completion.is_none());
+        assert!(
+            current_callback_snapshot(&store, mission.id, MissionStatus::Blocked)
+                .await
+                .is_none(),
+            "history text alone is not a generation receipt"
+        );
+        store
+            .update_mission_status_with_reason(
+                mission.id,
+                MissionStatus::Interrupted,
+                Some("server_shutdown"),
+            )
+            .await
+            .unwrap();
+        let (outage_run, outage) = callback_snapshot(
+            &store,
+            mission.id,
+            MissionStatus::Interrupted,
+            None,
+            None,
+            true,
+        )
+        .await;
+        assert!(outage_run.is_none());
+        assert_eq!(
+            outage.unwrap().terminal_reason.as_deref(),
+            Some("server_shutdown")
+        );
+        store
+            .update_mission_status_with_reason(
+                mission.id,
+                MissionStatus::Blocked,
+                Some("second reason"),
+            )
+            .await
+            .unwrap();
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::MissionStatusChanged {
+                    execution: None,
+                    completion: None,
+                    mission_id: mission.id,
+                    status: MissionStatus::Blocked,
+                    summary: Some("legacy current status".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let (legacy_run, legacy_outcome) =
+            callback_snapshot(&store, mission.id, MissionStatus::Blocked, None, None, true).await;
+        assert!(legacy_run.is_none());
+        assert_eq!(
+            legacy_outcome.unwrap().result_summary.as_deref(),
+            Some("legacy current status")
+        );
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::MissionStatusChanged {
+                    execution: store.get_latest_mission_run(mission.id).await.unwrap(),
+                    completion: Some(MissionCompletionSnapshot {
+                        result_summary: Some("second result".into()),
+                        terminal_reason: Some("second reason".into()),
+                        terminal_evidence: None,
+                    }),
+                    mission_id: mission.id,
+                    status: MissionStatus::Blocked,
+                    summary: None,
+                },
+            )
+            .await
+            .unwrap();
+        // Only the explicitly current reconciliation observation may acquire
+        // the current generation. It is never treated as the old live event.
+        let (execution, completion) =
+            callback_snapshot(&store, mission.id, MissionStatus::Blocked, None, None, true).await;
+        assert_eq!(execution.unwrap().generation, 2);
+        assert_eq!(
+            completion.unwrap().result_summary.as_deref(),
+            Some("second result")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_callback_identity_reaches_http_after_release_and_delayed_successor() {
+        for resume_before_delivery in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn MissionStore> = Arc::new(
+                mission_store::SqliteMissionStore::new(dir.path().join("db"), "http-callback")
+                    .await
+                    .unwrap(),
+            );
+            let mission = store
+                .create_mission(None, None, None, None, None, None, None)
+                .await
+                .unwrap();
+            let first = store
+                .begin_mission_run(mission.id, "test", None)
+                .await
+                .unwrap();
+            store
+                .finish_mission_run(first.run_id, first.generation, Some("native_goal_stopped"))
+                .await
+                .unwrap();
+            store
+                .update_mission_history(
+                    mission.id,
+                    &[MissionHistoryEntry {
+                        role: "assistant".into(),
+                        content: "first generation result".into(),
+                    }],
+                )
+                .await
+                .unwrap();
+            let (tx, rx) = tokio::sync::broadcast::channel(8);
+            let mut persist_rx = tx.subscribe();
+            maybe_finalize_terminal_mission(
+                &store,
+                &tx,
+                mission.id,
+                0,
+                Some(TerminalReason::NativeGoalStopped),
+                Some("first evidence"),
+                None,
+                true,
+                Some("first generation result"),
+                "http callback test",
+            )
+            .await;
+            store
+                .log_event(mission.id, &persist_rx.try_recv().unwrap())
+                .await
+                .unwrap();
+            // Queue the actual finalizer event, then acquire a successor BEFORE
+            // starting the forwarder. This deterministically exercises delay.
+            if resume_before_delivery {
+                store
+                    .update_mission_status(mission.id, MissionStatus::Active)
+                    .await
+                    .unwrap();
+                let next = store
+                    .begin_mission_run(mission.id, "test", None)
+                    .await
+                    .unwrap();
+                assert_eq!(next.generation, 2);
+                store
+                    .finish_mission_run(next.run_id, next.generation, Some("RateLimited"))
+                    .await
+                    .unwrap();
+                store
+                    .update_mission_history(
+                        mission.id,
+                        &[MissionHistoryEntry {
+                            role: "assistant".into(),
+                            content: "SECOND generation result".into(),
+                        }],
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .set_terminal_evidence(mission.id, "SECOND evidence")
+                    .await
+                    .unwrap();
+                store
+                    .update_mission_status_with_reason(
+                        mission.id,
+                        MissionStatus::Failed,
+                        Some("rate_limited"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mut markers = super::super::webhook_markers::MarkerStore::load(dir.path());
+            markers.set(
+                mission.id,
+                if resume_before_delivery {
+                    MissionStatus::Failed
+                } else {
+                    MissionStatus::Active
+                },
+            );
+            let (body_tx, mut body_rx) = tokio::sync::mpsc::channel(2);
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let body_tx = body_tx.clone();
+                    async move {
+                        body_tx.send(body).await.unwrap();
+                        axum::http::StatusCode::OK
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let workspaces =
+                Arc::new(workspace::WorkspaceStore::new(dir.path().to_path_buf()).await);
+            let forwarder = tokio::spawn(paloma_webhook_forwarder_loop(
+                rx,
+                store,
+                workspaces,
+                dir.path().to_path_buf(),
+                url,
+                None,
+                reqwest::Client::new(),
+            ));
+            let body = tokio::time::timeout(std::time::Duration::from_secs(5), body_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(body["mission_id"], mission.id.to_string());
+            assert_eq!(body["execution"]["run_id"], first.run_id.to_string());
+            assert_eq!(body["execution"]["generation"], 1);
+            assert_eq!(body["execution"]["state"], "terminal");
+            assert_eq!(body["result_summary"], "first generation result");
+            assert_eq!(body["terminal_reason"], "native_goal_stopped");
+            assert_eq!(body["terminal_evidence"], "first evidence");
+            forwarder.abort();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_callback_identity_persists_in_event_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "callback-event")
+                .await
+                .unwrap();
+        let mission = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let run = store
+            .begin_mission_run(mission.id, "test", None)
+            .await
+            .unwrap();
+        store
+            .finish_mission_run(run.run_id, run.generation, None)
+            .await
+            .unwrap();
+        let event = AgentEvent::MissionStatusChanged {
+            completion: Some(MissionCompletionSnapshot {
+                result_summary: Some("original result".into()),
+                terminal_reason: Some("native_goal_stopped".into()),
+                terminal_evidence: Some("original evidence".into()),
+            }),
+            execution: store.get_latest_mission_run(mission.id).await.unwrap(),
+            mission_id: mission.id,
+            status: MissionStatus::Blocked,
+            summary: None,
+        };
+        store.log_event(mission.id, &event).await.unwrap();
+        drop(store);
+        let reopened =
+            mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "callback-event")
+                .await
+                .unwrap();
+        let events = reopened
+            .get_events(mission.id, None, Some(10), None)
+            .await
+            .unwrap();
+        let restored = events.iter().find_map(stored_event_to_agent_event).unwrap();
+        let AgentEvent::MissionStatusChanged {
+            execution: Some(identity),
+            completion: Some(completion),
+            ..
+        } = restored
+        else {
+            panic!("persisted callback lost execution identity");
+        };
+        assert_eq!(identity.run_id, run.run_id);
+        assert_eq!(identity.generation, 1);
+        assert_eq!(
+            completion.result_summary.as_deref(),
+            Some("original result")
+        );
+        assert_eq!(
+            completion.terminal_reason.as_deref(),
+            Some("native_goal_stopped")
+        );
+        assert_eq!(
+            completion.terminal_evidence.as_deref(),
+            Some("original evidence")
+        );
+        assert!(identity.execution_state.is_terminal());
+        assert_eq!(
+            reopened
+                .get_latest_mission_run(mission.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .run_id,
+            run.run_id
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_callback_identity_survives_lease_release_and_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores: Vec<Arc<dyn MissionStore>> = vec![
+            Arc::new(mission_store::InMemoryMissionStore::new()),
+            Arc::new(
+                mission_store::FileMissionStore::new(dir.path().join("file"), "callback")
+                    .await
+                    .unwrap(),
+            ),
+            Arc::new(
+                mission_store::SqliteMissionStore::new(dir.path().join("sqlite"), "callback")
+                    .await
+                    .unwrap(),
+            ),
+        ];
+        for store in stores {
+            let mission = store
+                .create_mission(None, None, None, None, None, None, None)
+                .await
+                .unwrap();
+            let first = store
+                .begin_mission_run(mission.id, "test", None)
+                .await
+                .unwrap();
+            store
+                .finish_mission_run(first.run_id, first.generation, Some("native_goal_stopped"))
+                .await
+                .unwrap();
+            assert!(store
+                .get_active_mission_run(mission.id)
+                .await
+                .unwrap()
+                .is_none());
+            let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+            maybe_finalize_terminal_mission(
+                &store,
+                &tx,
+                mission.id,
+                0,
+                Some(TerminalReason::NativeGoalStopped),
+                None,
+                None,
+                true,
+                Some("phase one stopped"),
+                "callback test",
+            )
+            .await;
+            let event = rx.try_recv().unwrap();
+            let AgentEvent::MissionStatusChanged {
+                execution: Some(ref captured),
+                ..
+            } = event
+            else {
+                panic!("terminal transition lost execution identity");
+            };
+            assert_eq!(captured.run_id, first.run_id);
+            assert_eq!(captured.generation, 1);
+            assert!(captured.execution_state.is_terminal());
+            let projection = mission_execution_projection(captured, MissionStatus::Blocked);
+            assert_eq!(projection["health"], "healthy");
+            assert!(projection["status_conflict"].is_null());
+            assert!(projection["ended_at"].is_string());
+            let serialized = serde_json::to_value(&event).unwrap();
+            store
+                .update_mission_status(mission.id, MissionStatus::Active)
+                .await
+                .unwrap();
+            let second = store
+                .begin_mission_run(mission.id, "test", None)
+                .await
+                .unwrap();
+            assert_eq!(second.generation, 2);
+            assert_eq!(
+                store
+                    .get_latest_mission_run(mission.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .run_id,
+                second.run_id
+            );
+            // The queued event is an immutable first-generation receipt even
+            // if a same-mission successor has already acquired a live lease.
+            assert_eq!(serialized["execution"]["run_id"], first.run_id.to_string());
+            store
+                .finish_mission_run(second.run_id, second.generation, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_latest_mission_run(mission.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .run_id,
+                second.run_id
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn maybe_finalize_terminal_mission_preserves_interrupted_status() {
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
@@ -34154,6 +35062,172 @@ Investigate <service/> failures.
         ));
         assert!(!is_transport_failure_evidence(
             &completion_evidence_for_agent_result(&auth)
+        ));
+    }
+
+    #[tokio::test]
+    async fn grok_transport_recovery_budget_survives_restart_and_event_pagination() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "grok-retry")
+            .await
+            .unwrap();
+        let mission = store
+            .create_mission(
+                Some("grok retry"),
+                None,
+                None,
+                None,
+                None,
+                Some("grok"),
+                None,
+            )
+            .await
+            .unwrap();
+        // The reservation must be found beyond an arbitrary first page.
+        for _ in 0..110 {
+            store
+                .log_event(
+                    mission.id,
+                    &AgentEvent::UserMessage {
+                        id: Uuid::new_v4(),
+                        content: "checkpoint".to_string(),
+                        queued: false,
+                        mission_id: Some(mission.id),
+                        source: Some("api:test".to_string()),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let mut attempts = HashMap::new();
+        assert!(
+            reserve_transport_auto_resume(&store, &mut attempts, mission.id, true, false).await
+        );
+        assert!(
+            !reserve_transport_auto_resume(&store, &mut attempts, mission.id, true, false).await
+        );
+        drop(store);
+        let reopened =
+            mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "grok-retry")
+                .await
+                .unwrap();
+        let mut restarted_actor = HashMap::new();
+        assert!(
+            !reserve_transport_auto_resume(
+                &reopened,
+                &mut restarted_actor,
+                mission.id,
+                true,
+                false
+            )
+            .await
+        );
+        let reservations = reopened
+            .get_events(mission.id, Some(&["error"]), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            reservations.len(),
+            1,
+            "serial/parallel retries must share one durable reservation"
+        );
+        assert_eq!(reservations[0].content, GROK_TRANSPORT_RECOVERY_RESERVED);
+    }
+
+    #[tokio::test]
+    async fn grok_transport_recovery_gate_fails_closed_without_changing_other_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "grok-retry")
+            .await
+            .unwrap();
+        let mission = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("missions-grok-retry.db")).unwrap();
+        db.execute("DROP TABLE mission_events", []).unwrap();
+        let mut attempts = HashMap::new();
+        assert!(
+            !reserve_transport_auto_resume(&store, &mut attempts, mission.id, true, false).await
+        );
+        let other = Uuid::new_v4();
+        for _ in 0..3 {
+            assert!(
+                reserve_transport_auto_resume(&store, &mut attempts, other, false, false).await
+            );
+        }
+        assert!(!reserve_transport_auto_resume(&store, &mut attempts, other, false, false).await);
+    }
+
+    #[tokio::test]
+    async fn grok_transport_recovery_respects_preexisting_recovery_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "grok-retry")
+            .await
+            .unwrap();
+        let mission = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::UserMessage {
+                    id: Uuid::new_v4(),
+                    content: "prior recovery".to_string(),
+                    queued: false,
+                    mission_id: Some(mission.id),
+                    source: Some("transport_auto_resume".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !reserve_transport_auto_resume(&store, &mut HashMap::new(), mission.id, true, false)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn grok_transport_recovery_cancelled_completion_does_not_consume_or_queue_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mission_store::SqliteMissionStore::new(dir.path().to_path_buf(), "grok-retry")
+            .await
+            .unwrap();
+        let mission = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let mut attempts = HashMap::new();
+        assert!(
+            !reserve_transport_auto_resume(&store, &mut attempts, mission.id, true, true).await
+        );
+        assert!(attempts.is_empty());
+        assert!(store
+            .get_events(mission.id, Some(&["error"]), None, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            reserve_transport_auto_resume(&store, &mut attempts, mission.id, true, false).await
+        );
+    }
+
+    #[test]
+    fn grok_transport_timeout_cannot_be_promoted_to_success() {
+        let mut result = crate::agents::AgentResult::failure("Grok ACP transport-idle timeout after 600s without a protocol event; checkout preserved", 0)
+            .with_terminal_reason(TerminalReason::LlmError)
+            .with_data(serde_json::json!({
+                "failure_class": "transport_error",
+                "transport_failure_stage": "grok_acp_transport_idle",
+                "grok_acp_transport_failure": true,
+            }));
+        maybe_recover_soft_llm_error(&mut result);
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+        assert!(is_grok_acp_transport_failure(&result));
+        assert!(is_transport_failure_evidence(
+            &completion_evidence_for_agent_result(&result)
         ));
     }
 

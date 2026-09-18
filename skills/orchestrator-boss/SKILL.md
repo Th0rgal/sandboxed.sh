@@ -63,6 +63,15 @@ re-prescription of the work.
 12. Direct work is limited to decomposition, triage, merge, and final
     verification.
 
+## Native Codex Goal Size
+
+Keep each native Codex `/goal` objective at most **4000 Unicode characters**.
+This includes writer prompts automatically promoted to persistent goal mode.
+Put detailed evidence and background in referenced artifacts while keeping the
+objective and acceptance criteria explicit. Oversized goals are rejected before
+dispatch and are never truncated; do not retry the same oversized prompt.
+This limit applies to Codex native goals, not every backend's ordinary message.
+
 ## Backend Guide
 
 - `codex` + `gpt-5.6-terra`: default for bounded code changes

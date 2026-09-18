@@ -138,9 +138,10 @@ pub fn owned_body(slug: &str, track: &str, error: &LeaseError) -> serde_json::Va
             "lease_until": lease_until,
             "lease_id": lease_id,
             "message": format!(
-                "track '{track}' of '{slug}' is owned by mission {holder_attempt_id} until {lease_until}; \
-                 attach to it (send_message_to_mission), wait for it to end, or dispatch a read-only \
-                 intent (writer=false)"
+                "track '{track}' of '{slug}' is owned by mission {holder_attempt_id}; \
+                 ownership is released after execution is confirmed stopped, not at the renewal \
+                 deadline {lease_until}. Attach to it (send_message_to_mission), wait for it to end, \
+                 or dispatch a read-only intent (writer=false)"
             ),
         }),
         other => serde_json::json!({ "error": "lease_failed", "message": other.to_string() }),
@@ -165,6 +166,28 @@ pub struct LeaseSweepReport {
 pub async fn sweep(state: &Arc<AppState>) -> Result<LeaseSweepReport, String> {
     let _admission = super::control::DISPATCH_ADMISSION.lock().await;
     let _file_guard = super::control::dispatch_admission::durable_lock(&state.config).await?;
+    sweep_locked(state).await
+}
+
+/// Retry a conflicting acquisition after the same execution-evidence check as
+/// the periodic sweep. Callers must hold the admission mutex and durable file
+/// lock through both attempts, acquired before any PR-writer lock. A concurrent
+/// resume or creator must not slip between terminal cleanup and acquisition.
+/// The acquisition itself stays transactional in projects.db.
+pub(crate) async fn acquire_locked(
+    state: &Arc<AppState>,
+    request: &LeaseRequest,
+) -> Result<TrackLease, LeaseError> {
+    match state.projects.acquire_track_lease(request) {
+        Err(LeaseError::Owned { .. }) => {
+            sweep_locked(state).await.map_err(LeaseError::Store)?;
+            state.projects.acquire_track_lease(request)
+        }
+        result => result,
+    }
+}
+
+async fn sweep_locked(state: &Arc<AppState>) -> Result<LeaseSweepReport, String> {
     super::control::dispatch_admission::recover_sweep(state).await?;
     let ownership = super::control::execution_ownership::snapshot(&state.control).await?;
     let mut report = LeaseSweepReport::default();

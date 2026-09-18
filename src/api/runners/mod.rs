@@ -28,6 +28,59 @@ use crate::api::control::{AgentEvent, ControlStatus, FrontendToolHub};
 use crate::secrets::SecretsStore;
 use crate::workspace::Workspace;
 
+tokio::task_local! {
+    /// Set inside each spawned turn from its already-acquired lease. Backend
+    /// event producers and direct native persistence share this immutable stamp.
+    pub(crate) static SESSION_UPDATE_RUN: Option<super::mission_store::SessionUpdateRun>;
+}
+
+pub(crate) fn session_update_run() -> Option<super::mission_store::SessionUpdateRun> {
+    SESSION_UPDATE_RUN.try_with(Clone::clone).ok().flatten()
+}
+
+/// Commit native identity before completion/rotation can admit another turn.
+/// Broadcast is a notification only; delivery may occur after a successor starts.
+pub(crate) async fn persist_and_publish_native_session(
+    store: Option<&Arc<dyn super::mission_store::MissionStore>>,
+    mission_id: Uuid,
+    backend: &str,
+    session_id: &str,
+    events: &broadcast::Sender<AgentEvent>,
+) -> Result<(), Box<AgentResult>> {
+    let run = session_update_run();
+    let accepted = match store {
+        Some(store) => {
+            store
+                .update_mission_session_id(mission_id, session_id, backend, run.as_ref())
+                .await
+        }
+        None => Err("mission session store is unavailable".to_string()),
+    };
+    match accepted {
+        Ok(true) => {
+            let _ = events.send(AgentEvent::SessionIdUpdate {
+                mission_id,
+                backend: backend.to_string(),
+                session_id: session_id.to_string(),
+                run,
+            });
+            Ok(())
+        }
+        result => {
+            let reason = result
+                .err()
+                .unwrap_or_else(|| "stale or unattributed execution generation".to_string());
+            Err(Box::new(
+                AgentResult::failure(
+                    format!("{backend} native session persistence failed: {reason}"),
+                    0,
+                )
+                .with_terminal_reason(crate::agents::TerminalReason::NativeContinuityRequired),
+            ))
+        }
+    }
+}
+
 /// Everything a harness needs to run one turn.
 ///
 /// The common fields are identical across all harness backends; backend-specific
@@ -35,6 +88,7 @@ use crate::workspace::Workspace;
 /// `convo`, `/goal` passthrough) is the caller's responsibility — by the time
 /// a `TurnContext` exists, `message` is exactly what the harness should see.
 pub(crate) struct TurnContext<'a> {
+    pub mission_store: Option<Arc<dyn super::mission_store::MissionStore>>,
     pub workspace: &'a Workspace,
     pub work_dir: &'a std::path::Path,
     pub message: &'a str,
@@ -58,6 +112,9 @@ pub(crate) struct TurnContext<'a> {
 pub(crate) enum TurnExtras<'a> {
     #[default]
     None,
+    Codex {
+        current_message: &'a str,
+    },
     ClaudeCode {
         secrets: Option<Arc<SecretsStore>>,
         tool_hub: Option<Arc<FrontendToolHub>>,
@@ -124,6 +181,7 @@ impl HarnessRunner for ClaudeCodeRunner {
             }
         };
         Box::pin(claudecode::run_claudecode_turn_with_recovery(
+            ctx.mission_store,
             ctx.workspace,
             ctx.work_dir,
             ctx.message,
@@ -154,6 +212,7 @@ impl HarnessRunner for OpenCodeRunner {
         ctx: TurnContext<'a>,
     ) -> Pin<Box<dyn Future<Output = AgentResult> + Send + 'a>> {
         Box::pin(opencode::run_opencode_turn(
+            ctx.mission_store,
             ctx.workspace,
             ctx.work_dir,
             ctx.message,
@@ -202,6 +261,11 @@ impl HarnessRunner for CodexRunner {
             ctx.cancel,
             ctx.app_working_dir,
             ctx.session_id,
+            match ctx.extras {
+                TurnExtras::Codex { current_message } => current_message,
+                _ => ctx.message,
+            },
+            ctx.is_continuation,
         ))
     }
 }
@@ -214,7 +278,14 @@ impl HarnessRunner for GrokRunner {
         &'a self,
         ctx: TurnContext<'a>,
     ) -> Pin<Box<dyn Future<Output = AgentResult> + Send + 'a>> {
+        let Some(mission_store) = ctx.mission_store else {
+            return Box::pin(async {
+                AgentResult::failure("Grok session persistence store is unavailable", 0)
+                    .with_terminal_reason(crate::agents::TerminalReason::NativeContinuityRequired)
+            });
+        };
         Box::pin(grok::run_grok_turn(
+            mission_store,
             ctx.workspace,
             ctx.work_dir,
             ctx.message,
@@ -310,6 +381,199 @@ pub(crate) fn effective_mid_turn_kind(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn queued_successor_keeps_acknowledged_session_with_delayed_actor_delivery() {
+        use crate::api::mission_store::{
+            FileMissionStore, InMemoryMissionStore, MissionStore, SessionUpdateRun,
+            SqliteMissionStore,
+        };
+        for kind in ["memory", "file", "sqlite"] {
+            for backend in ["opencode", "claudecode"] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut store: Arc<dyn MissionStore> = match kind {
+                    "file" => Arc::new(
+                        FileMissionStore::new(dir.path().into(), "queued")
+                            .await
+                            .unwrap(),
+                    ),
+                    "sqlite" => Arc::new(
+                        SqliteMissionStore::new(dir.path().into(), "queued")
+                            .await
+                            .unwrap(),
+                    ),
+                    _ => Arc::new(InMemoryMissionStore::new()),
+                };
+                let mission = store
+                    .create_mission(
+                        Some("queued identity"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(backend),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let old = store
+                    .begin_mission_run(mission.id, "first", None)
+                    .await
+                    .unwrap();
+                let old_stamp = SessionUpdateRun::from(&old);
+                let (events, mut delayed) = broadcast::channel(8);
+                super::SESSION_UPDATE_RUN
+                    .scope(
+                        Some(old_stamp.clone()),
+                        super::persist_and_publish_native_session(
+                            Some(&store),
+                            mission.id,
+                            backend,
+                            "native-first",
+                            &events,
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                // Acknowledgement includes durable storage, not only an
+                // in-memory projection. Reopen persistent implementations.
+                store = match kind {
+                    "file" => Arc::new(
+                        FileMissionStore::new(dir.path().into(), "queued")
+                            .await
+                            .unwrap(),
+                    ),
+                    "sqlite" => Arc::new(
+                        SqliteMissionStore::new(dir.path().into(), "queued")
+                            .await
+                            .unwrap(),
+                    ),
+                    _ => store,
+                };
+                // Model the actor selecting completion before consuming the
+                // broadcast, then refreshing identity and acquiring a successor.
+                assert!(store
+                    .finish_mission_run(old.run_id, old.generation, Some("turn_complete"))
+                    .await
+                    .unwrap());
+                let refreshed = store.get_mission(mission.id).await.unwrap().unwrap();
+                assert_eq!(
+                    refreshed.session_id.as_deref(),
+                    Some("native-first"),
+                    "{kind}/{backend}"
+                );
+                let successor = store
+                    .begin_mission_run(mission.id, "queued", None)
+                    .await
+                    .unwrap();
+                assert!(successor.generation > old.generation);
+                let AgentEvent::SessionIdUpdate {
+                    mission_id,
+                    session_id,
+                    backend: source,
+                    run,
+                } = delayed.try_recv().unwrap()
+                else {
+                    panic!("expected identity notification")
+                };
+                assert_eq!(run.as_ref(), Some(&old_stamp));
+                // The old notification is stale, but the acknowledged binding
+                // was already available to the successor before acquisition.
+                assert!(!store
+                    .update_mission_session_id(mission_id, &session_id, &source, run.as_ref())
+                    .await
+                    .unwrap());
+                assert_eq!(
+                    store
+                        .get_mission(mission.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .session_id
+                        .as_deref(),
+                    Some("native-first")
+                );
+                let error = super::SESSION_UPDATE_RUN
+                    .scope(
+                        Some(old_stamp),
+                        super::persist_and_publish_native_session(
+                            Some(&store),
+                            mission.id,
+                            backend,
+                            "late-wrong",
+                            &events,
+                        ),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.terminal_reason,
+                    Some(crate::agents::TerminalReason::NativeContinuityRequired)
+                );
+                assert!(matches!(
+                    delayed.try_recv(),
+                    Err(broadcast::error::TryRecvError::Empty)
+                ));
+                assert_eq!(
+                    store
+                        .get_mission(mission.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .session_id
+                        .as_deref(),
+                    Some("native-first")
+                );
+                // Missing durable authority must not emit a successful binding.
+                let error = super::persist_and_publish_native_session(
+                    None,
+                    mission.id,
+                    backend,
+                    "uncommitted",
+                    &events,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    error.terminal_reason,
+                    Some(crate::agents::TerminalReason::NativeContinuityRequired)
+                );
+                assert!(matches!(
+                    delayed.try_recv(),
+                    Err(broadcast::error::TryRecvError::Empty)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_session_stamp_is_captured_per_turn_not_delivery() {
+        use crate::api::mission_store::SessionUpdateRun;
+        let first = SessionUpdateRun {
+            run_id: uuid::Uuid::new_v4(),
+            generation: 1,
+        };
+        let second = SessionUpdateRun {
+            run_id: uuid::Uuid::new_v4(),
+            generation: 2,
+        };
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut tasks = Vec::new();
+        for stamp in [first.clone(), second.clone()] {
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(super::SESSION_UPDATE_RUN.scope(
+                Some(stamp),
+                async move {
+                    barrier.wait().await;
+                    tokio::task::yield_now().await;
+                    super::session_update_run()
+                },
+            )));
+        }
+        assert_eq!(tasks.remove(0).await.unwrap(), Some(first));
+        assert_eq!(tasks.remove(0).await.unwrap(), Some(second));
+        assert_eq!(super::session_update_run(), None);
+    }
+
     use super::*;
 
     #[test]

@@ -780,8 +780,25 @@ async fn get_model(
         );
     }
     let data = collect_proxy_models(&state).await;
-    match data.into_iter().find(|m| m.id == id) {
-        Some(model) => Json(model).into_response(),
+    match data
+        .into_iter()
+        .find(|m| m.id == id || (is_known_kimi_model_id(&id) && m.id == format!("kimi/{id}")))
+    {
+        Some(mut model) => {
+            // OpenCode probes the stripped id (`k3-256k`) after listing
+            // `kimi/k3-256k`. Echo the requested id so the adapter keeps it.
+            if model.id != id {
+                model.id = id;
+            }
+            Json(model).into_response()
+        }
+        None if parse_kimi_bare_model_entry(&id).is_some() => Json(ModelObject {
+            id,
+            object: "model",
+            created: 0,
+            owned_by: "kimi",
+        })
+        .into_response(),
         None => error_response(
             StatusCode::NOT_FOUND,
             format!("The model '{id}' does not exist"),
@@ -1114,44 +1131,20 @@ fn body_has_previous_response_id(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-fn native_request_has_continuation(protocol: NativeProtocol, body: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return false;
-    };
+/// True only when the request depends on upstream server-side state.
+///
+/// `previous_response_id` refers to a response object that lives on one
+/// provider account, so it can only be honored by the exact account that
+/// produced it. Everything else a client can send — `function_call_output`
+/// items, reasoning items in `input`, signed `thinking` blocks, `tool_result`
+/// blocks — is client-side replay: the full transcript travels with the
+/// request, and the ordered chain failover can serve it like a fresh turn.
+/// Gating those on singleton affinity turned every tool turn on a multi-entry
+/// chain (for example `builtin/assistant`) into a hard 409.
+fn native_request_requires_server_state(protocol: NativeProtocol, body: &[u8]) -> bool {
     match protocol {
-        NativeProtocol::Responses => {
-            value
-                .get("previous_response_id")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|id| !id.is_empty())
-                || value
-                    .get("input")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|items| {
-                        items.iter().any(|item| {
-                            item.get("type").and_then(serde_json::Value::as_str)
-                                == Some("function_call_output")
-                        })
-                    })
-        }
-        NativeProtocol::AnthropicMessages => value
-            .get("messages")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|messages| {
-                messages.iter().any(|message| {
-                    message
-                        .get("content")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|blocks| {
-                            blocks.iter().any(|block| {
-                                matches!(
-                                    block.get("type").and_then(serde_json::Value::as_str),
-                                    Some("thinking" | "redacted_thinking" | "tool_result")
-                                )
-                            })
-                        })
-                })
-            }),
+        NativeProtocol::Responses => body_has_previous_response_id(body),
+        NativeProtocol::AnthropicMessages => false,
     }
 }
 
@@ -1218,6 +1211,7 @@ async fn native_protocol_proxy(
             .await;
         (id, configured, resolved)
     } else if let Some(direct) = parse_direct_model_entry(&requested_model)
+        .or(parse_kimi_bare_model_entry(&requested_model))
         .or(parse_custom_direct_model_entry(&state, &requested_model).await)
     {
         let resolved = state
@@ -1250,7 +1244,7 @@ async fn native_protocol_proxy(
         return unavailable_chain_response(&chain_id, cooling);
     }
 
-    if native_request_has_continuation(protocol, &body) {
+    if native_request_requires_server_state(protocol, &body) {
         let candidate_ids = state
             .chain_store
             .configured_account_ids(&chain_entries, &state.ai_providers, &standard_accounts)
@@ -1657,10 +1651,12 @@ pub(crate) async fn chat_completions_inner(
             .await;
         (id, chain_entries, entries)
     } else if let Some(direct) = parse_direct_model_entry(&requested_model)
+        .or(parse_kimi_bare_model_entry(&requested_model))
         .or(parse_custom_direct_model_entry(&state, &requested_model).await)
     {
         // Direct provider/model passthrough (single synthetic entry) — either a
-        // built-in provider prefix or a custom provider's sanitized name.
+        // built-in provider prefix, a bare Kimi catalog id (OpenCode strips
+        // `kimi/`), or a custom provider's sanitized name.
         let chain_entries = vec![direct.clone()];
         let entries = state
             .chain_store
@@ -3354,6 +3350,95 @@ fn should_attempt_kimi_auth_refresh(
     provider_type == ProviderType::Kimi && first_refresh_for_account
 }
 
+/// Placeholder for a Kimi chat message whose `content` would otherwise be
+/// empty. Kimi's coding endpoint 400s with `the message at position N with
+/// role 'assistant' must not be empty` on OpenAI-style tool-call turns that
+/// send `content: ""` / `content: []` next to `tool_calls`. A single period
+/// keeps the role sequence valid without inventing a reply.
+const KIMI_EMPTY_CONTENT_PLACEHOLDER: &str = ".";
+
+/// Bare model ids the `@ai-sdk/openai-compatible` adapter sends after it
+/// strips the `kimi/` provider prefix (`kimi/k3-256k` arrives as `k3-256k`).
+fn parse_kimi_bare_model_entry(model: &str) -> Option<crate::provider_health::ChainEntry> {
+    let model = model.trim();
+    if model.is_empty() || model.contains('/') {
+        return None;
+    }
+    if !is_known_kimi_model_id(model) {
+        return None;
+    }
+    Some(crate::provider_health::ChainEntry {
+        provider_id: "kimi".to_string(),
+        model_id: model.to_string(),
+    })
+}
+
+fn is_known_kimi_model_id(model: &str) -> bool {
+    if crate::api::providers::kimi_fallback_models()
+        .iter()
+        .any(|entry| entry.id == model)
+    {
+        return true;
+    }
+    // Future K3 context-window suffixes (`k3-1m`) and coding aliases.
+    model.starts_with("k3-") || model.starts_with("kimi-for-coding")
+}
+
+fn kimi_content_is_empty(content: &serde_json::Value) -> bool {
+    match content {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(text) => text.trim().is_empty(),
+        serde_json::Value::Array(parts) => parts.iter().all(|part| match part {
+            serde_json::Value::String(text) => text.trim().is_empty(),
+            serde_json::Value::Object(obj) => {
+                let kind = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match kind {
+                    "text" => obj
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty(),
+                    "reasoning" | "thinking" | "redacted_thinking" => true,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }),
+        _ => false,
+    }
+}
+
+fn kimi_message_content_is_empty(message: &serde_json::Value) -> bool {
+    match message.get("content") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(content) => kimi_content_is_empty(content),
+    }
+}
+
+/// Fill empty user/assistant `content` so Kimi does not 400 mid-session.
+/// Leaves non-empty content, tool_calls, and reasoning fields intact.
+fn sanitize_kimi_chat_messages(messages: &mut [serde_json::Value]) {
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if role != "assistant" && role != "user" {
+            continue;
+        }
+        if !kimi_message_content_is_empty(message) {
+            continue;
+        }
+        if let Some(obj) = message.as_object_mut() {
+            obj.insert(
+                "content".to_string(),
+                serde_json::Value::String(KIMI_EMPTY_CONTENT_PLACEHOLDER.to_string()),
+            );
+        }
+    }
+}
+
 /// Rewrite the model id and normalize sampling params for Kimi's coding endpoint.
 ///
 /// `kimi-for-coding` rejects any temperature other than 1 with
@@ -3362,6 +3447,10 @@ fn should_attempt_kimi_auth_refresh(
 /// therefore 400 on every request. Force the only accepted value when the
 /// caller specified a temperature; leave it absent otherwise so Kimi's own
 /// default applies.
+///
+/// Also fill empty assistant/user `content`. OpenCode (and other OpenAI-style
+/// clients) persist tool-only turns as `content: ""`; Kimi rejects those as
+/// empty assistant messages and the mission dies with `llm_error`.
 fn rewrite_model_for_kimi(body: &[u8], new_model: &str) -> Result<bytes::Bytes, String> {
     let mut value: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))?;
@@ -3369,6 +3458,12 @@ fn rewrite_model_for_kimi(body: &[u8], new_model: &str) -> Result<bytes::Bytes, 
     if let Some(obj) = value.as_object_mut() {
         if obj.contains_key("temperature") {
             obj.insert("temperature".to_string(), serde_json::json!(1));
+        }
+        if let Some(messages) = obj
+            .get_mut("messages")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            sanitize_kimi_chat_messages(messages);
         }
     }
     serde_json::to_vec(&value)
@@ -6392,22 +6487,28 @@ mod tests {
     }
 
     #[test]
-    fn native_continuation_detection_covers_stateful_protocol_items() {
-        assert!(native_request_has_continuation(
+    fn only_previous_response_id_requires_server_state_affinity() {
+        assert!(native_request_requires_server_state(
             NativeProtocol::Responses,
             br#"{"model":"x","previous_response_id":"resp_1","input":[]}"#
         ));
-        assert!(native_request_has_continuation(
+        // Tool-result replay carries the whole transcript: stateless.
+        assert!(!native_request_requires_server_state(
             NativeProtocol::Responses,
             br#"{"model":"x","input":[{"type":"function_call_output","call_id":"c","output":"ok"}]}"#
         ));
-        assert!(native_request_has_continuation(
+        assert!(!native_request_requires_server_state(
+            NativeProtocol::Responses,
+            br#"{"model":"x","previous_response_id":"","input":"hello"}"#
+        ));
+        // Messages continuity is client-side block replay, never server state.
+        assert!(!native_request_requires_server_state(
             NativeProtocol::AnthropicMessages,
             br#"{"model":"x","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"ok"}]}]}"#
         ));
-        assert!(!native_request_has_continuation(
-            NativeProtocol::Responses,
-            br#"{"model":"x","input":"hello"}"#
+        assert!(!native_request_requires_server_state(
+            NativeProtocol::AnthropicMessages,
+            br#"{"model":"x","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"s"}]}]}"#
         ));
     }
 
@@ -6764,6 +6865,46 @@ mod tests {
         // Empty halves.
         assert!(parse_direct_model_entry("xai/").is_none());
         assert!(parse_direct_model_entry("/grok-4.5").is_none());
+    }
+
+    #[test]
+    fn parse_kimi_bare_model_entry_accepts_catalog_ids() {
+        let e = parse_kimi_bare_model_entry("k3-256k").expect("k3-256k");
+        assert_eq!(e.provider_id, "kimi");
+        assert_eq!(e.model_id, "k3-256k");
+        assert!(parse_kimi_bare_model_entry("k3").is_some());
+        assert!(parse_kimi_bare_model_entry("kimi-for-coding").is_some());
+        assert!(parse_kimi_bare_model_entry("k3-1m").is_some());
+        assert!(parse_kimi_bare_model_entry("kimi/k3-256k").is_none());
+        assert!(parse_kimi_bare_model_entry("grok-4.5").is_none());
+        assert!(parse_kimi_bare_model_entry("smart").is_none());
+    }
+
+    #[test]
+    fn rewrite_model_for_kimi_fills_empty_assistant_content() {
+        let body = serde_json::json!({
+            "model": "kimi/k3-256k",
+            "temperature": 0,
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": "" },
+                { "role": "assistant", "content": [], "tool_calls": [{"id": "t1", "type": "function"}] },
+                { "role": "assistant", "content": [{"type": "text", "text": "  "}] },
+                { "role": "assistant", "content": "keep me" }
+            ]
+        });
+        let payload =
+            rewrite_model_for_kimi(serde_json::to_vec(&body).unwrap().as_slice(), "k3-256k")
+                .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(payload.as_ref()).unwrap();
+        assert_eq!(value["model"], "k3-256k");
+        assert_eq!(value["temperature"], 1);
+        let messages = value["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["content"], KIMI_EMPTY_CONTENT_PLACEHOLDER);
+        assert_eq!(messages[2]["content"], KIMI_EMPTY_CONTENT_PLACEHOLDER);
+        assert!(messages[2]["tool_calls"].as_array().unwrap().len() == 1);
+        assert_eq!(messages[3]["content"], KIMI_EMPTY_CONTENT_PLACEHOLDER);
+        assert_eq!(messages[4]["content"], "keep me");
     }
 
     #[test]

@@ -110,7 +110,7 @@ fn automatic_retry(
     terminal_reason: Option<TerminalReason>,
     output: &str,
 ) -> AutomaticRetry {
-    if terminal_reason == Some(TerminalReason::NativeGoalStopped) {
+    if terminal_reason.is_some_and(TerminalReason::requires_external_recovery) {
         return AutomaticRetry::Suppressed;
     }
     if task.backend != "chatgpt_ui" {
@@ -129,6 +129,8 @@ fn persisted_terminal_reason(reason: Option<&str>) -> Option<TerminalReason> {
         Some("turn_complete") => Some(TerminalReason::TurnComplete),
         Some("completed") => Some(TerminalReason::Completed),
         Some("native_goal_stopped") => Some(TerminalReason::NativeGoalStopped),
+        Some("codex_continuity_required") => Some(TerminalReason::CodexContinuityRequired),
+        Some("native_continuity_required") => Some(TerminalReason::NativeContinuityRequired),
         Some("cancelled") => Some(TerminalReason::Cancelled),
         Some("server_shutdown") => Some(TerminalReason::ServerShutdown),
         Some("llm_error") => Some(TerminalReason::LlmError),
@@ -461,7 +463,7 @@ pub fn classify_outcome(
 ) -> BoardTaskOutcome {
     // Native non-completion is authoritative, regardless of final prose or
     // an inconsistent success flag. Keep the board resumable and dependents gated.
-    if terminal_reason == Some(TerminalReason::NativeGoalStopped) {
+    if terminal_reason.is_some_and(TerminalReason::requires_external_recovery) {
         return BoardTaskOutcome::Blocked;
     }
     let failed = matches!(
@@ -896,24 +898,26 @@ fn dispatch_board_outbox_item(
             let release_tx = cmd_tx.clone();
             tokio::spawn(async move {
                 match rx.await {
-                    Ok(UserMessageAck::Queued | UserMessageAck::Delivered) => {
-                        match store.acknowledge_board_outbox(&idempotency_key).await {
-                            Ok(()) => {
-                                inflight
-                                    .lock()
-                                    .expect("board outbox lock")
-                                    .remove(&delivery_id);
-                            }
-                            Err(error) => {
-                                tracing::warn!(target = %target_mission_id, %idempotency_key,
-                                    "board: accepted delivery acknowledgement failed: {error}");
-                                inflight
-                                    .lock()
-                                    .expect("board outbox lock")
-                                    .remove(&delivery_id);
-                            }
+                    Ok(
+                        UserMessageAck::Queued
+                        | UserMessageAck::Delivered
+                        | UserMessageAck::Continued { .. },
+                    ) => match store.acknowledge_board_outbox(&idempotency_key).await {
+                        Ok(()) => {
+                            inflight
+                                .lock()
+                                .expect("board outbox lock")
+                                .remove(&delivery_id);
                         }
-                    }
+                        Err(error) => {
+                            tracing::warn!(target = %target_mission_id, %idempotency_key,
+                                    "board: accepted delivery acknowledgement failed: {error}");
+                            inflight
+                                .lock()
+                                .expect("board outbox lock")
+                                .remove(&delivery_id);
+                        }
+                    },
                     Ok(UserMessageAck::Dropped) => {
                         let _ = release_tx
                             .send(ControlCommand::ReleaseUserMessageId { id: delivery_id })
@@ -1496,9 +1500,9 @@ pub async fn scheduler_pass(
                         mission_store,
                         task.clone(),
                         if persisted_terminal_reason(worker.terminal_reason.as_deref())
-                            == Some(TerminalReason::NativeGoalStopped)
+                            .is_some_and(TerminalReason::requires_external_recovery)
                         {
-                            classify_outcome(Some(TerminalReason::NativeGoalStopped), false, &last)
+                            BoardTaskOutcome::Blocked
                         } else {
                             BoardTaskOutcome::Failed
                         },
@@ -1965,6 +1969,7 @@ mod tests {
             "usageLimited",
             "budgetLimited",
             "complete",
+            "continuity_required",
         ] {
             for output in [
                 "Fixed the parser; external validation unavailable.",
@@ -1974,6 +1979,8 @@ mod tests {
                 let complete = native_status == "complete";
                 let reason = if complete {
                     TerminalReason::Completed
+                } else if native_status == "continuity_required" {
+                    TerminalReason::CodexContinuityRequired
                 } else {
                     TerminalReason::NativeGoalStopped
                 };
@@ -2052,6 +2059,8 @@ mod tests {
                         },
                         Some(if complete {
                             "completed"
+                        } else if native_status == "continuity_required" {
+                            "codex_continuity_required"
                         } else {
                             "native_goal_stopped"
                         }),
@@ -2061,9 +2070,11 @@ mod tests {
                 store
                     .set_terminal_evidence(
                         worker.id,
-                        &format!(
-                            "Native Codex goal status={native_status}; objective: repair parser"
-                        ),
+                        &if native_status == "continuity_required" {
+                            "codex_continuity_missing: native identity unavailable".into()
+                        } else {
+                            format!("Native Codex goal status={native_status}; objective: repair parser")
+                        },
                     )
                     .await
                     .unwrap();

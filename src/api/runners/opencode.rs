@@ -79,6 +79,7 @@ pub(crate) fn normalize_opencode_model_id(model: &str) -> Cow<'_, str> {
 /// This uses `opencode run` directly for per-workspace isolation.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_opencode_turn(
+    mission_store: Option<std::sync::Arc<dyn crate::api::mission_store::MissionStore>>,
     workspace: &Workspace,
     work_dir: &std::path::Path,
     message: &str,
@@ -1897,14 +1898,20 @@ pub async fn run_opencode_turn(
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     let session_id = session_id.or_else(|| extract_opencode_session_id(&final_result));
-    // Persist the opencode session id so the next turn can resume the
-    // conversation with `--session <id>`. Mirrors the path used by Grok
-    // (see `AgentEvent::SessionIdUpdate` emission in `run_grok_turn`).
+    // Acknowledge the exact native binding before completion can admit a
+    // queued successor. Broadcast delivery is not a persistence barrier.
     if let Some(sid) = session_id.as_deref() {
-        let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+        if let Err(failure) = super::persist_and_publish_native_session(
+            mission_store.as_ref(),
             mission_id,
-            session_id: sid.to_string(),
-        });
+            "opencode",
+            sid,
+            &events_tx,
+        )
+        .await
+        {
+            return *failure;
+        }
     }
     let stored_message = session_id
         .as_deref()

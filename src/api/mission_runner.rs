@@ -123,7 +123,9 @@ fn failure_class_for_terminal_reason(reason: TerminalReason) -> FailureClass {
         }
         TerminalReason::Cancelled
         | TerminalReason::ServerShutdown
-        | TerminalReason::NativeGoalStopped => FailureClass::AgentError,
+        | TerminalReason::NativeGoalStopped
+        | TerminalReason::CodexContinuityRequired
+        | TerminalReason::NativeContinuityRequired => FailureClass::AgentError,
         TerminalReason::LlmError => FailureClass::ProviderError,
         TerminalReason::TurnComplete | TerminalReason::Completed => FailureClass::Unknown,
     }
@@ -169,6 +171,8 @@ pub(crate) fn turn_outcome_for_result(
             TerminalReason::Cancelled
                 | TerminalReason::ServerShutdown
                 | TerminalReason::NativeGoalStopped
+                | TerminalReason::CodexContinuityRequired
+                | TerminalReason::NativeContinuityRequired
         ) {
             interrupted_turn_outcome(reason)
         } else {
@@ -1936,8 +1940,7 @@ pub(crate) use super::runners::grok::{
 pub(crate) use super::runners::codex::{
     codex_final_message_looks_like_progress_update, codex_is_goal_request,
     codex_missing_goal_final_response_message, codex_turn_requires_tool_activity,
-    extract_codex_reset_window, run_codex_turn, run_codex_turn_with_rotation,
-    summarize_codex_usage_caps,
+    extract_codex_reset_window, run_codex_turn_with_rotation, summarize_codex_usage_caps,
 };
 
 // Gemini runner moved to `super::runners::gemini` (Phase 2). Re-exported so
@@ -2697,6 +2700,7 @@ pub struct MissionRunner {
 
     /// Durable generation lease for the currently executing turn.
     pub durable_run: Option<crate::api::mission_store::MissionRun>,
+    session_store: Option<Arc<dyn crate::api::mission_store::MissionStore>>,
 
     /// Once cancellation is requested, this runner must drain its current
     /// handle and be removed without starting queued or automated follow-ups.
@@ -2756,6 +2760,7 @@ impl MissionRunner {
             active_tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             background_tasks: HashMap::new(),
             durable_run: None,
+            session_store: None,
             cancellation_requested: false,
             cancellation_force_clear_deadline: None,
             force_abort_requested: false,
@@ -2787,6 +2792,7 @@ impl MissionRunner {
                 run.run_id, run.generation
             ));
         }
+        self.session_store = Some(mission_store.clone());
         self.durable_run = Some(run);
         Ok(())
     }
@@ -3111,37 +3117,47 @@ impl MissionRunner {
             source: msg_source,
         });
 
+        let session_store = self.session_store.clone();
+        let session_update_run = self
+            .durable_run
+            .as_ref()
+            .map(crate::api::mission_store::SessionUpdateRun::from);
         let handle = tokio::spawn(async move {
-            let result = run_mission_turn(
-                config,
-                root_agent,
-                mcp,
-                workspaces,
-                library,
-                events_tx,
-                tool_hub,
-                status,
-                cancel,
-                hist_snapshot,
-                user_message.clone(),
-                Some(mission_ctrl),
-                tree_ref,
-                progress_ref,
-                mission_id,
-                Some(workspace_id),
-                backend_id,
-                agent_override,
-                model_override,
-                model_effort,
-                fast_mode,
-                secrets,
-                session_id,
-                config_profile,
-                working_directory,
-                user_id,
-                pr_readonly,
-            )
-            .await;
+            let result = crate::api::runners::SESSION_UPDATE_RUN
+                .scope(
+                    session_update_run,
+                    run_mission_turn(
+                        session_store,
+                        config,
+                        root_agent,
+                        mcp,
+                        workspaces,
+                        library,
+                        events_tx,
+                        tool_hub,
+                        status,
+                        cancel,
+                        hist_snapshot,
+                        user_message.clone(),
+                        Some(mission_ctrl),
+                        tree_ref,
+                        progress_ref,
+                        mission_id,
+                        Some(workspace_id),
+                        backend_id,
+                        agent_override,
+                        model_override,
+                        model_effort,
+                        fast_mode,
+                        secrets,
+                        session_id,
+                        config_profile,
+                        working_directory,
+                        user_id,
+                        pr_readonly,
+                    ),
+                )
+                .await;
             (msg_id, user_message, result)
         });
 
@@ -3494,6 +3510,7 @@ pub(crate) fn claudecode_resume_current_session_message() -> &'static str {
 /// Execute a single turn for a mission.
 #[allow(clippy::too_many_arguments)]
 async fn run_mission_turn(
+    mission_store: Option<Arc<dyn crate::api::mission_store::MissionStore>>,
     config: Config,
     _root_agent: AgentRef,
     mcp: Arc<McpRegistry>,
@@ -3683,6 +3700,24 @@ async fn run_mission_turn(
 
     // Ensure mission workspace exists and is configured for OpenCode.
     let mut workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
+    // Validate the requested source before config synchronization can create
+    // directories. A missing checkout is not a request for a new workspace.
+    let explicit_worktree = match mission_working_directory
+        .as_deref()
+        .map(|requested| {
+            resolve_mission_working_directory(&workspace.path, workspace.workspace_type, requested)
+        })
+        .transpose()
+    {
+        Ok(path) => path,
+        Err(error) => {
+            return AgentResult::failure(
+                format!("explicit working_directory is invalid: {error}"),
+                0,
+            )
+        }
+    };
+
     if let Err(e) =
         workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &workspace).await
     {
@@ -3695,7 +3730,7 @@ async fn run_mission_turn(
     let mission_work_dir_result = {
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
-        workspace::prepare_mission_workspace_with_skills_backend(
+        workspace::prepare_mission_workspace_with_skills_backend_at(
             &mut workspace,
             &mcp,
             lib_ref,
@@ -3706,6 +3741,7 @@ async fn run_mission_turn(
             boss_user_id.as_deref(),
             Some(&config.working_dir),
             !pr_readonly,
+            explicit_worktree.as_deref(),
         )
         .await
     };
@@ -3847,11 +3883,18 @@ async fn run_mission_turn(
             turn_count, summary, user_message
         );
 
-        // Update session ID and notify via events
-        let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+        // Persist before rotating or allowing a queued successor to start.
+        if let Err(failure) = crate::api::runners::persist_and_publish_native_session(
+            mission_store.as_ref(),
             mission_id,
-            session_id: new_session_id.clone(),
-        });
+            "claudecode",
+            &new_session_id,
+            &events_tx,
+        )
+        .await
+        {
+            return *failure;
+        }
 
         session_id = Some(new_session_id.clone());
 
@@ -3932,11 +3975,16 @@ async fn run_mission_turn(
                     history: &history,
                     max_history_total_chars: config.context.max_history_total_chars,
                 }
+            } else if backend_id == "codex" {
+                super::runners::TurnExtras::Codex {
+                    current_message: &user_message,
+                }
             } else {
                 super::runners::TurnExtras::None
             };
             runner
                 .run_turn(super::runners::TurnContext {
+                    mission_store,
                     workspace: &workspace,
                     work_dir: &mission_work_dir,
                     message: &turn_message,
@@ -5522,6 +5570,49 @@ pub(crate) fn ensure_opencode_provider_for_model(
                 "options": options
             }))
         }
+        "kimi" => {
+            // OpenCode's kimi provider otherwise talks to api.kimi.com with
+            // the workspace OAuth token. Empty assistant turns then 400
+            // (`must not be empty`) and the mission dies with llm_error.
+            // Route through the host proxy so rewrite_model_for_kimi can
+            // fill those turns; the adapter still strips `kimi/`, so the
+            // proxy accepts bare catalog ids (`k3-256k`).
+            let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+            let proxy_key = std::env::var("SANDBOXED_PROXY_SECRET")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| {
+                    tracing::error!("SANDBOXED_PROXY_SECRET not set; kimi proxy auth will fail");
+                    String::new()
+                });
+            let mut options = serde_json::json!({
+                "baseURL": format!("http://{}:{}/v1", host_ip, port),
+                "apiKey": proxy_key
+            });
+            if let Some(mid) = mission_id {
+                options["headers"] = serde_json::json!({
+                    crate::api::proxy_liveness::MISSION_ID_HEADER: mid
+                });
+            }
+            let kimi_model = if model_id.starts_with("k3") {
+                serde_json::json!({
+                    "name": model_id,
+                    "capabilities": {
+                        "interleaved": { "field": "reasoning_content" }
+                    }
+                })
+            } else {
+                serde_json::json!({ "name": model_id })
+            };
+            Some(serde_json::json!({
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Kimi",
+                "models": {
+                    model_id: kimi_model
+                },
+                "options": options
+            }))
+        }
         _ => custom_opencode_provider_definition(app_working_dir, provider_id),
     };
 
@@ -5545,9 +5636,10 @@ pub(crate) fn ensure_opencode_provider_for_model(
         None => return,
     };
 
-    if provider_id == "builtin" {
-        // Always overwrite the builtin provider definition — the proxy secret
-        // (options.apiKey) changes on every server restart.
+    if provider_id == "builtin" || provider_id == "kimi" {
+        // Always overwrite proxy-backed providers — the proxy secret
+        // (options.apiKey) changes on every server restart, and Kimi must
+        // not keep a stale api.kimi.com block from workspace config.
         providers_map.insert(provider_id.to_string(), provider_def);
     } else if let Some(existing) = providers_map.get_mut(provider_id) {
         // Provider already exists – make sure the model is listed.
@@ -11248,6 +11340,52 @@ mod tests {
         let data_home2 = temp2.path().join(".local/share");
         fs::create_dir_all(data_home2.join("opencode/storage/message/ses_xyz")).unwrap();
         assert!(opencode_session_exists_in_data_home(&data_home2, "ses_xyz"));
+    }
+
+    #[test]
+    fn ensure_opencode_provider_kimi_routes_through_host_proxy() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp.path().join("ws");
+        let app_dir = temp.path().join("app");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+
+        // Workspace config would have written api.kimi.com; the runner must
+        // overwrite it so empty-assistant sanitization in the proxy applies.
+        fs::write(
+            config_dir.join("opencode.json"),
+            r#"{"provider":{"kimi":{"npm":"@ai-sdk/openai-compatible","name":"Kimi","options":{"baseURL":"https://api.kimi.com/coding/v1","apiKey":"stale"}}}}"#,
+        )
+        .unwrap();
+
+        ensure_opencode_provider_for_model(
+            &config_dir,
+            &app_dir,
+            "kimi/k3-256k",
+            "10.88.0.1",
+            Some("00000000-0000-0000-0000-000000000123"),
+        );
+
+        let opencode_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config_dir.join("opencode.json")).expect("opencode.json"),
+        )
+        .expect("parse opencode.json");
+        let provider = &opencode_json["provider"]["kimi"];
+        let base_url = provider["options"]["baseURL"].as_str().expect("baseURL");
+        assert!(
+            base_url.starts_with("http://10.88.0.1:"),
+            "expected host proxy baseURL, got {base_url}"
+        );
+        assert_ne!(base_url, "https://api.kimi.com/coding/v1");
+        assert_eq!(
+            provider["options"]["headers"][crate::api::proxy_liveness::MISSION_ID_HEADER],
+            "00000000-0000-0000-0000-000000000123"
+        );
+        assert_eq!(provider["models"]["k3-256k"]["name"], "k3-256k");
+        assert_eq!(
+            provider["models"]["k3-256k"]["capabilities"]["interleaved"]["field"],
+            "reasoning_content"
+        );
     }
 
     #[test]

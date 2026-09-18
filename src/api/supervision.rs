@@ -163,6 +163,8 @@ pub(crate) async fn recover_server_shutdown_missions(
                     MissionStatus::Interrupted,
                 );
                 let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                    completion: None,
+                    execution: None,
                     mission_id: mission.id,
                     status: MissionStatus::Interrupted,
                     summary: Some(
@@ -370,6 +372,8 @@ pub(crate) async fn cleanup_stale_active_missions_once(
                         MissionStatus::Completed,
                     );
                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                        completion: None,
+                        execution: None,
                         mission_id: mission.id,
                         status: MissionStatus::Completed,
                         summary: Some(format!(
@@ -425,6 +429,8 @@ pub(crate) async fn ack_promotion_loop(
             Ok(promoted) => {
                 for mission_id in promoted {
                     let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                        completion: None,
+                        execution: None,
                         mission_id,
                         status: MissionStatus::Acknowledged,
                         summary: None,
@@ -700,6 +706,8 @@ pub(crate) async fn stuck_mission_watchdog_loop(
                 continue;
             }
             let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                completion: None,
+                execution: None,
                 mission_id: info.mission_id,
                 status: MissionStatus::Interrupted,
                 summary: Some(format!(
@@ -769,6 +777,8 @@ pub(crate) async fn stuck_mission_watchdog_loop(
                 continue;
             }
             let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                completion: None,
+                execution: None,
                 mission_id: mission.id,
                 status: MissionStatus::Interrupted,
                 summary: Some(

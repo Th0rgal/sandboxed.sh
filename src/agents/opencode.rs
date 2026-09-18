@@ -115,6 +115,7 @@ impl OpenCodeAgent {
                 mission_id: ctx.mission_id,
                 resumable: ctx.mission_id.is_some(), // Can resume if within a mission
             },
+            OpenCodeEvent::CodexSessionBound { .. } => return,
             OpenCodeEvent::MessageComplete { .. } => return, // Don't forward completion marker
             OpenCodeEvent::Cancelled => return,              // Runner handles cancellation state
             OpenCodeEvent::TurnSummary { .. } => return,     // Summary is handled elsewhere

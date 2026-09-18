@@ -54,6 +54,8 @@ pub enum ExecutionEvent {
     Cancelled,
     /// Message execution completed.
     MessageComplete { session_id: String },
+    /// Native Codex identity, emitted only after the backend binding is durable.
+    CodexSessionBound { thread_id: String, goal_mode: bool },
     /// Error occurred.
     Error { message: String },
 }

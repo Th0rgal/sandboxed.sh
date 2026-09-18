@@ -239,6 +239,8 @@ struct LinkMissionToProjectParams {
     slug: String,
     #[serde(default)]
     track: Option<String>,
+    #[serde(default)]
+    writer: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -629,6 +631,11 @@ struct WorkspaceBashParams {
     cwd: Option<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    /// Supplying both ownership fields selects restart-safe execution.
+    #[serde(default)]
+    mission_id: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -681,25 +688,6 @@ fn workspace_job_command(
         (Some(_), Some(_)) => Err("Pass exactly one of command or argv, not both".to_string()),
         _ => Err("Pass a non-empty command or argv".to_string()),
     }
-}
-
-fn is_heavy_workspace_command(command: &str) -> bool {
-    let normalized = command
-        .split_whitespace()
-        .map(|part| part.to_ascii_lowercase())
-        .collect::<Vec<_>>()
-        .join(" ");
-    [
-        "lake build",
-        "lake test",
-        "cargo build --release",
-        "cargo test --all",
-        "npm run build",
-        "bun run build",
-        "next build",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
 }
 
 fn compact_workspace_job(job: Value) -> Value {
@@ -887,6 +875,65 @@ struct MissionDiagnosticsParams {
     mission_id: String,
     #[serde(default = "default_diagnostics_limit")]
     limit: usize,
+}
+
+/// Readable projection only: the persisted trace remains the raw receipt.
+fn diagnostic_result_snippet(content: &str) -> String {
+    fn collect(value: &Value, parts: &mut Vec<String>, depth: usize) {
+        if depth > 12 {
+            return;
+        }
+        match value {
+            Value::String(text) => {
+                if !text.trim().is_empty() && !parts.contains(text) {
+                    parts.push(text.clone());
+                }
+            }
+            Value::Array(values) => {
+                // Node Buffer/byte output must not become hundreds of integer tokens.
+                if !values.is_empty()
+                    && values
+                        .iter()
+                        .all(|value| value.as_u64().is_some_and(|byte| byte <= 255))
+                {
+                    let bytes: Vec<u8> = values
+                        .iter()
+                        .map(|value| value.as_u64().unwrap() as u8)
+                        .collect();
+                    if let Ok(text) = String::from_utf8(bytes) {
+                        collect(&Value::String(text), parts, depth + 1);
+                    }
+                } else {
+                    for value in values {
+                        collect(value, parts, depth + 1);
+                    }
+                }
+            }
+            Value::Object(fields) => {
+                for key in ["text", "content", "stdout", "stderr", "output", "rawOutput"] {
+                    if let Some(value) = fields.get(key) {
+                        collect(value, parts, depth + 1);
+                    }
+                }
+                if fields.get("type").and_then(Value::as_str) == Some("Buffer") {
+                    if let Some(value) = fields.get("data") {
+                        collect(value, parts, depth + 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut parts = Vec::new();
+    if let Ok(value) = serde_json::from_str::<Value>(content) {
+        collect(&value, &mut parts, 0);
+    }
+    let text = if parts.is_empty() {
+        content.to_string()
+    } else {
+        parts.join("\n")
+    };
+    truncate_snippet(&text, 800)
 }
 
 fn default_diagnostics_limit() -> usize {
@@ -1583,13 +1630,13 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "start_mission".to_string(),
-                description: "Start a new attempt on a work item. Pass project+track (the durable item) together with a stable idempotency_key; the server atomically declares/revises the track, reserves its owner lease, links the mission, and supersedes the previous owner. Retrying the same logical dispatch MUST reuse the key. Missions are attempts, not the work itself — use get_project_tasks for the declared roadmap and its separate unplanned_attempts. Set backend explicitly when possible. For Codex GPT-5.6/5.5/5.4, set fast_mode=true to request the native fast service tier; this consumes ChatGPT credits faster. Use backend=chatgpt_ui with model_override=gpt-5.6-pro only for exceptionally difficult read-only synthesis, research, or design-conflict questions; keep writer=false, then retrieve any generated files with list_mission_shared_files and download_shared_file. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title). Reviewers and certifiers must use writer=false: the server tags them pr-readonly and blocks git/gh mutations. Any PR-changing mission must use writer=true; the API rejects concurrent writers for the same PR and automatically runs writers in persistent /goal mode so a normal one-turn model stop cannot masquerade as completion.".to_string(),
+                description: "Start a new attempt on a work item. Pass project+track (the durable item) together with a stable idempotency_key; the server atomically declares/revises the track, reserves its owner lease, links the mission, and supersedes the previous owner. Retrying the same logical dispatch MUST reuse the key. Missions are attempts, not the work itself — use get_project_tasks for the declared roadmap and its separate unplanned_attempts. Set backend explicitly when possible. For Codex GPT-5.6/5.5/5.4, set fast_mode=true to request the native fast service tier; this consumes ChatGPT credits faster. Use backend=chatgpt_ui with model_override=gpt-5.6-pro only for exceptionally difficult read-only synthesis, research, or design-conflict questions; keep writer=false, then retrieve any generated files with list_mission_shared_files and download_shared_file. For compatibility, a native agent name (codex/claudecode/gemini/grok) selects the matching backend when backend is omitted; ordinary library agent names do not. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title). Reviewers and certifiers must use writer=false: the server tags them pr-readonly and blocks git/gh mutations. Any PR-changing mission must use writer=true; the API rejects concurrent writers for the same PR and automatically runs writers in persistent /goal mode so a normal one-turn model stop cannot masquerade as completion. Codex native /goal objectives are limited to 4000 Unicode characters, including automatically promoted writer prompts; provide a bounded objective and put supporting detail in referenced artifacts. Oversized objectives are rejected before dispatch and are never truncated.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["title", "prompt"],
                     "properties": {
                         "title": {"type": "string"},
-                        "prompt": {"type": "string"},
+                        "prompt": {"type": "string", "description": "Codex native /goal objective: maximum 4000 Unicode characters, including automatic writer promotion. Put supporting detail in referenced artifacts; never rely on truncation."},
                         "workspace_id": {"type": "string"},
                         "backend": {"type": "string", "enum": ["opencode", "claudecode", "codex", "gemini", "grok", "chatgpt_ui"]},
                         "model_override": {"type": "string", "description": "Exact account-supported model ID. For ChatGPT UI Pro use the canonical ID gpt-5.6-pro; the harness verifies the visible Pro picker option. For Codex Terra use gpt-5.6-terra with medium effort. Never invent variants such as gpt-5.5-sol."},
@@ -1935,14 +1982,15 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "link_mission_to_project".to_string(),
-                description: "Tag a mission as belonging to your project (and optionally a track), so it appears in the project's inventory. Use this for missions you dispatch that must be grouped under the project — a worker with no project tag is invisible in the roster.".to_string(),
+                description: "Tag a mission as belonging to your project (and optionally a track), so it appears in the project's inventory. Optional writer=false persists read-only capability, including when no PR is attached; writer=true requests writer capability through the existing ownership checks. Capability or assignment changes require stopped, drained work; Pending work must be cancelled first and resumed on the same mission after the update.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id", "slug"],
                     "properties": {
                         "mission_id": {"type": "string", "description": "Mission UUID or an unambiguous leading fragment."},
                         "slug": {"type": "string"},
-                        "track": {"type": "string"}
+                        "track": {"type": "string"},
+                        "writer": {"type": "boolean", "description": "Explicit capability update. False persists read-only; true requests writer ownership. Omit to preserve existing behavior."}
                     }
                 }),
             },
@@ -2085,7 +2133,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "workspace_bash".to_string(),
-                description: "Run a short diagnostic command inside a sandboxed.sh workspace. Defaults to 60 seconds and never exceeds 120 seconds. Heavy commands such as `lake build` are rejected; use start_workspace_job for long work.".to_string(),
+                description: "Run a command inside a sandboxed.sh workspace. For builds or any work that must survive this call, supply both mission_id and idempotency_key: returns a durable job id immediately, with no polling. Without those fields, runs a bounded diagnostic (default 60 seconds, maximum 120) and kills it at timeout. Command text is never used to guess execution mode.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["command"],
@@ -2093,7 +2141,9 @@ impl AssistantMcp {
                         "command": {"type": "string", "description": "Shell command to run in the workspace."},
                         "workspace_id": {"type": "string", "description": "Workspace UUID. Defaults to the assistant's default workspace."},
                         "cwd": {"type": "string", "description": "Working directory relative to the workspace root."},
-                        "timeout_secs": {"type": "integer", "description": "Timeout in seconds, default 60, max 120."}
+                        "timeout_secs": {"type": "integer", "description": "Runtime limit: diagnostic default 60/max 120; durable default 7200/max 86400."},
+                        "mission_id": {"type": "string", "description": "Owning mission UUID; supply together with idempotency_key for durable execution."},
+                        "idempotency_key": {"type": "string", "description": "Stable retry key for durable execution; requires mission_id. Reuse after a lost response."}
                     }
                 }),
             },
@@ -2147,7 +2197,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "get_mission_diagnostics".to_string(),
-                description: "Deep-dive a mission: a compact timeline of the most recent tool calls (with result snippets), per-tool call counts, repeated/looping calls, and full error events. Use when get_mission_health flags a problem and you need to see exactly what the model is doing.".to_string(),
+                description: "Deep-dive a mission: recent tool calls, deduplicated result snippets, per-tool counts, repeated calls, and bounded error summaries. Use get_mission_events for raw receipts. Use when get_mission_health flags a problem and you need to see exactly what the model is doing.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -2169,14 +2219,14 @@ impl AssistantMcp {
                         "model_override": {"type": "string", "description": "Model id. Empty string clears it. When backend changes this is reset unless set explicitly."},
                         "model_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                         "fast_mode": {"type": "boolean", "description": "Enable or disable Codex fast mode for future turns. Only backend=codex with GPT-5.6/5.5/5.4."},
-                        "agent": {"type": "string", "description": "Agent name. Empty string clears it."},
+                        "agent": {"type": "string", "description": "Agent name. Omission preserves it on the same backend and clears it on a backend switch. Empty string clears it."},
                         "config_profile": {"type": "string"}
                     }
                 }),
             },
             ToolDefinition {
                 name: "resume_mission".to_string(),
-                description: "Restart a mission that ended without finishing — interrupted, blocked or failed — by reconstructing context from history and the work directory, then running the next turn. This is the recovery path, not the only way to wake a mission: for a mission parked in awaiting_user or acknowledged, send_message_to_mission wakes it on the same id and is the normal choice. Pass `content` to steer the resume with a concrete hint (e.g. 'you still have budget — keep going until the build passes; do not stop to ask'). Without `content`, persisted Codex goal missions re-arm the full stored /goal objective; other missions receive the default continue-where-you-left-off prompt. Native blocked/paused/usageLimited/budgetLimited stops park as blocked with terminal_reason=native_goal_stopped after the final response drains; they never mean goal completion. Resolve the reported stop before resuming. Queued steering is delivered once in order, and explicit content remains the caller's exact next-turn input. For existing work with excluded/collaborating PR references, read get_mission and pass continue_identity with the exact stored project, track and github_pr (null if unset). For different work use explicit github_pr/track identity updates instead; ownership checks still apply.".to_string(),
+                description: "Resume an interrupted, blocked or failed mission. Bound Codex missions reattach to the same native thread, cwd, HOME and account; existing native goals preserve their objective, token budget and accumulated usage. Grok resumes its recorded native session; a first handoff creates a Grok session while preserving other harness identities. For a mission parked in awaiting_user or acknowledged, send_message_to_mission wakes it on the same id and is the normal choice. Pass `content` as the exact current steering input; on a bound native goal it steers that goal's turn. A new Codex /goal objective must be at most 4000 Unicode characters; oversized objectives are rejected without truncation. Without `content`, persisted Codex goal missions resume the full stored /goal objective; other missions receive the default continue-where-you-left-off prompt. Native blocked/paused/usageLimited/budgetLimited stops park as blocked with terminal_reason=native_goal_stopped after the final response drains; they never mean goal completion. Resolve the reported stop before resuming. codex_continuity_required or native_continuity_required means native identity/history or a tool outcome requires reconciliation: do not repeat identical resumes, change accounts, or assume a fresh thread or reset budget. Queued steering retains its durable order; unconfirmed native delivery is reported explicitly. For existing work with excluded/collaborating PR references, read get_mission and pass continue_identity with the exact stored project, track and github_pr (null if unset). For different work use explicit github_pr/track identity updates instead; ownership checks still apply.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -2428,6 +2478,9 @@ impl AssistantMcp {
             .or_else(|| native_backend_from_agent(params.agent.as_deref()));
         let writer = params.writer.unwrap_or(false);
         let prompt = writer_goal_prompt(params.prompt, writer);
+        if backend.as_deref() == Some("codex") {
+            sandboxed_sh::backend::codex::validate_goal_message(&prompt)?;
+        }
         let tags = mission_start_tags(
             params.tags,
             params.request_merge_authority.unwrap_or(false),
@@ -2508,12 +2561,26 @@ impl AssistantMcp {
         if params.command.trim().is_empty() {
             return Err("Command is empty".to_string());
         }
-        if is_heavy_workspace_command(&params.command) {
-            return Err(serde_json::to_string(&json!({
-                "error": "heavy_command_requires_durable_job",
-                "message": "This command can outlive a synchronous Hermes MCP call. Use start_workspace_job and poll get_workspace_job.",
-                "tool": "start_workspace_job"
-            })).unwrap_or_else(|_| "heavy command requires start_workspace_job".to_string()));
+        match (params.mission_id, params.idempotency_key) {
+            (Some(mission_id), Some(idempotency_key)) => {
+                if mission_id.trim().is_empty() || idempotency_key.trim().is_empty() {
+                    return Err("mission_id and idempotency_key must both be non-empty".into());
+                }
+                // Reuse the durable admission API: never submit synchronously first
+                // and then retry in the background, which could execute twice.
+                return self.start_workspace_job(StartWorkspaceJobParams {
+                    command: Some(params.command),
+                    argv: None,
+                    workspace_id: params.workspace_id,
+                    mission_id,
+                    cwd: params.cwd,
+                    timeout_secs: params.timeout_secs,
+                    resource_class: None,
+                    idempotency_key,
+                }).await;
+            }
+            (None, None) => {}
+            _ => return Err("Supply both mission_id and idempotency_key for durable execution, or omit both for a bounded diagnostic".into()),
         }
         let workspace_id = resolve_default_workspace_id(params.workspace_id).ok_or_else(|| {
             "No workspace_id given and no default workspace configured \
@@ -2548,6 +2615,7 @@ impl AssistantMcp {
         })?;
         let workspace_id = parse_uuid(&workspace_id)?;
         let mission_id = self.resolve_mission_id(&params.mission_id).await?;
+        self.assert_mission_scope(mission_id).await?;
         let command = workspace_job_command(params.command, params.argv)?;
         let key = params.idempotency_key.trim();
         if key.is_empty() {
@@ -3173,6 +3241,9 @@ impl AssistantMcp {
         {
             body.insert("track".to_string(), json!(track));
         }
+        if let Some(writer) = params.writer {
+            body.insert("writer".to_string(), json!(writer));
+        }
         let response = self
             .api_post(
                 &format!("/api/control/missions/{id}/project"),
@@ -3440,14 +3511,35 @@ impl AssistantMcp {
                  Only interrupted, blocked, or failed missions can be resumed."
             ));
         }
-        let mission: Value = response
+        let _accepted_mission: Value = response
             .json()
             .await
             .map_err(|error| format!("Failed to parse resumed mission: {error}"))?;
+        // Mutation success and state readback failure are different outcomes:
+        // do not invite a duplicate resume if only this GET failed, and do not
+        // substitute the old interrupted snapshot for an unknown current state.
+        let (mission, state_warning) = match self
+            .get_mission_digest(MissionIdParams {
+                mission_id: id.to_string(),
+            })
+            .await
+        {
+            Ok(digest) => (compact_digest_mission_summary(digest), None),
+            Err(error) => (
+                Value::Null,
+                Some(format!(
+                    "Resume request accepted, but current mission state could not be read: {error}. \
+                     Check get_mission_health; do not repeat the resume solely for this readback failure."
+                )),
+            ),
+        };
         let response_body = json!({
-            "mission": compact_mission_summary(mission),
+            "mission_id": id,
+            "resume_accepted": true,
+            "mission": mission,
             "steered": has_hint,
             "steer_warning": Value::Null,
+            "state_warning": state_warning,
         });
         Ok(response_body)
     }
@@ -3594,6 +3686,7 @@ impl AssistantMcp {
         let mut repeat_counts: std::collections::BTreeMap<(String, String), usize> =
             std::collections::BTreeMap::new();
         let mut errors = Vec::new();
+        let mut results = Vec::new();
 
         for event in events {
             let event_type = event
@@ -3616,6 +3709,14 @@ impl AssistantMcp {
                         "sequence": event.get("sequence").cloned().unwrap_or(Value::Null),
                         "tool": tool,
                         "args": truncate_snippet(args, 200),
+                    }));
+                }
+                "tool_result" => {
+                    let content = event.get("content").and_then(Value::as_str).unwrap_or("");
+                    results.push(json!({
+                        "sequence": event.get("sequence"),
+                        "tool_call_id": event.get("tool_call_id"),
+                        "snippet": diagnostic_result_snippet(content),
                     }));
                 }
                 "error" => {
@@ -3649,6 +3750,7 @@ impl AssistantMcp {
             "mission_id": id.to_string(),
             "events_scanned": events.len(),
             "tool_timeline": timeline_tail,
+            "tool_results": results.into_iter().rev().take(30).collect::<Vec<_>>(),
             "tool_counts": tool_counts,
             "repeated_calls": repeated,
             "errors": errors,
@@ -4026,6 +4128,43 @@ fn compact_mission_summary(mission: Value) -> Value {
     })
 }
 
+/// The digest nests project tags; retain the mutation tools' flat summary
+/// shape while projecting only fields present in the fresh readback.
+fn compact_digest_mission_summary(digest: Value) -> Value {
+    let mut mission = digest.get("mission").cloned().unwrap_or(digest);
+    if let Some(project) = mission
+        .get("project")
+        .filter(|value| value.is_object())
+        .cloned()
+    {
+        for key in [
+            "project",
+            "track",
+            "intent",
+            "tags",
+            "github_pr",
+            "desired_state",
+            "next_check_at",
+        ] {
+            mission[key] = project.get(key).cloned().unwrap_or_else(|| {
+                // MissionProject omits empty tags during serialization. Keep
+                // the existing array contract for an untagged mission.
+                if key == "tags" {
+                    json!([])
+                } else {
+                    Value::Null
+                }
+            });
+        }
+    }
+    // Today's digest does not expose fast_mode. Missing means unknown, not
+    // the false default used when projecting a full Mission response.
+    let fast_mode = mission.get("fast_mode").cloned().unwrap_or(Value::Null);
+    let mut summary = compact_mission_summary(mission);
+    summary["fast_mode"] = fast_mode;
+    summary
+}
+
 /// Verity's HTTP `get_project` is ~120 unabsorbed tracks / ~64KB. Dumping that
 /// on every controller tick is what exhausted the bound Hermes session
 /// (159,959 tokens, "Cannot compress further"). The dashboard still reads the
@@ -4280,9 +4419,15 @@ fn truncate_snippet(text: &str, max: usize) -> String {
 /// stream.
 fn error_signals_in(text: &str) -> Vec<&'static str> {
     let lower = text.to_ascii_lowercase();
+    // Match complete tokens: mission IDs and hashes often contain HTTP digits.
+    let has_code = |code: &str| {
+        lower
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+            .any(|token| token == code)
+    };
     let mut signals = Vec::new();
-    if lower.contains("429")
-        || lower.contains("529")
+    if has_code("429")
+        || has_code("529")
         || lower.contains("rate limit")
         || lower.contains("rate-limit")
         || lower.contains("rate_limit")
@@ -4298,13 +4443,17 @@ fn error_signals_in(text: &str) -> Vec<&'static str> {
         || lower.contains("hit your usage limit")
         || lower.contains("out of extra usage")
         || lower.contains("out of regular usage")
+        || lower.contains("weekly quota exhausted")
+        || lower.contains("weekly quota exceeded")
+        || lower.contains("weekly limit reached")
+        || lower.contains("weekly usage limit reached")
         || lower.contains("purchase more credits")
         || lower.contains("settings/usage")
     {
         signals.push("rate_limited");
     }
-    if lower.contains(" 401")
-        || lower.contains(" 403")
+    if has_code("401")
+        || has_code("403")
         || lower.contains("unauthorized")
         || lower.contains("forbidden")
         || lower.contains("invalid api key")
@@ -4317,7 +4466,7 @@ fn error_signals_in(text: &str) -> Vec<&'static str> {
         signals.push("auth_error");
     }
     if lower.contains("capacity")
-        || lower.contains("503")
+        || has_code("503")
         || lower.contains("service unavailable")
         || lower.contains("no capacity")
         || lower.contains("already have five missions running")
@@ -4341,10 +4490,9 @@ fn error_signals_in(text: &str) -> Vec<&'static str> {
     // (e.g. OpenCode "idle timeout: the model stopped producing output") are
     // harness-level problems, not routing/edge issues. Only tag network_error
     // for clear transport indicators.
-    let has_edge_code = lower.contains("502")
-        || lower.contains("520")
-        || lower.contains("521")
-        || lower.contains("522");
+    let has_edge_code = ["502", "520", "521", "522"]
+        .iter()
+        .any(|code| has_code(code));
     let is_transport_timeout = lower.contains("connection timed out")
         || lower.contains("request timed out")
         || lower.contains("read timeout")
@@ -4469,6 +4617,20 @@ fn build_recommendation(
     analysis: &TraceAnalysis,
 ) -> String {
     let live_state = live.get("state").and_then(Value::as_str);
+    if status == "pending"
+        && live_state != Some("running")
+        && analysis.recent_errors.iter().any(|error| {
+            error
+                .get("snippet")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("queued_assignment_unowned:"))
+        })
+    {
+        return "Queued mission could not acquire its admitted track assignment. Inspect the \
+                recorded reader/writer capability and track lease before retrying; the \
+                queued_assignment_unowned error does not by itself prove the lease was released."
+            .to_string();
+    }
     if backend == Some("chatgpt_ui") && live_state == Some("running") {
         return "ChatGPT UI Pro is still generating. The web UI may expose only a generic \
                 `Pro thinking` marker until the final answer begins, so event silence is not \
@@ -4764,6 +4926,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_message_preserves_authoritative_idle_continuation_receipt() {
+        let mission_id = Uuid::new_v4().to_string();
+        let reply = json!({
+            "id": Uuid::new_v4(), "mission_id": mission_id,
+            "queued": true, "message_accepted": true,
+            "previous_execution": {"run_id": Uuid::new_v4(), "generation": 7}
+        });
+        let (mcp, state, server) = mock_assistant(reply.clone(), false).await;
+        let result = mcp
+            .send_message(
+                parse_params(json!({
+                    "mission_id": mission_id, "content": "Continue the same work"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, reply);
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "/api/control/message");
+        assert_eq!(requests[0].1["mission_id"], mission_id);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn link_project_transports_explicit_reader_and_preserves_omission() {
+        let id = Uuid::new_v4().to_string();
+        let (mcp, state, server) = mock_assistant(json!({"id": id}), false).await;
+        let tool = AssistantMcp::tools()
+            .into_iter()
+            .find(|tool| tool.name == "link_mission_to_project")
+            .unwrap();
+        assert_eq!(tool.input_schema["properties"]["writer"]["type"], "boolean");
+        for writer in [None, Some(false), Some(true)] {
+            let mut input = json!({"mission_id":id,"slug":"lido","track":"review"});
+            if let Some(writer) = writer {
+                input["writer"] = json!(writer);
+            }
+            let params = parse_params::<LinkMissionToProjectParams>(input).unwrap();
+            mcp.link_mission_to_project(params).await.unwrap();
+            let requests = state.requests.lock().unwrap();
+            let (path, body) = requests.last().unwrap();
+            assert_eq!(path, &format!("/api/control/missions/{id}/project"));
+            assert_eq!(body["project"], "lido");
+            assert_eq!(body["track"], "review");
+            assert_eq!(
+                body.get("writer"),
+                writer.map(|value| json!(value)).as_ref()
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn continuation_and_retag_identity_use_one_atomic_resume_request() {
         let id = Uuid::new_v4().to_string();
         let (mcp, state, task) = mock_assistant(json!({"id": id}), false).await;
@@ -4871,6 +5088,35 @@ mod tests {
             "missing data must not claim goal mode is disabled"
         );
         assert!(legacy["goal_objective"].is_null());
+    }
+
+    #[tokio::test]
+    async fn promoted_codex_goal_is_rejected_before_any_dispatch_request() {
+        let (assistant, state, task) = mock_assistant(json!({}), false).await;
+        let params = parse_params(json!({
+            "title": "oversized native goal", "backend": "codex",
+            "writer": true, "prompt": "🦀".repeat(4001),
+        }))
+        .unwrap();
+        let error = assistant.start_mission(params).await.unwrap_err();
+        task.abort();
+        assert!(error.contains("4000"), "{error}");
+        assert!(state.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn diagnostic_projection_deduplicates_text_bytes_and_raw_output() {
+        let receipt = json!({
+            "content": [{"type": "content", "content": {"type": "text", "text": "done\n"}}],
+            "rawOutput": {"stdout": {"type": "Buffer", "data": [100,111,110,101,10]}, "stderr": "warning"}
+        }).to_string();
+        assert_eq!(diagnostic_result_snippet(&receipt), "done\n\nwarning");
+        assert!(receipt.contains("rawOutput"));
+        assert_eq!(diagnostic_result_snippet("plain result"), "plain result");
+        assert_eq!(
+            diagnostic_result_snippet(r#"{"exitCode":2}"#),
+            r#"{"exitCode":2}"#
+        );
     }
 
     #[test]
@@ -5069,6 +5315,196 @@ mod tests {
                 .expect("resolve"),
             id
         );
+    }
+
+    async fn exercise_resume_readback(
+        with_hint: bool,
+        with_tags: bool,
+        resume_status: axum::http::StatusCode,
+        readback_status: axum::http::StatusCode,
+        fast_mode: Option<bool>,
+    ) -> (Result<Value, String>, Vec<String>) {
+        use axum::{
+            extract::State,
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Fixture {
+            id: Uuid,
+            with_hint: bool,
+            with_tags: bool,
+            resume_status: axum::http::StatusCode,
+            readback_status: axum::http::StatusCode,
+            fast_mode: Option<bool>,
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+        async fn resume(
+            State(state): State<Fixture>,
+            Json(body): Json<Value>,
+        ) -> (axum::http::StatusCode, Json<Value>) {
+            assert_eq!(body["skip_message"], false);
+            if state.with_hint {
+                assert_eq!(body["content"], "Continue the existing proof");
+            } else {
+                assert!(body["content"].is_null());
+            }
+            state.calls.lock().unwrap().push("resume".into());
+            (
+                state.resume_status,
+                Json(json!({"id": state.id, "status": "interrupted", "updated_at": "before"})),
+            )
+        }
+        async fn readback(State(state): State<Fixture>) -> (axum::http::StatusCode, Json<Value>) {
+            state.calls.lock().unwrap().push("readback".into());
+            let status = if state.resume_status.is_success() {
+                "active"
+            } else {
+                "interrupted"
+            };
+            let mut digest = json!({
+                "id": state.id, "status": status, "updated_at": "after",
+                "backend": "grok", "model_override": "verified-model",
+                "project": {"project": "example", "track": "existing", "intent": "implementation", "tags": ["example"],
+                    "github_pr": "https://github.com/example/repo/pull/1",
+                    "desired_state": "running", "next_check_at": "later"}
+            });
+            if !state.with_tags {
+                digest["project"].as_object_mut().unwrap().remove("tags");
+            }
+            if let Some(fast_mode) = state.fast_mode {
+                digest["fast_mode"] = json!(fast_mode);
+            }
+            (state.readback_status, Json(digest))
+        }
+        let fixture = Fixture {
+            id: Uuid::new_v4(),
+            with_hint,
+            with_tags,
+            resume_status,
+            readback_status,
+            fast_mode,
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let router = Router::new()
+            .route("/api/control/missions/:id/resume", post(resume))
+            .route("/api/control/missions/:id/digest", get(readback))
+            .with_state(fixture.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mcp = AssistantMcp {
+            api_url,
+            api_token: None,
+            jwt_secret: None,
+            project_scope: None,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        };
+        let result = mcp
+            .resume_mission(ResumeMissionParams {
+                mission_id: fixture.id.to_string(),
+                identity: Default::default(),
+                clean_workspace: false,
+                content: with_hint.then(|| "Continue the existing proof".to_string()),
+            })
+            .await;
+        server.abort();
+        let calls = fixture.calls.lock().unwrap().clone();
+        (result, calls)
+    }
+
+    #[tokio::test]
+    async fn resume_reads_state_after_atomic_resume_with_hint() {
+        use axum::http::StatusCode;
+        let (result, calls) =
+            exercise_resume_readback(true, true, StatusCode::OK, StatusCode::OK, None).await;
+        let result = result.expect("accepted resume");
+        assert_eq!(calls, ["resume", "readback"]);
+        assert_eq!(result["mission"]["status"], "active");
+        assert_eq!(result["mission"]["updated_at"], "after");
+        assert_eq!(result["mission"]["project"], "example");
+        assert_eq!(result["mission"]["track"], "existing");
+        assert_eq!(
+            result["mission"]["github_pr"],
+            "https://github.com/example/repo/pull/1"
+        );
+        assert_eq!(result["mission"]["desired_state"], "running");
+        assert_eq!(result["mission"]["next_check_at"], "later");
+        assert!(result["mission"]["fast_mode"].is_null());
+        assert_eq!(result["steered"], true);
+        assert!(result["state_warning"].is_null());
+    }
+
+    #[tokio::test]
+    async fn resume_without_hint_also_returns_fresh_state() {
+        use axum::http::StatusCode;
+        let (result, calls) =
+            exercise_resume_readback(false, true, StatusCode::OK, StatusCode::OK, None).await;
+        let result = result.expect("accepted resume");
+        assert_eq!(calls, ["resume", "readback"]);
+        assert_eq!(result["mission"]["updated_at"], "after");
+        assert_eq!(result["steered"], false);
+        assert!(result["steer_warning"].is_null());
+    }
+
+    #[tokio::test]
+    async fn resume_refusal_does_not_read_or_claim_current_state() {
+        use axum::http::StatusCode;
+        let (result, calls) =
+            exercise_resume_readback(true, true, StatusCode::CONFLICT, StatusCode::OK, None).await;
+        assert_eq!(calls, ["resume"]);
+        assert!(result
+            .unwrap_err()
+            .contains("Failed to resume mission (409"));
+    }
+
+    #[tokio::test]
+    async fn resume_readback_failure_does_not_return_the_old_snapshot() {
+        use axum::http::StatusCode;
+        let (result, calls) = exercise_resume_readback(
+            true,
+            true,
+            StatusCode::OK,
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+        )
+        .await;
+        let result = result.expect("accepted resume");
+        assert_eq!(calls, ["resume", "readback"]);
+        assert_eq!(result["resume_accepted"], true);
+        assert_eq!(result["steered"], true);
+        assert!(result["mission"].is_null());
+        assert!(result["state_warning"]
+            .as_str()
+            .unwrap()
+            .contains("do not repeat"));
+    }
+
+    #[tokio::test]
+    async fn resume_preserves_fast_mode_when_readback_exposes_it() {
+        use axum::http::StatusCode;
+        for enabled in [true, false] {
+            let (result, _) =
+                exercise_resume_readback(true, true, StatusCode::OK, StatusCode::OK, Some(enabled))
+                    .await;
+            let result = result.expect("accepted resume");
+            assert_eq!(result["mission"]["fast_mode"], enabled);
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_untagged_digest_preserves_empty_array() {
+        use axum::http::StatusCode;
+        let (result, _) =
+            exercise_resume_readback(true, false, StatusCode::OK, StatusCode::OK, None).await;
+        let result = result.expect("accepted resume");
+        assert_eq!(result["mission"]["tags"], json!([]));
+        assert!(result["mission"]["tags"].is_array());
     }
 
     #[test]
@@ -5399,6 +5835,22 @@ mod tests {
     }
 
     #[test]
+    fn error_signals_do_not_classify_mission_identifiers_as_http_errors() {
+        for fragment in [
+            "b522", "a502", "a520", "a521", "a503", "a429", "a529", "401", "403",
+        ] {
+            assert!(error_signals_in(&format!(
+                "Parallel mission {fragment}0000-dc42-49c3-88a0-26934b2255ce cancellation requested"
+            ))
+            .is_empty());
+        }
+        for code in ["502", "520", "521", "522"] {
+            assert!(error_signals_in(&format!("HTTP {code}: upstream failed"))
+                .contains(&"network_error"));
+        }
+    }
+
+    #[test]
     fn error_signals_classify_known_failure_modes() {
         assert_eq!(
             error_signals_in("HTTP 429 Too Many Requests"),
@@ -5468,6 +5920,25 @@ mod tests {
         assert!(analysis.signals.contains("rate_limited"));
         assert_eq!(analysis.recent_errors.len(), 1);
         assert!(analysis.loop_tool.is_none());
+    }
+
+    #[test]
+    fn recommendation_reports_pending_assignment_failure_without_poisoning_active_run() {
+        let analysis = analyze_trace_events(&[json!({
+            "event_type":"error", "sequence":3,
+            "content":"Cannot activate mission: queued_assignment_unowned: original track claim is no longer held"
+        })]);
+        let pending = build_recommendation("pending", None, &Value::Null, &analysis);
+        assert!(pending.contains("Queued mission could not acquire"));
+        assert!(!pending.contains("healthy"));
+        let active = build_recommendation("active", None, &json!({"state":"running"}), &analysis);
+        assert!(!active.contains("Queued mission could not acquire"));
+        let starting =
+            build_recommendation("pending", None, &json!({"state":"running"}), &analysis);
+        assert!(!starting.contains("Queued mission could not acquire"));
+        let ordinary_pending =
+            build_recommendation("pending", None, &Value::Null, &TraceAnalysis::default());
+        assert!(!ordinary_pending.contains("Queued mission could not acquire"));
     }
 
     #[test]
@@ -5672,16 +6143,125 @@ mod tests {
     }
 
     #[test]
-    fn workspace_bash_rejects_heavy_commands_and_job_argv_is_quoted() {
-        assert!(is_heavy_workspace_command("lake build Verity"));
-        assert!(is_heavy_workspace_command("cd repo && cargo test --all"));
-        assert!(!is_heavy_workspace_command("git status --short"));
+    fn workspace_job_argv_is_quoted() {
         assert_eq!(
             workspace_job_command(None, Some(vec!["printf".into(), "%s".into(), "a'b".into()]))
                 .unwrap(),
             "'printf' '%s' 'a'\\''b'"
         );
         assert!(workspace_job_command(Some("true".into()), Some(vec!["true".into()])).is_err());
+    }
+
+    #[tokio::test]
+    async fn workspace_diagnostics_do_not_classify_quoted_command_text() {
+        let workspace_id = Uuid::new_v4().to_string();
+        let (mcp, state, task) = mock_assistant(json!({"exit_code": 0}), false).await;
+        let command = "ps -eo pid,args | rg 'lake build|cargo test --all'";
+        mcp.workspace_bash(
+            parse_params(json!({
+                "workspace_id": workspace_id, "command": command, "timeout_secs": 1000
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].0,
+            format!("/api/workspaces/{workspace_id}/exec")
+        );
+        assert_eq!(requests[0].1["command"], command);
+        assert_eq!(requests[0].1["timeout_secs"], 120);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn workspace_durable_execution_routes_each_call_with_the_same_retry_key() {
+        let mission_id = Uuid::new_v4().to_string();
+        let workspace_id = Uuid::new_v4().to_string();
+        let (mcp, state, task) =
+            mock_assistant(json!({"id": mission_id, "status": "queued"}), false).await;
+        // A build and an unrecognizable script use exactly the same durable route.
+        for (index, command) in ["lake build Target", "./long-running-script"]
+            .iter()
+            .enumerate()
+        {
+            for _ in 0..2 {
+                let result = mcp.workspace_bash(parse_params(json!({
+                    "workspace_id": workspace_id, "mission_id": mission_id,
+                    "idempotency_key": format!("build-input-sha-{index}"), "command": command,
+                    "cwd": "/workspaces/proof"
+                })).unwrap()).await.unwrap();
+                assert_eq!(result["job"]["id"], mission_id);
+            }
+        }
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        for (index, (path, body)) in requests.iter().enumerate() {
+            assert_eq!(path, "/api/durable-jobs");
+            assert_eq!(
+                body["idempotency_key"],
+                format!("build-input-sha-{}", index / 2)
+            );
+            assert_eq!(body["started_by_mission_id"], mission_id);
+            assert_eq!(body["workspace_id"], workspace_id);
+            assert_eq!(body["cwd"], "/workspaces/proof");
+            assert_eq!(body["timeout_secs"], 7200);
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn workspace_partial_durable_ownership_never_executes_a_command() {
+        let (mcp, state, task) = mock_assistant(json!({}), false).await;
+        for fields in [
+            json!({"mission_id": Uuid::new_v4().to_string()}),
+            json!({"idempotency_key": "input-sha"}),
+            json!({"mission_id": "", "idempotency_key": "input-sha"}),
+            json!({"mission_id": Uuid::new_v4().to_string(), "idempotency_key": " "}),
+        ] {
+            let mut input = fields;
+            input["command"] = json!("./long-running-script");
+            assert!(mcp
+                .workspace_bash(parse_params(input).unwrap())
+                .await
+                .is_err());
+        }
+        assert!(state.requests.lock().unwrap().is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn workspace_durable_execution_respects_project_scope_on_both_entrypoints() {
+        let mission_id = Uuid::new_v4().to_string();
+        let workspace_id = Uuid::new_v4().to_string();
+        for project in [json!("eip-8282"), Value::Null, json!("verity-lido")] {
+            let (mut mcp, state, task) = mock_assistant(
+                json!({
+                    "id": mission_id, "project": project
+                }),
+                false,
+            )
+            .await;
+            mcp.project_scope = Some(["verity-lido".to_string()].into_iter().collect());
+            let input = json!({
+                "workspace_id": workspace_id, "mission_id": mission_id,
+                "idempotency_key": "same-command", "command": "./build"
+            });
+            let via_bash = mcp
+                .workspace_bash(parse_params(input.clone()).unwrap())
+                .await;
+            let direct = mcp.start_workspace_job(parse_params(input).unwrap()).await;
+            let allowed = project == json!("verity-lido");
+            assert_eq!(via_bash.is_ok(), allowed);
+            assert_eq!(direct.is_ok(), allowed);
+            assert_eq!(
+                state.requests.lock().unwrap().len(),
+                if allowed { 2 } else { 0 }
+            );
+            task.abort();
+        }
     }
 
     #[test]

@@ -559,7 +559,13 @@ repeated.
 - `resume_mission` — restart interrupted/blocked/failed, optionally with a hint
 - `cancel_mission` — stop a running/pending mission (use before reconfiguring)
 - `start_mission` — create a new mission
-- `workspace_bash` — run commands in the mission's workspace (verify real state)
+- `workspace_bash` — bounded diagnostic by default (60s, maximum 120s). For
+  builds or work that must survive the call, pass both `mission_id` and
+  `idempotency_key`; it returns a durable job ID immediately. Shell text does
+  not select the mode. Reuse the same key when retrying the same submission.
+- `start_workspace_job`, `get_workspace_job`, `cancel_workspace_job` — durable
+  execution with explicit ownership; consume completion callbacks, not a model
+  polling loop. `start_workspace_job` also accepts `argv` and `resource_class`.
 - `list_workspaces`, `list_mission_shared_files`, `download_shared_file`
 
 ## Installation

@@ -164,7 +164,9 @@ impl Harness {
             .unwrap();
         let app = axum::Router::new()
             .nest("/remote-build", crate::api::remote_build::routes())
+            .nest("/workspaces", crate::api::workspaces::routes())
             .route("/message", axum::routing::post(post_message))
+            .route("/missions", axum::routing::post(create_mission))
             .route("/missions/:id/resume", axum::routing::post(resume_mission))
             .route(
                 "/missions/:id/title",
@@ -297,6 +299,674 @@ fn assert_status_metadata_eq(before: &Mission, after: &Mission) {
     ] {
         assert_eq!(after[field], before[field], "status metadata {field}");
     }
+}
+
+async fn track_dispatch_candidate(h: &Harness) -> Mission {
+    h.control
+        .mission_store
+        .create_mission(
+            Some("replacement"),
+            None,
+            None,
+            None,
+            None,
+            Some("test-no-execution"),
+            None,
+        )
+        .await
+        .unwrap()
+}
+
+async fn bind_track_dispatch(
+    h: &Harness,
+    candidate: &Mission,
+) -> Result<String, (StatusCode, String)> {
+    // Same boundary as create_mission, including the admission/file/PR order.
+    let _admission = DISPATCH_ADMISSION.lock().await;
+    let _file_guard = dispatch_admission::durable_lock(&h.state.config)
+        .await
+        .unwrap();
+    let _pr_guard = acquire_durable_pr_writer_lock(&h.state.control)
+        .await
+        .unwrap();
+    bind_mission_to_track(
+        &h.state,
+        &h.control,
+        candidate,
+        "lido",
+        Some("trio-reserve1"),
+        candidate.title.as_deref(),
+        None,
+        Some("implementation"),
+        Some(true),
+        &[],
+        true,
+        None,
+        &[],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn track_dispatch_replaces_cancelled_and_acknowledged_owner_without_timer() {
+    for acknowledge in [false, true] {
+        let h = Harness::new().await;
+        let old = h.writer(MissionStatus::Active, None).await;
+        h.control
+            .mission_store
+            .update_mission_status(old.id, MissionStatus::Interrupted)
+            .await
+            .unwrap();
+        if acknowledge {
+            h.control
+                .mission_store
+                .update_mission_status(old.id, MissionStatus::Acknowledged)
+                .await
+                .unwrap();
+        }
+        let candidate = track_dispatch_candidate(&h).await;
+        let old_lease = h.state.projects.live_leases(None).unwrap().remove(0);
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&old_lease.lease_until).unwrap()
+                > chrono::Utc::now()
+        );
+        assert!(
+            h.state
+                .projects
+                .acquire_track_lease(&crate::api::track_leases::lease_request(
+                    "lido",
+                    "trio-reserve1",
+                    &candidate.id.to_string(),
+                    "writer",
+                    None,
+                ))
+                .is_err(),
+            "the unswept lease reproduces the original conflict"
+        );
+
+        assert_eq!(
+            bind_track_dispatch(&h, &candidate).await.unwrap(),
+            "trio-reserve1"
+        );
+        let leases = h.state.projects.live_leases(None).unwrap();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].attempt_id, candidate.id.to_string());
+        assert_ne!(leases[0].id, old_lease.id);
+        // A late cleanup for the cancelled attempt cannot revoke its successor.
+        h.state
+            .projects
+            .release_leases_for_attempt(&old.id.to_string())
+            .unwrap();
+        assert!(bind_track_dispatch(&h, &candidate).await.is_ok());
+        assert_eq!(
+            h.state.projects.live_leases(None).unwrap()[0].id,
+            leases[0].id
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_handoff_clears_inherited_agent_but_preserves_explicit_selection() {
+    let h = Harness::new().await;
+    h.state.backend_registry.write().await.register(Arc::new(
+        crate::backend::claudecode::ClaudeCodeBackend::new(),
+    ));
+    for (initial_backend, supplied_agent, expected) in [
+        ("opencode", None, None),
+        (
+            "opencode",
+            Some("custom-native-agent"),
+            Some("custom-native-agent"),
+        ),
+        ("claudecode", None, Some("build")),
+    ] {
+        let mission = h
+            .control
+            .mission_store
+            .create_mission(
+                Some("agent handoff"),
+                None,
+                Some("build"),
+                None,
+                None,
+                Some(initial_backend),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut body = json!({"backend": "claudecode", "resume": false});
+        if let Some(agent) = supplied_agent {
+            body["agent"] = json!(agent);
+        }
+        let Json(updated) = update_mission_settings(
+            State(h.state.clone()),
+            Extension(h.user.clone()),
+            Path(mission.id),
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.get("agent").and_then(Value::as_str), expected);
+        let stored = h
+            .control
+            .mission_store
+            .get_mission(mission.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.agent.as_deref(), expected);
+        assert_eq!(stored.status, MissionStatus::Pending);
+        assert!(h.control.assignment_owners.read().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn oversized_native_goal_is_rejected_before_mission_dispatch() {
+    let h = Harness::new().await;
+    let response = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&json!({"backend":"codex", "prompt":format!("/goal {}", "x".repeat(4001))}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response.text().await.unwrap().contains("maximum is 4000"));
+    assert!(h.control.assignment_owners.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn host_workspace_creation_is_ready_on_disk_and_rejects_file_roots() {
+    let h = Harness::new().await;
+    let root = h._dir.path().join("new-host/source");
+    let response = h
+        .state
+        .http_client
+        .post(format!("{}/workspaces", h.url))
+        .json(&json!({"name":"new-host", "workspace_type":"host", "path":root}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}: {}",
+        response.status(),
+        response.text().await.unwrap()
+    );
+    assert!(
+        root.is_dir(),
+        "ready host root must exist before admission can stat it"
+    );
+    let invalid = h._dir.path().join("file-root");
+    std::fs::write(&invalid, "existing source").unwrap();
+    let response = h
+        .state
+        .http_client
+        .post(format!("{}/workspaces", h.url))
+        .json(&json!({"name":"invalid-host", "workspace_type":"host", "path":invalid}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(std::fs::read_to_string(invalid).unwrap(), "existing source");
+}
+
+#[tokio::test]
+async fn explicit_cancel_releases_parked_blocked_owner_without_resuming_it() {
+    let h = Harness::new().await;
+    let old = h.writer(MissionStatus::Blocked, None).await;
+    h.control
+        .mission_store
+        .update_mission_status_with_reason(
+            old.id,
+            MissionStatus::Blocked,
+            Some("native_goal_stopped"),
+        )
+        .await
+        .unwrap();
+    let candidate = track_dispatch_candidate(&h).await;
+    assert!(bind_track_dispatch(&h, &candidate).await.is_err());
+
+    for _ in 0..2 {
+        let Json(receipt) = cancel_mission(
+            State(h.state.clone()),
+            Extension(h.user.clone()),
+            Path(old.id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt["ok"], true);
+        let parked = h
+            .control
+            .mission_store
+            .get_mission(old.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parked.status, MissionStatus::Interrupted);
+        assert!(h
+            .control
+            .mission_store
+            .get_active_mission_run(old.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+    bind_track_dispatch(&h, &candidate).await.unwrap();
+    let leases = h.state.projects.live_leases(None).unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].attempt_id, candidate.id.to_string());
+}
+
+#[tokio::test]
+async fn track_dispatch_retains_nonterminal_and_native_goal_owners() {
+    for status in [
+        MissionStatus::Active,
+        MissionStatus::Pending,
+        MissionStatus::AwaitingUser,
+        MissionStatus::WaitingBackground,
+        MissionStatus::Paused,
+        MissionStatus::Blocked,
+    ] {
+        let h = Harness::new().await;
+        let old = h.writer(status, None).await;
+        if status == MissionStatus::Blocked {
+            h.control
+                .mission_store
+                .update_mission_status_with_reason(old.id, status, Some("native_goal_stopped"))
+                .await
+                .unwrap();
+        }
+        let candidate = track_dispatch_candidate(&h).await;
+        let (status, body) = bind_track_dispatch(&h, &candidate).await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["holder_mission_id"], old.id.to_string());
+        assert_eq!(
+            h.state.projects.live_leases(None).unwrap()[0].attempt_id,
+            old.id.to_string()
+        );
+    }
+}
+
+#[tokio::test]
+async fn track_dispatch_terminal_presentation_does_not_override_unresolved_execution() {
+    use crate::remote_node::job_ledger::{self, JobHandle, JobHandleKind};
+    for evidence in ["run", "actor", "remote", "admission"] {
+        let h = Harness::new().await;
+        let old = h
+            .writer(
+                if evidence == "run" {
+                    MissionStatus::Active
+                } else {
+                    MissionStatus::Acknowledged
+                },
+                None,
+            )
+            .await;
+        match evidence {
+            "run" => {
+                h.control
+                    .mission_store
+                    .begin_mission_run(old.id, "old-actor", None)
+                    .await
+                    .unwrap();
+                h.control
+                    .mission_store
+                    .update_mission_status(old.id, MissionStatus::Interrupted)
+                    .await
+                    .unwrap();
+            }
+            "actor" => {
+                // Admission consumes a published actor snapshot. Give this
+                // fixture its own snapshot so the idle actor's heartbeat
+                // cannot replace injected ownership while the request runs.
+                let mut published = h.control.clone();
+                published.assignment_owners = Arc::new(RwLock::new(HashSet::from([old.id])));
+                h.state
+                    .control
+                    .sessions
+                    .write()
+                    .await
+                    .insert(h.user.id.clone(), published);
+            }
+            "remote" => {
+                job_ledger::record(
+                    &h.state.config.working_dir,
+                    JobHandle {
+                        mission_id: old.id,
+                        node_id: "unreachable-node".into(),
+                        job_id: Uuid::new_v4(),
+                        started_at: chrono::Utc::now(),
+                        submission_sequence: 0,
+                        accepted_at: Some(chrono::Utc::now()),
+                        heartbeat_at: None,
+                        disk_reservation_bytes: 0,
+                        kind: JobHandleKind::Mission,
+                        identity: None,
+                        wait_for_completion: None,
+                        wake_on_terminal: false,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            "admission" => {
+                h.state
+                    .projects
+                    .save_dispatch_admission(&old.id.to_string(), &json!({"phase":"pending"}))
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let candidate = track_dispatch_candidate(&h).await;
+        let rejection = bind_track_dispatch(&h, &candidate)
+            .await
+            .expect_err(&format!("{evidence} must retain ownership"));
+        assert_eq!(rejection.0, StatusCode::CONFLICT, "{evidence}");
+        assert_eq!(
+            h.state.projects.live_leases(None).unwrap()[0].attempt_id,
+            old.id.to_string()
+        );
+    }
+}
+
+#[tokio::test]
+async fn track_dispatch_unreadable_store_cannot_release_terminal_owner() {
+    let h = Harness::new().await;
+    let old = h.writer(MissionStatus::Acknowledged, None).await;
+    let base = h.state.config.working_dir.join(".sandboxed-sh/missions");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("missions-unreadable.json"),
+        b"incomplete snapshot",
+    )
+    .unwrap();
+    let candidate = track_dispatch_candidate(&h).await;
+    assert_eq!(
+        bind_track_dispatch(&h, &candidate).await.unwrap_err().0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        h.state.projects.live_leases(None).unwrap()[0].attempt_id,
+        old.id.to_string()
+    );
+    assert_eq!(
+        h.control
+            .mission_store
+            .get_mission(candidate.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MissionStatus::Interrupted
+    );
+}
+
+fn isolated_track_http_test(test_name: &str) -> bool {
+    // Keep this HTTP/lock regression independent of the production 150 GiB
+    // disk floor without changing environment shared by other parallel tests.
+    const CHILD: &str = "TERMINAL_TRACK_LEASE_HTTP_TEST_CHILD";
+    if std::env::var(CHILD).ok().as_deref() != Some(test_name) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("api::control::dispatch_admission_tests::{test_name}"),
+                "--nocapture",
+            ])
+            .env(CHILD, test_name)
+            .env("MISSION_DISK_EMERGENCY_RESERVE_GB", "0")
+            // Fixture project names must not be rewritten by the host's
+            // live controller routes (for example lido -> verity-lido).
+            .env_remove("HERMES_PROJECTS_DIR")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated HTTP regression failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return true;
+    }
+    false
+}
+
+#[tokio::test]
+async fn explicit_reader_creation_without_pr_survives_queued_activation() {
+    if isolated_track_http_test("explicit_reader_creation_without_pr_survives_queued_activation") {
+        return;
+    }
+    assert_explicit_creation_role_survives_queued_activation(false).await;
+}
+
+#[tokio::test]
+async fn explicit_writer_creation_without_pr_survives_queued_activation() {
+    if isolated_track_http_test("explicit_writer_creation_without_pr_survives_queued_activation") {
+        return;
+    }
+    assert_explicit_creation_role_survives_queued_activation(true).await;
+}
+
+async fn assert_explicit_creation_role_survives_queued_activation(writer: bool) {
+    for pr in [None, Some("repo#244")] {
+        let h = Harness::new().await;
+        h.state.backend_registry.write().await.register(Arc::new(
+            crate::backend::opencode::OpenCodeBackend::new(
+                "http://127.0.0.1:9".into(),
+                None,
+                false,
+            ),
+        ));
+        let prompt = if writer {
+            "Read-only review and report findings without edits."
+        } else {
+            "Read-only review in verity-integration-b. Write output/review.md; no repository edits."
+        };
+        // Both directions must preserve explicit authority when the prose
+        // heuristic would infer the opposite role during queued activation.
+        assert_eq!(
+            inferred_pr_writer(None, Some("review"), Some(prompt)),
+            !writer
+        );
+        let expected_tag = if writer { "pr-writer" } else { "pr-readonly" };
+        let conflicting_tag = if writer { "pr-readonly" } else { "pr-writer" };
+        let response = h
+            .state
+            .http_client
+            .post(format!("{}/missions", h.url))
+            .json(&json!({
+                "title":"bounded read-only review", "backend":"opencode",
+                "project":"lido", "track":"independent-review", "intent":"review",
+                "github_pr":pr, "writer":writer, "tags":[conflicting_tag, "ssz"],
+                "prompt":prompt, "estimated_disk_gib":1,
+                "not_before":(chrono::Utc::now()+chrono::Duration::hours(1)).to_rfc3339()
+            }))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "{status}: {body}");
+        let created: Mission = serde_json::from_str(&body).unwrap();
+        let stored = h
+            .control
+            .mission_store
+            .get_mission(created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.project.tags.iter().any(|tag| tag == expected_tag));
+        assert!(!stored.project.tags.iter().any(|tag| tag == conflicting_tag));
+        assert_eq!(
+            mission_is_pr_writer_with_prompt(&stored, Some(prompt)),
+            writer
+        );
+        h.control
+            .mission_store
+            .log_event(
+                created.id,
+                &AgentEvent::UserMessage {
+                    id: Uuid::new_v4(),
+                    content: prompt.into(),
+                    queued: true,
+                    mission_id: Some(created.id),
+                    source: None,
+                },
+            )
+            .await
+            .unwrap();
+        // Exercise the real dequeue revalidation against the lease acquired
+        // by HTTP creation, after the initial prompt is persisted.
+        activate_mission_for_message(
+            &h.state.control,
+            &h.control.mission_store,
+            &h.control.events_tx,
+            &stored,
+            prompt,
+        )
+        .await
+        .unwrap();
+        let leases = h.state.projects.live_leases(None).unwrap();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].attempt_id, created.id.to_string());
+        assert_eq!(leases[0].mode, if writer { "writer" } else { "reader" });
+        assert!(h
+            .control
+            .mission_store
+            .get_active_mission_run(created.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn track_dispatch_http_creation_reconciles_without_deadlocking_actor_or_pr_lock() {
+    if isolated_track_http_test(
+        "track_dispatch_http_creation_reconciles_without_deadlocking_actor_or_pr_lock",
+    ) {
+        return;
+    }
+    for pr in [None, Some("repo#244")] {
+        let h = Harness::new().await;
+        h.state.backend_registry.write().await.register(Arc::new(
+            crate::backend::opencode::OpenCodeBackend::new(
+                "http://127.0.0.1:9".into(),
+                None,
+                false,
+            ),
+        ));
+        let old = h.writer(MissionStatus::Acknowledged, pr).await;
+        let response = h.state.http_client.post(format!("{}/missions", h.url))
+            .json(&json!({"title":"new replacement", "backend":"opencode", "project":"lido", "track":"trio-reserve1", "github_pr":pr, "writer":true, "estimated_disk_gib":1}))
+            .timeout(std::time::Duration::from_secs(10)).send().await.unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "{status}: {body}");
+        let mission: Mission = serde_json::from_str(&body).unwrap();
+        assert_ne!(mission.id, old.id);
+        assert_eq!(mission.project.track.as_deref(), Some("trio-reserve1"));
+        let leases = h.state.projects.live_leases(None).unwrap();
+        assert_eq!(leases.len(), 1, "pr={pr:?}, leases={leases:?}");
+        assert_eq!(leases[0].attempt_id, mission.id.to_string());
+    }
+}
+
+#[tokio::test]
+async fn track_dispatch_lock_failure_interrupts_candidate_and_releases_disk() {
+    if isolated_track_http_test(
+        "track_dispatch_lock_failure_interrupts_candidate_and_releases_disk",
+    ) {
+        return;
+    }
+    let h = Harness::new().await;
+    h.state.backend_registry.write().await.register(Arc::new(
+        crate::backend::opencode::OpenCodeBackend::new("http://127.0.0.1:9".into(), None, false),
+    ));
+    let old = h.writer(MissionStatus::Acknowledged, None).await;
+    // A directory at the lock-file path makes the real open fail, while
+    // leaving the actor's separate disk ledger and mission store writable.
+    let admission_guard = DISPATCH_ADMISSION.lock().await;
+    let file_guard = dispatch_admission::durable_lock(&h.state.config)
+        .await
+        .unwrap();
+    let lock_path = h
+        .state
+        .config
+        .working_dir
+        .join(".sandboxed-sh/missions/.dispatch-admission.lock");
+    std::fs::remove_file(&lock_path).unwrap();
+    std::fs::create_dir(&lock_path).unwrap();
+    drop(file_guard);
+    drop(admission_guard);
+    let response = h.state.http_client.post(format!("{}/missions", h.url))
+        .json(&json!({"title":"rejected replacement", "backend":"opencode", "project":"lido", "track":"trio-reserve1", "writer":true, "estimated_disk_gib":1}))
+        .timeout(std::time::Duration::from_secs(10)).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = response.text().await.unwrap();
+    let candidates = h
+        .control
+        .mission_store
+        .list_missions_filtered(&Default::default(), 10, 0)
+        .await
+        .unwrap();
+    let candidate = candidates.iter().find(|m| m.id != old.id).unwrap();
+    assert_eq!(candidate.status, MissionStatus::Interrupted);
+    assert_eq!(
+        candidate.terminal_reason.as_deref(),
+        Some("dispatch_admission_unavailable")
+    );
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["mission_id"], candidate.id.to_string());
+    assert!(body["cleanup_error"].is_null());
+    assert!(!read_disk_reservation_ledger(&h.state.config)
+        .unwrap()
+        .reservations
+        .contains_key(&candidate.id));
+    assert_eq!(
+        h.state.projects.live_leases(None).unwrap()[0].attempt_id,
+        old.id.to_string()
+    );
+    assert!(candidate.project.track.is_none());
+    assert!(candidate.history.is_empty());
+}
+
+#[tokio::test]
+async fn track_dispatch_concurrent_replacements_admit_exactly_one_writer() {
+    let h = Harness::new().await;
+    let old = h.writer(MissionStatus::Acknowledged, None).await;
+    let mut candidates = Vec::new();
+    for _ in 0..8 {
+        candidates.push(track_dispatch_candidate(&h).await);
+    }
+    let results = futures::future::join_all(
+        candidates
+            .iter()
+            .map(|candidate| bind_track_dispatch(&h, candidate)),
+    )
+    .await;
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert!(results
+        .iter()
+        .filter_map(|result| result.as_ref().err())
+        .all(|error| error.0 == StatusCode::CONFLICT));
+    let winner = candidates
+        .iter()
+        .zip(&results)
+        .find(|(_, result)| result.is_ok())
+        .unwrap()
+        .0;
+    h.state
+        .projects
+        .release_leases_for_attempt(&old.id.to_string())
+        .unwrap();
+    crate::api::track_leases::sweep(&h.state).await.unwrap();
+    let leases = h.state.projects.live_leases(None).unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].attempt_id, winner.id.to_string());
 }
 
 #[tokio::test]
@@ -583,7 +1253,8 @@ async fn http_actor_same_work_with_exclusions_and_missing_pr_can_queue() {
     let response = h.request(false, m.id, json!({"content":"Continue RESERVE-1 PR 244. Exclude PRs #230/#231 and coordinate with the ALLOC-1 collaborator.", "continue_identity":Harness::assertion(&m)})).await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let after = h
@@ -756,7 +1427,8 @@ async fn http_actor_resume_reacquires_track_and_preserves_goal_without_prompt() 
         .await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let after = h
@@ -809,7 +1481,8 @@ async fn http_actor_retask_requires_edit_or_a_trusted_semantic_assertion() {
         .await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     assert_eq!(
@@ -893,7 +1566,8 @@ async fn accepted_dispatch_cleanup_failure_is_not_reported_as_rejection() {
     let response = h.request(false, m.id, json!({"content":"Different work", "github_pr":"", "track":"new-track", "title":"Different work"})).await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     actor.await.unwrap();
@@ -941,7 +1615,8 @@ async fn http_actor_custom_resume_delivers_exactly_the_custom_prompt() {
         .await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1009,7 +1684,8 @@ async fn http_actor_resume_dequeue_failure_keeps_accepted_prompt_and_assignment(
     let response = h.request(true, m.id, json!({"content":"durable custom resume", "github_pr":"", "track":"new-track", "title":"Different work"})).await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let after = h
@@ -1094,7 +1770,8 @@ async fn http_actor_title_edit_does_not_deadlock_and_honors_recovery_fence() {
         .unwrap();
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let before = h
@@ -1297,7 +1974,8 @@ async fn http_real_reader_promotion_without_pr_checks_owner_and_persists_writer_
         .unwrap();
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let promoted = h
@@ -1319,7 +1997,8 @@ async fn http_real_reader_promotion_without_pr_checks_owner_and_persists_writer_
         .await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let leases = h.state.projects.live_leases(None).unwrap();
@@ -1448,6 +2127,111 @@ async fn wait_native_status(h: &Harness, id: Uuid, expected: MissionStatus) -> M
     })
     .await
     .expect("driver released its durable run and parked mission")
+}
+
+#[tokio::test]
+async fn codex_continuity_http_actor_parks_preserves_ownership_and_suppresses_automation() {
+    for parallel in [false, true] {
+        let h = Harness::new().await;
+        let blocker = if parallel {
+            let b = h
+                .control
+                .mission_store
+                .create_mission(Some("other"), None, None, None, None, Some("codex"), None)
+                .await
+                .unwrap();
+            let dir = install_native_fixture(&h, b.id, "before").await;
+            assert!(h
+                .request(
+                    false,
+                    b.id,
+                    json!({"content":"/goal unrelated synthetic work"})
+                )
+                .await
+                .status()
+                .is_success());
+            wait_native_file(&dir.join("started")).await;
+            Some((b.id, dir))
+        } else {
+            None
+        };
+        let m = h.writer(MissionStatus::Failed, Some("repo#244")).await;
+        let dir = install_native_fixture(&h, m.id, "continuity_required").await;
+        let automation: mission_store::Automation = serde_json::from_value(json!({
+            "id":Uuid::new_v4(), "mission_id":m.id,
+            "command_source":{"type":"inline", "content":"must not automatically repeat"},
+            "trigger":{"type":"agent_finished"}, "active":true,
+            "created_at":chrono::Utc::now().to_rfc3339(), "last_triggered_at":null,
+            "stop_policy":{"type":"never"}
+        }))
+        .unwrap();
+        h.control
+            .mission_store
+            .create_automation(automation)
+            .await
+            .unwrap();
+        let response = h.request(true, m.id, json!({"content":"/goal preserve native state", "continue_identity":Harness::assertion(&m)})).await;
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+        let parked = wait_native_status(&h, m.id, MissionStatus::Blocked).await;
+        assert_eq!(
+            parked.terminal_reason.as_deref(),
+            Some("codex_continuity_required")
+        );
+        assert!(parked.goal_mode);
+        crate::api::track_leases::sweep(&h.state).await.unwrap();
+        assert_eq!(
+            h.state.projects.live_leases(None).unwrap()[0].attempt_id,
+            m.id.to_string()
+        );
+        assert_eq!(
+            find_existing_pr_writer(&h.control.mission_store, "repo#244", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            m.id
+        );
+        assert_eq!(
+            find_existing_pr_writer_in_sqlite(
+                &h._dir.path().join("missions/missions-admission-test.db"),
+                "repo#244",
+                None
+            )
+            .unwrap()
+            .unwrap()
+            .id,
+            m.id
+        );
+        // The finished-turn automation runs after 500 ms if not suppressed.
+        tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+        assert_eq!(
+            std::fs::read_to_string(dir.join("requests.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            h.control
+                .mission_store
+                .get_mission(m.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MissionStatus::Blocked
+        );
+        if let Some((id, dir)) = blocker {
+            std::fs::write(dir.join("release"), "").unwrap();
+            wait_native_status(&h, id, MissionStatus::Blocked).await;
+            NATIVE_FIXTURES.lock().unwrap().remove(&id);
+        }
+        NATIVE_FIXTURES.lock().unwrap().remove(&m.id);
+    }
 }
 
 #[tokio::test]
@@ -1925,7 +2709,8 @@ async fn pending_deferred_assignment_refuses_multiple_retags_without_concatenati
     let response = h.request(false, m.id, json!({"content":"Continue old RESERVE-1 with extra evidence", "continue_identity":Harness::assertion(&m)})).await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let deferred = h
@@ -2458,7 +3243,8 @@ async fn remote_poll_loss_and_cancel_ack_retain_ownership_until_terminal_cleanup
         .await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     server.abort();
@@ -2815,7 +3601,8 @@ async fn http_terminal_build_response_retains_cleanup_after_request_and_node_los
         .unwrap();
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let response: Value = response.json().await.unwrap();
@@ -3298,6 +4085,8 @@ async fn assert_startup_identity_recovery(preceding_sweep: bool) {
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
             if let Ok(AgentEvent::MissionStatusChanged {
+                completion: None,
+                execution: None,
                 mission_id,
                 status: MissionStatus::Interrupted,
                 summary: Some(summary),
@@ -3378,7 +4167,8 @@ async fn adversarial_project_edit_cleanup_retries_after_database_reopen() {
         .unwrap();
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     let reopened = ProjectsStore::open(h._dir.path().join("projects.db")).unwrap();
@@ -3851,7 +4641,8 @@ async fn adversarial_internal_tag_between_snapshot_and_identity_write_survives_a
     let response = h.request(false, m.id, json!({"content":"different work", "track":"new-track", "github_pr":"", "title":"different work"})).await;
     assert!(
         response.status().is_success(),
-        "{}",
+        "{}: {}",
+        response.status(),
         response.text().await.unwrap()
     );
     actor.await.unwrap();
@@ -3972,4 +4763,118 @@ async fn adversarial_pr_lookup_cannot_omit_parked_writer_moving_across_pages() {
         .unwrap();
     assert!(moved.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(found.map(|writer| writer.id), Some(m.id));
+}
+
+#[tokio::test]
+async fn http_idle_message_continuation_captures_predecessor_before_delivery() {
+    for (busy, ended, actor_ack) in [
+        (false, true, UserMessageAck::Delivered),
+        (false, true, UserMessageAck::Queued),
+        (true, true, UserMessageAck::Queued),
+        (false, false, UserMessageAck::Delivered),
+        (false, true, UserMessageAck::Dropped),
+        (
+            false,
+            true,
+            UserMessageAck::Rejected("injected refusal".into()),
+        ),
+    ] {
+        let h = Harness::new().await;
+        let m = h.writer(MissionStatus::Active, Some("repo#244")).await;
+        let store = h.control.mission_store.clone();
+        let prior = store
+            .begin_mission_run(m.id, "prior-actor", None)
+            .await
+            .unwrap();
+        if ended {
+            store
+                .finish_mission_run(prior.run_id, prior.generation, Some("turn_complete"))
+                .await
+                .unwrap();
+            store
+                .update_mission_status(m.id, MissionStatus::AwaitingUser)
+                .await
+                .unwrap();
+        }
+        let (tx, mut rx) = mpsc::channel(1);
+        h.state
+            .control
+            .sessions
+            .write()
+            .await
+            .get_mut(&h.user.id)
+            .unwrap()
+            .cmd_tx = tx;
+        let should_accept = matches!(
+            actor_ack,
+            UserMessageAck::Delivered | UserMessageAck::Queued
+        );
+        let should_continue = !busy && ended && should_accept;
+        let expected_queued = actor_ack == UserMessageAck::Queued;
+        let mission_id = m.id;
+        let actor = tokio::spawn(async move {
+            let ControlCommand::AdmitDispatch { admission, command } = rx.recv().await.unwrap()
+            else {
+                panic!()
+            };
+            let command = dispatch_admission::admit_dispatch_with_lifetime(
+                *admission,
+                *command,
+                DISPATCH_ADMISSION.lock().await,
+                busy,
+                None,
+            )
+            .await
+            .unwrap();
+            if should_continue {
+                // The next native run can already finish before HTTP receives
+                // its acknowledgement. The reply must retain generation 1.
+                store
+                    .update_mission_status(mission_id, MissionStatus::Active)
+                    .await
+                    .unwrap();
+                let successor = store
+                    .begin_mission_run(mission_id, "next-actor", None)
+                    .await
+                    .unwrap();
+                assert_eq!(successor.generation, 2);
+                store
+                    .finish_mission_run(
+                        successor.run_id,
+                        successor.generation,
+                        Some("turn_complete"),
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .update_mission_status(mission_id, MissionStatus::AwaitingUser)
+                    .await
+                    .unwrap();
+            }
+            let ControlCommand::UserMessage { respond, .. } = command else {
+                panic!()
+            };
+            respond.send(actor_ack).unwrap();
+        });
+        let response = h.request(false, m.id, json!({"content":"Continue the same work", "continue_identity":Harness::assertion(&m)})).await;
+        actor.await.unwrap();
+        if !should_accept {
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            continue;
+        }
+        assert!(response.status().is_success());
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["mission_id"], m.id.to_string());
+        assert_ne!(body["id"], m.id.to_string());
+        assert_eq!(body["message_accepted"], true);
+        assert_eq!(body["queued"], expected_queued);
+        if should_continue {
+            assert_eq!(
+                body["previous_execution"],
+                json!({"run_id":prior.run_id,"generation":prior.generation})
+            );
+        } else {
+            assert!(body.get("previous_execution").is_none());
+        }
+    }
 }

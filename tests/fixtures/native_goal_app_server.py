@@ -39,6 +39,10 @@ for line in sys.stdin:
             'threadId': 'fixture-thread', 'objective': content, 'status': 'complete' if recovered else 'blocked',
             'tokenBudget': None, 'tokensUsed': 100, 'timeUsedSeconds': 3, 'createdAt': 1, 'updatedAt': 2}}
         emit({'id': req['id'], 'result': {'goal': goal['goal']} if is_goal else {'turn': turn}})
+        if order == 'continuity_required':
+            notify('item/agentMessage/delta', {'threadId': 'fixture-thread', 'delta': 'Synthetic prior output'})
+            notify('error', {'threadId': 'fixture-thread', 'error': {'message': 'codex_continuity_missing: verified native binding unavailable'}, 'willRetry': False})
+            continue
         if is_goal and order == 'before_started':
             notify('thread/goal/updated', goal)
         notify('turn/started', {'threadId': 'fixture-thread', 'turn': {'id': 'turn-1'}})

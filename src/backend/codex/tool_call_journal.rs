@@ -30,6 +30,10 @@ fn lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 impl ToolCallJournal {
+    pub fn at(path: PathBuf) -> Self {
+        Self { path }
+    }
+
     pub fn new(session_id: &str, thread_id: &str) -> Self {
         let safe = |value: &str| {
             value
@@ -87,6 +91,9 @@ impl ToolCallJournal {
             tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
         }
         tokio::fs::rename(tmp, &self.path).await?;
+        if let Some(parent) = self.path.parent() {
+            tokio::fs::File::open(parent).await?.sync_all().await?;
+        }
         Ok(())
     }
 

@@ -7,6 +7,14 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Immutable outcome coupled to a native execution at terminal publication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionCompletionSnapshot {
+    pub result_summary: Option<String>,
+    pub terminal_reason: Option<String>,
+    pub terminal_evidence: Option<String>,
+}
+
 /// A structured event emitted by the control session.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -124,6 +132,11 @@ pub enum AgentEvent {
     },
     /// Mission status changed (by agent or user)
     MissionStatusChanged {
+        /// Captured by the terminal writer, never inferred from a successor run.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        execution: Option<MissionRun>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        completion: Option<MissionCompletionSnapshot>,
         mission_id: Uuid,
         status: MissionStatus,
         summary: Option<String>,
@@ -189,6 +202,11 @@ pub enum AgentEvent {
     },
     /// Session ID update (for backends that generate their own session IDs)
     SessionIdUpdate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<crate::api::mission_store::SessionUpdateRun>,
+        /// Harness that issued this ID; late updates must not replace another harness.
+        #[serde(default)]
+        backend: String,
         /// The new session ID to use for continuation
         session_id: String,
         /// Mission this session ID belongs to
@@ -352,6 +370,12 @@ pub enum UserMessageAck {
     Queued,
     /// The message was delivered and a turn is starting now.
     Delivered,
+    /// Accepted wake of an idle mission with an authenticated terminal
+    /// predecessor, captured before admission (never from later readback).
+    Continued {
+        queued: bool,
+        previous_execution: MessagePreviousExecution,
+    },
     /// The message was dropped (parallel cap reached, mission load failure,
     /// rejected goal kickoff, …). An `AgentEvent::Error` with details was
     /// emitted on the event stream.
@@ -359,6 +383,12 @@ pub enum UserMessageAck {
     /// The actor rejected the message after HTTP preflight. The reason is
     /// returned to synchronous callers instead of being visible only on SSE.
     Rejected(String),
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MessagePreviousExecution {
+    pub run_id: Uuid,
+    pub generation: u64,
 }
 
 /// Internal control commands (queued and processed by the actor).
