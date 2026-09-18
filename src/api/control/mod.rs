@@ -7321,8 +7321,16 @@ fn collect_attention_missions_from_sqlite(
                     .map_err(|error| error.to_string())
             })
             .transpose()?;
+        // A present-but-unparseable kind is a real inventory error (above).
+        // A NULL kind is the legacy pre-`awaiting_kind` shape, which the live
+        // store also carries as `None` and which operator attention treats as
+        // an unqualified page. Erroring here would make the whole project's
+        // evidence permanently unavailable for one old row.
         if status == MissionStatus::AwaitingUser && awaiting_kind.is_none() {
-            return Err(format!("offline mission {id} has unknown awaiting kind"));
+            tracing::debug!(
+                mission_id = %id,
+                "offline awaiting_user mission has no awaiting kind; treating as legacy"
+            );
         }
         let tags: Vec<String> = tags_raw
             .as_deref()
@@ -29151,7 +29159,18 @@ mod tests {
         assert!(crate::api::operator_attention::mission_needs_operator(
             &rows[0], false, None, now
         ));
+        // Legacy rows predate `awaiting_kind`: they are kept (as the live
+        // store keeps `None`), not treated as an inventory failure.
         db.execute("UPDATE missions SET awaiting_kind=NULL", [])
+            .unwrap();
+        let rows = collect_attention_missions_from_sqlite(&path, "eip-8282").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].awaiting_kind, None);
+        assert!(!crate::api::operator_attention::mission_needs_operator(
+            &rows[0], false, None, now
+        ));
+        // A present but unknown kind is still an error.
+        db.execute("UPDATE missions SET awaiting_kind='bogus'", [])
             .unwrap();
         assert!(collect_attention_missions_from_sqlite(&path, "eip-8282").is_err());
     }
