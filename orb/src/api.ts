@@ -121,6 +121,8 @@ export interface CreateMissionBody {
   prompt?: string;
   remote_node_id?: string;
   remote_command?: string;
+  /** Stable project identifier — groups the mission under the project. */
+  project?: string;
 }
 
 export async function getRemoteNodes(): Promise<RemoteNodesResponse> {

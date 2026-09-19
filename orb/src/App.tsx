@@ -20,9 +20,11 @@ import {
   getRemoteNodes,
   isConnected,
   listMissions,
+  listProjects,
   cancelMission,
   sendMissionMessage,
   type Mission,
+  type ProjectSummary,
   type RemoteNodeView,
 } from "./api";
 
@@ -267,6 +269,7 @@ export default function App() {
   const [sbWidth, setSbWidth] = createSignal(220);
   const [streamingId, setStreamingId] = createSignal<string | null>(null);
   const [newProject, setNewProject] = createSignal(seed[0].id);
+  const [liveProjects, setLiveProjects] = createSignal<ProjectSummary[]>([]);
   const [newMachine, setNewMachine] = createSignal(MACHINES[0].id);
   const [envOpen, setEnvOpen] = createSignal<"machine" | "project" | null>(null);
   const [history, setHistory] = createSignal<(string | null)[]>(["a1"]);
@@ -331,6 +334,12 @@ export default function App() {
     if (isConnected()) {
       void refreshMissions();
       void refreshFleet();
+      listProjects()
+        .then(setLiveProjects)
+        .catch(() => setLiveProjects([]));
+      // Seed agent ids only exist offline — don't land on a demo transcript.
+      const sel = selected();
+      if (sel && !sel.includes(":") && !["settings", "machines", "providers"].includes(sel)) open(null);
       if (newMachine() !== "core" && !fleetNodes().some((n) => n.id === newMachine())) setNewMachine("core");
     } else if (newMachine() === "core" || fleetNodes().some((n) => n.id === newMachine())) {
       setNewMachine(MACHINES[0].id);
@@ -454,11 +463,12 @@ export default function App() {
     if (isConnected()) {
       const title = text.length > 42 ? text.slice(0, 42) : text;
       const node = fleetNodes().find((n) => n.id === newMachine());
+      const projectSlug = liveProjects().some((p) => p.slug === newProject()) ? newProject() : undefined;
       try {
         const m = await createMission(
           node
-            ? { title, prompt: text, remote_node_id: node.id, remote_command: buildRemoteAgentCommand(text, await ensureNodeAgentKey()) }
-            : { title, prompt: text },
+            ? { title, prompt: text, remote_node_id: node.id, remote_command: buildRemoteAgentCommand(text, await ensureNodeAgentKey()), project: projectSlug }
+            : { title, prompt: text, project: projectSlug },
         );
         await refreshMissions();
         open(`m:${m.id}`);
@@ -821,12 +831,14 @@ export default function App() {
                 <div class="na-meta">
                   <div class="na-drop" onPointerDown={(e) => e.stopPropagation()}>
                     <button class="na-drop-btn" onClick={() => setEnvOpen(envOpen() === "project" ? null : "project")}>
-                      {projects.find((p) => p.id === newProject())?.name}
+                      {isConnected()
+                        ? (liveProjects().find((p) => p.slug === newProject())?.title ?? liveProjects()[0]?.title ?? "No project")
+                        : projects.find((p) => p.id === newProject())?.name}
                       <Ic.ChevronDown size={12} />
                     </button>
                     <Show when={envOpen() === "project"}>
                       <div class="menu na-menu">
-                        <For each={projects}>
+                        <For each={isConnected() ? liveProjects().map((p) => ({ id: p.slug, name: p.title ?? p.slug })) : projects.map((p) => ({ id: p.id, name: p.name }))}>
                           {(p) => (
                             <button
                               class={`menu-item ${p.id === newProject() ? "on" : ""}`}
