@@ -232,7 +232,26 @@ async fn list_projects(
         .projects
         .list_projects()
         .map_err(super::projects_overview::store_err)?;
-    let entries: Vec<serde_json::Value> = projects
+    let hermes_dir = super::projects_overview::hermes_projects_dir();
+    let aliases = hermes_dir
+        .as_ref()
+        .map(|dir| super::projects_overview::read_alias_map(dir))
+        .unwrap_or_default();
+    let overrides = hermes_dir
+        .as_ref()
+        .map(|dir| super::projects_overview::read_overrides(dir))
+        .unwrap_or_default();
+    let rows: Vec<RosterRow> = projects
+        .into_iter()
+        .map(|p| RosterRow {
+            slug: p.slug,
+            title: p.title,
+            objective: p.objective,
+            status: Some(p.status),
+            updated_at: Some(p.updated_at),
+        })
+        .collect();
+    let entries: Vec<serde_json::Value> = dedupe_roster(rows, &aliases, &overrides)
         .into_iter()
         .map(|p| {
             serde_json::json!({
@@ -245,6 +264,81 @@ async fn list_projects(
         })
         .collect();
     Ok(Json(serde_json::json!({ "projects": entries })))
+}
+
+#[derive(Clone, Debug)]
+struct RosterRow {
+    slug: String,
+    title: Option<String>,
+    objective: Option<String>,
+    status: Option<String>,
+    updated_at: Option<String>,
+}
+
+/// Collapse alias rows onto their canonical project, drop archived/deleted
+/// projects (board overrides win over the stored status), and keep one entry
+/// per project. Desktop clients showed `verity` and `verity-core` as two
+/// projects because the roster store keeps a row per alias ever delivered.
+fn dedupe_roster(
+    rows: Vec<RosterRow>,
+    aliases: &std::collections::HashMap<String, String>,
+    overrides: &std::collections::HashMap<String, String>,
+) -> Vec<RosterRow> {
+    let mut by_canonical: std::collections::HashMap<String, RosterRow> =
+        std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for row in rows {
+        let canonical =
+            super::projects_overview::canonicalize_project_slug_with(aliases, &row.slug);
+        let canonical = if canonical.is_empty() {
+            row.slug.clone()
+        } else {
+            canonical
+        };
+        let is_canonical_row = row.slug == canonical;
+        match by_canonical.get_mut(&canonical) {
+            None => {
+                order.push(canonical.clone());
+                by_canonical.insert(
+                    canonical.clone(),
+                    RosterRow {
+                        slug: canonical.clone(),
+                        ..row
+                    },
+                );
+            }
+            Some(existing) => {
+                // Prefer the canonical row's fields; otherwise fill gaps and
+                // keep the freshest timestamp.
+                let take = |mine: &mut Option<String>, theirs: Option<String>| {
+                    if is_canonical_row {
+                        if theirs.is_some() {
+                            *mine = theirs;
+                        }
+                    } else if mine.is_none() {
+                        *mine = theirs;
+                    }
+                };
+                take(&mut existing.title, row.title);
+                take(&mut existing.objective, row.objective);
+                take(&mut existing.status, row.status);
+                if row.updated_at > existing.updated_at {
+                    existing.updated_at = row.updated_at;
+                }
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|slug| by_canonical.remove(&slug))
+        .map(|mut row| {
+            if let Some(forced) = overrides.get(&row.slug) {
+                row.status = Some(forced.clone());
+            }
+            row
+        })
+        .filter(|row| !matches!(row.status.as_deref(), Some("archived") | Some("deleted")))
+        .collect()
 }
 
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
@@ -260,6 +354,60 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roster_folds_aliases_and_hides_archived() {
+        let aliases: std::collections::HashMap<String, String> = [
+            ("verity".to_string(), "verity-core".to_string()),
+            ("Verity-Lido".to_string(), "verity-lido".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let overrides: std::collections::HashMap<String, String> =
+            [("old".to_string(), "archived".to_string())]
+                .into_iter()
+                .collect();
+        let row = |slug: &str, title: Option<&str>, status: &str, at: &str| RosterRow {
+            slug: slug.into(),
+            title: title.map(str::to_string),
+            objective: None,
+            status: Some(status.into()),
+            updated_at: Some(at.into()),
+        };
+        let out = dedupe_roster(
+            vec![
+                row(
+                    "verity",
+                    Some("Verity (alias)"),
+                    "active",
+                    "2026-09-19T10:00:00Z",
+                ),
+                row(
+                    "verity-core",
+                    Some("Verity"),
+                    "active",
+                    "2026-09-18T10:00:00Z",
+                ),
+                row("Verity-Lido", None, "archived", "2026-09-01T00:00:00Z"),
+                row(
+                    "verity-lido",
+                    Some("Lido"),
+                    "active",
+                    "2026-09-17T00:00:00Z",
+                ),
+                row("old", Some("Old"), "active", "2026-09-17T00:00:00Z"),
+            ],
+            &aliases,
+            &overrides,
+        );
+        let slugs: Vec<&str> = out.iter().map(|r| r.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["verity-core", "verity-lido"]);
+        // Canonical row's title wins, freshest timestamp is kept.
+        assert_eq!(out[0].title.as_deref(), Some("Verity"));
+        assert_eq!(out[0].updated_at.as_deref(), Some("2026-09-19T10:00:00Z"));
+        // Alias status (archived) must not hide the canonical live project.
+        assert_eq!(out[1].status.as_deref(), Some("active"));
+    }
 
     #[test]
     fn safe_join_rejects_traversal() {

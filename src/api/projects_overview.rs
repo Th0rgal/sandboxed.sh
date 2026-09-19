@@ -1960,7 +1960,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .merge(super::project_files::routes())
 }
 
-fn hermes_projects_dir() -> Option<PathBuf> {
+pub(crate) fn hermes_projects_dir() -> Option<PathBuf> {
     std::env::var("HERMES_PROJECTS_DIR")
         .ok()
         .map(PathBuf::from)
@@ -3668,7 +3668,7 @@ fn list_markdown_slugs(dir: &Path) -> Vec<String> {
 /// Optional `routes.json` in the trackers dir: `{ "verity": "verity-roadmap" }`
 /// maps a controller routing key (STATE_SIGNATURE prefix or mission project
 /// tag) onto the tracker slug that should own its row.
-fn read_alias_map(dir: &Path) -> HashMap<String, String> {
+pub(crate) fn read_alias_map(dir: &Path) -> HashMap<String, String> {
     std::fs::read_to_string(dir.join("routes.json"))
         .ok()
         .and_then(|raw| serde_json::from_str::<HashMap<String, String>>(&raw).ok())
@@ -4136,7 +4136,7 @@ fn overrides_path(dir: &Path) -> PathBuf {
     dir.join("board-overrides.json")
 }
 
-fn read_overrides(dir: &Path) -> HashMap<String, String> {
+pub(crate) fn read_overrides(dir: &Path) -> HashMap<String, String> {
     std::fs::read_to_string(overrides_path(dir))
         .ok()
         .and_then(|raw| serde_json::from_str::<HashMap<String, String>>(&raw).ok())
