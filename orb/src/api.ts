@@ -93,6 +93,8 @@ export interface AIProvider {
   label?: string | null;
   enabled: boolean;
   uses_oauth: boolean;
+  /** "cli_proxy" when CLIProxyAPI owns the OAuth credential (reconnect via proxy login). */
+  credential_owner?: "cli_proxy" | "sandboxed_sh";
   account_email?: string | null;
   status: { type: string; reason?: string; message?: string };
 }
@@ -129,6 +131,72 @@ export async function listProviders(): Promise<AIProvider[]> {
   const data = await api<AIProvider[] | { providers?: AIProvider[] }>("/api/ai/providers");
   if (Array.isArray(data)) return data;
   return Array.isArray(data.providers) ? data.providers : [];
+}
+
+export interface ProviderUsage {
+  provider_type: string;
+  error?: string;
+  unified_status?: string;
+  unified_5h_utilization?: number;
+  unified_5h_reset?: string;
+  unified_7d_utilization?: number;
+  unified_7d_reset?: string;
+}
+
+export async function getAllProviderUsage(): Promise<Record<string, ProviderUsage>> {
+  const data = await api<{ entries?: Record<string, ProviderUsage> }>("/api/ai/providers/usage");
+  return data.entries ?? {};
+}
+
+export type CliProxyLoginStatus = "pending" | "completing" | "completed" | "failed";
+
+export interface CliProxyLoginStart {
+  session_id: string;
+  auth_url: string;
+}
+
+export interface CliProxyLoginState {
+  status: CliProxyLoginStatus;
+  auth_url?: string;
+  message?: string;
+}
+
+export async function startCliProxyLogin(provider: string): Promise<CliProxyLoginStart> {
+  return api("/api/ai/providers/cli-proxy-login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider }),
+  });
+}
+
+export async function getCliProxyLogin(sessionId: string): Promise<CliProxyLoginState> {
+  return api(`/api/ai/providers/cli-proxy-login/${sessionId}`);
+}
+
+export async function submitCliProxyLoginCallback(sessionId: string, url: string): Promise<CliProxyLoginState> {
+  return api(`/api/ai/providers/cli-proxy-login/${sessionId}/callback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+}
+
+/** Open a URL in the system browser (tauri shell when native, tab in dev). */
+export async function openExternalUrl(url: string): Promise<void> {
+  try {
+    const g = window as unknown as {
+      __TAURI_INTERNALS__?: { invoke?: (c: string, a?: Record<string, unknown>) => Promise<unknown> };
+      __TAURI__?: { core?: { invoke?: (c: string, a?: Record<string, unknown>) => Promise<unknown> } };
+    };
+    const invoke = g.__TAURI__?.core?.invoke ?? g.__TAURI_INTERNALS__?.invoke;
+    if (invoke) {
+      await invoke("open_url", { url });
+      return;
+    }
+  } catch {
+    /* fall through */
+  }
+  window.open(url, "_blank");
 }
 
 export async function listMissions(): Promise<Mission[]> {

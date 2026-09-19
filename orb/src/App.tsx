@@ -9,6 +9,8 @@ import { Providers } from "./Providers";
 import { Dialog, Field } from "./Dialog";
 import { MenuList, PopupMenu, type MenuEntry } from "./Menu";
 import { MdSource, MdView } from "./Markdown";
+import { getMissionEvents, storedToStream, streamMission } from "./stream";
+import { Transcript, applyStreamEvent, type StreamItem } from "./Transcript";
 import {
   buildRemoteAgentCommand,
   ensureNodeAgentKey,
@@ -1241,8 +1243,14 @@ export default function App() {
 
 function MissionView(p: { id: string }) {
   const [mission, setMission] = createSignal<Mission | null>(null);
+  const [items, setItems] = createSignal<StreamItem[]>([]);
   const [error, setError] = createSignal<string | null>(null);
   let scroller: HTMLDivElement | undefined;
+  let nearBottom = true;
+
+  const scrollIfPinned = () => {
+    if (nearBottom) scroller?.scrollTo({ top: scroller.scrollHeight });
+  };
 
   const refresh = async () => {
     try {
@@ -1253,10 +1261,48 @@ function MissionView(p: { id: string }) {
     }
   };
 
+  // Rebuild the transcript from the stored event log (initial load and
+  // resync after stream lag). Stored rows map onto the live event shapes,
+  // so the same reducer handles both.
+  const resync = async () => {
+    try {
+      const events = await getMissionEvents(p.id);
+      let next: StreamItem[] = [];
+      for (const row of events) {
+        const ev = storedToStream(row);
+        if (ev) next = applyStreamEvent(next, ev);
+      }
+      setItems(next);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   onMount(() => {
-    void refresh().then(() => scroller?.scrollTo({ top: scroller.scrollHeight }));
-    const t = window.setInterval(() => void refresh(), 3000);
-    onCleanup(() => clearInterval(t));
+    void Promise.all([refresh(), resync()]).then(() => scroller?.scrollTo({ top: scroller.scrollHeight }));
+    const stopStream = streamMission(
+      p.id,
+      (ev) => {
+        if (ev.type === "mission_status_changed" || ev.type === "status") {
+          void refresh();
+          return;
+        }
+        setItems((cur) => {
+          const next = applyStreamEvent(cur, ev);
+          if (next !== cur) queueMicrotask(scrollIfPinned);
+          return next;
+        });
+      },
+      () => void resync(),
+    );
+    // Slow status poll — the stream is authoritative for content, but the
+    // composer busy state shouldn't depend on it alone.
+    const t = window.setInterval(() => void refresh(), 10000);
+    onCleanup(() => {
+      stopStream();
+      clearInterval(t);
+    });
   });
 
   const busy = () => {
@@ -1264,12 +1310,13 @@ function MissionView(p: { id: string }) {
     return s === "active" || s === "running";
   };
 
-  const turns = (): Turn[] =>
-    (mission()?.history ?? []).map((h): Turn =>
-      h.role === "user"
-        ? { role: "user", text: h.content }
-        : { role: "agent", worked: "", blocks: [{ kind: "p", text: h.content }] },
-    );
+  const viewItems = () => {
+    const list = items();
+    if (busy()) return list;
+    // Terminal mission: force-close any bubble left open by a dropped
+    // assistant_message finalizer.
+    return list.map((i) => (i.kind === "text" && i.live ? { ...i, live: false } : i));
+  };
 
   const sendMsg = (text: string) => {
     void sendMissionMessage(p.id, text)
@@ -1285,19 +1332,18 @@ function MissionView(p: { id: string }) {
 
   return (
     <>
-      <div class="scroll" ref={scroller}>
+      <div
+        class="scroll"
+        ref={scroller}
+        onScroll={() => {
+          nearBottom = !scroller || scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
+        }}
+      >
         <div class="col">
-          <For each={turns()}>
-            {(turn, i) =>
-              turn.role === "user" ? (
-                <div class="user">
-                  <span>{turn.text}</span>
-                </div>
-              ) : (
-                <AgentTurn turn={turn} streaming={busy() && i() === turns().length - 1} />
-              )
-            }
-          </For>
+          <Transcript items={viewItems()} />
+          <Show when={busy() && !items().some((i) => (i.kind === "text" && i.live) || (i.kind === "think" && !i.done))}>
+            <p class="s-lead shimmer">Working…</p>
+          </Show>
           <Show when={error()}>
             <p class="s-lead">{error()}</p>
           </Show>

@@ -1,9 +1,19 @@
-import { For, Show, createMemo, createSignal, onMount } from "solid-js";
+import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import * as Ic from "./icons";
 import { Dialog, Field } from "./Dialog";
 import { Toggle } from "./Settings";
-import { isConnected, listProviders, type AIProvider } from "./api";
+import {
+  getAllProviderUsage,
+  getCliProxyLogin,
+  isConnected,
+  listProviders,
+  openExternalUrl,
+  startCliProxyLogin,
+  submitCliProxyLoginCallback,
+  type AIProvider,
+  type ProviderUsage,
+} from "./api";
 
 type AuthKind = "oauth" | "api";
 type Owner = "cliproxy" | "sandboxed" | "gemini";
@@ -178,13 +188,14 @@ export function Providers() {
   const [remote, setRemote] = createSignal<AIProvider[] | null>(null);
   const [add, setAdd] = createSignal(false);
 
-  onMount(() => {
+  const reloadRemote = () => {
     if (isConnected()) {
       listProviders()
         .then(setRemote)
         .catch(() => {});
     }
-  });
+  };
+  onMount(reloadRemote);
 
   const live = () => (isConnected() ? remote() : null);
   const [step, setStep] = createSignal<"type" | "method" | "details">("type");
@@ -244,7 +255,7 @@ export function Providers() {
   };
 
   return (
-    <Show when={!live()} fallback={<LiveProviders list={live() ?? []} />}>
+    <Show when={!live()} fallback={<LiveProviders list={live() ?? []} onRefresh={reloadRemote} />}>
     <div class="page">
       <div class="page-head">
         <h2>Providers</h2>
@@ -392,20 +403,34 @@ export function Providers() {
   );
 }
 
-function LiveProviders(p: { list: AIProvider[] }) {
+function LiveProviders(p: { list: AIProvider[]; onRefresh: () => void }) {
+  const [usage, setUsage] = createSignal<Record<string, ProviderUsage>>({});
+  const [reauth, setReauth] = createSignal<AIProvider | null>(null);
   const oauth = () => p.list.filter((x) => x.uses_oauth);
   const keys = () => p.list.filter((x) => !x.uses_oauth);
+
+  const refreshUsage = () =>
+    getAllProviderUsage()
+      .then(setUsage)
+      .catch(() => {});
+  onMount(refreshUsage);
+
   return (
     <div class="page">
       <div class="page-head">
         <h2>Providers</h2>
+        <button class="s-btn" onClick={() => { refreshUsage(); p.onRefresh(); }}>
+          Refresh
+        </button>
       </div>
-      <p class="s-lead">Configured providers from the connected sandboxed.sh backend. Manage them in the dashboard.</p>
+      <p class="s-lead">Configured providers from the connected sandboxed.sh backend.</p>
 
       <section class="s-sec">
         <h3>Subscriptions (OAuth)</h3>
         <div class="s-card">
-          <For each={oauth()}>{(a) => <LiveRow a={a} />}</For>
+          <For each={oauth()}>
+            {(a) => <LiveRow a={a} usage={usage()[a.id]} onReconnect={() => setReauth(a)} />}
+          </For>
           <Show when={oauth().length === 0}>
             <div class="s-row"><div class="s-row-desc">No OAuth providers configured.</div></div>
           </Show>
@@ -415,17 +440,202 @@ function LiveProviders(p: { list: AIProvider[] }) {
       <section class="s-sec">
         <h3>API keys</h3>
         <div class="s-card">
-          <For each={keys()}>{(a) => <LiveRow a={a} />}</For>
+          <For each={keys()}>
+            {(a) => <LiveRow a={a} usage={usage()[a.id]} onReconnect={() => setReauth(a)} />}
+          </For>
           <Show when={keys().length === 0}>
             <div class="s-row"><div class="s-row-desc">No API key providers configured.</div></div>
           </Show>
         </div>
       </section>
+
+      <Show when={reauth()}>
+        {(a) => (
+          <ReAuthDialog
+            provider={a()}
+            onClose={() => setReauth(null)}
+            onDone={() => {
+              setReauth(null);
+              p.onRefresh();
+              refreshUsage();
+            }}
+          />
+        )}
+      </Show>
     </div>
   );
 }
 
-function LiveRow(p: { a: AIProvider }) {
+const CLIPROXY_LOGIN_TYPES = new Set(["anthropic", "openai", "xai", "kimi"]);
+
+/** Reconnect via CLIProxyAPI when the backend says so; fall back to the
+ * type allowlist for backends that predate the credential_owner field. */
+function cliProxyReconnectable(a: AIProvider): boolean {
+  if (!a.uses_oauth) return false;
+  if (a.credential_owner) return a.credential_owner === "cli_proxy";
+  return CLIPROXY_LOGIN_TYPES.has(a.provider_type);
+}
+
+function UsageBars(p: { usage: ProviderUsage }) {
+  const u = p.usage;
+  const windows = createMemo(() => {
+    const out: { label: string; used: number }[] = [];
+    if (u.unified_5h_utilization != null) out.push({ label: "5h", used: u.unified_5h_utilization });
+    if (u.unified_7d_utilization != null) out.push({ label: "7d", used: u.unified_7d_utilization });
+    return out;
+  });
+  return (
+    <Show when={windows().length > 0}>
+      <div class="p-usage">
+        <For each={windows()}>
+          {(w) => (
+            <div class="p-usage-row">
+              <span class="p-usage-label">{w.label}</span>
+              <div class="p-bar">
+                <div
+                  class={`p-bar-fill ${w.used > 0.9 ? "hot" : w.used > 0.7 ? "warm" : ""}`}
+                  style={{ width: `${Math.min(100, Math.round(w.used * 100))}%` }}
+                />
+              </div>
+              <span class="p-usage-pct">{Math.round(w.used * 100)}%</span>
+            </div>
+          )}
+        </For>
+      </div>
+    </Show>
+  );
+}
+
+function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: () => void }) {
+  const [session, setSession] = createSignal<{ id: string; url: string } | null>(null);
+  const [phase, setPhase] = createSignal<"starting" | "awaiting" | "finishing" | "failed">("starting");
+  const [error, setError] = createSignal<string | null>(null);
+  const [paste, setPaste] = createSignal("");
+  let pollTimer: ReturnType<typeof setInterval> | undefined;
+
+  const stopPolling = () => {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = undefined;
+  };
+  onCleanup(stopPolling);
+
+  const startPolling = (id: string) => {
+    stopPolling();
+    pollTimer = setInterval(() => {
+      getCliProxyLogin(id)
+        .then((st) => {
+          if (st.status === "completed") {
+            stopPolling();
+            p.onDone();
+          } else if (st.status === "failed") {
+            stopPolling();
+            setPhase("failed");
+            setError(st.message ?? "login failed");
+          }
+        })
+        .catch((e: Error) => {
+          stopPolling();
+          setPhase("failed");
+          setError(e.message);
+        });
+    }, 2000);
+  };
+
+  onMount(() => {
+    startCliProxyLogin(p.provider.provider_type)
+      .then((s) => {
+        setSession({ id: s.session_id, url: s.auth_url });
+        setPhase("awaiting");
+        startPolling(s.session_id);
+        void openExternalUrl(s.auth_url);
+      })
+      .catch((e: Error) => {
+        setPhase("failed");
+        setError(e.message);
+      });
+  });
+
+  const submitPaste = () => {
+    const s = session();
+    const url = paste().trim();
+    if (!s || !url) return;
+    setPhase("finishing");
+    setError(null);
+    submitCliProxyLoginCallback(s.id, url)
+      .then((st) => {
+        if (st.status === "failed") {
+          setPhase("failed");
+          setError(st.message ?? "callback rejected");
+        } else {
+          setPhase("awaiting");
+        }
+      })
+      .catch((e: Error) => {
+        setPhase("failed");
+        setError(e.message);
+      });
+  };
+
+  return (
+    <Dialog
+      title={`Reconnect ${p.provider.name}`}
+      onClose={p.onClose}
+      footer={
+        <>
+          <span class="dlg-spacer" />
+          <button class="s-btn" onClick={p.onClose}>
+            {phase() === "failed" ? "Close" : "Cancel"}
+          </button>
+        </>
+      }
+    >
+      <Show when={phase() === "starting"}>
+        <p class="s-lead">Starting the CLIProxyAPI login on the server…</p>
+      </Show>
+      <Show when={phase() === "failed"}>
+        <p class="s-lead">Could not start the login flow.</p>
+        <p class="s-row-desc">{error()}</p>
+        <Show when={/^(404|405)\b/.test(error() ?? "")}>
+          <p class="s-row-desc">This backend build does not expose the login endpoints yet — deploy the updated sandboxed.sh first.</p>
+        </Show>
+      </Show>
+      <Show when={phase() === "awaiting" || phase() === "finishing"}>
+        <p class="s-lead">
+          Authorize in the browser window that just opened. The redirect to localhost will fail — copy the full URL from the
+          address bar and paste it here.
+        </p>
+        <div class="field">
+          <span>Auth URL</span>
+          <div class="p-url">
+            <code>{session()?.url}</code>
+            <button class="s-btn" onClick={() => session() && void openExternalUrl(session()!.url)}>
+              Open
+            </button>
+          </div>
+        </div>
+        <Field label="Redirect URL (http://localhost:…)">
+          <input
+            type="text"
+            placeholder="http://localhost:54545/callback?code=…&state=…"
+            value={paste()}
+            onInput={(e) => setPaste(e.currentTarget.value)}
+            onKeyDown={(e) => e.key === "Enter" && submitPaste()}
+          />
+        </Field>
+        <Show when={error()}>
+          <p class="s-row-desc">{error()}</p>
+        </Show>
+        <div style={{ "margin-top": "10px", display: "flex", "justify-content": "flex-end" }}>
+          <button class="s-btn primary" disabled={phase() === "finishing" || !paste().trim()} onClick={submitPaste}>
+            {phase() === "finishing" ? "Submitting…" : "Submit callback"}
+          </button>
+        </div>
+      </Show>
+    </Dialog>
+  );
+}
+
+function LiveRow(p: { a: AIProvider; usage?: ProviderUsage; onReconnect: () => void }) {
   const a = p.a;
   const stClass = () =>
     a.status.type === "connected" ? "connected" : a.status.type === "needs_reauth" || a.status.type === "error" ? "needs_reauth" : "not_configured";
@@ -439,6 +649,7 @@ function LiveRow(p: { a: AIProvider }) {
           : a.status.type === "error"
             ? "Error"
             : "Unknown";
+  const canCliProxyLogin = () => cliProxyReconnectable(a);
   return (
     <div class="s-row p-acc">
       <div class="s-row-text">
@@ -453,7 +664,13 @@ function LiveRow(p: { a: AIProvider }) {
             {a.account_email}
           </Show>
         </div>
+        <Show when={p.usage && !p.usage!.error}>
+          <UsageBars usage={p.usage!} />
+        </Show>
       </div>
+      <Show when={canCliProxyLogin() && stClass() !== "connected"}>
+        <button class="s-btn" onClick={p.onReconnect}>Reconnect</button>
+      </Show>
     </div>
   );
 }
