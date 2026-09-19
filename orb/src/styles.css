@@ -333,7 +333,7 @@ code {
 .composer:focus-within { border-color: var(--stroke-strong); }
 .composer textarea { grid-column: 2; }
 .composer .plus-wrap { grid-column: 1; }
-.composer .model-wrap { grid-column: 3; }
+.composer .picks { grid-column: 3; }
 .composer .send { grid-column: 4; }
 .composer.tall {
   grid-template-columns: auto 1fr auto;
@@ -347,7 +347,7 @@ code {
   min-height: 56px; padding-left: 2px; align-self: stretch;
 }
 .composer.tall .plus-wrap { grid-column: 1; grid-row: 2; }
-.composer.tall .model-wrap { grid-column: 2; grid-row: 2; justify-self: start; }
+.composer.tall .picks { grid-column: 2; grid-row: 2; justify-self: start; }
 .composer.tall .send { grid-column: 3; grid-row: 2; }
 .plus { width: 24px; height: 24px; border-radius: 50%; background: var(--plus-bg); color: var(--fg-3); display: grid; place-items: center; flex: none; }
 .plus:hover { background: var(--hover-2); color: var(--fg); }
@@ -356,9 +356,14 @@ textarea {
   color: var(--fg); font: 13px/20px var(--sans); padding: 2px 0; max-height: 220px;
 }
 textarea::placeholder { color: var(--placeholder); }
+.picks { display: inline-flex; align-items: center; gap: 2px; min-width: 0; }
+.picks-sep { color: var(--fg-4); font-size: 12px; padding: 0 2px; }
 .model-wrap { position: relative; }
 .model { color: var(--fg-3); display: inline-flex; align-items: center; gap: 5px; height: 24px; }
-.model:hover { color: var(--fg); }
+.model:hover, .model.on { color: var(--fg); }
+.model { padding: 0 4px; border-radius: 5px; max-width: 200px; }
+.model > :first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model:hover, .model.on { background: var(--bg-active); }
 .send { width: 24px; height: 24px; border-radius: 50%; background: var(--send-bg); color: var(--send-fg); display: grid; place-items: center; }
 .send:hover { background: var(--send-bg-hover); }
 .menu {

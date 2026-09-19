@@ -216,6 +216,7 @@ function Composer(p: {
   const live = () => isConnected() && harnessChoices().length > 0;
   const [menu, setMenu] = createSignal(false);
   const [ctx, setCtx] = createSignal(false);
+  const [which, setWhich] = createSignal<"harness" | "model" | null>(null);
   let ta!: HTMLTextAreaElement;
   const resize = () => {
     ta.style.height = "auto";
@@ -233,6 +234,7 @@ function Composer(p: {
   const close = () => {
     setMenu(false);
     setCtx(false);
+    setWhich(null);
   };
   onMount(() => window.addEventListener("pointerdown", close));
   onCleanup(() => window.removeEventListener("pointerdown", close));
@@ -260,59 +262,94 @@ function Composer(p: {
       </Show>
     </div>
   );
+  // Two pickers, Cursor-style: harness first (Claude Code, Codex, …), then
+  // the model that harness can run. Changing the harness resets the model.
+  const pick = () => effectivePick();
+  const choice = () => harnessChoices().find((c) => c.backend.id === pick()?.backend);
+  const modelLabel = () => {
+    const m = choice()?.models.find((x) => x.value === pick()?.model);
+    return m ? shortModelLabel(m.label) : (pick()?.model ?? "Model");
+  };
   const modelBtn = (
     <Show when={p.picker !== false}>
-      <div class="model-wrap" onPointerDown={(e) => e.stopPropagation()}>
-        <button class="model" onClick={() => setMenu(!menu())} title="Harness and model for this agent">
-          {live() ? pickLabel(effectivePick()) : model()} <Ic.ChevronDown size={12} />
-        </button>
-        <Show when={menu()}>
-          <div class="menu model-menu">
-            <Show
-              when={live()}
-              fallback={
-                <For each={MODELS}>
-                  {(m) => (
+      <div class="picks" onPointerDown={(e) => e.stopPropagation()}>
+        <Show
+          when={live()}
+          fallback={
+            <div class="model-wrap">
+              <button class="model" onClick={() => setMenu(!menu())}>
+                {model()} <Ic.ChevronDown size={12} />
+              </button>
+              <Show when={menu()}>
+                <div class="menu">
+                  <For each={MODELS}>
+                    {(m) => (
+                      <button
+                        class={`menu-item ${m === model() ? "on" : ""}`}
+                        onClick={() => {
+                          setModel(m);
+                          setMenu(false);
+                        }}
+                      >
+                        {m}
+                      </button>
+                    )}
+                  </For>
+                </div>
+              </Show>
+            </div>
+          }
+        >
+          <div class="model-wrap">
+            <button class={`model ${which() === "harness" ? "on" : ""}`} title="Harness" onClick={() => setWhich(which() === "harness" ? null : "harness")}>
+              {choice()?.backend.name ?? "Harness"} <Ic.ChevronDown size={12} />
+            </button>
+            <Show when={which() === "harness"}>
+              <div class="menu">
+                <For each={harnessChoices()}>
+                  {(c) => (
                     <button
-                      class={`menu-item ${m === model() ? "on" : ""}`}
+                      class={`menu-item ${c.backend.id === pick()?.backend ? "on" : ""}`}
                       onClick={() => {
-                        setModel(m);
-                        setMenu(false);
+                        if (c.backend.id !== pick()?.backend) setHarnessPick({ backend: c.backend.id, model: c.models[0].value });
+                        setWhich(null);
                       }}
                     >
-                      {m}
+                      <span class="menu-col">
+                        <span>{c.backend.name}</span>
+                        <span class="menu-sub">{c.models.length} model{c.models.length === 1 ? "" : "s"}</span>
+                      </span>
                     </button>
                   )}
                 </For>
-              }
-            >
-              <For each={harnessChoices()}>
-                {(c) => (
-                  <>
-                    <div class="menu-group">{c.backend.name}</div>
-                    <For each={c.models}>
-                      {(m) => {
-                        const on = () => effectivePick()?.backend === c.backend.id && effectivePick()?.model === m.value;
-                        return (
-                          <button
-                            class={`menu-item ${on() ? "on" : ""}`}
-                            title={m.label}
-                            onClick={() => {
-                              setHarnessPick({ backend: c.backend.id, model: m.value });
-                              setMenu(false);
-                            }}
-                          >
-                            <span class="menu-col">
-                              <span>{shortModelLabel(m.label)}</span>
-                              <span class="menu-sub">{m.value}</span>
-                            </span>
-                          </button>
-                        );
+              </div>
+            </Show>
+          </div>
+          <span class="picks-sep">·</span>
+          <div class="model-wrap">
+            <button class={`model ${which() === "model" ? "on" : ""}`} title="Model" onClick={() => setWhich(which() === "model" ? null : "model")}>
+              {modelLabel()} <Ic.ChevronDown size={12} />
+            </button>
+            <Show when={which() === "model"}>
+              <div class="menu model-menu">
+                <For each={choice()?.models ?? []}>
+                  {(m) => (
+                    <button
+                      class={`menu-item ${m.value === pick()?.model ? "on" : ""}`}
+                      title={m.label}
+                      onClick={() => {
+                        setHarnessPick({ backend: choice()!.backend.id, model: m.value });
+                        setWhich(null);
                       }}
-                    </For>
-                  </>
-                )}
-              </For>
+                    >
+                      <span class="menu-col">
+                        <span>{shortModelLabel(m.label)}</span>
+                        <span class="menu-sub">{m.value}</span>
+                      </span>
+                    </button>
+                  )}
+                </For>
+              </div>
             </Show>
           </div>
         </Show>
