@@ -95,25 +95,67 @@ export function describeSchedule(p: Parsed): string {
 }
 
 const MODES: { id: Parsed["mode"]; label: string }[] = [
-  { id: "interval", label: "Interval" },
-  { id: "days", label: "Days & time" },
+  { id: "interval", label: "Every" },
+  { id: "days", label: "On days" },
   { id: "once", label: "Once" },
   { id: "custom", label: "Custom" },
 ];
 
-/** Structured editor for a Hermes cron schedule; emits the schedule string. */
+/** Small pop-up menu in the macOS style: a quiet button, a checkmarked list. */
+function PopUp<T extends string>(p: { value: T; options: { id: T; label: string }[]; onPick: (v: T) => void }) {
+  const [open, setOpen] = createSignal(false);
+  const close = () => setOpen(false);
+  const label = () => p.options.find((o) => o.id === p.value)?.label ?? p.value;
+  return (
+    <div class="sp-pop" onPointerDown={(e) => e.stopPropagation()}>
+      <button
+        class={`sp-pop-btn ${open() ? "on" : ""}`}
+        onClick={() => {
+          const next = !open();
+          setOpen(next);
+          if (next) window.addEventListener("pointerdown", close, { once: true });
+        }}
+      >
+        {label()}
+        <svg width="8" height="12" viewBox="0 0 8 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M1.5 4.5 4 2l2.5 2.5M1.5 7.5 4 10l2.5-2.5" />
+        </svg>
+      </button>
+      <Show when={open()}>
+        <div class="menu sp-pop-menu">
+          <For each={p.options}>
+            {(o) => (
+              <button
+                class={`menu-item ${o.id === p.value ? "on" : ""}`}
+                onClick={() => {
+                  p.onPick(o.id);
+                  setOpen(false);
+                }}
+              >
+                <span class="pick-name">{o.label}</span>
+                <span class="pick-check">{o.id === p.value ? "✓" : ""}</span>
+              </button>
+            )}
+          </For>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+/** Structured editor for a Hermes cron schedule; emits the schedule string.
+ * One line, right-aligned, like a system settings row. */
 export function SchedulePicker(p: { value: string; onChange: (v: string) => void }) {
   const parsed = createMemo(() => parseSchedule(p.value));
   // The mode the user picked wins over what the string happens to parse as,
-  // so switching to "Custom" with an interval string keeps the raw editor.
+  // so choosing "Custom" with an interval string keeps the raw editor.
   const [forced, setForced] = createSignal<Parsed["mode"] | null>(null);
   const mode = () => forced() ?? parsed().mode;
   const emit = (next: Parsed) => p.onChange(formatSchedule(next));
 
   const switchTo = (m: Parsed["mode"]) => {
     setForced(m);
-    const cur = parsed();
-    if (m === cur.mode) return;
+    if (m === parsed().mode) return;
     if (m === "interval") emit({ mode: "interval", n: 45, unit: "m" });
     else if (m === "days") emit({ mode: "days", hour: 9, minute: 0, days: [1, 2, 3, 4, 5] });
     else if (m === "once") {
@@ -135,95 +177,76 @@ export function SchedulePicker(p: { value: string; onChange: (v: string) => void
 
   return (
     <div class="sp">
-      <div class="cs-seg sp-modes">
-        <For each={MODES}>
-          {(m) => (
-            <button class={mode() === m.id ? "on" : ""} onClick={() => switchTo(m.id)}>
-              {m.label}
-            </button>
-          )}
-        </For>
-      </div>
+      <PopUp value={mode()} options={MODES} onPick={switchTo} />
+      <Switch>
+        <Match when={mode() === "interval"}>
+          <input
+            class="s-input sp-num"
+            inputmode="numeric"
+            value={interval().n}
+            onInput={(e) => {
+              const n = Number(e.currentTarget.value.replace(/[^0-9]/g, ""));
+              if (n > 0) emit({ ...interval(), n });
+            }}
+          />
+          <PopUp
+            value={interval().unit}
+            options={[
+              { id: "m", label: interval().n === 1 ? "minute" : "minutes" },
+              { id: "h", label: interval().n === 1 ? "hour" : "hours" },
+              { id: "d", label: interval().n === 1 ? "day" : "days" },
+            ]}
+            onPick={(u) => emit({ ...interval(), unit: u })}
+          />
+        </Match>
 
-      <div class="sp-body">
-        <Switch>
-          <Match when={mode() === "interval"}>
-            <span class="sp-word">Every</span>
-            <input
-              class="s-input sp-num"
-              inputmode="numeric"
-              value={interval().n}
-              onInput={(e) => {
-                const n = Number(e.currentTarget.value.replace(/[^0-9]/g, ""));
-                if (n > 0) emit({ ...interval(), n });
-              }}
-            />
-            <div class="cs-seg">
-              <For each={["m", "h", "d"] as const}>
-                {(u) => (
-                  <button class={interval().unit === u ? "on" : ""} onClick={() => emit({ ...interval(), unit: u })}>
-                    {UNIT_WORD[u]}s
-                  </button>
-                )}
-              </For>
-            </div>
-          </Match>
+        <Match when={mode() === "days"}>
+          <div class="sp-days">
+            <For each={WEEK_ORDER}>
+              {(d) => (
+                <button class={`sp-day ${days().days.includes(d) ? "on" : ""}`} title={DAY_NAMES[d]} onClick={() => toggleDay(d)}>
+                  {DAY_LABELS[d]}
+                </button>
+              )}
+            </For>
+          </div>
+          <input
+            class="s-input sp-time"
+            type="time"
+            value={`${pad(days().hour)}:${pad(days().minute)}`}
+            onInput={(e) => {
+              const [h, m] = e.currentTarget.value.split(":").map(Number);
+              if (Number.isFinite(h) && Number.isFinite(m)) emit({ ...days(), hour: h, minute: m });
+            }}
+          />
+        </Match>
 
-          <Match when={mode() === "days"}>
-            <div class="sp-days">
-              <For each={WEEK_ORDER}>
-                {(d) => (
-                  <button class={`sp-day ${days().days.includes(d) ? "on" : ""}`} title={DAY_NAMES[d]} onClick={() => toggleDay(d)}>
-                    {DAY_LABELS[d]}
-                  </button>
-                )}
-              </For>
-            </div>
-            <span class="sp-word">at</span>
-            <input
-              class="s-input sp-time"
-              type="time"
-              value={`${pad(days().hour)}:${pad(days().minute)}`}
-              onInput={(e) => {
-                const [h, m] = e.currentTarget.value.split(":").map(Number);
-                if (Number.isFinite(h) && Number.isFinite(m)) emit({ ...days(), hour: h, minute: m });
-              }}
-            />
-            <div class="sp-presets">
-              <button onClick={() => emit({ ...days(), days: [1, 2, 3, 4, 5] })}>Weekdays</button>
-              <button onClick={() => emit({ ...days(), days: [0, 1, 2, 3, 4, 5, 6] })}>Every day</button>
-            </div>
-          </Match>
+        <Match when={mode() === "once"}>
+          <input
+            class="s-input sp-datetime"
+            type="datetime-local"
+            value={once()}
+            onInput={(e) => e.currentTarget.value && emit({ mode: "once", local: e.currentTarget.value })}
+          />
+        </Match>
 
-          <Match when={mode() === "once"}>
-            <span class="sp-word">On</span>
-            <input
-              class="s-input sp-datetime"
-              type="datetime-local"
-              value={once()}
-              onInput={(e) => e.currentTarget.value && emit({ mode: "once", local: e.currentTarget.value })}
-            />
-          </Match>
-
-          <Match when={mode() === "custom"}>
-            <input
-              class="s-input sp-raw"
-              spellcheck={false}
-              placeholder="0 9 * * 1-5"
-              value={p.value}
-              onInput={(e) => p.onChange(e.currentTarget.value)}
-            />
-          </Match>
-        </Switch>
-      </div>
-
-      <div class="sp-foot">
-        <span class="sp-summary">{describeSchedule(parsed())}</span>
-        <Show when={parsed().mode !== "interval"}>
-          <span class="sp-tz">server time</span>
-        </Show>
-        <code class="sp-expr">{p.value.trim() || "—"}</code>
-      </div>
+        <Match when={mode() === "custom"}>
+          <input
+            class="s-input sp-raw"
+            spellcheck={false}
+            placeholder="0 9 * * 1-5"
+            value={p.value}
+            onInput={(e) => p.onChange(e.currentTarget.value)}
+          />
+        </Match>
+      </Switch>
     </div>
   );
+}
+
+/** One-line readout for the row subtitle, e.g. "Weekdays at 09:00 · server time". */
+export function scheduleSummary(value: string): string {
+  const parsed = parseSchedule(value);
+  const text = describeSchedule(parsed);
+  return parsed.mode === "days" || parsed.mode === "once" ? `${text} · server time` : text;
 }

@@ -2,9 +2,8 @@ import { For, Show, createEffect, createMemo, createSignal, on, type JSX } from 
 import { createStore } from "solid-js/store";
 import * as Ic from "./icons";
 import { updateController, type ControllerPatch, type ControllerView } from "./api";
-import { SchedulePicker } from "./SchedulePicker";
+import { SchedulePicker, scheduleSummary } from "./SchedulePicker";
 
-const EFFORTS = ["", "low", "medium", "high", "xhigh", "max"] as const;
 
 type Draft = {
   name: string;
@@ -142,25 +141,25 @@ export function ControllerSettingsPanel(p: { slug: string; view: ControllerView;
 
   return (
     <div class="cs">
-      <Section title="Schedule" hint="When Hermes wakes this cron. Each tick starts a fresh agent with the instruction below.">
+      <Section title="Schedule">
         <Row title="Name">
           <input class="s-input cs-input" value={draft.name} onInput={(e) => setDraft("name", e.currentTarget.value)} />
         </Row>
-        <Row title="Runs" desc="How often Hermes wakes it." stack>
+        <Row title="Runs" desc={scheduleSummary(draft.schedule)}>
           <SchedulePicker value={draft.schedule} onChange={(v) => setDraft("schedule", v)} />
         </Row>
-        <Row title="Repeat" desc={`Ran ${settings()?.repeat_completed ?? 0} times so far. Leave empty to repeat forever.`}>
+        <Row title="Stops after" desc={`${settings()?.repeat_completed ?? 0} runs so far`}>
           <input
             class="s-input cs-input cs-narrow"
             inputmode="numeric"
-            placeholder="forever"
+            placeholder="Never"
             value={draft.repeat}
             onInput={(e) => setDraft("repeat", e.currentTarget.value.replace(/[^0-9]/g, ""))}
           />
         </Row>
       </Section>
 
-      <Section title="Instruction" hint="The prompt the agent receives on every tick. Attached skills are inserted before it.">
+      <Section title="Instruction">
         <div class="cs-prompt-wrap">
           <textarea
             class="cs-prompt"
@@ -179,10 +178,7 @@ export function ControllerSettingsPanel(p: { slug: string; view: ControllerView;
         </div>
       </Section>
 
-      <Section
-        title="Skills"
-        hint="Preloaded into the prompt on every tick. Large skills count against a bound controller's budget; the instruction can ask the agent to load a skill on demand instead."
-      >
+      <Section title="Skills" hint="Inserted before the instruction on every run.">
         <div class="cs-skills">
           <For each={draft.skills}>
             {(skill) => (
@@ -210,67 +206,6 @@ export function ControllerSettingsPanel(p: { slug: string; view: ControllerView;
             onBlur={addSkill}
           />
         </div>
-      </Section>
-
-      <Section title="Model" hint="Leave empty to follow Hermes' default for crons.">
-        <Row title="Model">
-          <input class="s-input cs-input" spellcheck={false} placeholder="default" value={draft.model} onInput={(e) => setDraft("model", e.currentTarget.value)} />
-        </Row>
-        <Row title="Provider">
-          <input class="s-input cs-input" spellcheck={false} placeholder="default" value={draft.provider} onInput={(e) => setDraft("provider", e.currentTarget.value)} />
-        </Row>
-        <Row title="Reasoning effort">
-          <div class="cs-seg">
-            <For each={EFFORTS}>
-              {(e) => (
-                <button class={draft.reasoning_effort === e ? "on" : ""} onClick={() => setDraft("reasoning_effort", e)}>
-                  {e || "default"}
-                </button>
-              )}
-            </For>
-          </div>
-        </Row>
-      </Section>
-
-      <Section title="Delivery" hint="Where the agent's answer goes after each tick.">
-        <Row title="Deliver to" desc="origin (the chat that created it), local (save only), or project:<slug>.">
-          <input class="s-input cs-input" spellcheck={false} value={draft.deliver} onInput={(e) => setDraft("deliver", e.currentTarget.value)} />
-        </Row>
-        <Row title="On failure" desc="Optional separate target for failure notices. Empty uses the target above.">
-          <input class="s-input cs-input" spellcheck={false} placeholder="same as above" value={draft.failure_deliver} onInput={(e) => setDraft("failure_deliver", e.currentTarget.value)} />
-        </Row>
-        <Row title="Continuity" desc="Each tick sees this cron's previous output, so it can continue instead of starting over.">
-          <button class={`toggle ${draft.continuity ? "on" : ""}`} role="switch" aria-checked={draft.continuity} onClick={() => setDraft("continuity", !draft.continuity)} />
-        </Row>
-      </Section>
-
-      <Section title="Advanced">
-        <Row title="Working directory" desc="Absolute path the agent runs from. Empty clears it.">
-          <input class="s-input cs-input" spellcheck={false} placeholder="none" value={draft.workdir} onInput={(e) => setDraft("workdir", e.currentTarget.value)} />
-        </Row>
-        <Show when={settings()?.script}>
-          <Row title={settings()?.no_agent ? "Script (no agent)" : "Prelude script"} desc="Managed in Hermes.">
-            <code class="cs-ro">{settings()?.script}</code>
-          </Row>
-        </Show>
-        <Show when={settings()?.monitor_url || settings()?.monitor_script}>
-          <Row title="Monitor source" desc="Managed in Hermes.">
-            <code class="cs-ro">{settings()?.monitor_url ?? settings()?.monitor_script}</code>
-          </Row>
-        </Show>
-        <Show when={(settings()?.enabled_toolsets.length ?? 0) > 0}>
-          <Row title="Toolsets" desc="Managed in Hermes.">
-            <code class="cs-ro">{settings()?.enabled_toolsets.join(", ")}</code>
-          </Row>
-        </Show>
-        <Show when={settings()?.binding}>
-          <Row title="Scope binding" desc="Project scope and permissions enforced by Hermes. Read-only." stack>
-            <pre class="cs-binding">{JSON.stringify(settings()?.binding, null, 2)}</pre>
-          </Row>
-        </Show>
-        <Row title="Job id">
-          <code class="cs-ro">{p.view.job?.id}</code>
-        </Row>
       </Section>
 
       <Show when={dirtyCount() > 0 || error()}>

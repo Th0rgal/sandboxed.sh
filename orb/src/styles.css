@@ -198,35 +198,43 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 /* ---------- controller settings ---------- */
 .cs { padding: 6px 10px 90px; }
 .cs-sec { margin-top: 22px; }
+/* Pop-up menus must escape the card; rows keep the rounded corners instead. */
+.cs .s-card { overflow: visible; }
+.cs .s-card > :first-child { border-top-left-radius: 10px; border-top-right-radius: 10px; }
+.cs .s-card > :last-child { border-bottom-left-radius: 10px; border-bottom-right-radius: 10px; }
+.cs .s-row { min-height: 26px; padding: 10px 14px; }
+.cs .s-row-desc { font-size: 12px; color: var(--fg-3); margin-top: 1px; }
 .cs-sec h3 { margin-bottom: 4px; }
 .cs-hint { font-size: 12.5px; color: var(--fg-3); margin: 0 0 8px; line-height: 17px; max-width: 620px; }
-.cs-input { width: 300px; max-width: 46vw; }
-.cs-input.cs-narrow { width: 110px; }
-/* ---------- schedule picker ---------- */
-.sp { display: flex; flex-direction: column; gap: 10px; }
-.sp-modes { align-self: flex-start; }
-.sp-body { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-height: 28px; }
-.sp-word { font-size: 12.5px; color: var(--fg-3); }
-.sp-num { width: 64px; text-align: center; font-variant-numeric: tabular-nums; }
-.sp-time { width: 104px; font-variant-numeric: tabular-nums; }
-.sp-datetime { width: 210px; }
-.sp-raw { width: 320px; max-width: 100%; font-family: var(--mono); font-size: 12px; }
-.sp-days { display: inline-flex; gap: 4px; }
+.cs-input { width: 240px; max-width: 46vw; height: 26px; }
+.cs-input.cs-narrow { width: 84px; text-align: center; }
+/* ---------- schedule picker: one right-aligned line ---------- */
+.sp { display: inline-flex; align-items: center; gap: 6px; }
+.sp .s-input { height: 26px; }
+.sp-num { width: 52px; text-align: center; font-variant-numeric: tabular-nums; padding: 0 4px; }
+.sp-time { width: 96px; font-variant-numeric: tabular-nums; }
+.sp-datetime { width: 200px; }
+.sp-raw { width: 200px; font-family: var(--mono); font-size: 12px; }
+.sp-days { display: inline-flex; gap: 3px; }
 .sp-day {
-  width: 26px; height: 26px; border-radius: 50%; font-size: 11.5px; color: var(--fg-3);
-  border: 1px solid var(--stroke); display: grid; place-items: center;
+  width: 24px; height: 24px; border-radius: 50%; font-size: 11px; color: var(--fg-3);
+  background: var(--bg-btn); display: grid; place-items: center; transition: background .12s, color .12s;
 }
-.sp-day:hover { color: var(--fg); border-color: var(--stroke-strong); }
-.sp-day.on { background: var(--send-bg); color: var(--send-fg); border-color: transparent; }
-.sp-presets { display: inline-flex; gap: 4px; margin-left: 4px; }
-.sp-presets button { font-size: 11.5px; color: var(--fg-3); padding: 2px 7px; border-radius: 5px; }
-.sp-presets button:hover { background: var(--bg-active); color: var(--fg); }
-.sp-foot { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
-.sp-summary { color: var(--fg-2); }
-.sp-tz { color: var(--fg-4); font-size: 11px; }
-.sp-expr { margin-left: auto; font: 11px var(--mono); color: var(--fg-4); }
+.sp-day:hover { color: var(--fg); }
+.sp-day.on { background: var(--send-bg); color: var(--send-fg); }
+.sp-pop { position: relative; }
+.sp-pop-btn {
+  height: 26px; padding: 0 8px 0 10px; border-radius: 6px; display: inline-flex; align-items: center; gap: 7px;
+  background: var(--bg-btn); border: 1px solid var(--stroke); color: var(--fg); font-size: 13px;
+}
+.sp-pop-btn svg { color: var(--fg-3); flex: none; }
+.sp-pop-btn:hover, .sp-pop-btn.on { background: var(--bg-active); }
+.sp-pop-menu { top: 30px; bottom: auto; right: 0; left: auto; min-width: 132px; padding: 4px; }
+.sp-pop-menu .menu-item { padding: 5px 9px; font-size: 12.5px; gap: 10px; }
+.sp-pop-menu .pick-name { flex: 1; }
+.sp-pop-menu .pick-check { width: 12px; color: var(--fg-2); }
 .sp input[type="time"]::-webkit-calendar-picker-indicator,
-.sp input[type="datetime-local"]::-webkit-calendar-picker-indicator { filter: invert(0.6); opacity: .7; }
+.sp input[type="datetime-local"]::-webkit-calendar-picker-indicator { filter: invert(0.6); opacity: .6; }
 :root[data-theme="light"] .sp input::-webkit-calendar-picker-indicator { filter: none; }
 .cs-prompt-wrap { padding: 10px 12px 8px; }
 .cs-prompt {
