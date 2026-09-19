@@ -134,7 +134,7 @@ export function LiveProjectsSection(p: {
                 <Show when={isOpen()} fallback={<Ic.FolderIcon />}>
                   <Ic.FolderOpenIcon />
                 </Show>
-                <span class="row-label">{project.title ?? project.slug}</span>
+                <span class="row-label">{project.title || project.slug}</span>
                 <Ic.CloudIcon class="dim" />
               </button>
               <Show when={isOpen()}>
@@ -148,7 +148,7 @@ export function LiveProjectsSection(p: {
                       <span class="glyph">
                         <p.StatusGlyph agent={{ status: p.missionGlyph(m.status) }} busy={false} />
                       </span>
-                      <span class="row-label">{m.title ?? m.id}</span>
+                      <span class="row-label">{m.title || m.id}</span>
                     </button>
                   )}
                 </For>
@@ -191,22 +191,29 @@ export function ProjectFileView(p: { slug: string; path: string }) {
         setState("error");
       });
   });
-  onCleanup(() => {
+  let pending: string | null = null;
+  const flush = () => {
     if (saveTimer) clearTimeout(saveTimer);
-  });
+    saveTimer = undefined;
+    if (pending === null) return;
+    const t = pending;
+    pending = null;
+    writeProjectFile(p.slug, p.path, t)
+      .then(() => setState("saved"))
+      .catch((e) => {
+        setError(e instanceof Error ? e.message : String(e));
+        setState("error");
+      });
+  };
+  // Don't lose a debounced edit when the user switches files mid-save.
+  onCleanup(flush);
 
   const onInput = (t: string) => {
     setText(t);
     setState("saving");
+    pending = t;
     if (saveTimer) clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => {
-      writeProjectFile(p.slug, p.path, t)
-        .then(() => setState("saved"))
-        .catch((e) => {
-          setError(e instanceof Error ? e.message : String(e));
-          setState("error");
-        });
-    }, 800);
+    saveTimer = setTimeout(flush, 800);
   };
 
   const name = () => p.path.split("/").pop() ?? p.path;

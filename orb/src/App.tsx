@@ -283,6 +283,8 @@ export default function App() {
   const [streamingId, setStreamingId] = createSignal<string | null>(null);
   const [newProject, setNewProject] = createSignal(seed[0].id);
   const [liveProjects, setLiveProjects] = createSignal<ProjectSummary[]>([]);
+  const [createError, setCreateError] = createSignal<string | null>(null);
+  const [creating, setCreating] = createSignal(false);
   const [newMachine, setNewMachine] = createSignal(MACHINES[0].id);
   const [envOpen, setEnvOpen] = createSignal<"machine" | "project" | null>(null);
   const [history, setHistory] = createSignal<(string | null)[]>(["a1"]);
@@ -474,9 +476,14 @@ export default function App() {
 
   const create = async (text: string) => {
     if (isConnected()) {
+      if (creating()) return;
       const title = text.length > 42 ? text.slice(0, 42) : text;
       const node = fleetNodes().find((n) => n.id === newMachine());
-      const projectSlug = liveProjects().some((p) => p.slug === newProject()) ? newProject() : undefined;
+      // The picker falls back to the first live project when none was chosen
+      // explicitly — tag the mission with what the UI actually shows.
+      const projectSlug = liveProjects().some((p) => p.slug === newProject()) ? newProject() : liveProjects()[0]?.slug;
+      setCreating(true);
+      setCreateError(null);
       try {
         const m = await createMission(
           node
@@ -485,8 +492,10 @@ export default function App() {
         );
         await refreshMissions();
         open(`m:${m.id}`);
-      } catch {
-        /* surfaced by the next missions poll */
+      } catch (e) {
+        setCreateError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setCreating(false);
       }
       return;
     }
@@ -686,7 +695,7 @@ export default function App() {
                         <span class="glyph">
                           <StatusGlyph agent={{ status: missionGlyph(m.status) }} busy={false} />
                         </span>
-                        <span class="row-label">{m.title ?? m.id}</span>
+                        <span class="row-label">{m.title || m.id}</span>
                       </button>
                     )}
                   </For>
@@ -753,7 +762,7 @@ export default function App() {
             <Match when={currentMissionId()}>
               {(id) => (
                 <>
-                  <span>{missions().find((m) => m.id === id())?.title ?? "Mission"}</span>
+                  <span>{missions().find((m) => m.id === id())?.title || "Mission"}</span>
                   <Ic.CloudIcon class="dim" />
                 </>
               )}
@@ -982,9 +991,12 @@ export default function App() {
                     </Show>
                   </div>
                 </div>
+                <Show when={createError()}>
+                  <p class="st-error">{createError()}</p>
+                </Show>
                 <Composer
                   placeholder="Plan, Build, / for commands, @ for context"
-                  busy={false}
+                  busy={creating()}
                   onSend={create}
                   onStop={stop}
                   autofocus
