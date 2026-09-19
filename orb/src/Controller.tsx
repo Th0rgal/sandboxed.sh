@@ -87,7 +87,10 @@ function durationLabel(secs?: number | null): string {
 type Entry =
   | { kind: "day"; key: string; label: string }
   | { kind: "run"; key: string; run: ControllerRun }
-  | { kind: "silent"; key: string; runs: ControllerRun[] };
+  | { kind: "silent"; key: string; runs: ControllerRun[] }
+  | { kind: "failed"; key: string; runs: ControllerRun[]; error: string };
+
+const isFailed = (r: ControllerRun) => r.status === "failed" || !!r.error;
 
 function buildEntries(runs: ControllerRun[]): Entry[] {
   const out: Entry[] = [];
@@ -100,7 +103,13 @@ function buildEntries(runs: ControllerRun[]): Entry[] {
     }
     const last = out[out.length - 1];
     const running = run.status === "running" || run.status === "claimed";
-    if (run.silent && !running && !run.error) {
+    if (isFailed(run) && !running && !run.report) {
+      // A streak of the same failure (a broken cron fails every minute)
+      // reads as one line, not forty identical red cards.
+      const error = run.error ?? "failed";
+      if (last && last.kind === "failed" && last.error === error) last.runs.push(run);
+      else out.push({ kind: "failed", key: `f:${run.id}`, runs: [run], error });
+    } else if (run.silent && !running && !run.error) {
       if (last && last.kind === "silent") last.runs.push(run);
       else out.push({ kind: "silent", key: `s:${run.id}`, runs: [run] });
     } else {
@@ -168,6 +177,28 @@ function SilentFold(p: { runs: ControllerRun[] }) {
           )}
         </For>
       </Show>
+    </div>
+  );
+}
+
+function FailedFold(p: { runs: ControllerRun[]; error: string }) {
+  const span = () => {
+    const first = p.runs[p.runs.length - 1];
+    const last = p.runs[0];
+    return p.runs.length === 1 ? timeOf(last.at) : `${timeOf(first.at)} – ${timeOf(last.at)}`;
+  };
+  return (
+    <div class="cr-run failed cr-failed-fold">
+      <div class="cr-rail">
+        <span class="cr-time">{timeOf(p.runs[0].at)}</span>
+        <span class="cr-dur">×{p.runs.length}</span>
+      </div>
+      <div class="cr-body">
+        <p class="cr-failed-title">
+          {p.runs.length === 1 ? "Tick failed" : `${p.runs.length} ticks failed`} <span class="cr-failed-span">· {span()}</span>
+        </p>
+        <p class="st-error cr-error">{p.error}</p>
+      </div>
     </div>
   );
 }
@@ -272,6 +303,8 @@ export function ControllerView(p: { slug: string }) {
                         <div class="cr-day">{e.label}</div>
                       ) : e.kind === "silent" ? (
                         <SilentFold runs={e.runs} />
+                      ) : e.kind === "failed" ? (
+                        <FailedFold runs={e.runs} error={e.error} />
                       ) : (
                         <RunCard run={e.run} />
                       )
