@@ -109,6 +109,7 @@ export interface AIProvider {
 export interface CliProxyLoginStart {
   session_id: string;
   auth_url: string;
+  flow?: "redirect" | "device";
 }
 
 export type CliProxyLoginStatus = "pending" | "completing" | "completed" | "failed";
