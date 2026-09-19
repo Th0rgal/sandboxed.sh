@@ -5087,7 +5087,7 @@ fn anthropic_tools_from_openai(tools: Option<&serde_json::Value>) -> Option<serd
             function
                 .get("parameters")
                 .cloned()
-                .map(|schema| strip_json_schema_meta_keys(schema))
+                .map(strip_json_schema_meta_keys)
                 .unwrap_or_else(|| serde_json::json!({ "type": "object" })),
         );
         out.push(serde_json::Value::Object(converted));
