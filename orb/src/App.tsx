@@ -11,7 +11,7 @@ import { MenuList, PopupMenu, type MenuEntry } from "./Menu";
 import { MdSource, MdView, safeHref } from "./Markdown";
 import { getMissionEvents, storedToStream, streamMission, type StreamEvent } from "./stream";
 import { Transcript, applyStreamEvent, buildTranscript, type StreamItem } from "./Transcript";
-import { pollWhileVisible } from "./poll";
+import { mergeById, pollWhileVisible } from "./poll";
 import { LiveProjectsSection, ProjectFileView } from "./ProjectFiles";
 import {
   buildRemoteAgentCommand,
@@ -442,18 +442,15 @@ export default function App() {
   });
 
   const [missions, setMissions] = createSignal<Mission[]>([]);
-
   /** Only missions still doing something: the sidebar is a place to act,
-
    * not a history. Everything else lives under its project. */
-
   const LIVE = new Set(["active", "pending", "queued", "blocked", "awaiting_user", "resuming"]);
-
-  const liveMissions = () => missions().filter((m) => LIVE.has(m.status));
+  const liveMissions = createMemo(() => missions().filter((m) => LIVE.has(m.status)));
   const [fleetNodes, setFleetNodes] = createSignal<RemoteNodeView[]>([]);
   const refreshMissions = async () => {
     try {
-      setMissions(await listMissions());
+      const fresh = await listMissions();
+      setMissions((prev) => mergeById(prev, fresh));
     } catch {
       /* keep last good list */
     }

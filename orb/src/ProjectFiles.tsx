@@ -1,5 +1,5 @@
 import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
-import { pollWhileVisible } from "./poll";
+import { mergeById, pollWhileVisible } from "./poll";
 import { createStore } from "solid-js/store";
 import * as Ic from "./icons";
 import { MdSource, MdView } from "./Markdown";
@@ -64,7 +64,10 @@ export function LiveProjectsSection(p: {
 
   const loadMissions = (slug: string) => {
     listProjectMissions(slug)
-      .then((list) => setMissions(slug, list))
+      .then((list) => {
+        const merged = mergeById(missions[slug] ?? [], list);
+        if (merged !== missions[slug]) setMissions(slug, merged);
+      })
       .catch(() => {
         if (!missions[slug]) setMissions(slug, []);
       });
