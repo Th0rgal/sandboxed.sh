@@ -23,6 +23,10 @@ export function LiveProjectsSection(p: {
   open: (id: string) => void;
   missionGlyph: (status: string) => "idle" | "running" | "pr-closed" | "pr-merged";
   StatusGlyph: (props: { agent: { status: "idle" | "running" | "pr-closed" | "pr-merged" }; busy: boolean }) => any;
+  /** "+" on a project row: start a new agent in that project. */
+  onNewAgent: (slug: string) => void;
+  /** "+" on the section header: create a project (opens the picker flow). */
+  onNewProject: () => void;
 }) {
   const [projects, setProjects] = createSignal<ProjectSummary[]>([]);
   const [error, setError] = createSignal<string | null>(null);
@@ -143,7 +147,12 @@ export function LiveProjectsSection(p: {
 
   return (
     <>
-      <div class="section">Projects</div>
+      <div class="section section-row">
+        <span>Projects</span>
+        <button class="section-add" title="New project" onClick={() => p.onNewProject()}>
+          <Ic.PlusIcon size={13} />
+        </button>
+      </div>
       <Show when={error()}>
         <div class="row note">{error()}</div>
       </Show>
@@ -157,7 +166,18 @@ export function LiveProjectsSection(p: {
                   <Ic.FolderOpenIcon />
                 </Show>
                 <span class="row-label">{project.title || project.slug}</span>
-                <Ic.CloudIcon class="dim" />
+                <span
+                  class="row-action"
+                  role="button"
+                  title="New agent in this project"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    p.onNewAgent(project.slug);
+                  }}
+                >
+                  <Ic.PlusIcon size={13} />
+                </span>
+                <Ic.CloudIcon class="dim row-cloud" />
               </button>
               <Show when={isOpen()}>
                 <For each={liveOf(project.slug)}>

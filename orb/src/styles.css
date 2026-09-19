@@ -167,6 +167,14 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 .glyph { width: 16px; height: 16px; display: flex; align-items: center; justify-content: center; }
 .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--fg-4); opacity: .45; }
 .section { color: var(--fg-4); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; padding: 0 8px; margin: 16px 0 6px; }
+.section-row { display: flex; align-items: center; justify-content: space-between; }
+.section-add {
+  width: 18px; height: 18px; border-radius: 4px; display: grid; place-items: center;
+  color: var(--fg-4);
+}
+.section-add:hover { background: var(--bg-active); color: var(--fg); }
+/* Project row: the cloud badge yields to a + on hover. */
+.row.project:hover .row-cloud { display: none; }
 /* "New project…" inside the project picker: the menu turns into a field. */
 .menu-new {
   display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 10px;

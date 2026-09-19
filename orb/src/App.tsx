@@ -864,7 +864,22 @@ export default function App() {
                     </>
                   }
                 >
-                  <LiveProjectsSection selected={selected} open={open} missionGlyph={missionGlyph} StatusGlyph={StatusGlyph} />
+                  <LiveProjectsSection
+                    selected={selected}
+                    open={open}
+                    missionGlyph={missionGlyph}
+                    StatusGlyph={StatusGlyph}
+                    onNewAgent={(slug) => {
+                      setNewProject(slug);
+                      open(null);
+                    }}
+                    onNewProject={() => {
+                      open(null);
+                      setNewProjectName("");
+                      setNewProjectDraft(true);
+                      setEnvOpen("project");
+                    }}
+                  />
                 </Show>
 
               </>
