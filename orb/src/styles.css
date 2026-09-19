@@ -337,7 +337,13 @@ code {
 .pf-state { font-size: 12px; color: var(--fg-3); }
 
 /* ---------- dock / composer ---------- */
-.dock { flex: none; padding: 0 34px; }
+/* Composer dock: breathing room below the input (Cursor keeps ~16px) and a
+   soft fade so the transcript scrolling underneath reads as intentional. */
+.dock { flex: none; padding: 10px 34px 16px; position: relative; }
+.dock::before {
+  content: ""; position: absolute; left: 0; right: 0; top: -18px; height: 18px;
+  background: linear-gradient(to bottom, transparent, var(--bg)); pointer-events: none;
+}
 .actions { display: flex; gap: 4px; margin-bottom: 8px; }
 .pill {
   height: 28px; padding: 0 10px; border-radius: 14px;
