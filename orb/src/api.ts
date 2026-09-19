@@ -257,7 +257,7 @@ export async function listProjects(): Promise<ProjectSummary[]> {
 
 /** Missions tagged with this project (exact slug match on the backend). */
 export async function listProjectMissions(slug: string): Promise<Mission[]> {
-  return api(`/api/control/missions?project=${encodeURIComponent(slug)}&limit=100`);
+  return api(`/api/control/missions?project=${encodeURIComponent(slug)}&limit=100&all=true`);
 }
 
 export async function listProjectFiles(slug: string, path: string): Promise<ProjectFileEntry[]> {

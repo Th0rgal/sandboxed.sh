@@ -48,7 +48,6 @@ export function LiveProjectsSection(p: {
   onMount(refresh);
 
   const loadMissions = (slug: string) => {
-    if (missions[slug]) return;
     listProjectMissions(slug)
       .then((list) => setMissions(slug, list))
       .catch(() => setMissions(slug, []));
