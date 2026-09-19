@@ -5,7 +5,8 @@
 //! Hermes owns the job; this module only exposes a read model and three safe
 //! actions so a client can show the controller inside its project:
 //!
-//! - `GET  /api/projects/:slug/controller`         — job + recent runs
+//! - `GET  /api/projects/:slug/controller`         — job, settings, recent runs
+//! - `PUT  /api/projects/:slug/controller`         — edit the job's settings
 //! - `POST /api/projects/:slug/controller/action`  — `pause` | `resume` | `run`
 //!
 //! The data is read straight from the Hermes cron store that lives on the
@@ -75,11 +76,71 @@ pub struct ControllerRun {
     pub error: Option<String>,
 }
 
+/// Everything that defines what the cron does, as Hermes stores it. A cron
+/// is a prompt run on a schedule by a fresh agent: the prompt is prefixed
+/// with the attached skills, optionally with a script's stdout and with the
+/// job's previous output (continuity), run with a pinned or default model,
+/// and its answer is delivered to a target.
+#[derive(Debug, Serialize, Clone, PartialEq, Default)]
+pub struct ControllerSettings {
+    pub prompt: String,
+    pub prompt_chars: usize,
+    /// Skills preloaded into the prompt on every run.
+    pub skills: Vec<String>,
+    /// Where the answer goes: `origin`, `local`, `project:<slug>`, a platform…
+    pub deliver: Option<String>,
+    pub failure_deliver: Option<String>,
+    /// `None` = repeat forever.
+    pub repeat_times: Option<i64>,
+    pub repeat_completed: i64,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub workdir: Option<String>,
+    /// Script whose stdout is injected into the prompt (or IS the job).
+    pub script: Option<String>,
+    pub no_agent: bool,
+    /// Each run sees the job's own previous output.
+    pub continuity: bool,
+    pub monitor_url: Option<String>,
+    pub monitor_script: Option<String>,
+    pub enabled_toolsets: Vec<String>,
+    pub created_at: Option<String>,
+    /// Scope binding (project, permissions, mode). Read-only here.
+    pub binding: Option<serde_json::Value>,
+    /// Hard cap on the whole initial prompt (skills included) that Hermes
+    /// enforces for scope-bound controllers; `None` when unbound.
+    pub prompt_budget: Option<usize>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ControllerView {
     pub slug: String,
     pub job: Option<ControllerJob>,
+    pub settings: Option<ControllerSettings>,
     pub runs: Vec<ControllerRun>,
+}
+
+/// Mirrors `CONTROLLER_PROMPT_MAX_CHARS` in Hermes' `cron/controller_scope.py`.
+const BOUND_CONTROLLER_PROMPT_BUDGET: usize = 16_000;
+
+/// Editable settings. Absent fields are left untouched; an empty string
+/// clears an optional pin (model, provider, effort, workdir, failure target).
+#[derive(Debug, Deserialize, Default)]
+pub struct UpdateRequest {
+    pub name: Option<String>,
+    pub schedule: Option<String>,
+    pub prompt: Option<String>,
+    pub skills: Option<Vec<String>>,
+    pub deliver: Option<String>,
+    pub failure_deliver: Option<String>,
+    /// `Some(0)` or negative = forever.
+    pub repeat: Option<i64>,
+    pub workdir: Option<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub continuity: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +255,185 @@ fn job_view(job: &serde_json::Value) -> Option<ControllerJob> {
             .unwrap_or(0),
         deliver: str_field(job, "deliver"),
     })
+}
+
+fn string_list(value: Option<&serde_json::Value>) -> Vec<String> {
+    match value {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::to_string)
+            .collect(),
+        Some(serde_json::Value::String(one)) if !one.trim().is_empty() => vec![one.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn settings_view(job: &serde_json::Value) -> ControllerSettings {
+    let id = str_field(job, "id").unwrap_or_default();
+    let prompt = job
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let mut skills = string_list(job.get("skills"));
+    if skills.is_empty() {
+        skills = string_list(job.get("skill"));
+    }
+    let binding = job.get("controller").filter(|v| v.is_object()).cloned();
+    ControllerSettings {
+        prompt_chars: prompt.chars().count(),
+        prompt,
+        skills,
+        deliver: str_field(job, "deliver"),
+        failure_deliver: str_field(job, "failure_deliver"),
+        repeat_times: job
+            .get("repeat")
+            .and_then(|r| r.get("times"))
+            .and_then(|v| v.as_i64()),
+        repeat_completed: job
+            .get("repeat")
+            .and_then(|r| r.get("completed"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        model: str_field(job, "model"),
+        provider: str_field(job, "provider"),
+        reasoning_effort: str_field(job, "reasoning_effort"),
+        workdir: str_field(job, "workdir"),
+        script: str_field(job, "script"),
+        no_agent: job
+            .get("no_agent")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        continuity: string_list(job.get("context_from"))
+            .iter()
+            .any(|c| c == &id),
+        monitor_url: str_field(job, "monitor_url"),
+        monitor_script: str_field(job, "monitor_script"),
+        enabled_toolsets: string_list(job.get("enabled_toolsets")),
+        created_at: str_field(job, "created_at"),
+        prompt_budget: binding.as_ref().map(|_| BOUND_CONTROLLER_PROMPT_BUDGET),
+        binding,
+    }
+}
+
+const EFFORTS: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+fn plain_token(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value.len() <= 120
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.' | '/'))
+}
+
+/// Translate an update into `hermes cron edit` arguments. Pure so the
+/// mapping (and its validation) is testable without a Hermes install.
+fn edit_args(req: &UpdateRequest) -> Result<Vec<String>, String> {
+    let mut args: Vec<String> = Vec::new();
+    // `--flag=value`, never `--flag value`: argparse must not be able to read
+    // a user-supplied value that starts with `-` as another option.
+    let mut push = |flag: &str, value: &str| args.push(format!("{flag}={value}"));
+    if let Some(name) = req.name.as_deref().map(str::trim) {
+        if name.is_empty() || name.chars().count() > 120 || name.contains('\n') {
+            return Err("name must be 1 to 120 characters on one line".into());
+        }
+        push("--name", name);
+    }
+    if let Some(schedule) = req.schedule.as_deref().map(str::trim) {
+        if schedule.is_empty() || schedule.chars().count() > 120 || schedule.contains('\n') {
+            return Err(
+                "schedule must be 1 to 120 characters, e.g. 'every 45m' or '0 9 * * 1-5'".into(),
+            );
+        }
+        push("--schedule", schedule);
+    }
+    if let Some(prompt) = req.prompt.as_deref() {
+        if prompt.trim().is_empty() {
+            return Err("prompt cannot be empty".into());
+        }
+        if prompt.len() > 96 * 1024 {
+            return Err("prompt is larger than 96 KB".into());
+        }
+        push("--prompt", prompt);
+    }
+    if let Some(deliver) = req.deliver.as_deref().map(str::trim) {
+        if !plain_token(deliver) {
+            return Err(
+                "deliver must be a plain target such as origin, local or project:<slug>".into(),
+            );
+        }
+        push("--deliver", deliver);
+    }
+    if let Some(target) = req.failure_deliver.as_deref().map(str::trim) {
+        if !target.is_empty() && !plain_token(target) {
+            return Err("failure_deliver must be a plain target, or empty to clear".into());
+        }
+        push("--failure-deliver", target);
+    }
+    if let Some(workdir) = req.workdir.as_deref().map(str::trim) {
+        if !workdir.is_empty() && (!workdir.starts_with('/') || workdir.contains("..")) {
+            return Err("workdir must be an absolute path, or empty to clear".into());
+        }
+        push("--workdir", workdir);
+    }
+    if let Some(model) = req.model.as_deref().map(str::trim) {
+        if !model.is_empty() && !plain_token(model) {
+            return Err("model is not a valid model id".into());
+        }
+        push("--model", model);
+    }
+    if let Some(provider) = req.provider.as_deref().map(str::trim) {
+        if !provider.is_empty() && !plain_token(provider) {
+            return Err("provider is not a valid provider id".into());
+        }
+        push("--provider", provider);
+    }
+    if let Some(effort) = req.reasoning_effort.as_deref().map(str::trim) {
+        if !effort.is_empty() && !EFFORTS.contains(&effort) {
+            return Err(format!(
+                "reasoning_effort must be one of {}",
+                EFFORTS.join(", ")
+            ));
+        }
+        push("--reasoning-effort", effort);
+    }
+    if let Some(times) = req.repeat {
+        push(
+            "--repeat",
+            &if times <= 0 {
+                "forever".to_string()
+            } else {
+                times.to_string()
+            },
+        );
+    }
+    if let Some(skills) = req.skills.as_ref() {
+        if skills.iter().any(|s| !plain_token(s.trim())) {
+            return Err(
+                "skill names may only contain letters, digits, '-', '_', ':' and '/'".into(),
+            );
+        }
+        if skills.is_empty() {
+            args.push("--clear-skills".to_string());
+        } else {
+            for skill in skills {
+                args.push(format!("--skill={}", skill.trim()));
+            }
+        }
+    }
+    match req.continuity {
+        Some(true) => args.push("--continuity".to_string()),
+        Some(false) => args.push("--no-continuity".to_string()),
+        None => {}
+    }
+    if args.is_empty() {
+        return Err("no changes to apply".into());
+    }
+    Ok(args)
 }
 
 /// Split a run's response into report text and its machine trailers.
@@ -410,11 +650,14 @@ fn controller_view_sync(slug: &str, recorded_id: Option<String>, limit: usize) -
         return ControllerView {
             slug: slug.to_string(),
             job: None,
+            settings: None,
             runs: Vec::new(),
         };
     };
     let jobs = load_jobs(&home);
-    let job = find_job(&jobs, &project_keys(slug), recorded_id.as_deref()).and_then(job_view);
+    let raw = find_job(&jobs, &project_keys(slug), recorded_id.as_deref());
+    let job = raw.and_then(job_view);
+    let settings = job.as_ref().and(raw).map(settings_view);
     let runs = job
         .as_ref()
         .map(|j| build_runs(&home, &j.id, limit))
@@ -422,6 +665,7 @@ fn controller_view_sync(slug: &str, recorded_id: Option<String>, limit: usize) -
     ControllerView {
         slug: slug.to_string(),
         job,
+        settings,
         runs,
     }
 }
@@ -465,6 +709,91 @@ fn hermes_cli() -> String {
         })
 }
 
+/// Resolve the project's controller job id and the Hermes home it lives in.
+async fn resolve_controller(
+    slug: String,
+    recorded: Option<String>,
+) -> Result<(PathBuf, String), ApiError> {
+    tokio::task::spawn_blocking(move || {
+        let home = hermes_home()?;
+        let jobs = load_jobs(&home);
+        let id = find_job(&jobs, &project_keys(&slug), recorded.as_deref())
+            .and_then(|j| str_field(j, "id"))?;
+        Some((home, id))
+    })
+    .await
+    .map_err(internal)?
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "this project has no controller cron".to_string(),
+        )
+    })
+}
+
+/// Run `hermes cron <args…>` against `home`. Hermes stays the only writer of
+/// its cron store; this process never edits `jobs.json` itself.
+async fn run_hermes_cron(home: &Path, args: &[String]) -> Result<(), ApiError> {
+    let mut command = tokio::process::Command::new(hermes_cli());
+    command
+        .arg("cron")
+        .args(args)
+        .env("HERMES_HOME", home)
+        .kill_on_drop(true);
+    // The Hermes CLI expects the assistant's HOME (skills, secrets helper).
+    if let Ok(cli_home) = std::env::var("HERMES_CLI_HOME") {
+        command.env("HOME", cli_home);
+    } else if Path::new("/var/lib/hermes-assistant").is_dir() {
+        command.env("HOME", "/var/lib/hermes-assistant");
+    }
+    let verb = args.first().cloned().unwrap_or_default();
+    let output = tokio::time::timeout(std::time::Duration::from_secs(90), command.output())
+        .await
+        .map_err(|_| internal("hermes cron command timed out"))?
+        .map_err(|e| internal(format!("failed to run hermes cron {verb}: {e}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(str::trim)
+        .rfind(|l| !l.is_empty() && !l.contains("Bitwarden Secrets Manager"))
+        .unwrap_or("unknown error")
+        .to_string();
+    Err((
+        StatusCode::BAD_GATEWAY,
+        format!("hermes cron {verb} failed: {detail}"),
+    ))
+}
+
+async fn update_controller(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(slug): AxumPath<String>,
+    Json(req): Json<UpdateRequest>,
+) -> Result<Json<ControllerView>, ApiError> {
+    if !super::projects_overview::is_plain_key(&slug) {
+        return Err((StatusCode::BAD_REQUEST, "invalid project slug".to_string()));
+    }
+    let edit = edit_args(&req).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let slug = super::projects_overview::canonicalize_project_slug(&slug);
+    let recorded = recorded_controller_id(&state, &slug);
+    let (home, job_id) = resolve_controller(slug.clone(), recorded.clone()).await?;
+
+    let mut args = vec!["edit".to_string()];
+    args.extend(edit);
+    args.push(job_id);
+    run_hermes_cron(&home, &args).await?;
+
+    let view =
+        tokio::task::spawn_blocking(move || controller_view_sync(&slug, recorded, DEFAULT_RUNS))
+            .await
+            .map_err(internal)?;
+    Ok(Json(view))
+}
+
 async fn controller_action(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(slug): AxumPath<String>,
@@ -486,57 +815,13 @@ async fn controller_action(
     };
     let slug = super::projects_overview::canonicalize_project_slug(&slug);
     let recorded = recorded_controller_id(&state, &slug);
-    let lookup_slug = slug.clone();
-    let lookup_recorded = recorded.clone();
-    let (home, job_id) = tokio::task::spawn_blocking(move || {
-        let home = hermes_home()?;
-        let jobs = load_jobs(&home);
-        let id = find_job(
-            &jobs,
-            &project_keys(&lookup_slug),
-            lookup_recorded.as_deref(),
-        )
-        .and_then(|j| str_field(j, "id"))?;
-        Some((home, id))
-    })
-    .await
-    .map_err(internal)?
-    .ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            "this project has no controller cron".to_string(),
-        )
-    })?;
+    let (home, job_id) = resolve_controller(slug.clone(), recorded.clone()).await?;
 
-    let mut command = tokio::process::Command::new(hermes_cli());
-    command
-        .args(["cron", verb, &job_id])
-        .env("HERMES_HOME", &home)
-        .kill_on_drop(true);
+    let mut args = vec![verb.to_string(), job_id];
     if verb == "run" {
-        command.arg("--accept-hooks");
+        args.push("--accept-hooks".to_string());
     }
-    // The Hermes CLI expects the assistant's HOME (skills, secrets helper).
-    if let Ok(cli_home) = std::env::var("HERMES_CLI_HOME") {
-        command.env("HOME", cli_home);
-    } else if Path::new("/var/lib/hermes-assistant").is_dir() {
-        command.env("HOME", "/var/lib/hermes-assistant");
-    }
-    let output = tokio::time::timeout(std::time::Duration::from_secs(90), command.output())
-        .await
-        .map_err(|_| internal("hermes cron command timed out"))?
-        .map_err(|e| internal(format!("failed to run hermes cron {verb}: {e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!(
-                "hermes cron {verb} failed: {}",
-                stderr.trim().lines().last().unwrap_or(stdout.trim())
-            ),
-        ));
-    }
+    run_hermes_cron(&home, &args).await?;
 
     let view =
         tokio::task::spawn_blocking(move || controller_view_sync(&slug, recorded, DEFAULT_RUNS))
@@ -547,7 +832,10 @@ async fn controller_action(
 
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
     Router::new()
-        .route("/:slug/controller", get(get_controller))
+        .route(
+            "/:slug/controller",
+            get(get_controller).put(update_controller),
+        )
         .route("/:slug/controller/action", post(controller_action))
 }
 
@@ -566,6 +854,102 @@ mod tests {
         );
         assert_eq!(signature.as_deref(), Some("verity-pareto|gaps|x"));
         assert!(response_section("no heading here").is_none());
+    }
+
+    #[test]
+    fn settings_come_from_the_job_record() {
+        let job: serde_json::Value = serde_json::from_str(
+            r#"{"id":"j1","name":"c","prompt":"Do the thing.","skills":["controllers-policy","github-workflow"],
+                "deliver":"project:verity-lido","repeat":{"times":null,"completed":12},
+                "model":"builtin/assistant","provider":"sandboxed","context_from":["j1"],
+                "enabled_toolsets":["mcp"],"controller":{"project":"verity-lido","mode":"operator"}}"#,
+        )
+        .unwrap();
+        let s = settings_view(&job);
+        assert_eq!(s.prompt, "Do the thing.");
+        assert_eq!(s.prompt_chars, 13);
+        assert_eq!(s.skills, vec!["controllers-policy", "github-workflow"]);
+        assert_eq!(s.repeat_times, None);
+        assert_eq!(s.repeat_completed, 12);
+        assert!(s.continuity);
+        assert_eq!(s.prompt_budget, Some(BOUND_CONTROLLER_PROMPT_BUDGET));
+        // No binding → no budget; legacy single `skill` still listed.
+        let plain: serde_json::Value =
+            serde_json::from_str(r#"{"id":"j2","prompt":"x","skill":"controllers-policy"}"#)
+                .unwrap();
+        let s = settings_view(&plain);
+        assert_eq!(s.skills, vec!["controllers-policy"]);
+        assert_eq!(s.prompt_budget, None);
+        assert!(!s.continuity);
+    }
+
+    #[test]
+    fn updates_map_to_hermes_cron_edit_arguments() {
+        let req = UpdateRequest {
+            name: Some(" lido controller ".into()),
+            schedule: Some("every 30m".into()),
+            skills: Some(vec![]),
+            model: Some("".into()),
+            reasoning_effort: Some("high".into()),
+            continuity: Some(true),
+            repeat: Some(0),
+            ..UpdateRequest::default()
+        };
+        let args = edit_args(&req).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "--name=lido controller",
+                "--schedule=every 30m",
+                "--model=",
+                "--reasoning-effort=high",
+                "--repeat=forever",
+                "--clear-skills",
+                "--continuity",
+            ]
+        );
+        let skills = UpdateRequest {
+            skills: Some(vec!["a".into(), "b:c".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            edit_args(&skills).unwrap(),
+            vec!["--skill=a", "--skill=b:c"]
+        );
+        // A value that looks like a flag stays a value.
+        let sneaky = UpdateRequest {
+            name: Some("--clear-skills".into()),
+            ..Default::default()
+        };
+        assert_eq!(edit_args(&sneaky).unwrap(), vec!["--name=--clear-skills"]);
+
+        // Rejected before anything reaches the CLI.
+        assert!(edit_args(&UpdateRequest::default()).is_err());
+        let bad = |r: UpdateRequest| edit_args(&r).is_err();
+        assert!(bad(UpdateRequest {
+            prompt: Some("   ".into()),
+            ..Default::default()
+        }));
+        assert!(bad(UpdateRequest {
+            reasoning_effort: Some("extreme".into()),
+            ..Default::default()
+        }));
+        assert!(bad(UpdateRequest {
+            workdir: Some("relative/path".into()),
+            ..Default::default()
+        }));
+        assert!(bad(UpdateRequest {
+            skills: Some(vec!["--prompt".into()]),
+            ..Default::default()
+        }));
+        assert!(bad(UpdateRequest {
+            skills: Some(vec!["x; rm".into()]),
+            ..Default::default()
+        }));
+        assert!(bad(UpdateRequest {
+            deliver: Some("project:x --clear-skills".into()),
+            ..Default::default()
+        }));
     }
 
     #[test]
