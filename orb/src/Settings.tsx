@@ -1,6 +1,10 @@
 import { For, Show, createSignal, type JSX } from "solid-js";
 import * as Ic from "./icons";
 import { clearConnection, getApiUrl, isConnected, login, setApiUrl } from "./api";
+import { getThemePref, setThemePref, type ThemePref } from "./theme";
+
+const THEME_LABELS: Record<ThemePref, string> = { auto: "Auto", light: "Light", dark: "Dark" };
+const THEME_PREFS: Record<string, ThemePref> = { Auto: "auto", Light: "light", Dark: "dark" };
 
 export const SETTINGS_TABS = [
   { id: "backend", label: "Backend", icon: Ic.SlidersIcon },
@@ -37,7 +41,7 @@ export function Toggle(p: { on: boolean; onClick?: () => void }) {
   );
 }
 
-function Select(p: { value: string; options: string[] }) {
+function Select(p: { value: string; options: string[]; onChange?: (v: string) => void }) {
   const [v, setV] = createSignal(p.value);
   const [open, setOpen] = createSignal(false);
   return (
@@ -54,6 +58,7 @@ function Select(p: { value: string; options: string[] }) {
                 onClick={() => {
                   setV(o);
                   setOpen(false);
+                  p.onChange?.(o);
                 }}
               >
                 {o}
@@ -197,8 +202,12 @@ export function Settings(p: { tab: SettingsTab }) {
         <Show when={p.tab === "appearance"}>
           <h2>Appearance</h2>
           <Card>
-            <Row title="Theme" desc="Orb follows a dark theme.">
-              <Select value="Dark" options={["Dark"]} />
+            <Row title="Theme" desc="Auto follows your desktop appearance.">
+              <Select
+                value={THEME_LABELS[getThemePref()]}
+                options={["Auto", "Light", "Dark"]}
+                onChange={(v) => setThemePref(THEME_PREFS[v])}
+              />
             </Row>
             <Row title="Text Size" desc="Size of the conversation transcript.">
               <Select value="Default" options={["Small", "Default", "Large"]} />
