@@ -543,7 +543,7 @@ fn bad_slug() -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, "invalid project slug".to_string())
 }
 
-fn store_err(error: String) -> (StatusCode, String) {
+pub(crate) fn store_err(error: String) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error)
 }
 
@@ -1956,6 +1956,8 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/:slug/conversation",
             axum::routing::put(bind_project_conversation).delete(unbind_project_conversation),
         )
+        // Lightweight roster + per-project file storage for Orb/desktop.
+        .merge(super::project_files::routes())
 }
 
 fn hermes_projects_dir() -> Option<PathBuf> {
