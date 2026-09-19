@@ -22,6 +22,7 @@ pub mod automation_variables;
 pub mod backends;
 pub mod capabilities;
 pub mod claudecode;
+pub mod cli_proxy_login;
 pub mod codex_usage;
 mod console;
 pub mod control;
