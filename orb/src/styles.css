@@ -202,10 +202,32 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 .cs-hint { font-size: 12.5px; color: var(--fg-3); margin: 0 0 8px; line-height: 17px; max-width: 620px; }
 .cs-input { width: 300px; max-width: 46vw; }
 .cs-input.cs-narrow { width: 110px; }
-.cs-col { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
-.cs-examples { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; }
-.cs-example { font: 11px var(--mono); color: var(--fg-3); border: 1px solid var(--stroke-soft); border-radius: 4px; padding: 1px 6px; }
-.cs-example:hover { color: var(--fg); border-color: var(--stroke-strong); }
+/* ---------- schedule picker ---------- */
+.sp { display: flex; flex-direction: column; gap: 10px; }
+.sp-modes { align-self: flex-start; }
+.sp-body { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-height: 28px; }
+.sp-word { font-size: 12.5px; color: var(--fg-3); }
+.sp-num { width: 64px; text-align: center; font-variant-numeric: tabular-nums; }
+.sp-time { width: 104px; font-variant-numeric: tabular-nums; }
+.sp-datetime { width: 210px; }
+.sp-raw { width: 320px; max-width: 100%; font-family: var(--mono); font-size: 12px; }
+.sp-days { display: inline-flex; gap: 4px; }
+.sp-day {
+  width: 26px; height: 26px; border-radius: 50%; font-size: 11.5px; color: var(--fg-3);
+  border: 1px solid var(--stroke); display: grid; place-items: center;
+}
+.sp-day:hover { color: var(--fg); border-color: var(--stroke-strong); }
+.sp-day.on { background: var(--send-bg); color: var(--send-fg); border-color: transparent; }
+.sp-presets { display: inline-flex; gap: 4px; margin-left: 4px; }
+.sp-presets button { font-size: 11.5px; color: var(--fg-3); padding: 2px 7px; border-radius: 5px; }
+.sp-presets button:hover { background: var(--bg-active); color: var(--fg); }
+.sp-foot { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
+.sp-summary { color: var(--fg-2); }
+.sp-tz { color: var(--fg-4); font-size: 11px; }
+.sp-expr { margin-left: auto; font: 11px var(--mono); color: var(--fg-4); }
+.sp input[type="time"]::-webkit-calendar-picker-indicator,
+.sp input[type="datetime-local"]::-webkit-calendar-picker-indicator { filter: invert(0.6); opacity: .7; }
+:root[data-theme="light"] .sp input::-webkit-calendar-picker-indicator { filter: none; }
 .cs-prompt-wrap { padding: 10px 12px 8px; }
 .cs-prompt {
   width: 100%; min-height: 280px; max-height: 62vh; resize: vertical; box-sizing: border-box;

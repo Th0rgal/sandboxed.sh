@@ -2,9 +2,9 @@ import { For, Show, createEffect, createMemo, createSignal, on, type JSX } from 
 import { createStore } from "solid-js/store";
 import * as Ic from "./icons";
 import { updateController, type ControllerPatch, type ControllerView } from "./api";
+import { SchedulePicker } from "./SchedulePicker";
 
 const EFFORTS = ["", "low", "medium", "high", "xhigh", "max"] as const;
-const SCHEDULE_EXAMPLES = ["every 45m", "every 2h", "weekdays at 9am", "0 9 * * 1-5"];
 
 type Draft = {
   name: string;
@@ -146,19 +146,8 @@ export function ControllerSettingsPanel(p: { slug: string; view: ControllerView;
         <Row title="Name">
           <input class="s-input cs-input" value={draft.name} onInput={(e) => setDraft("name", e.currentTarget.value)} />
         </Row>
-        <Row title="Runs" desc="An interval, a weekday phrase, a cron expression or an ISO date for a one-off.">
-          <div class="cs-col">
-            <input class="s-input cs-input" spellcheck={false} value={draft.schedule} onInput={(e) => setDraft("schedule", e.currentTarget.value)} />
-            <div class="cs-examples">
-              <For each={SCHEDULE_EXAMPLES}>
-                {(ex) => (
-                  <button class="cs-example" onClick={() => setDraft("schedule", ex)}>
-                    {ex}
-                  </button>
-                )}
-              </For>
-            </div>
-          </div>
+        <Row title="Runs" desc="How often Hermes wakes it." stack>
+          <SchedulePicker value={draft.schedule} onChange={(v) => setDraft("schedule", v)} />
         </Row>
         <Row title="Repeat" desc={`Ran ${settings()?.repeat_completed ?? 0} times so far. Leave empty to repeat forever.`}>
           <input
