@@ -10,7 +10,8 @@ import { Dialog, Field } from "./Dialog";
 import { MenuList, PopupMenu, type MenuEntry } from "./Menu";
 import { MdSource, MdView, safeHref } from "./Markdown";
 import { getMissionEvents, storedToStream, streamMission, type StreamEvent } from "./stream";
-import { Transcript, applyStreamEvent, type StreamItem } from "./Transcript";
+import { Transcript, applyStreamEvent, buildTranscript, type StreamItem } from "./Transcript";
+import { pollWhileVisible } from "./poll";
 import { LiveProjectsSection, ProjectFileView } from "./ProjectFiles";
 import {
   buildRemoteAgentCommand,
@@ -758,15 +759,11 @@ export default function App() {
     };
     window.addEventListener("pointerdown", closePlus);
     onCleanup(() => window.removeEventListener("pointerdown", closePlus));
-    const missionsTimer = window.setInterval(() => {
-      if (isConnected()) void refreshMissions();
-    }, 5000);
-    const fleetTimer = window.setInterval(() => {
-      if (isConnected()) void refreshFleet();
-    }, 15000);
+    const stopMissions = pollWhileVisible(() => (isConnected() ? refreshMissions() : undefined), 5000);
+    const stopFleet = pollWhileVisible(() => (isConnected() ? refreshFleet() : undefined), 15000);
     onCleanup(() => {
-      clearInterval(missionsTimer);
-      clearInterval(fleetTimer);
+      stopMissions();
+      stopFleet();
     });
     toBottom();
   });
@@ -1300,12 +1297,12 @@ function MissionView(p: { id: string }) {
     held = [];
     try {
       const events = await getMissionEvents(p.id);
-      let next: StreamItem[] = [];
+      const stream: StreamEvent[] = [];
       for (const row of events) {
         const ev = storedToStream(row);
-        if (ev) next = applyStreamEvent(next, ev);
+        if (ev) stream.push(ev);
       }
-      setItems(next);
+      setItems(buildTranscript(stream));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1333,10 +1330,10 @@ function MissionView(p: { id: string }) {
     );
     // Slow status poll — the stream is authoritative for content, but the
     // composer busy state shouldn't depend on it alone.
-    const t = window.setInterval(() => void refresh(), 10000);
+    const stopPoll = pollWhileVisible(refresh, 10000);
     onCleanup(() => {
       stopStream();
-      clearInterval(t);
+      stopPoll();
     });
   });
 

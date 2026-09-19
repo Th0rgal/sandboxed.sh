@@ -1,4 +1,5 @@
 import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
+import { pollWhileVisible } from "./poll";
 import { createStore } from "solid-js/store";
 import * as Ic from "./icons";
 import { MdSource, MdView } from "./Markdown";
@@ -54,11 +55,11 @@ export function LiveProjectsSection(p: {
     refresh();
     // Mission statuses under expanded projects would otherwise freeze at
     // expand time (the flat "Sandboxed" list polls, this tree didn't).
-    const t = window.setInterval(() => {
+    const stop = pollWhileVisible(() => {
       if (!isConnected()) return;
       for (const project of projects()) if (expanded[project.slug]) loadMissions(project.slug);
     }, 10000);
-    onCleanup(() => clearInterval(t));
+    onCleanup(stop);
   });
 
   const loadMissions = (slug: string) => {

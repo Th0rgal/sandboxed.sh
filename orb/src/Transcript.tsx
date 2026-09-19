@@ -21,6 +21,45 @@ export type StreamItem =
 let keySeq = 0;
 const nextKey = () => `k${++keySeq}`;
 
+/**
+ * Build a transcript from a whole event log in one pass. `applyStreamEvent`
+ * copies the array per event (fine for a live trickle) and scans for tool
+ * call ids, which made a 4000-event replay quadratic. Here the array is
+ * mutated in place and tool rows are indexed by call id.
+ */
+export function buildTranscript(events: StreamEvent[]): StreamItem[] {
+  const items: StreamItem[] = [];
+  const toolIndex = new Map<string, number>();
+  for (const ev of events) {
+    if (ev.type === "tool_call") {
+      const callId = str(ev.data.tool_call_id);
+      if (toolIndex.has(callId)) continue;
+      toolIndex.set(callId, items.length);
+      items.push({ kind: "tool", key: nextKey(), callId, name: str(ev.data.name) || "tool", args: ev.data.args, done: false });
+      continue;
+    }
+    if (ev.type === "tool_result") {
+      const callId = str(ev.data.tool_call_id);
+      const idx = toolIndex.get(callId);
+      if (idx != null && items[idx]?.kind === "tool") {
+        items[idx] = { ...(items[idx] as Extract<StreamItem, { kind: "tool" }>), result: ev.data.result, done: true };
+        continue;
+      }
+      toolIndex.set(callId, items.length);
+      items.push({ kind: "tool", key: nextKey(), callId, name: str(ev.data.name) || "tool", args: null, result: ev.data.result, done: true });
+      continue;
+    }
+    // Everything else only touches the tail: reduce a 0/1-element window.
+    const last = items[items.length - 1];
+    const tail = last ? [last] : [];
+    const next = applyStreamEvent(tail, ev);
+    if (next === tail) continue;
+    if (last) items.pop();
+    for (const it of next) items.push(it);
+  }
+  return items;
+}
+
 const str = (v: unknown): string => (typeof v === "string" ? v : v == null ? "" : String(v));
 
 /**

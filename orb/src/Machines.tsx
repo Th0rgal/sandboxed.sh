@@ -1,4 +1,5 @@
 import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
+import { pollWhileVisible } from "./poll";
 import { createStore, produce } from "solid-js/store";
 import * as Ic from "./icons";
 import { readPalomaPub } from "./pubKey";
@@ -81,10 +82,7 @@ export function Machines() {
   onMount(() => {
     void readPalomaPub().then(setPub);
     if (isConnected()) void refresh();
-    const t = window.setInterval(() => {
-      if (isConnected()) void refresh();
-    }, 15000);
-    onCleanup(() => clearInterval(t));
+    onCleanup(pollWhileVisible(() => (isConnected() ? refresh() : undefined), 15000));
   });
 
   const save = () => {
