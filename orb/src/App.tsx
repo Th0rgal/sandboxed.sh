@@ -336,7 +336,11 @@ export default function App() {
     return { slug: rest.slice(0, sep), path: rest.slice(sep + 1) };
   });
   const missionGlyph = (s: string): Agent["status"] =>
-    s === "active" || s === "running" ? "running" : s === "failed" || s === "not_feasible" ? "pr-closed" : "idle";
+    s === "active" || s === "running"
+      ? "running"
+      : s === "failed" || s === "not_feasible" || s === "blocked" || s === "interrupted"
+        ? "pr-closed"
+        : "idle";
   const sortedNodes = () => [...fleetNodes()].sort((a, b) => Number(b.status === "online") - Number(a.status === "online"));
   const machineLabel = () => {
     if (isConnected()) {
