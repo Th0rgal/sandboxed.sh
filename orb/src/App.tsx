@@ -360,8 +360,12 @@ export default function App() {
       const sel = selected();
       if (sel && !sel.includes(":") && !["settings", "machines", "providers"].includes(sel)) open(null);
       if (newMachine() !== "core" && !fleetNodes().some((n) => n.id === newMachine())) setNewMachine("core");
-    } else if (newMachine() === "core" || fleetNodes().some((n) => n.id === newMachine())) {
-      setNewMachine(MACHINES[0].id);
+    } else {
+      // Backend views (missions, hosted files) can't render offline — e.g.
+      // after a 401 cleared the token mid-session.
+      const sel = selected();
+      if (sel && (sel.startsWith("m:") || sel.startsWith("pf:"))) open(null);
+      if (newMachine() === "core" || fleetNodes().some((n) => n.id === newMachine())) setNewMachine(MACHINES[0].id);
     }
   });
   const currentFile = createMemo(() => {
