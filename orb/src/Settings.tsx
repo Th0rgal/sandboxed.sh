@@ -126,10 +126,7 @@ function BackendTab() {
             class="s-input"
             value={url()}
             placeholder="https://agent-backend.thomas.md"
-            onInput={(e) => {
-              setUrl(e.currentTarget.value);
-              setApiUrl(e.currentTarget.value);
-            }}
+            onInput={(e) => setUrl(e.currentTarget.value)}
           />
         </Row>
         <Show when={!isConnected()}>
