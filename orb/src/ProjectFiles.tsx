@@ -36,7 +36,14 @@ export function LiveProjectsSection(p: {
         setProjects(list);
         setError(null);
       })
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+      .catch((e) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        setError(
+          /^(404|405)\b/.test(msg)
+            ? "This backend build doesn't expose projects yet — update the core."
+            : msg,
+        );
+      });
   };
   onMount(refresh);
 
