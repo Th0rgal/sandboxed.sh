@@ -291,6 +291,17 @@ code {
   border-left: 2px solid var(--stroke-soft);
   color: var(--fg-3); font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere;
 }
+.st-tools { margin: 6px 10px; }
+.st-tools-head {
+  display: flex; align-items: center; gap: 6px; height: 22px; width: 100%; text-align: left;
+  color: var(--fg-3); font-size: 12.5px;
+}
+.st-tools-head:hover { color: var(--fg-2); }
+.st-tools-head .chev { opacity: 1; transition: transform .12s; }
+.st-tools-head .chev.open { transform: rotate(90deg); }
+.st-tools-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.st-tools-body { margin: 2px 0 4px 6px; padding-left: 10px; border-left: 1px solid var(--stroke-soft); }
+.st-tools-body .st-tool { margin: 0; }
 .st-tool { margin: 2px 10px; }
 .st-tool-head {
   display: flex; align-items: center; gap: 6px; width: 100%;

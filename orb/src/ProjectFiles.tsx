@@ -28,7 +28,7 @@ export function LiveProjectsSection(p: {
   const [expanded, setExpanded] = createStore<Record<string, boolean>>({});
   /** Per project: whether finished missions are unfolded (default folded). */
   const [showDone, setShowDone] = createStore<Record<string, boolean>>({});
-  const LIVE = new Set(["active", "pending", "queued", "blocked", "awaiting_user", "resuming"]);
+  const LIVE = new Set(["active", "pending", "queued", "awaiting_user", "resuming"]);
   const liveOf = (slug: string) => (missions[slug] ?? []).filter((m) => LIVE.has(m.status));
   const doneOf = (slug: string) => (missions[slug] ?? []).filter((m) => !LIVE.has(m.status));
   // Missions per project slug; file listings per `${slug}:${dirPath}`.

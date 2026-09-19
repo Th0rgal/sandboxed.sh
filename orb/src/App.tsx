@@ -449,7 +449,7 @@ export default function App() {
   const [missions, setMissions] = createSignal<Mission[]>([]);
   /** Only missions still doing something: the sidebar is a place to act,
    * not a history. Everything else lives under its project. */
-  const LIVE = new Set(["active", "pending", "queued", "blocked", "awaiting_user", "resuming"]);
+  const LIVE = new Set(["active", "pending", "queued", "awaiting_user", "resuming"]);
   const liveMissions = createMemo(() => missions().filter((m) => LIVE.has(m.status)));
   const [fleetNodes, setFleetNodes] = createSignal<RemoteNodeView[]>([]);
   const refreshMissions = async () => {

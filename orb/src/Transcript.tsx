@@ -1,4 +1,4 @@
-import { For, Show, createSignal } from "solid-js";
+import { For, Show, createSignal, createMemo } from "solid-js";
 import * as Ic from "./icons";
 import { MdView } from "./Markdown";
 import type { StreamEvent } from "./stream";
@@ -284,12 +284,65 @@ function ThinkBlock(p: { item: Extract<StreamItem, { kind: "think" }> }) {
   );
 }
 
+/** Consecutive tool calls fold into one collapsible group, Cursor-style:
+ * collapsed once every call in the run has finished, open while running. */
+type Grouped = StreamItem | { kind: "tools"; key: string; items: Extract<StreamItem, { kind: "tool" }>[] };
+
+function groupTools(items: StreamItem[]): Grouped[] {
+  const out: Grouped[] = [];
+  for (const it of items) {
+    const last = out[out.length - 1];
+    if (it.kind === "tool") {
+      if (last && last.kind === "tools") last.items.push(it);
+      else out.push({ kind: "tools", key: it.callId, items: [it] });
+    } else {
+      out.push(it);
+    }
+  }
+  return out;
+}
+
+function ToolGroup(p: { items: Extract<StreamItem, { kind: "tool" }>[] }) {
+  const running = () => p.items.some((t) => !t.done);
+  const [forced, setForced] = createSignal<boolean | null>(null);
+  const open = () => forced() ?? running();
+  const label = () => {
+    const n = p.items.length;
+    if (running()) {
+      const cur = p.items.find((t) => !t.done);
+      return cur ? `${cur.name} ${toolTarget(cur.name, cur.args) ?? ""}`.trim() : "Working…";
+    }
+    return `Ran ${n} tool${n === 1 ? "" : "s"}`;
+  };
+  return (
+    <div class={`st-tools ${open() ? "open" : ""}`}>
+      <button class="st-tools-head" onClick={() => setForced(!open())}>
+        <Ic.ChevronRight size={12} class={`chev ${open() ? "open" : ""}`} />
+        <Show when={running()} fallback={<span class="st-tools-label">{label()}</span>}>
+          <span class="st-tools-label shimmer">{label()}</span>
+        </Show>
+        <Show when={!running()}>
+          <span class="st-tool-check">✓</span>
+        </Show>
+      </button>
+      <Show when={open()}>
+        <div class="st-tools-body">
+          <For each={p.items}>{(t) => <ToolRow item={t} />}</For>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
 export function Transcript(p: { items: StreamItem[] }) {
+  const grouped = createMemo(() => groupTools(p.items));
   return (
     <>
-      <For each={p.items}>
+      <For each={grouped()}>
         {(item) => {
           switch (item.kind) {
+            case "tools":
+              return <ToolGroup items={item.items} />;
             case "user":
               return (
                 <div class="user">
