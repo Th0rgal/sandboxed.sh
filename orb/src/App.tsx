@@ -663,8 +663,11 @@ export default function App() {
                   fallback={
                     <>
                       <div class="section">Projects</div>
-                      <div class="row dim" style={{ "font-size": "12px" }}>
-                        Connect in Settings → Backend to see projects.
+                      <div class="sb-empty">
+                        No backend connected.
+                        <button class="sb-link" onClick={() => openSettings("backend")}>
+                          Connect
+                        </button>
                       </div>
                     </>
                   }

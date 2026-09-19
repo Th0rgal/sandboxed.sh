@@ -1,7 +1,6 @@
 import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import * as Ic from "./icons";
-import { Dialog, Field } from "./Dialog";
 import { readPalomaPub } from "./pubKey";
 import { getRemoteNodes, isConnected, type RemoteNodeView } from "./api";
 
@@ -125,6 +124,59 @@ export function Machines() {
 
   const editable = () => (isConnected() ? list.filter((m) => m.custom) : list.slice(1));
 
+  const remove = (id: string) => {
+    setList(produce((ls) => {
+      const i = ls.findIndex((m) => m.id === id);
+      if (i >= 0) ls.splice(i, 1);
+    }));
+    persist();
+    setDraft(null);
+  };
+
+  /** Inline editor rendered in place of a row (edit) or after the list (add). */
+  const Editor = (p: { d: Draft }) => {
+    const set = (patch: Partial<Draft>) => setDraft({ ...(draft() ?? p.d), ...patch });
+    const keys = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setDraft(null);
+      else if (e.key === "Enter") save();
+    };
+    const valid = () => !!(draft()?.host ?? "").trim();
+    return (
+      <div class="m-edit" onKeyDown={keys}>
+        <div class="m-edit-grid">
+          <label class="m-field">
+            <span>Name</span>
+            <input value={p.d.name} placeholder={p.d.host || "agent-core"} autofocus onInput={(e) => set({ name: e.currentTarget.value })} />
+          </label>
+          <label class="m-field">
+            <span>Host</span>
+            <input value={p.d.host} placeholder="192.168.1.10" spellcheck={false} onInput={(e) => set({ host: e.currentTarget.value })} />
+          </label>
+          <label class="m-field">
+            <span>User</span>
+            <input value={p.d.user} spellcheck={false} onInput={(e) => set({ user: e.currentTarget.value })} />
+          </label>
+          <label class="m-field narrow">
+            <span>Port</span>
+            <input value={p.d.port} inputmode="numeric" onInput={(e) => set({ port: e.currentTarget.value })} />
+          </label>
+          <label class="m-field wide">
+            <span>Note</span>
+            <input value={p.d.note} placeholder="Optional" onInput={(e) => set({ note: e.currentTarget.value })} />
+          </label>
+        </div>
+        <div class="m-edit-foot">
+          <Show when={p.d.id}>
+            <button class="s-btn sm quiet danger" onClick={() => remove(p.d.id!)}>Remove</button>
+          </Show>
+          <span class="dlg-spacer" />
+          <button class="s-btn sm quiet" onClick={() => setDraft(null)}>Cancel</button>
+          <button class="s-btn sm primary" disabled={!valid()} onClick={save}>{p.d.id ? "Save" : "Add"}</button>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div class="page">
       <div class="page-head">
@@ -175,36 +227,31 @@ export function Machines() {
         </Show>
 
         <For each={editable()}>
-          {(m) => {
-            const index = () => list.findIndex((x) => x.id === m.id);
-            return (
-              <div class="m-row" onClick={() => setDraft({ id: m.id, name: m.name, host: m.host, user: m.user, port: String(m.port), note: m.note })}>
-                <span class="m-dot on" title="Paloma SSH" />
-                <div class="m-text">
-                  <div class="m-name">{m.name}</div>
-                  <div class="m-meta">{target(m)}</div>
-                  <Show when={m.note}>
-                    <div class="m-note">{m.note}</div>
-                  </Show>
-                </div>
+          {(m) => (
+            <Show
+              when={draft()?.id === m.id && draft()}
+              fallback={
                 <button
-                  class="icon-btn m-del"
-                  title="Remove"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    const i = index();
-                    if (i >= 0) {
-                      setList(produce((ls) => { ls.splice(i, 1); }));
-                      persist();
-                    }
-                  }}
+                  class="m-row editable"
+                  onClick={() => setDraft({ id: m.id, name: m.name, host: m.host, user: m.user, port: String(m.port), note: m.note })}
                 >
-                  <Ic.CloseIcon size={14} />
+                  <span class="m-dot on" title="Paloma SSH" />
+                  <div class="m-text">
+                    <div class="m-name">{m.name}</div>
+                    <div class="m-meta">{target(m)}</div>
+                    <Show when={m.note}>
+                      <div class="m-note">{m.note}</div>
+                    </Show>
+                  </div>
+                  <span class="m-edit-hint">Edit</span>
                 </button>
-              </div>
-            );
-          }}
+              }
+            >
+              {(d) => <Editor d={d()} />}
+            </Show>
+          )}
         </For>
+        <Show when={draft() && !draft()!.id && draft()}>{(d) => <Editor d={d()} />}</Show>
       </div>
 
       <div class="key-bar">
@@ -217,50 +264,6 @@ export function Machines() {
         </button>
       </div>
 
-      <Show when={draft()}>
-        {(d) => (
-          <Dialog title={d().id ? "Edit machine" : "Add machine"} onClose={() => setDraft(null)} footer={
-            <>
-              <Show when={d().id}>
-                <button
-                  class="s-btn danger"
-                  onClick={() => {
-                    setList(produce((ls) => {
-                      const i = ls.findIndex((m) => m.id === d().id);
-                      if (i >= 0) ls.splice(i, 1);
-                    }));
-                    persist();
-                    setDraft(null);
-                  }}
-                >
-                  Remove
-                </button>
-              </Show>
-              <span class="dlg-spacer" />
-              <button class="s-btn" onClick={() => setDraft(null)}>Cancel</button>
-              <button class="s-btn primary" onClick={save}>{d().id ? "Save" : "Add"}</button>
-            </>
-          }>
-            <Field label="Name">
-              <input value={d().name} autofocus onInput={(e) => setDraft({ ...d(), name: e.currentTarget.value })} />
-            </Field>
-            <Field label="Host">
-              <input value={d().host} placeholder="192.168.1.10" onInput={(e) => setDraft({ ...d(), host: e.currentTarget.value })} />
-            </Field>
-            <div class="field-row">
-              <Field label="User">
-                <input value={d().user} onInput={(e) => setDraft({ ...d(), user: e.currentTarget.value })} />
-              </Field>
-              <Field label="Port">
-                <input value={d().port} onInput={(e) => setDraft({ ...d(), port: e.currentTarget.value })} />
-              </Field>
-            </div>
-            <Field label="Note">
-              <input value={d().note} placeholder="Optional" onInput={(e) => setDraft({ ...d(), note: e.currentTarget.value })} />
-            </Field>
-          </Dialog>
-        )}
-      </Show>
     </div>
   );
 }
