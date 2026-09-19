@@ -47,7 +47,10 @@ enum LoginStatus {
 
 struct LoginSession {
     auth_url: String,
-    callback_port: u16,
+    /// Loopback listener port for redirect flows (claude/codex/grok). `None`
+    /// for device-code flows (kimi), where the CLI polls the provider and
+    /// writes the credential on its own once the user authorizes.
+    callback_port: Option<u16>,
     oauth_state: Option<String>,
     status: LoginStatus,
     message: Option<String>,
@@ -118,6 +121,10 @@ struct StartRequest {
 struct StartResponse {
     session_id: String,
     auth_url: String,
+    /// "redirect": the provider redirects to a dead localhost URL the user
+    /// pastes back. "device": the provider shows a code on its own page and
+    /// the CLI completes on its own — no callback paste needed.
+    flow: &'static str,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -196,20 +203,38 @@ async fn start_login(
         .stdout
         .take()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "no stdout".to_string()))?;
-    let mut lines = BufReader::new(stdout).lines();
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "no stderr".to_string()))?;
+
+    // The login CLI logs to stdout for some providers and stderr for others;
+    // merge both into one line stream and scan for the first https:// URL.
+    let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(64);
+    fn spawn_drain(
+        stream: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+        tx: tokio::sync::mpsc::Sender<String>,
+    ) {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stream).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if tx.send(line).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    spawn_drain(stdout, line_tx.clone());
+    spawn_drain(stderr, line_tx.clone());
+    drop(line_tx);
+
     let deadline = Instant::now() + URL_WAIT;
     let mut auth_url = None;
     let mut early_lines = Vec::new();
     while Instant::now() < deadline {
-        let line = match tokio::time::timeout(Duration::from_secs(2), lines.next_line()).await {
-            Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => break,
-            Ok(Err(e)) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("reading login output: {e}"),
-                ))
-            }
+        let line = match tokio::time::timeout(Duration::from_secs(2), line_rx.recv()).await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
             Err(_) => continue,
         };
         if let Some(url) = parse_auth_url(&line) {
@@ -237,13 +262,10 @@ async fn start_login(
         ));
     };
 
-    let Some(port) = callback_port_of(&auth_url) else {
-        let _ = child.kill().await;
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            "could not parse the callback port from the auth URL".to_string(),
-        ));
-    };
+    // Redirect flows encode a loopback redirect_uri; device-code flows (kimi)
+    // have no listener — the CLI completes by itself after user authorization.
+    let port = callback_port_of(&auth_url);
+    let flow: &'static str = if port.is_some() { "redirect" } else { "device" };
 
     // Keep draining stdout so the child never blocks on a full pipe; when the
     // child exits, record the outcome on the session.
@@ -259,8 +281,9 @@ async fn start_login(
     };
     sessions().inner.lock().await.insert(id.clone(), session);
 
-    // Reap task: keep draining stdout (so the child never blocks on a full
-    // pipe), wait for exit, update status, drop the session after TTL.
+    // Reap task: keep draining the merged line stream (so the child never
+    // blocks on a full pipe), keep a short tail for error reporting, wait for
+    // exit, update status, drop the session after TTL.
     let reaper_id = id.clone();
     tokio::spawn(async move {
         let exit_status = {
@@ -271,25 +294,19 @@ async fn start_login(
                     None => return,
                 }
             };
-            // Also drain stderr into the session message on failure.
-            let stderr = child.stderr.take();
-            tokio::spawn(async move {
-                let mut drain = lines;
-                while let Ok(Some(_)) = drain.next_line().await {}
+            let drain = tokio::spawn(async move {
+                let mut tail: std::collections::VecDeque<String> =
+                    std::collections::VecDeque::with_capacity(6);
+                while let Some(line) = line_rx.recv().await {
+                    if tail.len() >= 5 {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
+                }
+                tail.into_iter().collect::<Vec<_>>().join(" | ")
             });
             let status = child.wait().await;
-            let mut tail = String::new();
-            if let Some(stderr) = stderr {
-                let mut err_lines = BufReader::new(stderr).lines();
-                let mut collected = Vec::new();
-                while let Ok(Some(l)) = err_lines.next_line().await {
-                    collected.push(l);
-                    if collected.len() > 5 {
-                        collected.remove(0);
-                    }
-                }
-                tail = collected.join(" | ");
-            }
+            let tail = drain.await.unwrap_or_default();
             (status, tail)
         };
         let mut guard = sessions().inner.lock().await;
@@ -328,6 +345,7 @@ async fn start_login(
     Ok(Json(StartResponse {
         session_id: id,
         auth_url,
+        flow,
     }))
 }
 
@@ -354,7 +372,14 @@ async fn login_callback(
         let s = guard
             .get(&id)
             .ok_or((StatusCode::NOT_FOUND, "login session not found".to_string()))?;
-        (s.callback_port, s.oauth_state.clone())
+        let port = s.callback_port.ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "this provider uses a device-code flow — authorize in the browser and it completes automatically"
+                    .to_string(),
+            )
+        })?;
+        (port, s.oauth_state.clone())
     };
 
     let url = req.url.trim();
@@ -441,6 +466,15 @@ mod tests {
         assert!(url.starts_with("https://claude.ai/oauth/authorize"));
         assert_eq!(callback_port_of(&url), Some(54545));
         assert_eq!(oauth_state_of(&url), Some("xyz".to_string()));
+    }
+
+    #[test]
+    fn parses_device_code_url_without_callback_port() {
+        let line = "https://www.kimi.com/code/authorize_device?user_code=39WC-FOFX";
+        let url = parse_auth_url(line).unwrap();
+        assert!(url.starts_with("https://www.kimi.com/code/authorize_device"));
+        assert_eq!(callback_port_of(&url), None);
+        assert_eq!(oauth_state_of(&url), None);
     }
 
     #[test]

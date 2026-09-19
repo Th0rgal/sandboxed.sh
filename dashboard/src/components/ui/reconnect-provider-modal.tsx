@@ -89,7 +89,7 @@ export function ReconnectProviderModal({
   const [oauthResponse, setOauthResponse] = useState<OAuthAuthorizeResponse | null>(null);
   const [oauthCode, setOauthCode] = useState('');
   const [loading, setLoading] = useState(false);
-  const [cliSession, setCliSession] = useState<{ id: string; url: string } | null>(null);
+  const [cliSession, setCliSession] = useState<{ id: string; url: string; flow?: string } | null>(null);
   const [cliPaste, setCliPaste] = useState('');
   const [cliError, setCliError] = useState<string | null>(null);
   const [cliSubmitting, setCliSubmitting] = useState(false);
@@ -112,7 +112,7 @@ export function ReconnectProviderModal({
       try {
         const s = await startCliProxyLogin(prov.provider_type);
         if (authorizeReqRef.current !== reqId) return;
-        setCliSession({ id: s.session_id, url: s.auth_url });
+        setCliSession({ id: s.session_id, url: s.auth_url, flow: s.flow });
         setStep('cli-proxy');
         window.open(s.auth_url, '_blank');
         stopPolling();
@@ -305,9 +305,9 @@ export function ReconnectProviderModal({
           {step === 'cli-proxy' && (
             <div className="space-y-4">
               <div className="text-sm text-white/60">
-                This account is owned by CLIProxyAPI. Authorize in the browser tab that just
-                opened; the redirect to <code className="text-white/80">localhost</code> will fail —
-                copy the full URL from the address bar and paste it below.
+                {cliSession?.flow === 'device'
+                  ? 'This account is owned by CLIProxyAPI. Authorize in the browser tab that just opened and enter the code shown — the login completes automatically.'
+                  : <>This account is owned by CLIProxyAPI. Authorize in the browser tab that just opened; the redirect to <code className="text-white/80">localhost</code> will fail — copy the full URL from the address bar and paste it below.</>}
               </div>
               {cliError && (
                 <div className="text-sm text-red-400/90 whitespace-pre-line">{cliError}</div>
@@ -321,6 +321,7 @@ export function ReconnectProviderModal({
                   Open auth page again
                 </button>
               )}
+              {cliSession?.flow !== 'device' && (
               <input
                 type="text"
                 value={cliPaste}
@@ -329,6 +330,8 @@ export function ReconnectProviderModal({
                 autoFocus
                 className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-sm text-white placeholder-white/30 focus:outline-none focus:border-indigo-500/50 font-mono"
               />
+              )}
+              {cliSession?.flow !== 'device' && (
               <button
                 onClick={async () => {
                   if (!provider || !cliSession || !cliPaste.trim()) return;
@@ -354,6 +357,7 @@ export function ReconnectProviderModal({
                   'Submit callback'
                 )}
               </button>
+              )}
               {cliSession && (
                 <div className="flex items-center gap-2 text-xs text-white/40">
                   <Loader className="h-3 w-3 animate-spin" />
