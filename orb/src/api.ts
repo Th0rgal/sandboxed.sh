@@ -310,6 +310,26 @@ export async function listProjects(): Promise<ProjectSummary[]> {
   return data.projects ?? [];
 }
 
+/** Create (or update) a project record on the core. Slug: lowercase, dashes. */
+export async function createProject(body: { slug: string; title?: string; objective?: string }): Promise<ProjectSummary> {
+  return api("/api/projects", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+/** "Pareto Credit Vault" → "pareto-credit-vault". */
+export function slugify(title: string): string {
+  return title
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+}
+
 /** Missions tagged with this project (exact slug match on the backend). */
 export async function listProjectMissions(slug: string): Promise<Mission[]> {
   return api(`/api/control/missions?project=${encodeURIComponent(slug)}&limit=100&all=true`);

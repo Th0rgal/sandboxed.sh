@@ -163,6 +163,20 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 .glyph { width: 16px; height: 16px; display: flex; align-items: center; justify-content: center; }
 .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--fg-4); opacity: .45; }
 .section { color: var(--fg-4); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; padding: 0 8px; margin: 16px 0 6px; }
+.section-row { display: flex; align-items: center; justify-content: space-between; }
+.section-add {
+  width: 18px; height: 18px; border-radius: 4px; display: grid; place-items: center;
+  color: var(--fg-4); opacity: 0; transition: opacity .12s;
+}
+.sidebar:hover .section-add, .section-add:focus-visible { opacity: 1; }
+.section-add:hover { background: var(--bg-active); color: var(--fg); }
+.row.new-project { color: var(--fg-2); gap: 9px; }
+.new-project-input {
+  flex: 1; min-width: 0; height: 22px; padding: 0 6px; border-radius: 5px;
+  border: 1px solid var(--stroke-strong); background: var(--bg-field); color: var(--fg);
+  font: 13px var(--sans);
+}
+.new-project-input:focus { outline: 0; border-color: var(--focus-border); }
 .group.has { margin-bottom: 10px; }
 .sb-foot {
   flex: none;
