@@ -7,6 +7,9 @@ import { cn } from '@/lib/utils';
 import {
   oauthAuthorize,
   oauthCallback,
+  startCliProxyLogin,
+  getCliProxyLogin,
+  submitCliProxyLoginCallback,
   AIProvider,
   OAuthAuthorizeResponse,
 } from '@/lib/api';
@@ -65,7 +68,7 @@ interface ReconnectProviderModalProps {
   onSuccess: (providerId: string) => void;
 }
 
-type Step = 'select-method' | 'oauth-callback';
+type Step = 'select-method' | 'oauth-callback' | 'cli-proxy';
 
 export function ReconnectProviderModal({
   provider,
@@ -79,14 +82,65 @@ export function ReconnectProviderModal({
   // late response can't apply its URL/step/loading state to a different (or
   // already-closed) provider.
   const authorizeReqRef = useRef(0);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const [step, setStep] = useState<Step>('select-method');
   const [methodIndex, setMethodIndex] = useState<number | null>(null);
   const [oauthResponse, setOauthResponse] = useState<OAuthAuthorizeResponse | null>(null);
   const [oauthCode, setOauthCode] = useState('');
   const [loading, setLoading] = useState(false);
+  const [cliSession, setCliSession] = useState<{ id: string; url: string } | null>(null);
+  const [cliPaste, setCliPaste] = useState('');
+  const [cliError, setCliError] = useState<string | null>(null);
+  const [cliSubmitting, setCliSubmitting] = useState(false);
 
-  const methods = provider ? RECONNECT_OAUTH_METHODS[provider.provider_type] ?? [] : [];
+  const isCliProxyOwned = provider?.credential_owner === 'cli_proxy';
+  const methods = provider && !isCliProxyOwned ? RECONNECT_OAUTH_METHODS[provider.provider_type] ?? [] : [];
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  const startCliProxy = useCallback(
+    async (prov: AIProvider) => {
+      const reqId = ++authorizeReqRef.current;
+      setLoading(true);
+      setCliError(null);
+      try {
+        const s = await startCliProxyLogin(prov.provider_type);
+        if (authorizeReqRef.current !== reqId) return;
+        setCliSession({ id: s.session_id, url: s.auth_url });
+        setStep('cli-proxy');
+        window.open(s.auth_url, '_blank');
+        stopPolling();
+        pollRef.current = setInterval(async () => {
+          try {
+            const st = await getCliProxyLogin(s.session_id);
+            if (st.status === 'completed') {
+              stopPolling();
+              onSuccess(prov.id);
+              onClose();
+            } else if (st.status === 'failed') {
+              stopPolling();
+              setCliError(st.message ?? 'Login failed');
+            }
+          } catch {
+            // transient poll failure — keep polling
+          }
+        }, 2000);
+      } catch (err) {
+        if (authorizeReqRef.current !== reqId) return;
+        setCliError(err instanceof Error ? err.message : 'Unknown error');
+        setStep('cli-proxy');
+      } finally {
+        if (authorizeReqRef.current === reqId) setLoading(false);
+      }
+    },
+    [onClose, onSuccess, stopPolling]
+  );
 
   const startAuthorize = useCallback(
     async (index: number) => {
@@ -112,29 +166,40 @@ export function ReconnectProviderModal({
     [provider]
   );
 
-  // Reset on open. When only a single OAuth method exists (e.g. xAI), skip the
-  // selection step and kick off authorization immediately.
+  // Reset on open. CLIProxyAPI-owned providers go straight to the proxy login
+  // flow; sandboxed.sh-owned ones with a single OAuth method (e.g. xAI) skip
+  // the selection step and kick off authorization immediately.
   useEffect(() => {
     if (open && provider) {
       // Invalidate any authorize request still in flight from a previous open.
       authorizeReqRef.current += 1;
+      stopPolling();
       setStep('select-method');
       setMethodIndex(null);
       setOauthResponse(null);
       setOauthCode('');
       setLoading(false);
-      if (methods.length === 1) {
+      setCliSession(null);
+      setCliPaste('');
+      setCliError(null);
+      if (provider.credential_owner === 'cli_proxy') {
+        void startCliProxy(provider);
+      } else if (methods.length === 1) {
         startAuthorize(methods[0].index);
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, provider?.id]);
 
+  // Stop the status poller when the modal unmounts.
+  useEffect(() => stopPolling, [stopPolling]);
+
   const handleClose = useCallback(() => {
     // Supersede any in-flight authorize so its late response is ignored.
     authorizeReqRef.current += 1;
+    stopPolling();
     onClose();
-  }, [onClose]);
+  }, [onClose, stopPolling]);
 
   // Escape to close
   useEffect(() => {
@@ -233,6 +298,67 @@ export function ReconnectProviderModal({
                     </div>
                   </button>
                 ))
+              )}
+            </div>
+          )}
+
+          {step === 'cli-proxy' && (
+            <div className="space-y-4">
+              <div className="text-sm text-white/60">
+                This account is owned by CLIProxyAPI. Authorize in the browser tab that just
+                opened; the redirect to <code className="text-white/80">localhost</code> will fail —
+                copy the full URL from the address bar and paste it below.
+              </div>
+              {cliError && (
+                <div className="text-sm text-red-400/90 whitespace-pre-line">{cliError}</div>
+              )}
+              {cliSession && (
+                <button
+                  onClick={() => window.open(cliSession.url, '_blank')}
+                  className="w-full rounded-xl border border-white/[0.06] px-4 py-3 text-sm text-white/70 hover:bg-white/[0.04] transition-colors cursor-pointer text-left truncate"
+                >
+                  <ExternalLink className="inline h-3.5 w-3.5 mr-2 -mt-0.5" />
+                  Open auth page again
+                </button>
+              )}
+              <input
+                type="text"
+                value={cliPaste}
+                onChange={(e) => setCliPaste(e.target.value)}
+                placeholder="http://localhost:54545/callback?code=…&state=…"
+                autoFocus
+                className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3 text-sm text-white placeholder-white/30 focus:outline-none focus:border-indigo-500/50 font-mono"
+              />
+              <button
+                onClick={async () => {
+                  if (!provider || !cliSession || !cliPaste.trim()) return;
+                  setCliSubmitting(true);
+                  setCliError(null);
+                  try {
+                    const st = await submitCliProxyLoginCallback(cliSession.id, cliPaste.trim());
+                    if (st.status === 'failed') setCliError(st.message ?? 'Callback rejected');
+                  } catch (err) {
+                    setCliError(err instanceof Error ? err.message : 'Unknown error');
+                  } finally {
+                    setCliSubmitting(false);
+                  }
+                }}
+                disabled={!cliSession || !cliPaste.trim() || cliSubmitting}
+                className="w-full rounded-xl bg-indigo-500 px-4 py-3 text-sm font-medium text-white hover:bg-indigo-600 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {cliSubmitting ? (
+                  <Loader className="h-4 w-4 animate-spin mx-auto" />
+                ) : loading && !cliSession ? (
+                  'Starting login…'
+                ) : (
+                  'Submit callback'
+                )}
+              </button>
+              {cliSession && (
+                <div className="flex items-center gap-2 text-xs text-white/40">
+                  <Loader className="h-3 w-3 animate-spin" />
+                  Waiting for the login to complete…
+                </div>
               )}
             </div>
           )}
