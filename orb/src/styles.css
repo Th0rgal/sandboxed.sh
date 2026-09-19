@@ -494,7 +494,8 @@ textarea::placeholder { color: var(--placeholder); }
 .p-acc-wrap { border-bottom: 1px solid var(--stroke-soft); }
 .s-card .p-acc-wrap:last-child { border-bottom: 0; }
 .p-acc-btn { width: 100%; text-align: left; border-bottom: 0 !important; }
-.p-acc-chev { color: var(--fg-4); font-size: 15px; flex: none; display: inline-block; }
+.p-acc-chev { color: var(--fg-4); font-size: 15px; flex: none; display: inline-block; opacity: 1; transition: transform .12s; }
+.p-acc-chev.open { transform: rotate(90deg); }
 .p-acc-body { padding: 0 14px 14px; }
 .p-acc-actions { margin-top: 10px; display: flex; justify-content: flex-end; }
 .p-detail { display: flex; flex-direction: column; gap: 6px; }
