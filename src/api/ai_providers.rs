@@ -2107,6 +2107,73 @@ pub(crate) fn has_fresh_cli_proxy_codex_account() -> bool {
     has_fresh_cli_proxy_account_of_type("codex-", "codex")
 }
 
+/// The freshest usable access token from the CLI proxy's auth directory for
+/// the given provider (e.g. `claude-*.json`). Under CLI-proxy ownership the
+/// proxy's file is the only credential that stays fresh, so the usage probe
+/// must read it instead of sandboxed.sh's own (deliberately stale) record.
+pub(crate) fn cli_proxy_access_token(file_prefix: &str, type_tag: &str) -> Option<String> {
+    let now = chrono::Utc::now();
+    let mut best: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
+    for dir in cli_proxy_auth_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !(name.starts_with(file_prefix) && name.ends_with(".json")) {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+                continue;
+            };
+            if value
+                .get("disabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || value.get("type").and_then(|v| v.as_str()) != Some(type_tag)
+            {
+                continue;
+            }
+            let Some(access) = value
+                .get("access_token")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let expiry = value
+                .get("expired")
+                .or_else(|| value.get("expires"))
+                .or_else(|| value.get("expires_at"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&chrono::Utc));
+            // Prefer a token that is still valid; among valid ones take the
+            // longest-lived. Expired tokens are skipped: the proxy refreshes
+            // its files proactively, so an expired file means the account is
+            // dead anyway and probing with it would just 401.
+            let Some(expires_at) = expiry else {
+                continue;
+            };
+            if expires_at <= now {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(e, _)| expires_at > *e) {
+                best = Some((expires_at, access));
+            }
+        }
+    }
+    best.map(|(_, token)| token)
+}
+
 /// Scan the CLI proxy's auth directory for entries with
 /// `name.starts_with(file_prefix)` and `type == type_tag`, returning true
 /// as soon as one is enabled and has a non-empty access_token that hasn't
@@ -2295,6 +2362,10 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/:id/default", post(set_default))
         .route("/:id/health", post(check_provider_health))
         .route("/:id/usage", get(get_provider_usage_cached))
+        // UI-drivable OAuth login for CLIProxyAPI-owned providers (claude /
+        // codex / grok / kimi): spawn the CLI login, hand the auth URL to the
+        // UI, replay the pasted localhost callback against the process.
+        .merge(super::cli_proxy_login::routes())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4447,6 +4518,11 @@ pub struct ProviderResponse {
     pub openai_auth: Option<OpenAIAuthStatusResponse>,
     /// Which backends this provider is used for (e.g., ["opencode", "claudecode"])
     pub use_for_backends: Vec<String>,
+    /// Who owns (and refreshes) this provider's OAuth credential. When
+    /// `cli_proxy`, the reconnect flow must go through CLIProxyAPI's login
+    /// CLI — sandboxed.sh's own OAuth endpoints would write to the wrong
+    /// store. `sandboxed_sh` for API-key-only providers and legacy mode.
+    pub credential_owner: &'static str,
     /// Account identifier (email or username) from the connected OAuth account
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_email: Option<String>,
@@ -4534,6 +4610,16 @@ struct ProviderConfigEntry {
     google_project_id: Option<String>,
 }
 
+/// Who the UI must send the reconnect flow to for this provider's OAuth
+/// credential: CLIProxyAPI when the proxy owns it, sandboxed.sh otherwise.
+pub(crate) fn credential_owner_for(provider_type: ProviderType, has_oauth: bool) -> &'static str {
+    if has_oauth && crate::api::oauth_owner::cli_proxy_owns(provider_type) {
+        "cli_proxy"
+    } else {
+        "sandboxed_sh"
+    }
+}
+
 fn build_provider_response(
     provider_type: ProviderType,
     config: Option<ProviderConfigEntry>,
@@ -4590,6 +4676,10 @@ fn build_provider_response(
         status,
         openai_auth,
         use_for_backends,
+        credential_owner: credential_owner_for(
+            provider_type,
+            matches!(auth, Some(AuthKind::OAuth)),
+        ),
         account_email,
         created_at: now,
         updated_at: now,
@@ -4664,6 +4754,7 @@ fn build_response_from_store(provider: &crate::ai_providers::AIProvider) -> Prov
         status,
         openai_auth,
         use_for_backends,
+        credential_owner: credential_owner_for(pt, has_oauth),
         account_email: provider.account_email.clone(),
         created_at: provider.created_at,
         updated_at: provider.updated_at,
@@ -8171,7 +8262,7 @@ async fn get_provider_usage(
             // — sending them as `x-api-key` gets rejected with 401, which
             // is what users on a Claude subscription (no api_key, OAuth only)
             // were seeing while their missions still worked via Claude Code.
-            let (auth, is_oauth) = if let Some(ref key) = api_key_opt {
+            let (mut auth, mut is_oauth) = if let Some(ref key) = api_key_opt {
                 (key.clone(), false)
             } else if let Some(ref o) = oauth {
                 // Refresh the token if expired before using it.
@@ -8276,6 +8367,17 @@ async fn get_provider_usage(
                     "error": "No credentials configured"
                 })));
             };
+
+            // Under CLI-proxy ownership, sandboxed.sh's own Anthropic OAuth
+            // record is deliberately stale (the proxy owns refresh). Probe
+            // with the proxy's live access token instead so the usage window
+            // data (5h / 7d) reflects the credential missions actually use.
+            if crate::api::oauth_owner::cli_proxy_owns(ProviderType::Anthropic) {
+                if let Some(token) = cli_proxy_access_token("claude-", "claude") {
+                    auth = token;
+                    is_oauth = true;
+                }
+            }
 
             // Minimal messages API call to get rate limit headers
             let mut req_builder = client

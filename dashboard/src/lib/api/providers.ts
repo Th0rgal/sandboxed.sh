@@ -94,10 +94,43 @@ export interface AIProvider {
   /** Independent OpenAI authentication surfaces; only present for OpenAI providers. */
   openai_auth?: OpenAIAuthStatus;
   use_for_backends: string[];
+  /**
+   * Who owns (and refreshes) this provider's OAuth credential. When
+   * `cli_proxy`, reconnect must go through the CLIProxyAPI login endpoints —
+   * sandboxed.sh's own OAuth callback would write to the wrong store.
+   */
+  credential_owner?: "cli_proxy" | "sandboxed_sh";
   /** Account identifier (email) from the connected OAuth account */
   account_email?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface CliProxyLoginStart {
+  session_id: string;
+  auth_url: string;
+}
+
+export type CliProxyLoginStatus = "pending" | "completing" | "completed" | "failed";
+
+export interface CliProxyLoginState {
+  status: CliProxyLoginStatus;
+  auth_url?: string;
+  message?: string;
+}
+
+/** Spawn the CLIProxyAPI login CLI for a provider type; returns the auth URL. */
+export async function startCliProxyLogin(providerType: string): Promise<CliProxyLoginStart> {
+  return apiPost("/api/ai/providers/cli-proxy-login", { provider: providerType }, "Failed to start CLIProxyAPI login");
+}
+
+export async function getCliProxyLogin(sessionId: string): Promise<CliProxyLoginState> {
+  return apiGet(`/api/ai/providers/cli-proxy-login/${sessionId}`, "Failed to get login status");
+}
+
+/** Replay the pasted localhost redirect URL against the login process. */
+export async function submitCliProxyLoginCallback(sessionId: string, url: string): Promise<CliProxyLoginState> {
+  return apiPost(`/api/ai/providers/cli-proxy-login/${sessionId}/callback`, { url }, "Failed to submit callback");
 }
 
 export interface AIProviderAuthResponse {
