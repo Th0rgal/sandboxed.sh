@@ -328,10 +328,9 @@ function Composer(p: {
                         setWhich(null);
                       }}
                     >
-                      <span class="menu-col">
-                        <span>{c.backend.name}</span>
-                        <span class="menu-sub">{c.models.length} model{c.models.length === 1 ? "" : "s"}</span>
-                      </span>
+                      <span class="pick-name">{c.backend.name}</span>
+                      <span class="pick-meta">{c.models.length}</span>
+                      <span class="pick-check">{c.backend.id === pick()?.backend ? "✓" : ""}</span>
                     </button>
                   )}
                 </For>
@@ -344,21 +343,27 @@ function Composer(p: {
               {modelLabel()} <Ic.ChevronDown size={12} />
             </button>
             <Show when={which() === "model"}>
-              <div class="menu model-menu">
+              <div
+                class="menu model-menu"
+                ref={(el) => {
+                  // Fresh element each open: start at the top, then keep the
+                  // current model in view without jumping past the first rows.
+                  el.scrollTop = 0;
+                  requestAnimationFrame(() => el.querySelector(".menu-item.on")?.scrollIntoView({ block: "nearest" }));
+                }}
+              >
                 <For each={choice()?.models ?? []}>
                   {(m) => (
                     <button
                       class={`menu-item ${m.value === pick()?.model ? "on" : ""}`}
-                      title={m.label}
+                      title={m.value}
                       onClick={() => {
                         setHarnessPick({ backend: choice()!.backend.id, model: m.value });
                         setWhich(null);
                       }}
                     >
-                      <span class="menu-col">
-                        <span>{shortModelLabel(m.label)}</span>
-                        <span class="menu-sub">{m.value}</span>
-                      </span>
+                      <span class="pick-name">{shortModelLabel(m.label)}</span>
+                      <span class="pick-check">{m.value === pick()?.model ? "✓" : ""}</span>
                     </button>
                   )}
                 </For>

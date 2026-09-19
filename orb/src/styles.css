@@ -136,6 +136,9 @@ button:focus-visible { outline: 1px solid var(--blue); outline-offset: -1px; }
 .sb-top { height: 35px; flex: none; }
 /* Keyboard focus only (mouse clicks stay quiet). */
 :focus-visible { outline: 1.5px solid var(--focus-border); outline-offset: 1px; border-radius: 6px; }
+/* The composer is one surface: its outer border brightens on focus, the
+   textarea inside must never draw its own ring (Cursor does the same). */
+.composer textarea:focus-visible, .composer textarea:focus { outline: 0; box-shadow: none; }
 button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focus:not(:focus-visible) { outline: 0; }
 .sb-scroll { flex: 1; overflow-y: auto; padding: 0 8px 12px; scrollbar-width: none; }
 .sb-scroll::-webkit-scrollbar { display: none; }
@@ -535,7 +538,13 @@ textarea::placeholder { color: var(--placeholder); }
 .p-detail { display: flex; flex-direction: column; gap: 8px; }
 .menu-group { font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase; color: var(--fg-4); padding: 8px 10px 3px; }
 .menu-group:first-child { padding-top: 4px; }
-.model-menu { max-height: 360px; overflow-y: auto; min-width: 240px; }
+/* Picker menus open above their pill, left-aligned, one line per entry. */
+.picks .menu { left: 0; right: auto; bottom: 32px; min-width: 200px; max-width: 280px; padding: 4px; }
+.picks .menu-item { padding: 5px 9px; font-size: 12.5px; gap: 10px; }
+.picks .menu-item .pick-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picks .menu-item .pick-meta { font-size: 11px; color: var(--fg-4); font-variant-numeric: tabular-nums; }
+.picks .menu-item .pick-check { width: 12px; color: var(--fg-2); flex: none; }
+.model-menu { max-height: 300px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
 .row.done-toggle { color: var(--fg-4); font-size: 12px; height: 24px; }
 .row.done-toggle:hover { color: var(--fg-2); }
 .row.done-toggle .chev { transition: transform .12s; }
