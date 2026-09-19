@@ -351,10 +351,60 @@ export interface ControllerRun {
   error?: string | null;
 }
 
+/** What the cron does: a prompt run on a schedule by a fresh agent. */
+export interface ControllerSettings {
+  prompt: string;
+  prompt_chars: number;
+  skills: string[];
+  deliver?: string | null;
+  failure_deliver?: string | null;
+  repeat_times?: number | null;
+  repeat_completed: number;
+  model?: string | null;
+  provider?: string | null;
+  reasoning_effort?: string | null;
+  workdir?: string | null;
+  script?: string | null;
+  no_agent: boolean;
+  continuity: boolean;
+  monitor_url?: string | null;
+  monitor_script?: string | null;
+  enabled_toolsets: string[];
+  created_at?: string | null;
+  binding?: Record<string, unknown> | null;
+  /** Cap on prompt + preloaded skills for scope-bound controllers. */
+  prompt_budget?: number | null;
+}
+
 export interface ControllerView {
   slug: string;
   job: ControllerJob | null;
+  settings?: ControllerSettings | null;
   runs: ControllerRun[];
+}
+
+/** Only the fields that changed; "" clears an optional pin. */
+export interface ControllerPatch {
+  name?: string;
+  schedule?: string;
+  prompt?: string;
+  skills?: string[];
+  deliver?: string;
+  failure_deliver?: string;
+  repeat?: number;
+  workdir?: string;
+  model?: string;
+  provider?: string;
+  reasoning_effort?: string;
+  continuity?: boolean;
+}
+
+export async function updateController(slug: string, patch: ControllerPatch): Promise<ControllerView> {
+  return api(`/api/projects/${encodeURIComponent(slug)}/controller`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
 }
 
 export async function getProjectController(slug: string, limit = 40): Promise<ControllerView> {

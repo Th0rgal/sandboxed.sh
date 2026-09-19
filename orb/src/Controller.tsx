@@ -1,6 +1,7 @@
 import { For, Show, createMemo, createSignal, onCleanup } from "solid-js";
 import { MdView } from "./Markdown";
 import { pollWhileVisible } from "./poll";
+import { ControllerSettingsPanel } from "./ControllerSettings";
 import { controllerAction, getProjectController, isConnected, type ControllerJob, type ControllerRun, type ControllerView as View } from "./api";
 
 /** How a controller is doing, derived from its Hermes job record. */
@@ -209,6 +210,7 @@ export function ControllerView(p: { slug: string }) {
   const [error, setError] = createSignal<string | null>(null);
   const [busy, setBusy] = createSignal<string | null>(null);
   const [now, setNow] = createSignal(Date.now());
+  const [tab, setTab] = createSignal<"runs" | "settings">("runs");
 
   const load = async () => {
     if (!isConnected()) return;
@@ -296,7 +298,19 @@ export function ControllerView(p: { slug: string }) {
                   <p class="st-error cr-error">{j().last_error}</p>
                 </Show>
 
-                <div class="cr-timeline">
+                <div class="cr-tabs">
+                  <button class={tab() === "runs" ? "on" : ""} onClick={() => setTab("runs")}>
+                    Runs
+                  </button>
+                  <button class={tab() === "settings" ? "on" : ""} onClick={() => setTab("settings")}>
+                    Settings
+                  </button>
+                </div>
+
+                <Show when={tab() === "settings"}>
+                  <ControllerSettingsPanel slug={p.slug} view={view()!} onSaved={setView} />
+                </Show>
+                <div class="cr-timeline" style={{ display: tab() === "runs" ? "block" : "none" }}>
                   <For each={entries()}>
                     {(e) =>
                       e.kind === "day" ? (
