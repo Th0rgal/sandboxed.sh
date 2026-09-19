@@ -5524,6 +5524,10 @@ pub struct ListMissionsQuery {
     /// Optional filter: workspace by id or (case-insensitive) name.
     #[serde(default)]
     pub workspace: Option<String>,
+    /// Include acknowledged/completed/absorbed missions that default listings
+    /// hide (e.g. a project's full history view). Ignored when `status` is set.
+    #[serde(default)]
+    pub all: Option<bool>,
 }
 
 fn mission_execution_projection(run: &MissionRun, status: MissionStatus) -> serde_json::Value {
@@ -5967,8 +5971,9 @@ pub async fn list_missions(
         tag: query.tag.clone(),
         origin_session_id: query.origin_session_id.clone(),
         // Default listings (no explicit status) hide acknowledged / completed /
-        // absorbed attempts. An explicit status is a precise query.
-        attention_only: query.status.is_none(),
+        // absorbed attempts. An explicit status is a precise query; `all=true`
+        // opts out for callers that want full history (project views).
+        attention_only: query.status.is_none() && query.all != Some(true),
     };
     // Workspace is the one predicate the store cannot answer: matching by
     // name needs `populate_workspace_names`, and the persisted
