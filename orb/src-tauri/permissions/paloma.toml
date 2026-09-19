@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-paloma-ssh-pubkey"
+description = "Read the Paloma SSH public key"
+commands.allow = ["paloma_ssh_pubkey"]
