@@ -91,10 +91,10 @@ function parse(src: string): Block[] {
   return out;
 }
 
-export function MdView(p: { text: string }) {
+export function MdView(p: { text: string; compact?: boolean }) {
   const blocks = createMemo(() => parse(p.text));
   return (
-    <div class="md">
+    <div class={`md ${p.compact ? "md-compact" : ""}`}>
       <For each={blocks()}>
         {(b) =>
           b.t === "h" && b.n === 1 ? (

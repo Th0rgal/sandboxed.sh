@@ -449,8 +449,6 @@ export default function App() {
   const [missions, setMissions] = createSignal<Mission[]>([]);
   /** Only missions still doing something: the sidebar is a place to act,
    * not a history. Everything else lives under its project. */
-  const LIVE = new Set(["active", "pending", "queued", "awaiting_user", "resuming"]);
-  const liveMissions = createMemo(() => missions().filter((m) => LIVE.has(m.status)));
   const [fleetNodes, setFleetNodes] = createSignal<RemoteNodeView[]>([]);
   const refreshMissions = async () => {
     try {
@@ -839,25 +837,6 @@ export default function App() {
                   <LiveProjectsSection selected={selected} open={open} missionGlyph={missionGlyph} StatusGlyph={StatusGlyph} />
                 </Show>
 
-                <Show when={isConnected()}>
-                  <div class="section">Running</div>
-                  <For each={liveMissions()}>
-                    {(m) => (
-                      <button
-                        class={`row agent ${selected() === `m:${m.id}` ? "active" : ""}`}
-                        onClick={() => open(`m:${m.id}`)}
-                      >
-                        <span class="glyph">
-                          <StatusGlyph agent={{ status: missionGlyph(m.status) }} busy={false} />
-                        </span>
-                        <span class="row-label">{m.title || m.id}</span>
-                      </button>
-                    )}
-                  </For>
-                  <Show when={liveMissions().length === 0}>
-                    <div class="sb-empty">Nothing running.</div>
-                  </Show>
-                </Show>
               </>
             }
           >

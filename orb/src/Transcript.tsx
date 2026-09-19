@@ -293,17 +293,19 @@ function ThinkBlock(p: { item: Extract<StreamItem, { kind: "think" }> }) {
   );
 }
 
-/** Consecutive tool calls fold into one collapsible group, Cursor-style:
- * collapsed once every call in the run has finished, open while running. */
-type Grouped = StreamItem | { kind: "tools"; key: string; items: Extract<StreamItem, { kind: "tool" }>[] };
+/** Everything an agent does between two pieces of visible text (thoughts
+ * and tool calls, interleaved) folds into one "Worked" line, Cursor-style:
+ * open with the current activity while running, collapsed once done. */
+type WorkItem = Extract<StreamItem, { kind: "tool" | "think" }>;
+type Grouped = StreamItem | { kind: "work"; key: string; items: WorkItem[] };
 
-function groupTools(items: StreamItem[]): Grouped[] {
+function groupWork(items: StreamItem[]): Grouped[] {
   const out: Grouped[] = [];
   for (const it of items) {
     const last = out[out.length - 1];
-    if (it.kind === "tool") {
-      if (last && last.kind === "tools") last.items.push(it);
-      else out.push({ kind: "tools", key: it.callId, items: [it] });
+    if (it.kind === "tool" || it.kind === "think") {
+      if (last && last.kind === "work") last.items.push(it);
+      else out.push({ kind: "work", key: it.key, items: [it] });
     } else {
       out.push(it);
     }
@@ -311,32 +313,32 @@ function groupTools(items: StreamItem[]): Grouped[] {
   return out;
 }
 
-function ToolGroup(p: { items: Extract<StreamItem, { kind: "tool" }>[] }) {
-  const running = () => p.items.some((t) => !t.done);
+function WorkFold(p: { items: WorkItem[] }) {
+  const running = () => p.items.some((t) => (t.kind === "tool" ? !t.done : !t.done));
   const [forced, setForced] = createSignal<boolean | null>(null);
   const open = () => forced() ?? running();
-  const label = () => {
-    const n = p.items.length;
-    if (running()) {
-      const cur = p.items.find((t) => !t.done);
-      return cur ? `${cur.name} ${toolTarget(cur.name, cur.args) ?? ""}`.trim() : "Working…";
-    }
-    return `Ran ${n} tool${n === 1 ? "" : "s"}`;
+  const tools = () => p.items.filter((t) => t.kind === "tool").length;
+  const current = () => {
+    const cur = [...p.items].reverse().find((t) => (t.kind === "tool" ? !t.done : !t.done));
+    if (!cur) return "Working…";
+    if (cur.kind === "think") return "Thinking…";
+    return `${cur.name} ${toolTarget(cur.name, cur.args) ?? ""}`.trim();
+  };
+  const summary = () => {
+    const n = tools();
+    return n === 0 ? "Thought" : `Worked · ${n} tool${n === 1 ? "" : "s"}`;
   };
   return (
-    <div class={`st-tools ${open() ? "open" : ""}`}>
-      <button class="st-tools-head" onClick={() => setForced(!open())}>
+    <div class={`st-work ${open() ? "open" : ""}`}>
+      <button class="st-work-head" onClick={() => setForced(!open())}>
         <Ic.ChevronRight size={12} class={`chev ${open() ? "open" : ""}`} />
-        <Show when={running()} fallback={<span class="st-tools-label">{label()}</span>}>
-          <span class="st-tools-label shimmer">{label()}</span>
-        </Show>
-        <Show when={!running()}>
-          <span class="st-tool-check">✓</span>
+        <Show when={running()} fallback={<span class="st-work-label">{summary()}</span>}>
+          <span class="st-work-label shimmer">{current()}</span>
         </Show>
       </button>
       <Show when={open()}>
-        <div class="st-tools-body">
-          <For each={p.items}>{(t) => <ToolRow item={t} />}</For>
+        <div class="st-work-body">
+          <For each={p.items}>{(t) => (t.kind === "tool" ? <ToolRow item={t} /> : <ThinkBlock item={t} />)}</For>
         </div>
       </Show>
     </div>
@@ -344,14 +346,14 @@ function ToolGroup(p: { items: Extract<StreamItem, { kind: "tool" }>[] }) {
 }
 
 export function Transcript(p: { items: StreamItem[] }) {
-  const grouped = createMemo(() => groupTools(p.items));
+  const grouped = createMemo(() => groupWork(p.items));
   return (
     <>
       <For each={grouped()}>
         {(item) => {
           switch (item.kind) {
-            case "tools":
-              return <ToolGroup items={item.items} />;
+            case "work":
+              return <WorkFold items={item.items} />;
             case "user":
               return (
                 <div class="user">
@@ -363,7 +365,7 @@ export function Transcript(p: { items: StreamItem[] }) {
             case "text":
               return (
                 <div class={`st-text ${item.live ? "live" : ""}`}>
-                  <MdView text={item.text} />
+                  <MdView text={item.text} compact />
                   <Show when={item.live}>
                     <span class="st-caret" />
                   </Show>
