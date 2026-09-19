@@ -255,153 +255,22 @@ export function Providers() {
   };
 
   return (
-    <Show when={!live()} fallback={<LiveProviders list={live() ?? []} onRefresh={reloadRemote} />}>
-    <div class="page">
-      <div class="page-head">
-        <h2>Providers</h2>
-        <button class="s-btn" onClick={() => setAdd(true)}>
-          <Ic.PlusIcon size={14} /> Add
-        </button>
-      </div>
-      <p class="s-lead">
-        Accounts sync from sandboxed.sh. Claude, ChatGPT and xAI OAuth are owned by CLIProxyAPI — Orb will not refresh those tokens.
-      </p>
-
-      <Show when={toast()}>
-        <div class="p-toast">{toast()}</div>
-      </Show>
-
-      <section class="s-sec">
-        <h3>Subscriptions</h3>
-        <div class="s-card">
-          <For each={oauth()}>
-            {(a) => (
-              <AccountRow
-                a={a}
-                onSignIn={() => signIn(a)}
-                onToggle={() => setList(list.findIndex((x) => x.id === a.id), "enabled", !a.enabled)}
-                onRemove={() =>
-                  setList(
-                    produce((ls) => {
-                      const j = ls.findIndex((x) => x.id === a.id);
-                      if (j >= 0) ls.splice(j, 1);
-                    }),
-                  )
-                }
-              />
-            )}
-          </For>
-          <Show when={oauth().length === 0}>
-            <div class="s-row"><div class="s-row-desc">No OAuth accounts yet.</div></div>
-          </Show>
+    <Show
+      when={isConnected()}
+      fallback={
+        <div class="page">
+          <div class="page-head"><h2>Providers</h2></div>
+          <p class="s-lead">Providers are configured on the sandboxed.sh core — connect in Settings → Backend to see them.</p>
         </div>
-      </section>
-
-      <section class="s-sec">
-        <h3>API keys</h3>
-        <div class="s-card">
-          <For each={keys()}>
-            {(a) => (
-              <AccountRow
-                a={a}
-                onSignIn={() => signIn(a)}
-                onToggle={() => setList(list.findIndex((x) => x.id === a.id), "enabled", !a.enabled)}
-                onRemove={() =>
-                  setList(
-                    produce((ls) => {
-                      const j = ls.findIndex((x) => x.id === a.id);
-                      if (j >= 0) ls.splice(j, 1);
-                    }),
-                  )
-                }
-              />
-            )}
-          </For>
-          <Show when={keys().length === 0}>
-            <div class="s-row"><div class="s-row-desc">No API keys yet.</div></div>
-          </Show>
-        </div>
-      </section>
-
-      <Show when={add()}>
-        <Dialog
-          title={step() === "type" ? "Add provider" : step() === "method" ? kind()?.name ?? "Method" : method()?.label ?? "Details"}
-          onClose={resetAdd}
-          footer={
-            <>
-              <Show when={step() !== "type"}>
-                <button class="s-btn" onClick={() => setStep(step() === "details" && (kind()?.methods.length ?? 0) > 1 ? "method" : "type")}>
-                  Back
-                </button>
-              </Show>
-              <span class="dlg-spacer" />
-              <button class="s-btn" onClick={resetAdd}>Cancel</button>
-              <Show when={step() === "details"}>
-                <button class="s-btn primary" onClick={finish}>
-                  {method()?.kind === "oauth" ? "Sign in" : "Save"}
-                </button>
-              </Show>
-            </>
-          }
-        >
-          <Show when={step() === "type"}>
-            <div class="p-grid">
-              <For each={KINDS}>
-                {(k) => (
-                  <button class="p-type" onClick={() => pickType(k.id)}>
-                    <div class="p-type-name">{k.name}</div>
-                    <div class="p-type-meta">{k.methods.some((m) => m.kind === "oauth") ? "OAuth" : "API key"}</div>
-                  </button>
-                )}
-              </For>
-            </div>
-          </Show>
-          <Show when={step() === "method"}>
-            <For each={kind()?.methods ?? []}>
-              {(m, i) => (
-                <button class="p-method" onClick={() => { setMethodI(i()); setStep("details"); }}>
-                  <div class="s-row-title">{m.label}</div>
-                  <div class="s-row-desc">{m.desc}</div>
-                </button>
-              )}
-            </For>
-          </Show>
-          <Show when={step() === "details"}>
-            <p class="s-lead" style={{ "margin-bottom": "12px" }}>{method()?.desc}</p>
-            <Show when={(BACKENDS[kindId() ?? ""] ?? []).length > 0}>
-              <div class="field">
-                <span>Use for</span>
-                <div class="p-backs">
-                  <For each={BACKENDS[kindId() ?? ""] ?? ["opencode"]}>
-                    {(b) => (
-                      <button
-                        class={`pill ${backends().includes(b) ? "on" : ""}`}
-                        onClick={() =>
-                          setBackends(backends().includes(b) ? backends().filter((x) => x !== b) : [...backends(), b])
-                        }
-                      >
-                        {BACKEND_LABEL[b] ?? b}
-                      </button>
-                    )}
-                  </For>
-                </div>
-              </div>
-            </Show>
-            <Show when={method()?.kind === "api"}>
-              <Field label="API key">
-                <input type="password" placeholder="sk-…" value={key()} onInput={(e) => setKey(e.currentTarget.value)} />
-              </Field>
-            </Show>
-            <Show when={method()?.kind === "oauth"}>
-              <p class="s-row-desc">Sign-in will be handed to sandboxed.sh / CLIProxyAPI. Nothing is stored in Orb yet.</p>
-            </Show>
-          </Show>
-        </Dialog>
+      }
+    >
+      <Show when={live()} fallback={<div class="page"><p class="s-lead shimmer">Loading providers…</p></div>}>
+        <LiveProviders list={live() ?? []} onRefresh={reloadRemote} />
       </Show>
-    </div>
     </Show>
   );
 }
+
 
 function LiveProviders(p: { list: AIProvider[]; onRefresh: () => void }) {
   const [usage, setUsage] = createSignal<Record<string, ProviderUsage>>({});
@@ -640,8 +509,9 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
   );
 }
 
-/** ISO timestamp or relative ("2s", "1m30s") → readable reset label. */
+/** ISO timestamp, epoch-seconds string, or relative ("2s") → readable label. */
 function fmtReset(v: string): string {
+  if (/^\d+$/.test(v)) return fmtResetEpoch(v.length > 12 ? Number(v) / 1000 : Number(v));
   const t = Date.parse(v);
   if (Number.isNaN(t)) return v;
   return fmtResetEpoch(t / 1000);
@@ -685,7 +555,7 @@ function UsageDetail(p: { usage: ProviderUsage }) {
         <Show when={u.account_name}><span>{u.account_name}</span></Show>
         <Show when={u.organization}><span>{u.organization}</span></Show>
         <Show when={u.unified_status}>
-          <span class={u.unified_status === "ok" ? "c-green" : "c-red"}>status: {u.unified_status}</span>
+          <span class={u.unified_status === "ok" || u.unified_status === "allowed" ? "c-green" : "c-red"}>status: {u.unified_status}</span>
         </Show>
       </div>
 
