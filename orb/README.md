@@ -1,8 +1,10 @@
 # Orb
 
-Desktop client for sandboxed.sh (Tauri 2 + SolidJS). The Agents-window UI is in
-place: projects, machines, providers (shaped for CLIProxyAPI-owned OAuth vs
-API keys), and a New Agent composer. **It is not wired to the API yet.**
+Desktop client for sandboxed.sh (Tauri 2 + SolidJS): projects and their files,
+running missions with live transcripts, machines (the remote-node fleet plus
+Paloma SSH hosts), providers (CLIProxyAPI-owned OAuth vs API keys) and a New
+Agent composer. Connect a backend in Settings → Backend (dashboard password);
+the URL and JWT are kept in localStorage.
 
 ```
 pnpm install
