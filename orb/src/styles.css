@@ -227,6 +227,14 @@ code {
   font: 12px/18px var(--mono); color: var(--fg-3); white-space: pre-wrap; overflow-wrap: anywhere;
 }
 
+/* ---------- hosted project files ---------- */
+.pf-bar {
+  flex: none; display: flex; align-items: center; gap: 10px;
+  padding: 8px 24px; border-bottom: 1px solid var(--stroke-soft);
+}
+.pf-path { font: 12px var(--mono); color: var(--fg-4); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pf-state { font-size: 12px; color: var(--fg-3); }
+
 /* ---------- dock / composer ---------- */
 .dock { flex: none; padding: 0 34px; }
 .actions { display: flex; gap: 4px; margin-bottom: 8px; }

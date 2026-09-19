@@ -199,6 +199,67 @@ export async function openExternalUrl(url: string): Promise<void> {
   window.open(url, "_blank");
 }
 
+export interface ProjectSummary {
+  slug: string;
+  title?: string | null;
+  objective?: string | null;
+  status: string;
+  updated_at: string;
+}
+
+export interface ProjectFileEntry {
+  name: string;
+  kind: "dir" | "file";
+  size?: number;
+  modified?: string;
+}
+
+export async function listProjects(): Promise<ProjectSummary[]> {
+  const data = await api<{ projects?: ProjectSummary[] }>("/api/projects");
+  return data.projects ?? [];
+}
+
+/** Missions tagged with this project (exact slug match on the backend). */
+export async function listProjectMissions(slug: string): Promise<Mission[]> {
+  return api(`/api/control/missions?project=${encodeURIComponent(slug)}&limit=100`);
+}
+
+export async function listProjectFiles(slug: string, path: string): Promise<ProjectFileEntry[]> {
+  const data = await api<{ entries?: ProjectFileEntry[] }>(
+    `/api/projects/${encodeURIComponent(slug)}/files?path=${encodeURIComponent(path)}`,
+  );
+  return data.entries ?? [];
+}
+
+export async function readProjectFile(slug: string, path: string): Promise<string> {
+  const data = await api<{ content?: string }>(
+    `/api/projects/${encodeURIComponent(slug)}/file?path=${encodeURIComponent(path)}`,
+  );
+  return data.content ?? "";
+}
+
+export async function writeProjectFile(slug: string, path: string, content: string): Promise<void> {
+  await api(`/api/projects/${encodeURIComponent(slug)}/file`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, content }),
+  });
+}
+
+export async function mkdirProjectFile(slug: string, path: string): Promise<void> {
+  await api(`/api/projects/${encodeURIComponent(slug)}/file/mkdir`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+}
+
+export async function deleteProjectFile(slug: string, path: string): Promise<void> {
+  await api(`/api/projects/${encodeURIComponent(slug)}/file?path=${encodeURIComponent(path)}`, {
+    method: "DELETE",
+  });
+}
+
 export async function listMissions(): Promise<Mission[]> {
   return api("/api/control/missions");
 }

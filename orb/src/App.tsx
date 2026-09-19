@@ -11,6 +11,7 @@ import { MenuList, PopupMenu, type MenuEntry } from "./Menu";
 import { MdSource, MdView } from "./Markdown";
 import { getMissionEvents, storedToStream, streamMission } from "./stream";
 import { Transcript, applyStreamEvent, type StreamItem } from "./Transcript";
+import { LiveProjectsSection, ProjectFileView } from "./ProjectFiles";
 import {
   buildRemoteAgentCommand,
   ensureNodeAgentKey,
@@ -306,6 +307,15 @@ export default function App() {
   const currentMissionId = createMemo(() => {
     const id = selected();
     return id && id.startsWith("m:") ? id.slice(2) : null;
+  });
+  // Hosted project file: `pf:<slug>:<path>` (path may itself contain slashes).
+  const currentProjectFile = createMemo(() => {
+    const id = selected();
+    if (!id || !id.startsWith("pf:")) return null;
+    const rest = id.slice(3);
+    const sep = rest.indexOf(":");
+    if (sep < 0) return null;
+    return { slug: rest.slice(0, sep), path: rest.slice(sep + 1) };
   });
   const missionGlyph = (s: string): Agent["status"] =>
     s === "active" || s === "running" ? "running" : s === "failed" || s === "not_feasible" ? "pr-closed" : "idle";
@@ -625,6 +635,12 @@ export default function App() {
                   <span class="row-label">Providers</span>
                 </button>
 
+                <Show
+                  when={!isConnected()}
+                  fallback={
+                    <LiveProjectsSection selected={selected} open={open} missionGlyph={missionGlyph} StatusGlyph={StatusGlyph} />
+                  }
+                >
                 <div class="section">Projects</div>
                 <For each={projects}>
                   {(project) => {
@@ -828,6 +844,7 @@ export default function App() {
                     );
                   }}
                 </For>
+                </Show>
 
                 <Show when={isConnected()}>
                   <div class="section">Sandboxed</div>
@@ -912,6 +929,14 @@ export default function App() {
                 </>
               )}
             </Match>
+            <Match when={currentProjectFile()}>
+              {(pf) => (
+                <>
+                  <span>{pf().path.split("/").pop()}</span>
+                  <Ic.CloudIcon class="dim" />
+                </>
+              )}
+            </Match>
             <Match when={currentFile()}>
               {(f) => (
                 <>
@@ -952,6 +977,13 @@ export default function App() {
             {(id) => (
               <Show when={id()} keyed>
                 {(mid) => <MissionView id={mid} />}
+              </Show>
+            )}
+          </Match>
+          <Match when={currentProjectFile()}>
+            {(pf) => (
+              <Show when={pf()} keyed>
+                {(f) => <ProjectFileView slug={f.slug} path={f.path} />}
               </Show>
             )}
           </Match>
