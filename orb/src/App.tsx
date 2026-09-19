@@ -8,7 +8,7 @@ import { MACHINES, Machines } from "./Machines";
 import { Providers } from "./Providers";
 import { Dialog, Field } from "./Dialog";
 import { MenuList, PopupMenu, type MenuEntry } from "./Menu";
-import { MdSource, MdView } from "./Markdown";
+import { MdSource, MdView, safeHref } from "./Markdown";
 import { getMissionEvents, storedToStream, streamMission } from "./stream";
 import { Transcript, applyStreamEvent, type StreamItem } from "./Transcript";
 import { LiveProjectsSection, ProjectFileView } from "./ProjectFiles";
@@ -26,6 +26,7 @@ import {
   type Mission,
   type ProjectSummary,
   type RemoteNodeView,
+  openExternalUrl,
 } from "./api";
 
 const PAGES = new Set(["settings", "machines", "providers"]);
@@ -41,7 +42,19 @@ function inline(text: string): JSX.Element[] {
     if (m.index > last) out.push(text.slice(last, m.index));
     if (m[1] !== undefined) out.push(<strong>{inline(m[1])}</strong>);
     else if (m[2] !== undefined) out.push(<code>{m[2]}</code>);
-    else out.push(<a href={m[4]} onClick={(e) => e.preventDefault()}>{inline(m[3])}</a>);
+    else
+      out.push(
+        <a
+          href={safeHref(m[4]) ?? "#"}
+          onClick={(e) => {
+            e.preventDefault();
+            const href = safeHref(m[4]);
+            if (href) void openExternalUrl(href);
+          }}
+        >
+          {inline(m[3])}
+        </a>,
+      );
     last = m.index + m[0].length;
   }
   if (last < text.length) out.push(text.slice(last));

@@ -1,4 +1,12 @@
 import { For, createMemo, type JSX } from "solid-js";
+import { openExternalUrl } from "./api";
+
+/** Only http(s)/mailto links are rendered as real links; anything else
+ * (javascript:, data:, file:) is neutralised so markdown from a mission
+ * transcript cannot run script in the webview. */
+export function safeHref(raw: string): string | null {
+  return /^(https?:|mailto:)/i.test(raw.trim()) ? raw.trim() : null;
+}
 
 function inline(text: string): JSX.Element[] {
   const out: JSX.Element[] = [];
@@ -10,7 +18,14 @@ function inline(text: string): JSX.Element[] {
     else if (m[2] !== undefined) out.push(<code>{m[2]}</code>);
     else
       out.push(
-        <a href={m[4]} onClick={(e) => e.preventDefault()}>
+        <a
+          href={safeHref(m[4]) ?? "#"}
+          onClick={(e) => {
+            e.preventDefault();
+            const href = safeHref(m[4]);
+            if (href) void openExternalUrl(href);
+          }}
+        >
           {inline(m[3])}
         </a>,
       );
