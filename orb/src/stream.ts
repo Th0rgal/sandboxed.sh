@@ -46,7 +46,19 @@ export function storedToStream(ev: StoredEvent): StreamEvent | null {
     case "user_message":
       return d({ content: ev.content });
     case "assistant_message":
-      return d({ content: ev.content, success: true });
+    case "assistant_message_canonical":
+      // Canonical rows are the finalized text_op bubble; treat both as the
+      // turn's final message (the reducer dedupes identical text).
+      return { type: "assistant_message", data: { content: ev.content, success: ev.metadata?.success !== false } };
+    case "text_op": {
+      let ops: unknown = [];
+      try {
+        ops = JSON.parse(ev.content);
+      } catch {
+        ops = [];
+      }
+      return d({ bubble_id: ev.metadata?.bubble_id, ops });
+    }
     case "tool_call": {
       let args: unknown = null;
       try {

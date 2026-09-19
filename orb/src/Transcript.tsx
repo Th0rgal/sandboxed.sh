@@ -121,12 +121,23 @@ export function applyStreamEvent(items: StreamItem[], ev: StreamEvent): StreamIt
       ];
     }
     case "assistant_message": {
-      // Final full text for the turn: close the open live bubble with it.
       const text = str(ev.data.content);
-      if (last?.kind === "text") {
+      if (ev.data.success === false) {
+        // Failed turn: the content is the failure reason, not assistant prose.
+        const closed = last?.kind === "text" && last.live ? [...items.slice(0, -1), { ...last, live: false }] : items;
+        return [...closed, { kind: "error", key: nextKey(), text: text || "Mission failed" }];
+      }
+      // Final full text for the turn: close the open live bubble with it.
+      if (last?.kind === "text" && last.live) {
         return [...items.slice(0, -1), { ...last, text: text || last.text, live: false }];
       }
       if (!text) return items;
+      // A just-finalized text_op bubble, or an assistant_message_canonical
+      // row stored next to assistant_message, carries the same turn — fold
+      // it into the previous bubble instead of rendering it twice.
+      if (last?.kind === "text" && (text.startsWith(last.text) || last.text.startsWith(text))) {
+        return text.length > last.text.length ? [...items.slice(0, -1), { ...last, text }] : items;
+      }
       return [...items, { kind: "text", key: nextKey(), text, live: false }];
     }
     case "error": {
