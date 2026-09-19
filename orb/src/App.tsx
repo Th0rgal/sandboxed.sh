@@ -9,7 +9,7 @@ import { Providers } from "./Providers";
 import { Dialog, Field } from "./Dialog";
 import { MenuList, PopupMenu, type MenuEntry } from "./Menu";
 import { MdSource, MdView, safeHref } from "./Markdown";
-import { getMissionEvents, storedToStream, streamMission } from "./stream";
+import { getMissionEvents, storedToStream, streamMission, type StreamEvent } from "./stream";
 import { Transcript, applyStreamEvent, type StreamItem } from "./Transcript";
 import { LiveProjectsSection, ProjectFileView } from "./ProjectFiles";
 import {
@@ -1150,7 +1150,20 @@ function MissionView(p: { id: string }) {
   // Rebuild the transcript from the stored event log (initial load and
   // resync after stream lag). Stored rows map onto the live event shapes,
   // so the same reducer handles both.
+  // Live events that arrive while a replay is in flight would be clobbered
+  // by the replay's setItems; hold them and fold them in afterwards.
+  let replaying = false;
+  let held: StreamEvent[] = [];
+  const applyLive = (ev: StreamEvent) => {
+    setItems((cur) => {
+      const next = applyStreamEvent(cur, ev);
+      if (next !== cur) queueMicrotask(scrollIfPinned);
+      return next;
+    });
+  };
   const resync = async () => {
+    replaying = true;
+    held = [];
     try {
       const events = await getMissionEvents(p.id);
       let next: StreamItem[] = [];
@@ -1162,6 +1175,11 @@ function MissionView(p: { id: string }) {
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      replaying = false;
+      const queued = held;
+      held = [];
+      for (const ev of queued) applyLive(ev);
     }
   };
 
@@ -1174,11 +1192,8 @@ function MissionView(p: { id: string }) {
           void refresh();
           return;
         }
-        setItems((cur) => {
-          const next = applyStreamEvent(cur, ev);
-          if (next !== cur) queueMicrotask(scrollIfPinned);
-          return next;
-        });
+        if (replaying) held.push(ev);
+        else applyLive(ev);
       },
       () => void resync(),
     );
