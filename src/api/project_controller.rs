@@ -320,7 +320,7 @@ fn build_runs(home: &Path, job_id: &str, limit: usize) -> Vec<ControllerRun> {
             Some((stamp, path))
         })
         .collect();
-    stems.sort_by(|a, b| b.0.cmp(&a.0));
+    stems.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     stems.truncate(limit);
 
     for (stamp, path) in stems {
