@@ -45,12 +45,23 @@ export function LiveProjectsSection(p: {
         );
       });
   };
-  onMount(refresh);
+  onMount(() => {
+    refresh();
+    // Mission statuses under expanded projects would otherwise freeze at
+    // expand time (the flat "Sandboxed" list polls, this tree didn't).
+    const t = window.setInterval(() => {
+      if (!isConnected()) return;
+      for (const project of projects()) if (expanded[project.slug]) loadMissions(project.slug);
+    }, 10000);
+    onCleanup(() => clearInterval(t));
+  });
 
   const loadMissions = (slug: string) => {
     listProjectMissions(slug)
       .then((list) => setMissions(slug, list))
-      .catch(() => setMissions(slug, []));
+      .catch(() => {
+        if (!missions[slug]) setMissions(slug, []);
+      });
   };
 
   const loadDir = (slug: string, path: string) => {
