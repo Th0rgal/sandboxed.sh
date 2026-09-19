@@ -453,7 +453,7 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
       footer={
         <>
           <span class="dlg-spacer" />
-          <button class="s-btn" onClick={p.onClose}>
+          <button class="s-btn sm quiet" onClick={p.onClose}>
             {phase() === "failed" ? "Close" : "Cancel"}
           </button>
         </>
@@ -479,7 +479,7 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
           <span>Auth URL</span>
           <div class="p-url">
             <code>{session()?.url}</code>
-            <button class="s-btn" onClick={() => session() && void openExternalUrl(session()!.url)}>
+            <button class="s-btn sm" onClick={() => session() && void openExternalUrl(session()!.url)}>
               Open
             </button>
           </div>
@@ -499,8 +499,8 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
           <p class="s-row-desc">{error()}</p>
         </Show>
         <Show when={session()?.flow !== "device"}>
-          <div style={{ "margin-top": "10px", display: "flex", "justify-content": "flex-end" }}>
-            <button class="s-btn primary" disabled={phase() === "finishing" || !paste().trim()} onClick={submitPaste}>
+          <div class="p-acc-actions">
+            <button class="s-btn sm primary" disabled={phase() === "finishing" || !paste().trim()} onClick={submitPaste}>
               {phase() === "finishing" ? "Submitting…" : "Submit callback"}
             </button>
           </div>

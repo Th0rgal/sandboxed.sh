@@ -237,8 +237,20 @@ function Composer(p: {
     setCtx(false);
     setWhich(null);
   };
-  onMount(() => window.addEventListener("pointerdown", close));
-  onCleanup(() => window.removeEventListener("pointerdown", close));
+  const onEsc = (e: KeyboardEvent) => {
+    if (e.key === "Escape" && (menu() || ctx() || which())) {
+      e.stopPropagation();
+      close();
+    }
+  };
+  onMount(() => {
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("keydown", onEsc, true);
+  });
+  onCleanup(() => {
+    window.removeEventListener("pointerdown", close);
+    window.removeEventListener("keydown", onEsc, true);
+  });
   const plus = (
     <div class="plus-wrap" onPointerDown={(e) => e.stopPropagation()}>
       <button class="plus" title="Add context" onClick={() => setCtx(!ctx())}>
@@ -1237,8 +1249,8 @@ export default function App() {
             footer={
               <>
                 <span class="dlg-spacer" />
-                <button class="s-btn" onClick={() => setNameDlg(null)}>Cancel</button>
-                <button class="s-btn primary" onClick={confirmName}>{d().kind.startsWith("rename") ? "Save" : "Create"}</button>
+                <button class="s-btn sm quiet" onClick={() => setNameDlg(null)}>Cancel</button>
+                <button class="s-btn sm primary" onClick={confirmName}>{d().kind.startsWith("rename") ? "Save" : "Create"}</button>
               </>
             }
           >

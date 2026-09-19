@@ -105,8 +105,8 @@ export function LiveProjectsSection(p: {
             return (
               <>
                 <button
-                  class="row folder"
-                  style={{ "padding-left": `${8 + (dp.depth + 1) * 14}px` }}
+                  class="row folder depth"
+                  style={{ "--depth": dp.depth + 1 }}
                   onClick={() => toggleDir(dp.slug, childPath())}
                 >
                   <Show when={expanded[key()]} fallback={<Ic.FolderIcon />}>
@@ -123,8 +123,8 @@ export function LiveProjectsSection(p: {
           const id = () => `pf:${dp.slug}:${childPath()}`;
           return (
             <button
-              class={`row file ${p.selected() === id() ? "active" : ""}`}
-              style={{ "padding-left": `${8 + (dp.depth + 1) * 14}px` }}
+              class={`row file depth ${p.selected() === id() ? "active" : ""}`}
+              style={{ "--depth": dp.depth + 1 }}
               onClick={() => p.open(id())}
             >
               <Ic.FileIcon />
@@ -140,7 +140,7 @@ export function LiveProjectsSection(p: {
     <>
       <div class="section">Projects</div>
       <Show when={error()}>
-        <div class="row dim" style={{ "font-size": "12px" }}>{error()}</div>
+        <div class="row note">{error()}</div>
       </Show>
       <For each={projects()}>
         {(project) => {
@@ -158,8 +158,7 @@ export function LiveProjectsSection(p: {
                 <For each={liveOf(project.slug)}>
                   {(m) => (
                     <button
-                      class={`row agent ${p.selected() === `m:${m.id}` ? "active" : ""}`}
-                      style={{ "padding-left": "22px" }}
+                      class={`row agent d1 ${p.selected() === `m:${m.id}` ? "active" : ""}`}
                       onClick={() => p.open(`m:${m.id}`)}
                     >
                       <span class="glyph">
@@ -171,8 +170,7 @@ export function LiveProjectsSection(p: {
                 </For>
                 <Show when={doneOf(project.slug).length > 0}>
                   <button
-                    class="row done-toggle"
-                    style={{ "padding-left": "22px" }}
+                    class="row done-toggle d1"
                     onClick={() => setShowDone(project.slug, !showDone[project.slug])}
                   >
                     <Ic.ChevronRight size={11} class={`chev ${showDone[project.slug] ? "open" : ""}`} />
@@ -184,8 +182,7 @@ export function LiveProjectsSection(p: {
                     <For each={doneOf(project.slug)}>
                       {(m) => (
                         <button
-                          class={`row agent done ${p.selected() === `m:${m.id}` ? "active" : ""}`}
-                          style={{ "padding-left": "36px" }}
+                          class={`row agent done d2 ${p.selected() === `m:${m.id}` ? "active" : ""}`}
                           onClick={() => p.open(`m:${m.id}`)}
                         >
                           <span class="glyph">
@@ -199,7 +196,7 @@ export function LiveProjectsSection(p: {
                 </Show>
                 <DirRows slug={project.slug} path="" depth={0} />
                 <Show when={(missions[project.slug]?.length ?? 0) === 0 && (dirs[`${project.slug}:`]?.length ?? 0) === 0}>
-                  <div class="row dim" style={{ "padding-left": "22px", "font-size": "12px" }}>
+                  <div class="row note d1">
                     No missions or files yet.
                   </div>
                 </Show>
@@ -209,7 +206,7 @@ export function LiveProjectsSection(p: {
         }}
       </For>
       <Show when={projects().length === 0 && !error()}>
-        <div class="row dim" style={{ "font-size": "12px" }}>No projects on the core backend.</div>
+        <div class="row note">No projects on the core backend.</div>
       </Show>
     </>
   );
