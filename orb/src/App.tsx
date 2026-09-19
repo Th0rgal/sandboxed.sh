@@ -1,4 +1,4 @@
-import { For, Show, Switch, Match, createMemo, createSignal, createEffect, onCleanup, onMount, batch } from "solid-js";
+import { For, Show, Switch, Match, createMemo, createSignal, createEffect, on, onCleanup, onMount, batch } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import type { JSX } from "solid-js";
 import { projects as seed, LOREM_REPLY, type Agent, type Block, type Turn } from "./data";
@@ -349,8 +349,11 @@ export default function App() {
     }
     return MACHINES.find((m) => m.id === newMachine())?.name;
   };
-  createEffect(() => {
-    if (isConnected()) {
+  // Keyed on the connection only: the body reads selected()/newMachine()/
+  // fleetNodes(), and tracking those made every fleet poll re-run the
+  // effect, which re-polled the fleet — an endless fetch loop.
+  createEffect(on(isConnected, (connected) => {
+    if (connected) {
       void refreshMissions();
       void refreshFleet();
       listProjects()
@@ -367,7 +370,7 @@ export default function App() {
       if (sel && (sel.startsWith("m:") || sel.startsWith("pf:"))) open(null);
       if (newMachine() === "core" || fleetNodes().some((n) => n.id === newMachine())) setNewMachine(MACHINES[0].id);
     }
-  });
+  }));
   const currentFile = createMemo(() => {
     const id = selected();
     if (!id?.startsWith("f:")) return null;
