@@ -227,20 +227,27 @@ export function ProjectFileView(p: { slug: string; path: string }) {
           {editing() ? "Preview" : "Edit"}
         </button>
       </div>
-      <div class="scroll">
-        <div class="col">
-          <Show when={state() === "error"}>
-            <p class="st-error">{error()}</p>
-          </Show>
-          <Show when={text() !== null} fallback={<p class="s-lead shimmer">Loading {name()}…</p>}>
-            <div class="file-view">
-              <Show when={editing()} fallback={<MdView text={text() ?? ""} />}>
-                <MdSource text={text() ?? ""} onInput={onInput} />
+      <Show
+        when={editing()}
+        fallback={
+          <div class="scroll">
+            <div class="col">
+              <Show when={state() === "error"}>
+                <p class="st-error">{error()}</p>
+              </Show>
+              <Show when={text() !== null} fallback={<p class="s-lead shimmer">Loading {name()}…</p>}>
+                <MdView text={text() ?? ""} />
               </Show>
             </div>
+          </div>
+        }
+      >
+        <div class="file-view">
+          <Show when={text() !== null} fallback={<p class="s-lead shimmer">Loading {name()}…</p>}>
+            <MdSource text={text() ?? ""} onInput={onInput} />
           </Show>
         </div>
-      </div>
+      </Show>
     </>
   );
 }
