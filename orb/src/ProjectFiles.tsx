@@ -14,7 +14,10 @@ import {
   type ProjectFileEntry,
   type ProjectSummary,
   projectsVersion,
+  getProjectController,
+  type ControllerView as ControllerData,
 } from "./api";
+import { CronGlyph, untilLabel } from "./Controller";
 
 /** Sidebar section listing the core backend's projects with their missions
  * and hosted files. Replaces the demo projects when connected. */
@@ -52,6 +55,13 @@ export function LiveProjectsSection(p: {
   // Missions per project slug; file listings per `${slug}:${dirPath}`.
   const [missions, setMissions] = createStore<Record<string, Mission[]>>({});
   const [dirs, setDirs] = createStore<Record<string, ProjectFileEntry[]>>({});
+  // The project's controller (Hermes cron), shown as the folder's first row.
+  const [controllers, setControllers] = createStore<Record<string, ControllerData>>({});
+  const loadController = (slug: string) => {
+    getProjectController(slug, 3)
+      .then((view) => setControllers(slug, view))
+      .catch(() => {});
+  };
 
   const refresh = () => {
     if (!isConnected()) return;
@@ -76,7 +86,11 @@ export function LiveProjectsSection(p: {
     // expand time (the flat "Sandboxed" list polls, this tree didn't).
     const stop = pollWhileVisible(() => {
       if (!isConnected()) return;
-      for (const project of projects()) if (expanded[project.slug]) loadMissions(project.slug);
+      for (const project of projects()) {
+        if (!expanded[project.slug]) continue;
+        loadMissions(project.slug);
+        loadController(project.slug);
+      }
     }, 10000);
     onCleanup(stop);
   });
@@ -106,6 +120,7 @@ export function LiveProjectsSection(p: {
     if (next) {
       loadMissions(slug);
       loadDir(slug, "");
+      loadController(slug);
     }
   };
 
@@ -192,6 +207,29 @@ export function LiveProjectsSection(p: {
                 </span>
               </button>
               <Show when={isOpen()}>
+                <Show when={controllers[project.slug]?.job}>
+                  {(job) => {
+                    const ticking = () =>
+                      (controllers[project.slug]?.runs ?? []).some((r) => r.status === "running" || r.status === "claimed");
+                    return (
+                      <button
+                        class={`row agent d1 cron ${p.selected() === `c:${project.slug}` ? "active" : ""}`}
+                        title="Controller (Hermes cron)"
+                        onClick={() => p.open(`c:${project.slug}`)}
+                      >
+                        <span class="glyph">
+                          <CronGlyph job={job()} running={ticking()} />
+                        </span>
+                        <span class="row-label">{job().name}</span>
+                        <span class="row-machine">
+                          <span class="row-machine-name cron-next">
+                            {ticking() ? "ticking" : !job().enabled || job().state === "paused" ? "paused" : untilLabel(job().next_run_at, Date.now())}
+                          </span>
+                        </span>
+                      </button>
+                    );
+                  }}
+                </Show>
                 <For each={liveOf(project.slug)}>
                   {(m) => (
                     <button

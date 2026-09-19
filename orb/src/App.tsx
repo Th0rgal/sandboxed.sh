@@ -13,6 +13,7 @@ import { getMissionEvents, storedToStream, streamMission, type StreamEvent } fro
 import { Transcript, applyStreamEvent, buildTranscript, type StreamItem } from "./Transcript";
 import { mergeById, pollWhileVisible } from "./poll";
 import { LiveProjectsSection, ProjectFileView } from "./ProjectFiles";
+import { ControllerView } from "./Controller";
 import {
   buildRemoteAgentCommand,
   ensureNodeAgentKey,
@@ -499,6 +500,11 @@ export default function App() {
     const id = selected();
     return id && id.startsWith("m:") ? id.slice(2) : null;
   });
+  // Project controller (Hermes cron): `c:<slug>`.
+  const currentController = createMemo(() => {
+    const id = selected();
+    return id && id.startsWith("c:") ? id.slice(2) : null;
+  });
   // Hosted project file: `pf:<slug>:<path>` (path may itself contain slashes).
   const currentProjectFile = createMemo(() => {
     const id = selected();
@@ -541,7 +547,7 @@ export default function App() {
       // Backend views (missions, hosted files) can't render offline — e.g.
       // after a 401 cleared the token mid-session.
       const sel = selected();
-      if (sel && (sel.startsWith("m:") || sel.startsWith("pf:"))) open(null);
+      if (sel && (sel.startsWith("m:") || sel.startsWith("pf:") || sel.startsWith("c:"))) open(null);
       if (newMachine() === "core" || fleetNodes().some((n) => n.id === newMachine())) setNewMachine(MACHINES[0].id);
     }
   }));
@@ -994,6 +1000,13 @@ export default function App() {
             {(id) => (
               <Show when={id()} keyed>
                 {(mid) => <MissionView id={mid} />}
+              </Show>
+            )}
+          </Match>
+          <Match when={currentController()}>
+            {(slug) => (
+              <Show when={slug()} keyed>
+                {(s) => <ControllerView slug={s} />}
               </Show>
             )}
           </Match>

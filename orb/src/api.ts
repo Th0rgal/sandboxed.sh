@@ -319,6 +319,56 @@ export async function createProject(body: { slug: string; title?: string; object
   });
 }
 
+/** A project's controller: the Hermes cron job that drives it. */
+export interface ControllerJob {
+  id: string;
+  name: string;
+  schedule?: string | null;
+  enabled: boolean;
+  state?: string | null;
+  paused_reason?: string | null;
+  next_run_at?: string | null;
+  last_run_at?: string | null;
+  last_status?: string | null;
+  last_error?: string | null;
+  failure_streak: number;
+  deliver?: string | null;
+}
+
+export interface ControllerRun {
+  id: string;
+  at?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  duration_secs?: number | null;
+  status?: string | null;
+  source?: string | null;
+  delivery_outcome?: string | null;
+  silent: boolean;
+  report: string;
+  ctrl?: string | null;
+  signature?: string | null;
+  error?: string | null;
+}
+
+export interface ControllerView {
+  slug: string;
+  job: ControllerJob | null;
+  runs: ControllerRun[];
+}
+
+export async function getProjectController(slug: string, limit = 40): Promise<ControllerView> {
+  return api(`/api/projects/${encodeURIComponent(slug)}/controller?limit=${limit}`);
+}
+
+export async function controllerAction(slug: string, action: "pause" | "resume" | "run"): Promise<ControllerView> {
+  return api(`/api/projects/${encodeURIComponent(slug)}/controller/action`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action }),
+  });
+}
+
 /** Bumped after a project is created so every list re-fetches. */
 const [projectsVersion, setProjectsVersion] = createSignal(0);
 export { projectsVersion };
