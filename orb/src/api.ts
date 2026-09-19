@@ -138,11 +138,44 @@ export async function listProviders(): Promise<AIProvider[]> {
 export interface ProviderUsage {
   provider_type: string;
   error?: string;
+  status?: string;
+  account_email?: string | null;
+  account_name?: string | null;
+  organization?: string | null;
   unified_status?: string;
   unified_5h_utilization?: number;
   unified_5h_reset?: string;
+  unified_5h_status?: string;
   unified_7d_utilization?: number;
   unified_7d_reset?: string;
+  unified_7d_status?: string;
+  requests_limit?: number;
+  requests_remaining?: number;
+  requests_reset?: string;
+  tokens_limit?: number;
+  tokens_remaining?: number;
+  tokens_reset?: string;
+  codex_plan_type?: string;
+  codex_primary_used_percent?: number;
+  codex_primary_reset_at?: number;
+  codex_secondary_used_percent?: number;
+  codex_secondary_reset_at?: number;
+  minimax_interval_remaining_percent?: number;
+  minimax_interval_reset?: number;
+  minimax_weekly_remaining_percent?: number;
+  minimax_weekly_reset?: number;
+  model_usage?: Array<{
+    model: string;
+    interval_remaining_percent: number;
+    weekly_remaining_percent: number;
+    interval_reset: number;
+    weekly_reset: number;
+  }>;
+  zai_plan?: string;
+  zai_tokens_percentage?: number;
+  zai_tokens_reset?: number;
+  zai_mcp_percentage?: number;
+  zai_mcp_reset?: number;
 }
 
 export async function getAllProviderUsage(): Promise<Record<string, ProviderUsage>> {
@@ -155,6 +188,7 @@ export type CliProxyLoginStatus = "pending" | "completing" | "completed" | "fail
 export interface CliProxyLoginStart {
   session_id: string;
   auth_url: string;
+  flow?: "redirect" | "device";
 }
 
 export interface CliProxyLoginState {

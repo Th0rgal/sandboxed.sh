@@ -507,7 +507,7 @@ function UsageBars(p: { usage: ProviderUsage }) {
 }
 
 function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: () => void }) {
-  const [session, setSession] = createSignal<{ id: string; url: string } | null>(null);
+  const [session, setSession] = createSignal<{ id: string; url: string; flow?: string } | null>(null);
   const [phase, setPhase] = createSignal<"starting" | "awaiting" | "finishing" | "failed">("starting");
   const [error, setError] = createSignal<string | null>(null);
   const [paste, setPaste] = createSignal("");
@@ -544,7 +544,7 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
   onMount(() => {
     startCliProxyLogin(p.provider.provider_type)
       .then((s) => {
-        setSession({ id: s.session_id, url: s.auth_url });
+        setSession({ id: s.session_id, url: s.auth_url, flow: s.flow });
         setPhase("awaiting");
         startPolling(s.session_id);
         void openExternalUrl(s.auth_url);
@@ -601,8 +601,9 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
       </Show>
       <Show when={phase() === "awaiting" || phase() === "finishing"}>
         <p class="s-lead">
-          Authorize in the browser window that just opened. The redirect to localhost will fail — copy the full URL from the
-          address bar and paste it here.
+          {session()?.flow === "device"
+            ? "Authorize in the browser window that just opened and enter the code shown — the login completes automatically."
+            : "Authorize in the browser window that just opened. The redirect to localhost will fail — copy the full URL from the address bar and paste it here."}
         </p>
         <div class="field">
           <span>Auth URL</span>
@@ -613,25 +614,127 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
             </button>
           </div>
         </div>
-        <Field label="Redirect URL (http://localhost:…)">
-          <input
-            type="text"
-            placeholder="http://localhost:54545/callback?code=…&state=…"
-            value={paste()}
-            onInput={(e) => setPaste(e.currentTarget.value)}
-            onKeyDown={(e) => e.key === "Enter" && submitPaste()}
-          />
-        </Field>
+        <Show when={session()?.flow !== "device"}>
+          <Field label="Redirect URL (http://localhost:…)">
+            <input
+              type="text"
+              placeholder="http://localhost:54545/callback?code=…&state=…"
+              value={paste()}
+              onInput={(e) => setPaste(e.currentTarget.value)}
+              onKeyDown={(e) => e.key === "Enter" && submitPaste()}
+            />
+          </Field>
+        </Show>
         <Show when={error()}>
           <p class="s-row-desc">{error()}</p>
         </Show>
-        <div style={{ "margin-top": "10px", display: "flex", "justify-content": "flex-end" }}>
-          <button class="s-btn primary" disabled={phase() === "finishing" || !paste().trim()} onClick={submitPaste}>
-            {phase() === "finishing" ? "Submitting…" : "Submit callback"}
-          </button>
-        </div>
+        <Show when={session()?.flow !== "device"}>
+          <div style={{ "margin-top": "10px", display: "flex", "justify-content": "flex-end" }}>
+            <button class="s-btn primary" disabled={phase() === "finishing" || !paste().trim()} onClick={submitPaste}>
+              {phase() === "finishing" ? "Submitting…" : "Submit callback"}
+            </button>
+          </div>
+        </Show>
       </Show>
     </Dialog>
+  );
+}
+
+/** ISO timestamp or relative ("2s", "1m30s") → readable reset label. */
+function fmtReset(v: string): string {
+  const t = Date.parse(v);
+  if (Number.isNaN(t)) return v;
+  return fmtResetEpoch(t / 1000);
+}
+
+function fmtResetEpoch(sec: number): string {
+  const delta = sec * 1000 - Date.now();
+  if (delta <= 0) return "now";
+  const mins = Math.round(delta / 60000);
+  if (mins < 60) return `in ${mins}m`;
+  const hours = Math.round(mins / 60);
+  if (hours < 48) return `in ${hours}h`;
+  return `in ${Math.round(hours / 24)}d`;
+}
+
+function DetailBar(p: { label: string; usedPct: number; reset?: string }) {
+  return (
+    <div class="p-usage-row">
+      <span class="p-usage-label p-usage-label-wide">{p.label}</span>
+      <div class="p-bar">
+        <div
+          class={`p-bar-fill ${p.usedPct > 90 ? "hot" : p.usedPct > 70 ? "warm" : ""}`}
+          style={{ width: `${Math.min(100, Math.round(p.usedPct))}%` }}
+        />
+      </div>
+      <span class="p-usage-pct">{Math.round(p.usedPct)}%</span>
+      <Show when={p.reset}>
+        <span class="p-usage-reset">{p.reset}</span>
+      </Show>
+    </div>
+  );
+}
+
+function UsageDetail(p: { usage: ProviderUsage }) {
+  const u = p.usage;
+  const type = u.provider_type;
+  return (
+    <div class="p-detail">
+      <div class="p-detail-meta">
+        <Show when={u.account_email}><span>{u.account_email}</span></Show>
+        <Show when={u.account_name}><span>{u.account_name}</span></Show>
+        <Show when={u.organization}><span>{u.organization}</span></Show>
+        <Show when={u.unified_status}>
+          <span class={u.unified_status === "ok" ? "c-green" : "c-red"}>status: {u.unified_status}</span>
+        </Show>
+      </div>
+
+      <Show when={type === "anthropic" && u.unified_5h_utilization != null}>
+        <DetailBar label="5h window" usedPct={(u.unified_5h_utilization ?? 0) * 100} reset={u.unified_5h_reset ? `reset ${fmtReset(u.unified_5h_reset!)}` : undefined} />
+      </Show>
+      <Show when={type === "anthropic" && u.unified_7d_utilization != null}>
+        <DetailBar label="7d window" usedPct={(u.unified_7d_utilization ?? 0) * 100} reset={u.unified_7d_reset ? `reset ${fmtReset(u.unified_7d_reset!)}` : undefined} />
+      </Show>
+
+      <Show when={type === "openai" && u.codex_primary_used_percent != null}>
+        <Show when={u.codex_plan_type}>
+          <div class="p-detail-meta"><span>plan: {u.codex_plan_type}</span></div>
+        </Show>
+        <DetailBar label="5h window" usedPct={u.codex_primary_used_percent ?? 0} reset={u.codex_primary_reset_at ? `reset ${fmtResetEpoch(u.codex_primary_reset_at!)}` : undefined} />
+        <Show when={u.codex_secondary_used_percent != null}>
+          <DetailBar label="Weekly" usedPct={u.codex_secondary_used_percent ?? 0} reset={u.codex_secondary_reset_at ? `reset ${fmtResetEpoch(u.codex_secondary_reset_at!)}` : undefined} />
+        </Show>
+      </Show>
+      <Show when={type === "openai" && u.requests_limit != null}>
+        <DetailBar label="Requests" usedPct={100 - ((u.requests_remaining ?? 0) / (u.requests_limit ?? 1)) * 100} reset={u.requests_reset ? `reset ${fmtReset(u.requests_reset!)}` : undefined} />
+      </Show>
+
+      <Show when={type === "minimax" && u.model_usage && u.model_usage.length > 0}>
+        <For each={u.model_usage}>
+          {(m) => (
+            <div class="p-model">
+              <div class="p-model-name">{m.model}</div>
+              <DetailBar label="5h window" usedPct={100 - m.interval_remaining_percent} reset={m.interval_reset > 0 ? `reset ${fmtResetEpoch(m.interval_reset)}` : undefined} />
+              <DetailBar label="Weekly" usedPct={100 - m.weekly_remaining_percent} reset={m.weekly_reset > 0 ? `reset ${fmtResetEpoch(m.weekly_reset)}` : undefined} />
+            </div>
+          )}
+        </For>
+      </Show>
+
+      <Show when={type === "zai" && u.zai_tokens_percentage != null}>
+        <Show when={u.zai_plan}>
+          <div class="p-detail-meta"><span>plan: {u.zai_plan}</span></div>
+        </Show>
+        <DetailBar label="Tokens" usedPct={u.zai_tokens_percentage ?? 0} reset={u.zai_tokens_reset ? `reset ${fmtResetEpoch(u.zai_tokens_reset!)}` : undefined} />
+        <Show when={u.zai_mcp_percentage != null}>
+          <DetailBar label="MCP" usedPct={u.zai_mcp_percentage ?? 0} reset={u.zai_mcp_reset ? `reset ${fmtResetEpoch(u.zai_mcp_reset!)}` : undefined} />
+        </Show>
+      </Show>
+
+      <Show when={u.error}>
+        <p class="s-row-desc c-red">{u.error}</p>
+      </Show>
+    </div>
   );
 }
 
@@ -650,26 +753,41 @@ function LiveRow(p: { a: AIProvider; usage?: ProviderUsage; onReconnect: () => v
             ? "Error"
             : "Unknown";
   const canCliProxyLogin = () => cliProxyReconnectable(a);
+  const [open, setOpen] = createSignal(false);
   return (
-    <div class="s-row p-acc">
-      <div class="s-row-text">
-        <div class="s-row-title">
-          {a.name}
-          <span class="p-chip">{a.provider_type}</span>
-        </div>
-        <div class="s-row-desc">
-          <span class={`p-st ${stClass()}`}>{stLabel()}</span>
-          <Show when={a.account_email}>
-            <span class="p-dot">·</span>
-            {a.account_email}
+    <div class="p-acc-wrap">
+      <button class="s-row p-acc p-acc-btn" onClick={() => setOpen(!open())}>
+        <div class="s-row-text">
+          <div class="s-row-title">
+            {a.name}
+            <span class="p-chip">{a.provider_type}</span>
+          </div>
+          <div class="s-row-desc">
+            <span class={`p-st ${stClass()}`}>{stLabel()}</span>
+            <Show when={a.account_email}>
+              <span class="p-dot">·</span>
+              {a.account_email}
+            </Show>
+          </div>
+          <Show when={!open() && p.usage && !p.usage!.error}>
+            <UsageBars usage={p.usage!} />
           </Show>
         </div>
-        <Show when={p.usage && !p.usage!.error}>
-          <UsageBars usage={p.usage!} />
-        </Show>
-      </div>
-      <Show when={canCliProxyLogin() && stClass() !== "connected"}>
-        <button class="s-btn" onClick={p.onReconnect}>Reconnect</button>
+        <span class={`chev p-acc-chev ${open() ? "open" : ""}`}>›</span>
+      </button>
+      <Show when={open()}>
+        <div class="p-acc-body">
+          <Show when={p.usage} fallback={<p class="s-row-desc">No usage data yet — the backend probes it periodically.</p>}>
+            <UsageDetail usage={p.usage!} />
+          </Show>
+          <Show when={canCliProxyLogin()}>
+            <div class="p-acc-actions">
+              <button class="s-btn" onClick={p.onReconnect}>
+                {stClass() === "connected" ? "Re-auth" : "Reconnect"}
+              </button>
+            </div>
+          </Show>
+        </div>
       </Show>
     </div>
   );
