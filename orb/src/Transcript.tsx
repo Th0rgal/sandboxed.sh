@@ -42,11 +42,39 @@ export function applyStreamEvent(items: StreamItem[], ev: StreamEvent): StreamIt
       }
       return [...items, { kind: "text", key: nextKey(), text, live: true }];
     }
+    case "text_op": {
+      // Live stream shape: the server rewrites text_delta into CRDT-style
+      // ops on a "text_delta_latest" bubble (insert/replace carry the full
+      // accumulated text; finalize closes the bubble).
+      const ops = Array.isArray(ev.data.ops) ? (ev.data.ops as Array<Record<string, unknown>>) : [];
+      let text = last?.kind === "text" && last.live ? last.text : "";
+      let finalized = false;
+      for (const op of ops) {
+        if (!op || typeof op !== "object") continue;
+        if (op.type === "insert") {
+          const pos = typeof op.pos === "number" ? Math.max(0, Math.min(op.pos, text.length)) : text.length;
+          text = text.slice(0, pos) + str(op.text) + text.slice(pos);
+        } else if (op.type === "replace") {
+          const range = Array.isArray(op.range) ? (op.range as unknown[]) : [];
+          const start = typeof range[0] === "number" ? Math.max(0, Math.min(range[0], text.length)) : 0;
+          const end = typeof range[1] === "number" ? Math.max(start, Math.min(range[1], text.length)) : text.length;
+          text = text.slice(0, start) + str(op.text) + text.slice(end);
+        } else if (op.type === "finalize") {
+          finalized = true;
+        }
+      }
+      if (last?.kind === "text" && last.live) {
+        return [...items.slice(0, -1), { ...last, text: text || last.text, live: !finalized }];
+      }
+      if (!text) return items;
+      return [...items, { kind: "text", key: nextKey(), text, live: !finalized }];
+    }
     case "thinking": {
       const done = ev.data.done === true;
       const text = str(ev.data.content);
       if (last?.kind === "think" && !last.done) {
-        return [...items.slice(0, -1), { ...last, text: text || last.text, done }];
+        // Snapshots are cumulative; never let a shorter/late chunk shrink the block.
+        return [...items.slice(0, -1), { ...last, text: text.length >= last.text.length ? text : last.text, done }];
       }
       if (!text && done) return items;
       return [...items, { kind: "think", key: nextKey(), text, done }];

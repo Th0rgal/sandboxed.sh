@@ -1,4 +1,4 @@
-import { getApiUrl, getJwt } from "./api";
+import { clearConnection, getApiUrl, getJwt } from "./api";
 
 export interface StoredEvent {
   id: number;
@@ -21,6 +21,10 @@ async function apiRaw(path: string): Promise<Response> {
   const res = await fetch(`${getApiUrl()}${path}`, {
     headers: jwt ? { Authorization: `Bearer ${jwt}` } : {},
   });
+  if (res.status === 401) {
+    clearConnection();
+    throw new Error("401 Unauthorized — reconnect in Settings → Backend");
+  }
   if (!res.ok) throw new Error(`${res.status} ${await res.text().catch(() => "")}`.trim());
   return res;
 }
@@ -97,7 +101,17 @@ export function streamMission(
         },
         signal: controller.signal,
       });
+      if (res.status === 401) {
+        // Token expired/revoked: reconnecting would loop forever.
+        clearConnection();
+        stopped = true;
+        return;
+      }
       if (!res.ok || !res.body) throw new Error(`stream ${res.status}`);
+      if (retry > 0) {
+        // Events emitted while we were disconnected never reached us.
+        onLagged();
+      }
       retry = 0;
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
