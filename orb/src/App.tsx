@@ -24,6 +24,10 @@ import {
   listProjects,
   listHarnessChoices,
   shortModelLabel,
+  createProject,
+  slugify,
+  bumpProjects,
+  projectsVersion,
   type HarnessChoice,
   cancelMission,
   sendMissionMessage,
@@ -422,6 +426,32 @@ export default function App() {
   const [sbWidth, setSbWidth] = createSignal(220);
   const [streamingId, setStreamingId] = createSignal<string | null>(null);
   const [newProject, setNewProject] = createSignal(seed[0].id);
+  // "New project…" inside the project picker (Cursor puts creation at the
+  // bottom of the picker it belongs to, never in the sidebar chrome).
+  const [newProjectDraft, setNewProjectDraft] = createSignal(false);
+  const [newProjectName, setNewProjectName] = createSignal("");
+  const [newProjectBusy, setNewProjectBusy] = createSignal(false);
+  createEffect(on(projectsVersion, () => {
+    if (isConnected()) listProjects().then(setLiveProjects).catch(() => {});
+  }, { defer: true }));
+  const submitNewProject = async () => {
+    const title = newProjectName().trim();
+    const slug = slugify(title);
+    if (!slug || newProjectBusy()) return;
+    setNewProjectBusy(true);
+    try {
+      await createProject({ slug, title });
+      bumpProjects();
+      setNewProject(slug);
+      setNewProjectDraft(false);
+      setNewProjectName("");
+      setEnvOpen(null);
+    } catch (e) {
+      setCreateError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setNewProjectBusy(false);
+    }
+  };
   const [liveProjects, setLiveProjects] = createSignal<ProjectSummary[]>([]);
   const [createError, setCreateError] = createSignal<string | null>(null);
   const [creating, setCreating] = createSignal(false);
@@ -997,22 +1027,54 @@ export default function App() {
                     </button>
                     <Show when={envOpen() === "project"}>
                       <div class="menu na-menu">
-                        <For each={isConnected() ? liveProjects().map((p) => ({ id: p.slug, name: p.title ?? p.slug })) : projects.map((p) => ({ id: p.id, name: p.name }))}>
-                          {(p) => (
-                            <button
-                              class={`menu-item ${p.id === newProject() ? "on" : ""}`}
-                              onClick={() => {
-                                setNewProject(p.id);
-                                setEnvOpen(null);
-                              }}
-                            >
+                        <Show
+                          when={!newProjectDraft()}
+                          fallback={
+                            <div class="menu-new">
+                              <Ic.FolderIcon />
+                              <input
+                                placeholder="Project name"
+                                value={newProjectName()}
+                                autofocus
+                                disabled={newProjectBusy()}
+                                onInput={(e) => setNewProjectName(e.currentTarget.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") void submitNewProject();
+                                  else if (e.key === "Escape") {
+                                    e.stopPropagation();
+                                    setNewProjectDraft(false);
+                                  }
+                                }}
+                              />
+                            </div>
+                          }
+                        >
+                          <For each={isConnected() ? liveProjects().map((p) => ({ id: p.slug, name: p.title ?? p.slug })) : projects.map((p) => ({ id: p.id, name: p.name }))}>
+                            {(p) => (
+                              <button
+                                class={`menu-item ${p.id === newProject() ? "on" : ""}`}
+                                onClick={() => {
+                                  setNewProject(p.id);
+                                  setEnvOpen(null);
+                                }}
+                              >
+                                <span class="menu-ico">
+                                  <Ic.FolderIcon />
+                                </span>
+                                {p.name}
+                              </button>
+                            )}
+                          </For>
+                          <Show when={isConnected()}>
+                            <div class="menu-sep" />
+                            <button class="menu-item quiet" onClick={() => setNewProjectDraft(true)}>
                               <span class="menu-ico">
-                                <Ic.FolderIcon />
+                                <Ic.PlusIcon size={14} />
                               </span>
-                              {p.name}
+                              New project…
                             </button>
-                          )}
-                        </For>
+                          </Show>
+                        </Show>
                       </div>
                     </Show>
                   </div>

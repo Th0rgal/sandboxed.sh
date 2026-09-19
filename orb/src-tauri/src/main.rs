@@ -35,6 +35,26 @@ fn open_url(url: String) -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
+        .setup(|app| {
+            // macOS vibrancy: the window is transparent and the sidebar
+            // shows the desktop through a sidebar-material blur, like
+            // Cursor/Xcode. The main pane paints an opaque background in
+            // CSS so only the sidebar is translucent.
+            #[cfg(target_os = "macos")]
+            {
+                use tauri::Manager;
+                use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState};
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = apply_vibrancy(
+                        &window,
+                        NSVisualEffectMaterial::Sidebar,
+                        Some(NSVisualEffectState::Active),
+                        Some(10.0),
+                    );
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![paloma_ssh_pubkey, open_url])
         .run(tauri::generate_context!())
         .expect("error while running orb");

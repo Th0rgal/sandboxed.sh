@@ -1,4 +1,4 @@
-import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, createSignal, onCleanup, onMount, createEffect, on } from "solid-js";
 import { mergeById, pollWhileVisible } from "./poll";
 import { createStore } from "solid-js/store";
 import * as Ic from "./icons";
@@ -13,8 +13,7 @@ import {
   type Mission,
   type ProjectFileEntry,
   type ProjectSummary,
-  createProject,
-  slugify,
+  projectsVersion,
 } from "./api";
 
 /** Sidebar section listing the core backend's projects with their missions
@@ -27,29 +26,6 @@ export function LiveProjectsSection(p: {
 }) {
   const [projects, setProjects] = createSignal<ProjectSummary[]>([]);
   const [error, setError] = createSignal<string | null>(null);
-  // "+" in the section header opens an inline name row; Enter creates.
-  const [adding, setAdding] = createSignal(false);
-  const [newName, setNewName] = createSignal("");
-  const [addBusy, setAddBusy] = createSignal(false);
-  const submitNew = async () => {
-    const title = newName().trim();
-    const slug = slugify(title);
-    if (!slug || addBusy()) return;
-    setAddBusy(true);
-    try {
-      await createProject({ slug, title });
-      setAdding(false);
-      setNewName("");
-      refresh();
-      setExpanded(slug, true);
-      loadMissions(slug);
-      loadDir(slug, "");
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setAddBusy(false);
-    }
-  };
   const [expanded, setExpanded] = createStore<Record<string, boolean>>({});
   /** Per project: whether finished missions are unfolded (default folded). */
   const [showDone, setShowDone] = createStore<Record<string, boolean>>({});
@@ -76,6 +52,7 @@ export function LiveProjectsSection(p: {
         );
       });
   };
+  createEffect(on(projectsVersion, () => refresh(), { defer: true }));
   onMount(() => {
     refresh();
     // Mission statuses under expanded projects would otherwise freeze at
@@ -166,42 +143,7 @@ export function LiveProjectsSection(p: {
 
   return (
     <>
-      <div class="section section-row">
-        <span>Projects</span>
-        <button
-          class="section-add"
-          title="New project"
-          onClick={() => {
-            setAdding(true);
-            setError(null);
-          }}
-        >
-          <Ic.PlusIcon size={13} />
-        </button>
-      </div>
-      <Show when={adding()}>
-        <div class="row new-project">
-          <Ic.FolderIcon />
-          <input
-            class="new-project-input"
-            placeholder="Project name"
-            value={newName()}
-            autofocus
-            disabled={addBusy()}
-            onInput={(e) => setNewName(e.currentTarget.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") void submitNew();
-              else if (e.key === "Escape") {
-                setAdding(false);
-                setNewName("");
-              }
-            }}
-            onBlur={() => {
-              if (!newName().trim()) setAdding(false);
-            }}
-          />
-        </div>
-      </Show>
+      <div class="section">Projects</div>
       <Show when={error()}>
         <div class="row note">{error()}</div>
       </Show>

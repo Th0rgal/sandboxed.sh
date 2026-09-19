@@ -319,6 +319,11 @@ export async function createProject(body: { slug: string; title?: string; object
   });
 }
 
+/** Bumped after a project is created so every list re-fetches. */
+const [projectsVersion, setProjectsVersion] = createSignal(0);
+export { projectsVersion };
+export const bumpProjects = () => setProjectsVersion((v) => v + 1);
+
 /** "Pareto Credit Vault" → "pareto-credit-vault". */
 export function slugify(title: string): string {
   return title

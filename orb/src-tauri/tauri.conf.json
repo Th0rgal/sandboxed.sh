@@ -19,13 +19,24 @@
         "minHeight": 480,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "trafficLightPosition": { "x": 12, "y": 20 },
-        "backgroundColor": "#191919",
-        "theme": "Dark"
+        "trafficLightPosition": {
+          "x": 12,
+          "y": 20
+        },
+        "theme": "Dark",
+        "transparent": true
       }
     ],
     "withGlobalTauri": true,
-    "security": { "csp": null }
+    "security": {
+      "csp": null
+    },
+    "macOSPrivateApi": true
   },
-  "bundle": { "active": false, "icon": ["icons/icon.png"] }
+  "bundle": {
+    "active": false,
+    "icon": [
+      "icons/icon.png"
+    ]
+  }
 }
