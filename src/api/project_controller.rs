@@ -295,7 +295,12 @@ fn execution_matches(exec: &Execution, stamp: chrono::NaiveDateTime) -> bool {
     stamp >= start - chrono::Duration::seconds(5) && stamp <= end
 }
 
-fn is_silent(report: &str, delivery_outcome: Option<&str>) -> bool {
+/// A tick that ran fine and had nothing new to say. A failed tick is never
+/// silent, however empty its output: it is the thing the operator must see.
+fn is_silent(report: &str, delivery_outcome: Option<&str>, failed: bool) -> bool {
+    if failed {
+        return false;
+    }
     delivery_outcome == Some("suppressed")
         || report.is_empty()
         || report.trim().eq_ignore_ascii_case("[SILENT]")
@@ -368,7 +373,8 @@ fn build_runs(home: &Path, job_id: &str, limit: usize) -> Vec<ControllerRun> {
                 .single()
                 .map(|t| t.to_rfc3339());
         }
-        run.silent = is_silent(&run.report, run.delivery_outcome.as_deref());
+        let failed = run.status.as_deref() == Some("failed") || run.error.is_some();
+        run.silent = is_silent(&run.report, run.delivery_outcome.as_deref(), failed);
         runs.push(run);
     }
 
@@ -564,10 +570,12 @@ mod tests {
 
     #[test]
     fn silent_ticks_are_detected() {
-        assert!(is_silent("", Some("delivered")));
-        assert!(is_silent("[SILENT]", None));
-        assert!(is_silent("Same as before.", Some("suppressed")));
-        assert!(!is_silent("Merged #2406.", Some("delivered")));
+        assert!(is_silent("", Some("delivered"), false));
+        assert!(is_silent("[SILENT]", None, false));
+        assert!(is_silent("Same as before.", Some("suppressed"), false));
+        assert!(!is_silent("Merged #2406.", Some("delivered"), false));
+        // A failed tick with no output is a failure, not a quiet tick.
+        assert!(!is_silent("", Some("delivered"), true));
     }
 
     #[test]
