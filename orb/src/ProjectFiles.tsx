@@ -25,6 +25,11 @@ export function LiveProjectsSection(p: {
   const [projects, setProjects] = createSignal<ProjectSummary[]>([]);
   const [error, setError] = createSignal<string | null>(null);
   const [expanded, setExpanded] = createStore<Record<string, boolean>>({});
+  /** Per project: whether finished missions are unfolded (default folded). */
+  const [showDone, setShowDone] = createStore<Record<string, boolean>>({});
+  const LIVE = new Set(["active", "pending", "queued", "blocked", "awaiting_user", "resuming"]);
+  const liveOf = (slug: string) => (missions[slug] ?? []).filter((m) => LIVE.has(m.status));
+  const doneOf = (slug: string) => (missions[slug] ?? []).filter((m) => !LIVE.has(m.status));
   // Missions per project slug; file listings per `${slug}:${dirPath}`.
   const [missions, setMissions] = createStore<Record<string, Mission[]>>({});
   const [dirs, setDirs] = createStore<Record<string, ProjectFileEntry[]>>({});
@@ -149,7 +154,7 @@ export function LiveProjectsSection(p: {
                 <Ic.CloudIcon class="dim" />
               </button>
               <Show when={isOpen()}>
-                <For each={missions[project.slug] ?? []}>
+                <For each={liveOf(project.slug)}>
                   {(m) => (
                     <button
                       class={`row agent ${p.selected() === `m:${m.id}` ? "active" : ""}`}
@@ -163,6 +168,34 @@ export function LiveProjectsSection(p: {
                     </button>
                   )}
                 </For>
+                <Show when={doneOf(project.slug).length > 0}>
+                  <button
+                    class="row done-toggle"
+                    style={{ "padding-left": "22px" }}
+                    onClick={() => setShowDone(project.slug, !showDone[project.slug])}
+                  >
+                    <Ic.ChevronRight size={11} class={`chev ${showDone[project.slug] ? "open" : ""}`} />
+                    <span class="row-label">
+                      {doneOf(project.slug).length} finished
+                    </span>
+                  </button>
+                  <Show when={showDone[project.slug]}>
+                    <For each={doneOf(project.slug)}>
+                      {(m) => (
+                        <button
+                          class={`row agent done ${p.selected() === `m:${m.id}` ? "active" : ""}`}
+                          style={{ "padding-left": "36px" }}
+                          onClick={() => p.open(`m:${m.id}`)}
+                        >
+                          <span class="glyph">
+                            <p.StatusGlyph agent={{ status: p.missionGlyph(m.status) }} busy={false} />
+                          </span>
+                          <span class="row-label">{m.title || m.id}</span>
+                        </button>
+                      )}
+                    </For>
+                  </Show>
+                </Show>
                 <DirRows slug={project.slug} path="" depth={0} />
                 <Show when={(missions[project.slug]?.length ?? 0) === 0 && (dirs[`${project.slug}:`]?.length ?? 0) === 0}>
                   <div class="row dim" style={{ "padding-left": "22px", "font-size": "12px" }}>

@@ -353,21 +353,22 @@ function UsageBars(p: { usage: ProviderUsage }) {
     if (u.unified_7d_utilization != null) out.push({ label: "7d", used: u.unified_7d_utilization });
     return out;
   });
+  // Collapsed: one line, each window as a tiny bar with its percentage.
   return (
     <Show when={windows().length > 0}>
-      <div class="p-usage">
+      <div class="p-usage compact">
         <For each={windows()}>
           {(w) => (
-            <div class="p-usage-row">
+            <span class="p-usage-chip" title={`${w.label} window: ${Math.round(w.used * 100)}% used`}>
               <span class="p-usage-label">{w.label}</span>
-              <div class="p-bar">
-                <div
+              <span class="p-bar">
+                <span
                   class={`p-bar-fill ${w.used > 0.9 ? "hot" : w.used > 0.7 ? "warm" : ""}`}
                   style={{ width: `${Math.min(100, Math.round(w.used * 100))}%` }}
                 />
-              </div>
+              </span>
               <span class="p-usage-pct">{Math.round(w.used * 100)}%</span>
-            </div>
+            </span>
           )}
         </For>
       </div>
@@ -528,19 +529,15 @@ function fmtResetEpoch(sec: number): string {
 }
 
 function DetailBar(p: { label: string; usedPct: number; reset?: string }) {
+  const pct = () => Math.max(0, Math.min(100, Math.round(p.usedPct)));
   return (
-    <div class="p-usage-row">
+    <div class="p-usage-grid">
       <span class="p-usage-label p-usage-label-wide">{p.label}</span>
       <div class="p-bar">
-        <div
-          class={`p-bar-fill ${p.usedPct > 90 ? "hot" : p.usedPct > 70 ? "warm" : ""}`}
-          style={{ width: `${Math.min(100, Math.round(p.usedPct))}%` }}
-        />
+        <div class={`p-bar-fill ${pct() > 90 ? "hot" : pct() > 70 ? "warm" : ""}`} style={{ width: `${pct()}%` }} />
       </div>
-      <span class="p-usage-pct">{Math.round(p.usedPct)}%</span>
-      <Show when={p.reset}>
-        <span class="p-usage-reset">{p.reset}</span>
-      </Show>
+      <span class="p-usage-pct">{pct()}%</span>
+      <span class="p-usage-reset">{p.reset ?? ""}</span>
     </div>
   );
 }

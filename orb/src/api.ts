@@ -123,6 +123,61 @@ export interface CreateMissionBody {
   remote_command?: string;
   /** Stable project identifier — groups the mission under the project. */
   project?: string;
+  /** Harness id (claudecode, codex, opencode, grok, gemini). */
+  backend?: string;
+  /** Model id understood by that harness, e.g. claude-fable-5-1. */
+  model_override?: string;
+  model_effort?: string;
+}
+
+export interface BackendInfo {
+  id: string;
+  name: string;
+}
+
+export interface BackendModelOption {
+  value: string;
+  label: string;
+  description?: string;
+  provider_id?: string;
+}
+
+/** Harness (backend) with the models it can run right now. */
+export interface HarnessChoice {
+  backend: BackendInfo;
+  models: BackendModelOption[];
+}
+
+export async function listBackends(): Promise<BackendInfo[]> {
+  const data = await api<BackendInfo[] | { backends?: BackendInfo[] }>("/api/backends");
+  return Array.isArray(data) ? data : (data.backends ?? []);
+}
+
+export async function listBackendModels(): Promise<Record<string, BackendModelOption[]>> {
+  const data = await api<{ backends?: Record<string, BackendModelOption[]> }>("/api/providers/backend-models");
+  return data.backends ?? {};
+}
+
+/** Harness order for the composer: the native agents first, then routers. */
+const HARNESS_ORDER = ["claudecode", "codex", "grok", "gemini", "opencode"];
+
+export async function listHarnessChoices(): Promise<HarnessChoice[]> {
+  const [backends, models] = await Promise.all([listBackends(), listBackendModels()]);
+  return backends
+    .filter((b) => (models[b.id]?.length ?? 0) > 0)
+    .sort((a, b) => {
+      const ia = HARNESS_ORDER.indexOf(a.id);
+      const ib = HARNESS_ORDER.indexOf(b.id);
+      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+    })
+    .map((b) => ({ backend: b, models: models[b.id] ?? [] }));
+}
+
+/** "Claude (Subscription) — Claude Fable 5.1" → "Fable 5.1". */
+export function shortModelLabel(label: string): string {
+  const tail = label.includes("—") ? label.slice(label.lastIndexOf("—") + 1).trim() : label.trim();
+  // "Claude Fable 5.1" → "Fable 5.1"; other vendors keep their family name.
+  return tail.replace(/^Claude\s+/, "");
 }
 
 export async function getRemoteNodes(): Promise<RemoteNodesResponse> {

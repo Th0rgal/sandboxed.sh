@@ -21,6 +21,9 @@ import {
   isConnected,
   listMissions,
   listProjects,
+  listHarnessChoices,
+  shortModelLabel,
+  type HarnessChoice,
   cancelMission,
   sendMissionMessage,
   type Mission,
@@ -32,6 +35,50 @@ import {
 const PAGES = new Set(["settings", "machines", "providers"]);
 
 const MODELS = ["Orb Lorem 4.6 High Fast", "Ipsum 5 Max", "Dolor 4.5 Sonnet", "Auto"];
+
+/** Harness + model chosen for new agents; persisted per user. */
+export type HarnessPick = { backend: string; model: string };
+const PICK_KEY = "orb.harnessPick";
+const loadPick = (): HarnessPick | null => {
+  try {
+    const raw = localStorage.getItem(PICK_KEY);
+    return raw ? (JSON.parse(raw) as HarnessPick) : null;
+  } catch {
+    return null;
+  }
+};
+const [harnessChoices, setHarnessChoices] = createSignal<HarnessChoice[]>([]);
+const [harnessPick, setHarnessPickRaw] = createSignal<HarnessPick | null>(loadPick());
+const setHarnessPick = (p: HarnessPick) => {
+  setHarnessPickRaw(p);
+  try {
+    localStorage.setItem(PICK_KEY, JSON.stringify(p));
+  } catch {
+    /* ignore */
+  }
+};
+/** Effective pick: stored one if still offered, else Claude Code's first model. */
+const effectivePick = (): HarnessPick | null => {
+  const choices = harnessChoices();
+  if (!choices.length) return null;
+  const stored = harnessPick();
+  if (stored && choices.some((c) => c.backend.id === stored.backend && c.models.some((m) => m.value === stored.model))) return stored;
+  const first = choices.find((c) => c.backend.id === "claudecode") ?? choices[0];
+  return { backend: first.backend.id, model: first.models[0].value };
+};
+const pickLabel = (pick: HarnessPick | null): string => {
+  if (!pick) return "Choose model";
+  const c = harnessChoices().find((x) => x.backend.id === pick.backend);
+  const m = c?.models.find((x) => x.value === pick.model);
+  return `${c?.backend.name ?? pick.backend} · ${m ? shortModelLabel(m.label) : pick.model}`;
+};
+async function refreshHarnessChoices() {
+  try {
+    setHarnessChoices(await listHarnessChoices());
+  } catch {
+    /* keep last */
+  }
+}
 
 /** Inline markup: `code`, **bold**, [label](href). Nesting is limited to code inside bold/link. */
 function inline(text: string): JSX.Element[] {
@@ -161,9 +208,12 @@ function Composer(p: {
   files?: { id: string; name: string }[];
   attached?: string[];
   onToggleFile?: (id: string) => void;
+  /** Show the harness + model picker (new agents only). */
+  picker?: boolean;
 }) {
   const [text, setText] = createSignal("");
   const [model, setModel] = createSignal(MODELS[0]);
+  const live = () => isConnected() && harnessChoices().length > 0;
   const [menu, setMenu] = createSignal(false);
   const [ctx, setCtx] = createSignal(false);
   let ta!: HTMLTextAreaElement;
@@ -211,28 +261,63 @@ function Composer(p: {
     </div>
   );
   const modelBtn = (
-    <div class="model-wrap" onPointerDown={(e) => e.stopPropagation()}>
-      <button class="model" onClick={() => setMenu(!menu())}>
-        {model()} <Ic.ChevronDown size={12} />
-      </button>
-      <Show when={menu()}>
-        <div class="menu">
-          <For each={MODELS}>
-            {(m) => (
-              <button
-                class={`menu-item ${m === model() ? "on" : ""}`}
-                onClick={() => {
-                  setModel(m);
-                  setMenu(false);
-                }}
-              >
-                {m}
-              </button>
-            )}
-          </For>
-        </div>
-      </Show>
-    </div>
+    <Show when={p.picker !== false}>
+      <div class="model-wrap" onPointerDown={(e) => e.stopPropagation()}>
+        <button class="model" onClick={() => setMenu(!menu())} title="Harness and model for this agent">
+          {live() ? pickLabel(effectivePick()) : model()} <Ic.ChevronDown size={12} />
+        </button>
+        <Show when={menu()}>
+          <div class="menu model-menu">
+            <Show
+              when={live()}
+              fallback={
+                <For each={MODELS}>
+                  {(m) => (
+                    <button
+                      class={`menu-item ${m === model() ? "on" : ""}`}
+                      onClick={() => {
+                        setModel(m);
+                        setMenu(false);
+                      }}
+                    >
+                      {m}
+                    </button>
+                  )}
+                </For>
+              }
+            >
+              <For each={harnessChoices()}>
+                {(c) => (
+                  <>
+                    <div class="menu-group">{c.backend.name}</div>
+                    <For each={c.models}>
+                      {(m) => {
+                        const on = () => effectivePick()?.backend === c.backend.id && effectivePick()?.model === m.value;
+                        return (
+                          <button
+                            class={`menu-item ${on() ? "on" : ""}`}
+                            title={m.label}
+                            onClick={() => {
+                              setHarnessPick({ backend: c.backend.id, model: m.value });
+                              setMenu(false);
+                            }}
+                          >
+                            <span class="menu-col">
+                              <span>{shortModelLabel(m.label)}</span>
+                              <span class="menu-sub">{m.value}</span>
+                            </span>
+                          </button>
+                        );
+                      }}
+                    </For>
+                  </>
+                )}
+              </For>
+            </Show>
+          </div>
+        </Show>
+      </div>
+    </Show>
   );
   const sendBtn = (
     <Show
@@ -364,6 +449,7 @@ export default function App() {
     if (connected) {
       void refreshMissions();
       void refreshFleet();
+      void refreshHarnessChoices();
       listProjects()
         .then(setLiveProjects)
         .catch(() => setLiveProjects([]));
@@ -503,11 +589,13 @@ export default function App() {
       const projectSlug = liveProjects().some((p) => p.slug === newProject()) ? newProject() : liveProjects()[0]?.slug;
       setCreating(true);
       setCreateError(null);
+      const pick = effectivePick();
+      const harness = pick ? { backend: pick.backend, model_override: pick.model } : {};
       try {
         const m = await createMission(
           node
-            ? { title, prompt: text, remote_node_id: node.id, remote_command: buildRemoteAgentCommand(text, await ensureNodeAgentKey()), project: projectSlug }
-            : { title, prompt: text, project: projectSlug },
+            ? { title, prompt: text, remote_node_id: node.id, remote_command: buildRemoteAgentCommand(text, await ensureNodeAgentKey()), project: projectSlug, ...harness }
+            : { title, prompt: text, project: projectSlug, ...harness },
         );
         await refreshMissions();
         open(`m:${m.id}`);
@@ -1081,6 +1169,7 @@ export default function App() {
                   </Show>
                   <Composer
                     placeholder="Send follow-up"
+                    picker={false}
                     busy={streamingId() === c.id}
                     onSend={send}
                     onStop={stop}
@@ -1260,7 +1349,7 @@ function MissionView(p: { id: string }) {
       </div>
       <div class="dock">
         <div class="col">
-          <Composer placeholder="Send follow-up" busy={busy()} onSend={sendMsg} onStop={stopM} />
+          <Composer placeholder="Send follow-up" picker={false} busy={busy()} onSend={sendMsg} onStop={stopM} />
         </div>
       </div>
     </>
