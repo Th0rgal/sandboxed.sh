@@ -173,8 +173,10 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
   color: var(--fg-4);
 }
 .section-add:hover { background: var(--bg-active); color: var(--fg); }
-/* Project row: the cloud badge yields to a + on hover. */
-.row.project:hover .row-cloud { display: none; }
+.row-machine { display: inline-flex; align-items: center; gap: 5px; flex: none; color: var(--fg-4); }
+.row-machine svg { width: 14px; height: 14px; }
+.row-machine-name { display: none; font-size: 11px; font-family: var(--mono); color: var(--fg-4); }
+.row.agent:hover .row-machine-name, .row.agent.active .row-machine-name { display: inline; }
 /* "New project…" inside the project picker: the menu turns into a field. */
 .menu-new {
   display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 10px;

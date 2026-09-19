@@ -18,6 +18,19 @@ import {
 
 /** Sidebar section listing the core backend's projects with their missions
  * and hosted files. Replaces the demo projects when connected. */
+/** Where an agent runs: the workspace/machine name behind a cloud glyph.
+ * Per agent, not per project — one project can run on several machines. */
+function MachineBadge(p: { name?: string | null }) {
+  return (
+    <Show when={p.name}>
+      <span class="row-machine" title={`Runs on ${p.name}`}>
+        <span class="row-machine-name">{p.name}</span>
+        <Ic.CloudIcon />
+      </span>
+    </Show>
+  );
+}
+
 export function LiveProjectsSection(p: {
   selected: () => string | null;
   open: (id: string) => void;
@@ -177,7 +190,6 @@ export function LiveProjectsSection(p: {
                 >
                   <Ic.PlusIcon size={13} />
                 </span>
-                <Ic.CloudIcon class="dim row-cloud" />
               </button>
               <Show when={isOpen()}>
                 <For each={liveOf(project.slug)}>
@@ -190,6 +202,7 @@ export function LiveProjectsSection(p: {
                         <p.StatusGlyph agent={{ status: p.missionGlyph(m.status) }} busy={false} />
                       </span>
                       <span class="row-label">{m.title || m.id}</span>
+                      <MachineBadge name={m.workspace_name} />
                     </button>
                   )}
                 </For>
@@ -214,6 +227,7 @@ export function LiveProjectsSection(p: {
                             <p.StatusGlyph agent={{ status: p.missionGlyph(m.status) }} busy={false} />
                           </span>
                           <span class="row-label">{m.title || m.id}</span>
+                          <MachineBadge name={m.workspace_name} />
                         </button>
                       )}
                     </For>
