@@ -68,6 +68,15 @@ const str = (v: unknown): string => (typeof v === "string" ? v : v == null ? "" 
  * tool calls are keyed by tool_call_id so results update in place.
  */
 export function applyStreamEvent(items: StreamItem[], ev: StreamEvent): StreamItem[] {
+  // A live text bubble is over as soon as anything that is not text follows
+  // it (a tool call, a thought, a new user turn). Harnesses that stream
+  // text_delta snapshots without a finalize would otherwise leave the
+  // bubble "live" forever: caret blinking, min-height reserved, and the
+  // next snapshot merged into the wrong bubble.
+  if (!(ev.type === "text_delta" || ev.type === "text_op")) {
+    const tail = items[items.length - 1];
+    if (tail?.kind === "text" && tail.live) items = [...items.slice(0, -1), { ...tail, live: false }];
+  }
   const last = items[items.length - 1];
   switch (ev.type) {
     case "user_message": {

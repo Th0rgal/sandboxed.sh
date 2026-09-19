@@ -271,7 +271,7 @@ code {
 
 /* ---------- mission stream transcript ---------- */
 .st-text { padding: 0 10px; overflow-wrap: anywhere; }
-.st-text.live { min-height: 21px; }
+.st-text:empty { display: none; }
 .st-caret {
   display: inline-block; width: 7px; height: 14px; margin-left: 2px;
   background: var(--fg-3); border-radius: 1px; vertical-align: -2px;
