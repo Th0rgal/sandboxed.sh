@@ -34,7 +34,7 @@ export function withInitialPrompt(items: StreamItem[], mission: Mission | null, 
   return prompt && !items.some(item => item.kind === "user") ? [{kind:"user",key:`initial:${mission?.id ?? "launch"}`,text:prompt}, ...items] : items;
 }
 export function launchError(error: unknown): string {
-  if (error instanceof ApiError && /remote_command.*required/i.test(error.detail)) return "This remote launch requires a supported harness command. Your draft is kept; no fallback machine was selected.";
+  if (error instanceof ApiError && /remote_command.*required/i.test(error.detail)) return "This backend does not support structured remote launches. Update the connected backend to enable them. Your draft and selection are kept.";
   if (error instanceof ApiError) return error.detail || "The launch request was rejected. Your draft is kept.";
   return error instanceof Error ? error.message : String(error);
 }

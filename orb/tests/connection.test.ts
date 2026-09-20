@@ -29,10 +29,24 @@ it("a previous connection's delayed 401 cannot log out the new connection", asyn
 });
 
 
-it.each(["grok", "claudecode", "opencode", "codex", "gemini"])("rejects unprovisioned remote %s before any POST or credential request", async backend => {
-  const fetcher = vi.fn(); vi.stubGlobal("fetch", fetcher);
-  await expect(createMission({remote_node_id:"dgx-spark",backend,model_override:"chosen-model",prompt:"Keep my draft"})).rejects.toThrow(`${backend} (chosen-model)`);
-  expect(fetcher).not.toHaveBeenCalled();
+it.each(["grok", "claudecode", "opencode", "codex", "gemini"])("lets the server validate remote %s without changing selection or retrying", async backend => {
+  const fetcher = vi.fn(async (_url: string, _init?: RequestInit) => new Response(`Selected ${backend} is unavailable on the node`, {status:400}));
+  vi.stubGlobal("fetch", fetcher);
+  const body = {remote_node_id:"dgx-spark",backend,model_override:"chosen-model",prompt:"Keep my draft"};
+  await expect(createMission(body)).rejects.toThrow(`Selected ${backend} is unavailable`);
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  expect(JSON.parse(fetcher.mock.calls[0][1]!.body as string)).toEqual(body);
+});
+
+it("accepts server-provisioned remote execution without shell or credential requests", async () => {
+  const mission = {id:"accepted",status:"active",remote_job:{node_id:"dgx-spark",job_id:"job",phase:"observed"},execution:{state:"waiting_remote_job"}};
+  const fetcher = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(mission)));
+  vi.stubGlobal("fetch", fetcher);
+  const body = {remote_node_id:"dgx-spark",backend:"opencode",model_override:"xai/grok-4.6",prompt:"Build it",idempotency_key:"attempt"};
+  await expect(createMission(body)).resolves.toEqual(mission);
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  expect(fetcher.mock.calls[0][0]).toContain("/api/control/missions");
+  expect(JSON.parse(fetcher.mock.calls[0][1]!.body as string)).toEqual(body);
 });
 
 it("preserves the selected local harness and model in the supported create contract", async () => {
