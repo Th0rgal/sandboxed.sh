@@ -7,6 +7,9 @@
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
-    "allow-voice"
+    "allow-voice",
+    "allow-paloma-ssh-pubkey",
+    "allow-window-theme",
+    "allow-open-url"
   ]
 }
