@@ -2,7 +2,7 @@ import { For, Show, createEffect, createMemo, createSignal, on, onCleanup, type 
 import { createStore } from "solid-js/store";
 import * as Ic from "./icons";
 import { getApiUrl, updateController, type ControllerPatch, type ControllerView } from "./api";
-import { ignoredCronFields } from "./cronSchema";
+import { ignoredCronFields, scheduleExpression } from "./cronSchema";
 import { SchedulePicker } from "./SchedulePicker";
 
 
@@ -26,7 +26,7 @@ export function draftOf(view: ControllerView): CronDraft {
   const s = view.settings;
   return {
     name: j?.name ?? "",
-    schedule: (j?.schedule ?? "").trim(),
+    schedule: scheduleExpression(j?.schedule).trim(),
     prompt: s?.prompt ?? "",
     skills: [...(s?.skills ?? [])],
     deliver: s?.deliver ?? "",
@@ -267,11 +267,11 @@ export function CronForm(p: {
         <Row title="Deliver to">
           <input class="s-input cs-input" placeholder="local" aria-label="Delivery" value={draft.deliver} onInput={(e) => setDraft("deliver", e.currentTarget.value)} />
         </Row>
-        <Row title="Model">
-          <input class="s-input cs-input" placeholder="Hermes default" aria-label="Model" value={draft.model} onInput={(e) => setDraft("model", e.currentTarget.value)} />
+        <Row title="Model" desc={settings()?.model_snapshot ? `Saved default: ${settings()!.model_snapshot}` : undefined}>
+          <input class="s-input cs-input" placeholder={settings()?.model_snapshot ? "No override" : "Hermes default"} aria-label="Model" value={draft.model} onInput={(e) => setDraft("model", e.currentTarget.value)} />
         </Row>
-        <Row title="Provider">
-          <input class="s-input cs-input" placeholder="Hermes default" aria-label="Provider" value={draft.provider} onInput={(e) => setDraft("provider", e.currentTarget.value)} />
+        <Row title="Provider" desc={settings()?.provider_snapshot ? `Saved default: ${settings()!.provider_snapshot}` : undefined}>
+          <input class="s-input cs-input" placeholder={settings()?.provider_snapshot ? "No override" : "Hermes default"} aria-label="Provider" value={draft.provider} onInput={(e) => setDraft("provider", e.currentTarget.value)} />
         </Row>
         <Row title="Failure delivery"><input class="s-input cs-input" placeholder="Same as delivery" aria-label="Failure delivery" value={draft.failure_deliver} onInput={(e) => setDraft("failure_deliver", e.currentTarget.value)} /></Row>
         <Row title="Working directory"><input class="s-input cs-input" placeholder="Hermes default" aria-label="Working directory" value={draft.workdir} onInput={(e) => setDraft("workdir", e.currentTarget.value)} /></Row>

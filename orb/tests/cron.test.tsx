@@ -1,10 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup } from "@solidjs/testing-library";
 import fixtures from "./fixtures/hermes-jobs.json";
-import { getProjectCronFromJob, hermesPatch, ignoredCronFields, scheduleExpression } from "../src/cronSchema";
-import { CronForm } from "../src/ControllerSettings";
+import { getProjectCronFromJob, hermesPatch, ignoredCronFields, normalizeControllerView, scheduleExpression } from "../src/cronSchema";
+import { CronForm, draftOf } from "../src/ControllerSettings";
 import { parseSchedule, describeSchedule, SchedulePicker } from "../src/SchedulePicker";
-import { getProjectCron, listProjectCrons, projectCronAction, updateProjectCron } from "../src/api";
+import { getProjectCron, getProjectController, listProjectCrons, projectCronAction, updateProjectCron } from "../src/api";
 import { PopupMenu } from "../src/Menu";
 
 const view = () => getProjectCronFromJob("notes", fixtures.hourly);
@@ -19,6 +19,26 @@ describe("real Hermes records", () => {
     expect(scheduleExpression(fixtures.once.schedule)).toBe("2099-04-05T09:00:00+02:00");
     expect(getProjectCronFromJob("notes", fixtures.once).settings?.repeat_times).toBe(1);
     expect(getProjectCronFromJob("notes", fixtures.weekdays).settings?.repeat_times).toBeNull();
+  });
+  it("normalizes primary controller records before the form calls trim", async () => {
+    for (const job of [fixtures.hourly, fixtures.weekdays, fixtures.once]) {
+      const result = normalizeControllerView({ slug: "notes", job, runs: [] });
+      expect(() => draftOf(result)).not.toThrow();
+      expect(draftOf(result).schedule).toBe(scheduleExpression(job.schedule));
+    }
+    const fetcher = vi.spyOn(globalThis, "fetch").mockResolvedValue(response({ slug: "notes", job: fixtures.hourly, runs: [] }));
+    try { expect((await getProjectController("notes")).job?.schedule).toBe("every 1h"); }
+    finally { fetcher.mockRestore(); }
+  });
+  it("shows real saved defaults without turning snapshots into editable overrides", () => {
+    const result = getProjectCronFromJob("notes", fixtures.snapshot);
+    expect(result.settings).toMatchObject({ model: null, provider: null, model_snapshot: "fixture-local-model", provider_snapshot: "custom" });
+    expect(draftOf(result)).toMatchObject({ model: "", provider: "", repeat: "" });
+    render(() => <CronForm draftKey="snapshots" view={result} save={async () => result} onSaved={() => {}} />);
+    expect(screen.getByText("Saved default: fixture-local-model")).toBeTruthy();
+    expect(screen.getByText("Saved default: custom")).toBeTruthy();
+    expect((screen.getByLabelText("Model") as HTMLInputElement).value).toBe("");
+    expect(screen.queryByText("Save")).toBeNull();
   });
   it("maps continuity to the real self context reference", () => {
     expect(hermesPatch({ continuity: true })).toEqual({ context_from: ["self"] });

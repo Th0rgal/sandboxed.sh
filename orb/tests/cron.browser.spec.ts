@@ -50,6 +50,7 @@ for (const theme of ["light", "dark"]) {
     await page.getByRole("menuitem", { name: "New cron" }).click();
     await page.getByLabel("Name", { exact: true }).fill("Project notes");
     await page.keyboard.press("Escape");
+    await expect(action).toBeFocused();
     await action.click(); await page.getByRole("menuitem", { name: "New cron" }).click();
     await expect(page.getByLabel("Name", { exact: true })).toHaveValue("Project notes");
     await page.getByLabel("Instruction", { exact: true }).fill(fixtures.hourly.prompt);
@@ -58,6 +59,10 @@ for (const theme of ["light", "dark"]) {
     const widths = await Promise.all([schedule, page.getByLabel("Name", { exact: true }), page.getByLabel("Stops after")].map(async (el) => (await el.boundingBox())!.width));
     expect(Math.max(...widths) - Math.min(...widths)).toBeLessThan(1);
     await schedule.click();
+    await page.keyboard.press("Shift+Tab");
+    await expect(page.getByRole("button", { name: "Done", exact: true })).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(page.getByLabel("Schedule type")).toBeFocused();
     await page.getByLabel("Schedule type").selectOption("days");
     await expect(schedule).toContainText("Weekdays at 09:00");
     const panel = page.getByRole("dialog", { name: "Schedule editor" });
@@ -68,6 +73,12 @@ for (const theme of ["light", "dark"]) {
     expect(await panel.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
     await page.getByLabel("Date and time").focus(); await page.keyboard.press("Escape");
     await expect(schedule).toBeFocused();
+    await expect(page.getByRole("dialog", { name: "New cron", exact: true })).toBeVisible();
+    await page.getByLabel("Name", { exact: true }).focus();
+    await page.keyboard.press("Shift+Tab");
+    await expect(page.getByRole("button", { name: "Create", exact: true })).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(page.getByLabel("Name", { exact: true })).toBeFocused();
     await page.getByRole("button", { name: "Create", exact: true }).click();
     await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeVisible();
     await expect(project).toHaveAttribute("aria-expanded", "true");
@@ -106,3 +117,29 @@ test("compact window: days and datetime stay inside the schedule popover", async
   }
   expect(await page.locator(".dlg-wide").evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
 });
+
+for (const theme of ["light", "dark"]) {
+  test(`${theme}: native snapshot defaults remain unpinned`, async ({ page }) => {
+    await page.route("**/api/**", (route) => {
+      const path = new URL(route.request().url()).pathname;
+      const json = path === "/api/projects" ? { projects: [{ slug: "notes", title: "Project notes" }] }
+        : path.endsWith("/missions") ? []
+        : path.endsWith("/files") ? { entries: [] }
+        : path.endsWith("/controller") ? { slug: "notes", job: null, runs: [] }
+        : path.endsWith("/crons") ? { jobs: [fixtures.snapshot] }
+        : { job: fixtures.snapshot };
+      return route.fulfill({ json });
+    });
+    await page.goto(`/tests/browser.html?theme=${theme}`);
+    await page.getByRole("button", { name: "Project notes", exact: true }).click();
+    await page.getByRole("button", { name: /Saved local defaults/ }).click();
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await expect(page.getByText("Saved default: fixture-local-model")).toBeVisible();
+    await expect(page.getByText("Saved default: custom")).toBeVisible();
+    await expect(page.getByLabel("Model", { exact: true })).toHaveValue("");
+    await expect(page.getByLabel("Provider", { exact: true })).toHaveValue("");
+    await expect(page.getByRole("button", { name: "Save", exact: true })).toHaveCount(0);
+    await page.setViewportSize({ width: 1100, height: 1450 });
+    await page.screenshot({ path: `test-results/cron-snapshots-${theme}.png`, fullPage: true, style: ".harness-controls { visibility: hidden; }" });
+  });
+}

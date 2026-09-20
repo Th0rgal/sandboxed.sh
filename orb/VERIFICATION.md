@@ -21,8 +21,8 @@ Passed commands:
 
 - `pnpm install --frozen-lockfile` (esbuild rebuild completed with the explicit allowlist)
 - `pnpm build`
-- `pnpm test` — 11 tests
-- `pnpm test:browser` — 3 Chromium tests, including light/dark and compact viewport
+- `pnpm test` — 17 tests
+- `pnpm test:browser` — 5 Chromium tests, including light/dark, compact viewport and saved defaults
 - `cargo +stable fmt --all --check`
 - `cargo +stable fmt --manifest-path orb/src-tauri/Cargo.toml -- --check`
 - `cargo +stable check --locked --bin sandboxed-sh -j 2`
@@ -47,3 +47,22 @@ fields but its REST API filters them. The companion
 verified on an isolated copy of that exact source. It is not deployed. Orb also
 reports dropped fields from an older API and preserves the requested overrides
 as a draft. The sandboxed.sh Hermes submodule pointer is unchanged.
+
+Follow-up after inspecting both uploaded Cursor references:
+
+- Both files were accessible under predecessor context c68142d2. Inspected the
+  full-window and sidebar images: muted dark surfaces, compact folder hierarchy,
+  rounded active rows, trailing cloud glyphs and contextual row actions.
+- Native schedule normalization now covers primary-controller reads, updates
+  and actions as well as additional project crons; the form no longer calls
+  `.trim()` directly on a potentially structured schedule.
+- Real Hermes snapshot defaults are preserved and shown separately from explicit
+  model/provider overrides. A generated snapshot fixture covers this behavior.
+- Dialogs and schedule popovers share stacked focus ownership. Only the top
+  layer handles Escape, Tab/Shift+Tab remain within it, and focus returns to its
+  opener. Global app shortcuts defer to the active focus scope. Menu actions
+  restore their trigger before opening dialogs.
+- Committed component tests cover nested dialogs/popovers and keyboard behavior,
+  in addition to the intercepted browser integration tests.
+
+Follow-up validation: `pnpm build`, all 17 component/unit tests, and all 5 browser tests passed. Native Mac integration has not been run in this Linux checkout.

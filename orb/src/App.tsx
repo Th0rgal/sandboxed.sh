@@ -1,3 +1,4 @@
+import { hasFocusScope } from "./focusScope";
 import { For, Show, Switch, Match, createMemo, createSignal, createEffect, on, onCleanup, onMount, batch } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import type { JSX } from "solid-js";
@@ -243,6 +244,7 @@ function Composer(p: {
     setWhich(null);
   };
   const onEsc = (e: KeyboardEvent) => {
+    if (e.defaultPrevented || hasFocusScope()) return;
     if (e.key === "Escape" && (menu() || ctx() || which())) {
       e.stopPropagation();
       close();
@@ -774,6 +776,7 @@ export default function App() {
   };
 
   const onKey = (e: KeyboardEvent) => {
+    if (e.defaultPrevented || hasFocusScope()) return;
     if (nameDlg()) {
       if (e.key === "Escape") setNameDlg(null);
       return;

@@ -15,8 +15,9 @@ export function MenuList(p: { items: MenuEntry[]; onPick?: () => void }) {
             role="menuitem"
             class={`menu-item ${it.danger ? "danger" : ""}`}
             onClick={() => {
-              it.onClick();
+              // Restore the menu opener before an action mounts a dialog.
               p.onPick?.();
+              it.onClick();
             }}
           >
             <span class="menu-ico">{it.icon && <it.icon />}</span>
@@ -30,8 +31,9 @@ export function MenuList(p: { items: MenuEntry[]; onPick?: () => void }) {
 
 export function PopupMenu(p: { x: number; y: number; items: MenuEntry[]; onClose: () => void }) {
   let el!: HTMLDivElement;
+  let trigger: HTMLElement | null = null;
   onMount(() => {
-    const trigger = document.activeElement as HTMLElement | null;
+    trigger = document.activeElement as HTMLElement | null;
     const buttons = () => Array.from(el.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
     buttons()[0]?.focus();
     const r = el.getBoundingClientRect();
@@ -70,7 +72,7 @@ export function PopupMenu(p: { x: number; y: number; items: MenuEntry[]; onClose
       style={{ left: `${p.x}px`, top: `${p.y}px` }}
       onPointerDown={(e) => e.stopPropagation()}
     >
-      <MenuList items={p.items} onPick={p.onClose} />
+      <MenuList items={p.items} onPick={() => { p.onClose(); trigger?.focus(); }} />
     </div>
   );
 }

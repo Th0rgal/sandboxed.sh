@@ -1,6 +1,6 @@
 {
   "hourly": {
-    "id": "142587e2c97a",
+    "id": "66757bbd3f17",
     "name": "Project notes",
     "prompt": "Summarize the local project notes.",
     "skills": [
@@ -34,8 +34,8 @@
     "state": "scheduled",
     "paused_at": null,
     "paused_reason": null,
-    "created_at": "2026-09-20T07:52:13.628803+00:00",
-    "next_run_at": "2026-09-20T08:52:13.631914+00:00",
+    "created_at": "2026-09-20T08:09:32.741246+00:00",
+    "next_run_at": "2026-09-20T09:09:32.741606+00:00",
     "last_run_at": null,
     "last_status": null,
     "last_error": null,
@@ -45,12 +45,12 @@
     "deliver": "local",
     "origin": null,
     "enabled_toolsets": null,
-    "workdir": "/tmp/orb-hermes-fixtures-hv9eudv5",
+    "workdir": "/tmp/orb-hermes-fixtures-8uc4uhub",
     "reasoning_effort": "high",
     "failure_deliver": "local"
   },
   "weekdays": {
-    "id": "cf173afc5eab",
+    "id": "30265aa46049",
     "name": "Project notes",
     "prompt": "Summarize the local project notes.",
     "skills": [
@@ -82,7 +82,7 @@
     "state": "scheduled",
     "paused_at": null,
     "paused_reason": null,
-    "created_at": "2026-09-20T07:52:13.656775+00:00",
+    "created_at": "2026-09-20T08:09:32.758313+00:00",
     "next_run_at": "2026-09-21T09:00:00+00:00",
     "last_run_at": null,
     "last_status": null,
@@ -93,12 +93,12 @@
     "deliver": "local",
     "origin": null,
     "enabled_toolsets": null,
-    "workdir": "/tmp/orb-hermes-fixtures-hv9eudv5",
+    "workdir": "/tmp/orb-hermes-fixtures-8uc4uhub",
     "reasoning_effort": "high",
     "failure_deliver": "local"
   },
   "once": {
-    "id": "894d9a2cfda8",
+    "id": "11cc54daf1bc",
     "name": "Project notes",
     "prompt": "Summarize the local project notes.",
     "skills": [
@@ -130,7 +130,7 @@
     "state": "scheduled",
     "paused_at": null,
     "paused_reason": null,
-    "created_at": "2026-09-20T07:52:13.670013+00:00",
+    "created_at": "2026-09-20T08:09:32.766435+00:00",
     "next_run_at": "2099-04-05T09:00:00+02:00",
     "last_run_at": null,
     "last_status": null,
@@ -141,12 +141,12 @@
     "deliver": "local",
     "origin": null,
     "enabled_toolsets": null,
-    "workdir": "/tmp/orb-hermes-fixtures-hv9eudv5",
+    "workdir": "/tmp/orb-hermes-fixtures-8uc4uhub",
     "reasoning_effort": "high",
     "failure_deliver": "local"
   },
   "updated": {
-    "id": "142587e2c97a",
+    "id": "66757bbd3f17",
     "name": "Project notes",
     "prompt": "Summarize the local project notes.",
     "skills": [
@@ -180,8 +180,8 @@
     "state": "scheduled",
     "paused_at": null,
     "paused_reason": null,
-    "created_at": "2026-09-20T07:52:13.628803+00:00",
-    "next_run_at": "2026-09-20T08:52:13.631914+00:00",
+    "created_at": "2026-09-20T08:09:32.741246+00:00",
+    "next_run_at": "2026-09-20T09:09:32.741606+00:00",
     "last_run_at": null,
     "last_status": null,
     "last_error": null,
@@ -191,12 +191,12 @@
     "deliver": "local",
     "origin": null,
     "enabled_toolsets": null,
-    "workdir": "/tmp/orb-hermes-fixtures-hv9eudv5",
+    "workdir": "/tmp/orb-hermes-fixtures-8uc4uhub",
     "reasoning_effort": "high",
     "failure_deliver": "local"
   },
   "run": {
-    "id": "142587e2c97a",
+    "id": "66757bbd3f17",
     "name": "Project notes",
     "prompt": "Summarize the local project notes.",
     "skills": [
@@ -230,8 +230,8 @@
     "state": "scheduled",
     "paused_at": null,
     "paused_reason": null,
-    "created_at": "2026-09-20T07:52:13.628803+00:00",
-    "next_run_at": "2026-09-20T07:52:13.695298+00:00",
+    "created_at": "2026-09-20T08:09:32.741246+00:00",
+    "next_run_at": "2026-09-20T08:09:32.782009+00:00",
     "last_run_at": null,
     "last_status": null,
     "last_error": null,
@@ -241,10 +241,54 @@
     "deliver": "local",
     "origin": null,
     "enabled_toolsets": null,
-    "workdir": "/tmp/orb-hermes-fixtures-hv9eudv5",
+    "workdir": "/tmp/orb-hermes-fixtures-8uc4uhub",
     "reasoning_effort": "high",
     "failure_deliver": "local",
-    "manual_run_at": "2026-09-20T07:52:13.695298+00:00",
+    "manual_run_at": "2026-09-20T08:09:32.782009+00:00",
     "manual_run_prompt": null
+  },
+  "snapshot": {
+    "id": "0b7d161ad618",
+    "name": "Saved local defaults",
+    "prompt": "Summarize the local project notes.",
+    "skills": [],
+    "skill": null,
+    "model": null,
+    "provider": null,
+    "provider_snapshot": "custom",
+    "model_snapshot": "fixture-local-model",
+    "base_url": null,
+    "script": null,
+    "no_agent": false,
+    "monitor_script": null,
+    "monitor_url": null,
+    "monitor_state": null,
+    "context_from": null,
+    "schedule": {
+      "kind": "interval",
+      "minutes": 60,
+      "display": "every 60m"
+    },
+    "schedule_display": "every 60m",
+    "repeat": {
+      "times": null,
+      "completed": 0
+    },
+    "enabled": true,
+    "state": "scheduled",
+    "paused_at": null,
+    "paused_reason": null,
+    "created_at": "2026-09-20T08:09:32.691719+00:00",
+    "next_run_at": "2026-09-20T09:09:32.733425+00:00",
+    "last_run_at": null,
+    "last_status": null,
+    "last_error": null,
+    "last_delivery_error": null,
+    "last_delivery_unverified": null,
+    "failure_streak": 0,
+    "deliver": "local",
+    "origin": null,
+    "enabled_toolsets": null,
+    "workdir": null
   }
 }

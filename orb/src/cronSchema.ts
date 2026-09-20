@@ -61,3 +61,11 @@ export function ignoredCronFields(patch: import("./api").ControllerPatch, view: 
     return key === "continuity" ? !!patch[key] !== !!settings?.[key] : (patch[key] || "") !== (settings?.[key] || "");
   });
 }
+
+/** Both primary controllers and additional jobs may contain native schedule objects. */
+export type HermesControllerView = Omit<ControllerView, "job"> & { job: HermesJob | null };
+export function normalizeControllerView(view: HermesControllerView): ControllerView {
+  if (!view.job) return { ...view, job: null };
+  const normalized = getProjectCronFromJob(view.slug, view.job);
+  return { ...view, job: normalized.job, settings: { ...normalized.settings!, ...view.settings } };
+}

@@ -1,5 +1,5 @@
 import { createSignal } from "solid-js";
-import { getProjectCronFromJob, hermesPatch, type HermesJob } from "./cronSchema";
+import { getProjectCronFromJob, hermesPatch, normalizeControllerView, type HermesControllerView, type HermesJob } from "./cronSchema";
 
 const URL_KEY = "orb.apiUrl";
 const JWT_KEY = "orb.jwt";
@@ -363,6 +363,9 @@ export interface ControllerSettings {
   repeat_completed: number;
   model?: string | null;
   provider?: string | null;
+  /** Creation-time defaults, kept separate from explicit overrides. */
+  model_snapshot?: string | null;
+  provider_snapshot?: string | null;
   reasoning_effort?: string | null;
   workdir?: string | null;
   script?: string | null;
@@ -401,23 +404,23 @@ export interface ControllerPatch {
 }
 
 export async function updateController(slug: string, patch: ControllerPatch): Promise<ControllerView> {
-  return api(`/api/projects/${encodeURIComponent(slug)}/controller`, {
+  return normalizeControllerView(await api<HermesControllerView>(`/api/projects/${encodeURIComponent(slug)}/controller`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(patch),
-  });
+  }));
 }
 
 export async function getProjectController(slug: string, limit = 40): Promise<ControllerView> {
-  return api(`/api/projects/${encodeURIComponent(slug)}/controller?limit=${limit}`);
+  return normalizeControllerView(await api<HermesControllerView>(`/api/projects/${encodeURIComponent(slug)}/controller?limit=${limit}`));
 }
 
 export async function controllerAction(slug: string, action: "pause" | "resume" | "run"): Promise<ControllerView> {
-  return api(`/api/projects/${encodeURIComponent(slug)}/controller/action`, {
+  return normalizeControllerView(await api<HermesControllerView>(`/api/projects/${encodeURIComponent(slug)}/controller/action`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action }),
-  });
+  }));
 }
 
 /** Additional Hermes jobs explicitly bound to this project by the core. */

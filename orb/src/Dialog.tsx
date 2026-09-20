@@ -1,4 +1,6 @@
-import { onCleanup, onMount, type JSX } from "solid-js";
+import { createUniqueId, onCleanup, onMount, type JSX } from "solid-js";
+
+import { trapFocus } from "./focusScope";
 
 export function Dialog(p: {
   title: string;
@@ -7,21 +9,19 @@ export function Dialog(p: {
   children: JSX.Element;
   footer: JSX.Element;
 }) {
-  onMount(() => {
-    const k = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !e.defaultPrevented) p.onClose();
-    };
-    window.addEventListener("keydown", k);
-    onCleanup(() => window.removeEventListener("keydown", k));
-  });
+  let root!: HTMLDivElement;
+  const titleId = createUniqueId();
+  onMount(() => onCleanup(trapFocus(root, p.onClose)));
   return (
     <div class="dlg-back" onMouseDown={p.onClose}>
       <div
+        ref={root}
+        role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}
         class={`dlg ${p.wide ? "dlg-wide" : ""}`}
         onMouseDown={(e) => e.stopPropagation()}
         onClick={(e) => e.stopPropagation()}
       >
-        <h3>{p.title}</h3>
+        <h3 id={titleId}>{p.title}</h3>
         <div class="dlg-body">{p.children}</div>
         <div class="dlg-foot">{p.footer}</div>
       </div>
