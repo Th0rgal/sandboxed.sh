@@ -114,7 +114,7 @@ body {
 body.resizing, body.resizing * { cursor: col-resize !important; }
 button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
 button:disabled { cursor: default; }
-input, textarea, [contenteditable="true"] { cursor: text; }
+input, textarea, [contenteditable="true"] { cursor: text; user-select: text; -webkit-user-select: text; }
 button:focus-visible { outline: 1px solid var(--blue); outline-offset: -1px; }
 
 .app {
