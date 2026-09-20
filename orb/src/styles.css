@@ -128,6 +128,17 @@ button:focus-visible { outline: 1px solid var(--blue); outline-offset: -1px; }
 .app.sb-hidden { grid-template-columns: 0 1fr; }
 .app.sb-hidden .sidebar { display: none; }
 
+/* Orb's native minimum width is desktop-sized, but the web preview and
+   embedded/narrow windows must leave the editor usable. The sidebar remains
+   available through the titlebar toggle when there is room again. */
+@media (max-width: 720px) {
+  .app { grid-template-columns: 0 1fr; }
+  .sidebar { display: none !important; }
+  .titlebar, .main { grid-column: 2; }
+  .app:not(.sb-hidden) .tb-left { position: static; width: auto; margin-left: 0; }
+  .scroll { padding: 0 14px; }
+}
+
 /* ---------- sidebar ---------- */
 .sidebar {
   grid-row: 1 / 3;
