@@ -14,6 +14,12 @@ pnpm tauri build    # release binary
 
 Shortcuts: ⌘N new agent · ⌘B sidebar · ⌘[ / ⌘] history · ⌘, settings · Esc back · ⌘/ markdown source.
 
+Start a draft with `/goal <objective>` to launch a goal-mode mission: the composer
+shows a Goal tag, the objective becomes the title, and the backend receives the
+canonical `/goal` prompt it already understands. Remote launches follow the
+`remote_launch` capability advertised by `GET /api/remote-nodes`; harnesses the
+server has not confirmed for a node are refused before any request is sent.
+
 Cron forms share the same schedule, instruction, skills, repeat, advanced fields,
 validation and discard behavior. Drafts are kept in session storage, scoped to
 the backend and project/job, across navigation and dialog dismissal; Save or
