@@ -362,6 +362,19 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 .col { width: 100%; max-width: var(--col); margin: 0 auto; }
 .scroll .col { padding: 16px 0 24px; user-select: text; -webkit-user-select: text; cursor: auto; font-size: 13px; line-height: 21px; }
 
+.sk-transcript { margin-top: 8px; }
+.sk-bar, .sk-lines i, .sk-user {
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  border-radius: 6px;
+  animation: sk-pulse 1.2s ease-in-out infinite;
+}
+.sk-bar { height: 24px; }
+.sk-user { min-height: 52px; }
+.sk-lines { margin: 8px 10px 16px; }
+.sk-lines i { display: block; height: 13px; margin: 8px 0; border-radius: 4px; }
+@keyframes sk-pulse { 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .sk-bar, .sk-lines i, .sk-user { animation: none; } }
+
 .user {
   position: relative;
   background: var(--bg-elev); border: 1px solid var(--stroke);

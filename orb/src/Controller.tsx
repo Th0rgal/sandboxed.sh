@@ -3,6 +3,8 @@ import { MdView } from "./Markdown";
 import { pollWhileVisible } from "./poll";
 import { ControllerSettingsPanel } from "./ControllerSettings";
 import { controllerAction, getProjectController, getProjectCron, isConnected, projectCronAction, updateProjectCron, type ControllerJob, type ControllerRun, type ControllerView as View } from "./api";
+import { cacheLoad, cachePeek, cachePut, cacheRemember } from "./pageCache";
+import { ControllerSkeleton } from "./Skeleton";
 
 /** How a controller is doing, derived from its Hermes job record. */
 export type CronState = "running" | "paused" | "attention" | "scheduled";
@@ -206,16 +208,19 @@ function FailedFold(p: { runs: ControllerRun[]; error: string }) {
 
 /** Page for a project's controller: a timeline of ticks, newest first. */
 export function ControllerView(p: { slug: string; id?: string }) {
-  const [view, setView] = createSignal<View | null>(null);
+  const viewKey = () => `c:${p.slug}:${p.id ?? ""}`;
+  const [view, setView] = createSignal<View | null>(cachePeek<View>(viewKey()) ?? null);
   const [error, setError] = createSignal<string | null>(null);
   const [busy, setBusy] = createSignal<string | null>(null);
   const [now, setNow] = createSignal(Date.now());
   const [tab, setTab] = createSignal<"runs" | "settings">("runs");
+  cacheRemember(viewKey());
 
   const load = async () => {
     if (!isConnected()) return;
     try {
-      setView(p.id ? await getProjectCron(p.slug, p.id) : await getProjectController(p.slug));
+      const next = await cacheLoad(viewKey(), () => (p.id ? getProjectCron(p.slug, p.id) : getProjectController(p.slug)));
+      setView(next);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -235,7 +240,9 @@ export function ControllerView(p: { slug: string; id?: string }) {
     if (busy()) return;
     setBusy(action);
     try {
-      setView(p.id ? await projectCronAction(p.slug, p.id, action) : await controllerAction(p.slug, action));
+      const next = p.id ? await projectCronAction(p.slug, p.id, action) : await controllerAction(p.slug, action);
+      cachePut(viewKey(), next);
+      setView(next);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -247,7 +254,7 @@ export function ControllerView(p: { slug: string; id?: string }) {
   return (
     <div class="scroll">
       <div class="col cr-page">
-        <Show when={view()} fallback={<p class="s-lead">{error() ?? "Loading controller…"}</p>}>
+        <Show when={view()} fallback={error() ? <p class="s-lead">{error()}</p> : <ControllerSkeleton />}>
           <Show when={job()} fallback={<p class="s-lead">This project has no controller cron in Hermes.</p>}>
             {(j) => (
               <>

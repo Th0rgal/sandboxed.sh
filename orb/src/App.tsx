@@ -13,8 +13,11 @@ import { Providers } from "./Providers";
 import { Dialog, Field } from "./Dialog";
 import { MenuList, PopupMenu, type MenuEntry } from "./Menu";
 import { MdSource, MdView, safeHref } from "./Markdown";
-import { getMissionEvents, storedToStream, streamMission, heldAfterHistory, type StreamEvent } from "./stream";
-import { Transcript, UserTurn, applyStreamEvent, buildTranscript, type StreamItem } from "./Transcript";
+import { streamMission, heldAfterHistory, type StreamEvent } from "./stream";
+import { Transcript, UserTurn, applyStreamEvent, type StreamItem } from "./Transcript";
+import { cacheRemember, cacheRecents } from "./pageCache";
+import { loadTranscript, peekTranscript, peekTranscriptHeight, prefetchTranscript, putTranscript, putTranscriptHeight, putTranscriptItems } from "./missionCache";
+import { TranscriptSkeleton } from "./Skeleton";
 import { mergeById, pollWhileVisible } from "./poll";
 import { LiveProjectsSection, ProjectFileView } from "./ProjectFiles";
 import { VoiceButton, ensureVoiceProbe, voiceAvailable } from "./VoiceButton";
@@ -556,6 +559,11 @@ export default function App() {
     try {
       const fresh = await listMissions();
       setMissions((prev) => mergeById(prev, fresh));
+      const live = new Set(["active", "running", "pending", "queued", "starting", "resuming"]);
+      for (const m of fresh) if (live.has(m.status)) prefetchTranscript(m.id);
+      for (const key of cacheRecents()) {
+        if (key.startsWith("m:")) prefetchTranscript(key.slice(2));
+      }
     } catch {
       /* keep last good list */
     }
@@ -681,6 +689,7 @@ export default function App() {
         setHIdx(h.length - 1);
       }
     });
+    if (id?.startsWith("m:")) void loadTranscript(id.slice(2));
     toBottom();
   };
   const nav = (d: number) => {
@@ -1450,13 +1459,16 @@ function MissionDock(p: { mission: Mission | null; items: StreamItem[]; destinat
 
 function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: Mission | null) => void }) {
   const receipt = recalledLaunch(p.id);
+  const cached = peekTranscript(p.id);
   const [mission, setMission] = createSignal<Mission | null>(p.initial ?? null);
   createEffect(() => p.onMission?.(mission()));
   onCleanup(() => p.onMission?.(null));
-  const [items, setItems] = createSignal<StreamItem[]>([]);
+  const [items, setItems] = createSignal<StreamItem[]>(cached?.items ?? []);
+  const [awaiting, setAwaiting] = createSignal(!cached);
   const [error, setError] = createSignal<string | null>(null);
   let scroller: HTMLDivElement | undefined;
   let nearBottom = true;
+  cacheRemember(`m:${p.id}`);
 
   const scrollIfPinned = () => {
     if (nearBottom) scroller?.scrollTo({ top: scroller.scrollHeight });
@@ -1481,7 +1493,10 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
   const applyLive = (ev: StreamEvent) => {
     setItems((cur) => {
       const next = applyStreamEvent(cur, ev);
-      if (next !== cur) queueMicrotask(scrollIfPinned);
+      if (next !== cur) {
+        putTranscriptItems(p.id, next);
+        queueMicrotask(scrollIfPinned);
+      }
       return next;
     });
   };
@@ -1491,19 +1506,16 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
     held = [];
     let history: StreamEvent[] = [];
     try {
-      const events = await getMissionEvents(p.id);
-      const stream: StreamEvent[] = [];
-      for (const row of events) {
-        const ev = storedToStream(row);
-        if (ev) stream.push(ev);
-      }
-      history = stream;
-      setItems(buildTranscript(stream));
+      const snap = await loadTranscript(p.id);
+      history = snap.stream;
+      setItems(snap.items);
+      putTranscript(p.id, snap);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       replaying = false;
+      setAwaiting(false);
       const queued = held;
       held = [];
       for (const ev of heldAfterHistory(history, queued)) applyLive(ev);
@@ -1533,6 +1545,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
     // composer busy state shouldn't depend on it alone.
     const stopPoll = pollWhileVisible(refresh, 10000);
     onCleanup(() => {
+      if (scroller) putTranscriptHeight(p.id, scroller.scrollHeight);
       stopStream();
       stopPoll();
     });
@@ -1571,9 +1584,12 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
           nearBottom = !scroller || scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
         }}
       >
-        <div class="col">
-          <LaunchStatus destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={items().some(i => ["text","tool","think"].includes(i.kind))} />
+        <div class="col" style={peekTranscriptHeight(p.id) && awaiting() ? { "min-height": `${peekTranscriptHeight(p.id)}px` } : undefined}>
+          <LaunchStatus destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={viewItems().some(i => ["text","tool","think"].includes(i.kind))} />
           <Transcript items={viewItems()} />
+          <Show when={awaiting() && !cached}>
+            <TranscriptSkeleton />
+          </Show>
           <Show when={error()}>
             <p class="s-lead" role="alert">{error()}</p>
           </Show>

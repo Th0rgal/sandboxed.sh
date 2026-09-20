@@ -30,6 +30,9 @@ import { Dialog, Field } from "./Dialog";
 import { PopupMenu, type MenuEntry } from "./Menu";
 import { CronForm } from "./ControllerSettings";
 import { getProjectCronFromJob } from "./cronSchema";
+import { loadTranscript, prefetchTranscript } from "./missionCache";
+import { cacheLoad, cachePeek, cachePrefetch, cachePut, cacheRemember } from "./pageCache";
+import { FileSkeleton } from "./Skeleton";
 
 /** Sidebar section listing the core backend's projects with their missions
  * and hosted files. Replaces the demo projects when connected. */
@@ -268,6 +271,8 @@ export function LiveProjectsSection(p: {
         if (!currentConnection(version)) return;
         const merged = mergeById(missions[slug] ?? [], list);
         if (merged !== missions[slug]) setMissions(slug, merged);
+        const live = new Set(["active", "pending", "queued", "awaiting_user", "resuming", "running", "starting"]);
+        for (const m of merged) if (live.has(m.status)) prefetchTranscript(m.id);
       })
       .catch(() => {
         if (currentConnection(version) && !missions[slug]) setMissions(slug, []);
@@ -367,11 +372,17 @@ export function LiveProjectsSection(p: {
             );
           }
           const id = () => `pf:${dp.slug}:${childPath()}`;
+          const tip = rowTip.bind(rowDetail(entry.name));
           return (
             <button
               class={`row file depth ${p.selected() === id() ? "active" : ""}`}
               style={{ "--depth": dp.depth + 1 }}
-              {...rowTip.bind(rowDetail(entry.name))}
+              {...tip}
+              onPointerEnter={(e) => {
+                tip.onPointerEnter(e);
+                const path = childPath();
+                cachePrefetch(`pf:${dp.slug}:${path}`, () => readProjectFile(dp.slug, path).then((text) => cachePut(`pf:${dp.slug}:${path}`, text)));
+              }}
               onClick={() => p.open(id())}
             >
               <span class="row-ico"><Ic.FileIcon /></span>
@@ -471,10 +482,13 @@ export function LiveProjectsSection(p: {
                   )}
                 </For>
                 <For each={liveOf(project.slug)}>
-                  {(m) => (
+                  {(m) => {
+                    const tip = rowTip.bind(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]));
+                    return (
                     <button
                       class={`row agent d1 ${p.selected() === `m:${m.id}` ? "active" : ""}`}
-                      {...rowTip.bind(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]))}
+                      {...tip}
+                      onPointerEnter={(e) => { tip.onPointerEnter(e); void loadTranscript(m.id); }}
                       onClick={() => p.open(`m:${m.id}`)}
                     >
                       <span class="row-ico glyph">
@@ -483,7 +497,8 @@ export function LiveProjectsSection(p: {
                       <span class="row-label">{displayTitle(m.title) || m.id}</span>
                       <MachineBadge name={missionMachine(m)} />
                     </button>
-                  )}
+                    );
+                  }}
                 </For>
                 <Show when={doneOf(project.slug).length > 0}>
                   <button
@@ -497,10 +512,13 @@ export function LiveProjectsSection(p: {
                   </button>
                   <Show when={showDone[project.slug]}>
                     <For each={doneOf(project.slug)}>
-                      {(m) => (
+                      {(m) => {
+                        const tip = rowTip.bind(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]));
+                        return (
                         <button
                           class={`row agent done d1 ${p.selected() === `m:${m.id}` ? "active" : ""}`}
-                          {...rowTip.bind(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]))}
+                          {...tip}
+                          onPointerEnter={(e) => { tip.onPointerEnter(e); void loadTranscript(m.id); }}
                           onClick={() => p.open(`m:${m.id}`)}
                         >
                           <span class="row-ico glyph">
@@ -509,7 +527,8 @@ export function LiveProjectsSection(p: {
                           <span class="row-label">{displayTitle(m.title) || m.id}</span>
                           <MachineBadge name={missionMachine(m)} />
                         </button>
-                      )}
+                        );
+                      }}
                     </For>
                   </Show>
                 </Show>
@@ -574,16 +593,17 @@ export function LiveProjectsSection(p: {
 
 /** Markdown view/editor for a file hosted on the core backend. Autosaves. */
 export function ProjectFileView(p: { slug: string; path: string }) {
-  const [text, setText] = createSignal<string | null>(null);
+  const fileKey = () => `pf:${p.slug}:${p.path}`;
+  const cached = cachePeek<string>(fileKey());
+  const [text, setText] = createSignal<string | null>(cached ?? null);
   const [editing, setEditing] = createSignal(false);
-  const [state, setState] = createSignal<"loading" | "saved" | "saving" | "error">("loading");
+  const [state, setState] = createSignal<"loading" | "saved" | "saving" | "error">(cached != null ? "saved" : "loading");
   const [error, setError] = createSignal<string | null>(null);
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
+  cacheRemember(fileKey());
 
   onMount(() => {
-    setText(null);
-    setState("loading");
-    readProjectFile(p.slug, p.path)
+    cacheLoad(fileKey(), () => readProjectFile(p.slug, p.path))
       .then((content) => {
         setText(content);
         setState("saved");
@@ -601,7 +621,7 @@ export function ProjectFileView(p: { slug: string; path: string }) {
     const t = pending;
     pending = null;
     writeProjectFile(p.slug, p.path, t)
-      .then(() => setState("saved"))
+      .then(() => { cachePut(fileKey(), t); setState("saved"); })
       .catch((e) => {
         setError(e instanceof Error ? e.message : String(e));
         setState("error");
@@ -643,7 +663,7 @@ export function ProjectFileView(p: { slug: string; path: string }) {
               <Show when={state() === "error"}>
                 <p class="st-error">{error()}</p>
               </Show>
-              <Show when={text() !== null} fallback={<p class="s-lead shimmer">Loading {name()}…</p>}>
+              <Show when={text() !== null} fallback={<FileSkeleton />}>
                 <MdView text={text() ?? ""} />
               </Show>
             </div>
