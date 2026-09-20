@@ -11246,6 +11246,7 @@ async fn dispatch_remote_mission_mvp(
         success,
         content,
         "remote_node_mvp",
+        false,
     )
     .await?;
     state
@@ -11289,6 +11290,19 @@ impl RemoteMissionOwner {
             mission_store,
             events_tx: None,
         }
+    }
+
+    /// Native streaming events have one persistence owner. Live events are
+    /// saved in broadcast order by the session logger; direct writes would
+    /// race queued deltas and place them after the canonical assistant message.
+    /// Recovery without a live session still needs durable events.
+    async fn publish_native(&self, event: AgentEvent) {
+        if self.events_tx.is_none() {
+            if let Some(id) = event.mission_id() {
+                let _ = self.mission_store.log_event(id, &event).await;
+            }
+        }
+        self.send(event);
     }
 
     fn send(&self, event: AgentEvent) {
@@ -12424,6 +12438,7 @@ async fn finalize_remote_mission(
     success: bool,
     content: String,
     status_reason: &str,
+    native_stream: bool,
 ) -> Result<(), String> {
     let event = AgentEvent::AssistantMessage {
         id: Uuid::new_v4(),
@@ -12439,8 +12454,12 @@ async fn finalize_remote_mission(
         resumable: !success,
         completion_evidence: None,
     };
-    let _ = owner.mission_store.log_event(mission_id, &event).await;
-    owner.send(event);
+    if native_stream {
+        owner.publish_native(event).await;
+    } else {
+        let _ = owner.mission_store.log_event(mission_id, &event).await;
+        owner.send(event);
+    }
     let status = if success {
         MissionStatus::Completed
     } else {
@@ -13494,6 +13513,7 @@ async fn poll_remote_job(
                         false,
                         content,
                         "remote_node_lost",
+                        grok.is_some(),
                     )
                     .await;
                     fleet.record_outcome(outcome(
@@ -13554,6 +13574,7 @@ async fn poll_remote_job(
                             success,
                             content,
                             status_reason,
+                            grok.is_some(),
                         )
                         .await
                         {
@@ -13674,26 +13695,48 @@ async fn poll_remote_job(
                     }
                 }
                 if status.state != last_state {
-                    // Sparse progress note: only on job state changes.
-                    let event = AgentEvent::AssistantMessage {
-                        id: Uuid::new_v4(),
-                        content: format!(
-                            "Remote job {} on node '{}' is now {}",
-                            job_id, node.id, status.state
-                        ),
-                        success: true,
-                        cost_cents: 0,
-                        cost_source: crate::agents::CostSource::Unknown,
-                        usage: None,
-                        model: None,
-                        model_normalized: None,
-                        mission_id: Some(mission_id),
-                        shared_files: None,
-                        resumable: false,
-                        completion_evidence: None,
-                    };
-                    let _ = owner.mission_store.log_event(mission_id, &event).await;
-                    owner.send(event);
+                    if grok.is_some() {
+                        tracing::debug!(%mission_id, %job_id, node = %node.id,
+                            state = %status.state, "native remote job state changed");
+                        owner
+                            .publish_native(AgentEvent::MissionStatusChanged {
+                                completion: None,
+                                execution: owner
+                                    .mission_store
+                                    .get_latest_mission_run(mission_id)
+                                    .await
+                                    .ok()
+                                    .flatten(),
+                                mission_id,
+                                status: inactive_status.unwrap_or(MissionStatus::Active),
+                                summary: Some(format!(
+                                    "Remote node '{}' is {}",
+                                    node.id, status.state
+                                )),
+                            })
+                            .await;
+                    } else {
+                        // Sparse progress note: only on job state changes.
+                        let event = AgentEvent::AssistantMessage {
+                            id: Uuid::new_v4(),
+                            content: format!(
+                                "Remote job {} on node '{}' is now {}",
+                                job_id, node.id, status.state
+                            ),
+                            success: true,
+                            cost_cents: 0,
+                            cost_source: crate::agents::CostSource::Unknown,
+                            usage: None,
+                            model: None,
+                            model_normalized: None,
+                            mission_id: Some(mission_id),
+                            shared_files: None,
+                            resumable: false,
+                            completion_evidence: None,
+                        };
+                        let _ = owner.mission_store.log_event(mission_id, &event).await;
+                        owner.send(event);
+                    }
                     fleet.record_outcome(outcome(&status.state, None, None, false));
                     last_state = status.state.clone();
                 }
@@ -35978,12 +36021,23 @@ Investigate <service/> failures.
             true,
             "remote result".to_string(),
             "remote_node_job",
+            true,
         )
         .await
         .unwrap();
 
         let finalized = store.get_mission(mission.id).await.unwrap().unwrap();
         assert_eq!(finalized.status, MissionStatus::Completed);
+        let events = store
+            .get_events(mission.id, Some(&["assistant_message"]), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "offline native finalization remains durable"
+        );
+        assert_eq!(events[0].content, "remote result");
     }
 
     #[test]

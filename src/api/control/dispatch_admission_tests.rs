@@ -6523,6 +6523,28 @@ async fn native_grok_auto_track_continuation(
         store.get_mission(id).await.unwrap().unwrap().status,
         MissionStatus::Active
     );
+    wait_until("native running status persisted", 10, || async {
+        store
+            .get_events(id, Some(&["mission_status_changed"]), None, None)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.content.contains("is running"))
+    })
+    .await;
+    let assistant_events = store
+        .get_events(id, Some(&["assistant_message"]), None, None)
+        .await
+        .unwrap();
+    assert!(
+        assistant_events.is_empty(),
+        "operational job status is not assistant prose: {assistant_events:?}"
+    );
+    assert_eq!(
+        fixture.submissions.lock().unwrap().len(),
+        1,
+        "stream observation must not submit a second node command"
+    );
     store
         .update_mission_status(id, MissionStatus::Interrupted)
         .await

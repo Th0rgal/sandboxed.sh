@@ -651,12 +651,7 @@ impl NativeGrokObserver {
                                 mission_id: Some(self.mission_id),
                             }
                         };
-                        let _ = self
-                            .owner
-                            .mission_store
-                            .log_event(self.mission_id, &event)
-                            .await;
-                        self.owner.send(event);
+                        self.owner.publish_native(event).await;
                     }
                 }
                 StreamUpdate::ThinkingSnapshot(content) => {
@@ -846,12 +841,7 @@ impl NativeGrokObserver {
                 objective,
                 mission_id: Some(self.mission_id),
             };
-            let _ = self
-                .owner
-                .mission_store
-                .log_event(self.mission_id, &event)
-                .await;
-            self.owner.send(event);
+            self.owner.publish_native(event).await;
         }
 
         TerminalVerdict {
@@ -1230,6 +1220,121 @@ mod tests {
     const SPARK_STREAM: &str =
         include_str!("../../../tests/fixtures/native_grok_goal_resume.jsonl");
     const SPARK_TEXT: &str = include_str!("../../../tests/fixtures/native_grok_goal_resume.txt");
+
+    #[tokio::test]
+    async fn native_finish_preserves_event_order_with_delayed_logger() {
+        use crate::api::mission_store::{MissionStore, SqliteMissionStore};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn MissionStore> = Arc::new(
+            SqliteMissionStore::new(dir.path().join("missions"), "native-events")
+                .await
+                .unwrap(),
+        );
+        let mission = store
+            .create_mission(Some("hostname"), None, None, None, None, Some("grok"), None)
+            .await
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1024);
+        let owner = RemoteMissionOwner {
+            mission_store: store.clone(),
+            events_tx: Some(tx),
+        };
+        let job_id = Uuid::new_v4();
+        let mut observer = NativeGrokObserver::attach(&owner, "spark", mission.id, job_id)
+            .await
+            .unwrap();
+        observer.streaming = LogStreaming::Supported;
+        // The real hostname canary has one tool invocation, text deltas and
+        // a repeated full text snapshot. Hold the logger until after finish
+        // to deterministically reproduce the former direct-write race.
+        let fixture = include_str!("../../../tests/fixtures/native_grok_fixed_session.jsonl");
+        for line in fixture.lines() {
+            let updates = observer.stream.feed(&format!("{line}\n"));
+            observer.broadcast(updates).await;
+        }
+        let status: NodeJobStatus = serde_json::from_value(serde_json::json!({
+            "job_id":job_id, "mission_id":mission.id, "state":"succeeded",
+            "exit_code":0, "created_at":"2026-09-20T00:00:00Z"
+        }))
+        .unwrap();
+        let verdict = observer.verdict(&status, "spark").await;
+        assert!(verdict.success);
+        let final_text = verdict.content.clone();
+        super::super::finalize_remote_mission(
+            &owner,
+            mission.id,
+            None,
+            "spark",
+            verdict.success,
+            verdict.content,
+            verdict.status_reason,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            store
+                .get_events(mission.id, None, None, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "native events must not race the queued logger with direct writes"
+        );
+        let mut canonical_seen = false;
+        let mut canonical_count = 0;
+        let mut tool_calls = 0;
+        let mut tool_results = 0;
+        while let Ok(event) = rx.try_recv() {
+            match &event {
+                AgentEvent::AssistantMessage { content, .. } => {
+                    assert_eq!(content, &final_text);
+                    canonical_seen = true;
+                    canonical_count += 1;
+                }
+                AgentEvent::TextDelta { .. } => assert!(
+                    !canonical_seen,
+                    "no text delta after the canonical assistant message"
+                ),
+                AgentEvent::ToolCall { .. } => tool_calls += 1,
+                AgentEvent::ToolResult { .. } => tool_results += 1,
+                _ => {}
+            }
+            if super::super::should_persist_event(&event) {
+                store.log_event(mission.id, &event).await.unwrap();
+            }
+        }
+        assert_eq!(canonical_count, 1);
+        assert_eq!(
+            tool_calls, 1,
+            "observation must not repeat the node invocation"
+        );
+        assert_eq!(tool_results, 1);
+        let saved = store
+            .get_events(mission.id, None, None, None)
+            .await
+            .unwrap();
+        let canonical = saved
+            .iter()
+            .find(|e| e.event_type == "assistant_message")
+            .unwrap();
+        assert!(saved
+            .iter()
+            .filter(|e| e.event_type == "text_delta")
+            .all(|e| e.sequence < canonical.sequence));
+        assert_eq!(
+            saved.iter().filter(|e| e.event_type == "tool_call").count(),
+            1
+        );
+        assert_eq!(
+            saved
+                .iter()
+                .filter(|e| e.event_type == "tool_result")
+                .count(),
+            1
+        );
+    }
 
     fn assert_spark_stream(stream: &GrokStream, updates: &[StreamUpdate]) {
         assert_eq!(stream.json_events, 420);
