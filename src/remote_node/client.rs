@@ -5,7 +5,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use super::protocol::{
-    CancelJobResponse, ExecuteResponse, LeaseRequest, NodeHeartbeat, NodeJobStatus,
+    CancelJobResponse, ExecuteResponse, JobLogChunk, LeaseRequest, NodeHeartbeat, NodeJobStatus,
     SubmitJobRequest, SubmitJobResponse,
 };
 use super::{RemoteNodeConfig, RemoteNodeError};
@@ -165,6 +165,39 @@ impl RemoteNodeClient {
             .map_err(|e| RemoteNodeError::Request(e.to_string()))
     }
 
+    /// Fetch a bounded range of a job's combined log
+    /// (`GET /jobs/:id/log?offset=N`). Nodes that predate the route answer
+    /// `404` (`RemoteNodeError::is_not_found`).
+    pub async fn get_job_log(
+        &self,
+        node: &RemoteNodeConfig,
+        shared_token: &str,
+        job_id: Uuid,
+        offset: u64,
+    ) -> Result<JobLogChunk, RemoteNodeError> {
+        let url = format!("{}/jobs/{}/log?offset={}", node.base_url, job_id, offset);
+        let response = self
+            .http
+            .get(url)
+            .timeout(JOB_STATUS_TIMEOUT)
+            .bearer_auth(shared_token)
+            .send()
+            .await
+            .map_err(transport_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RemoteNodeError::Rejected {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        response
+            .json::<JobLogChunk>()
+            .await
+            .map_err(|e| RemoteNodeError::Request(e.to_string()))
+    }
+
     /// Request cancellation of a job (`POST /jobs/:id/cancel`).
     pub async fn cancel_job(
         &self,
@@ -225,6 +258,7 @@ mod tests {
                 cached_toolchains: vec![],
                 source_bundle_capacity: Some(crate::node::lean::source_bundle_capacity()),
                 lean_runtime_ready: Some(true),
+                managed_auth: Vec::new(),
             })
         }
         let app = Router::new().route("/heartbeat", get(heartbeat));
@@ -272,6 +306,7 @@ mod tests {
                 command: "true".to_string(),
                 timeout_secs: None,
                 env: None,
+                managed_auth: Vec::new(),
             },
         };
 

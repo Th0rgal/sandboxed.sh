@@ -852,3 +852,46 @@ memory shared with vLLM and a GitHub CI runner — is handled by an external
   (91 = fleet unavailable). Other commands still use the legacy
   `/api/spark/offload` path until it is retired (step 9).
 >>>>>>> 7d8a390e (Step 8: DGX Spark as a fleet node — arbiter slot provider on the node, spark-build via remote-lean-build)
+
+### Native Grok goals (CLI 1.0.34)
+
+A typed launch with `backend: "grok"`, `model_override: "grok-4.6"`,
+`remote_node_id`, and a prompt beginning `/goal ` runs the native Grok CLI.
+The command uses `--cwd "$PWD" --always-approve --no-plan --output-format
+streaming-json -p '<literal prompt>'`. Native Grok owns planning,
+implementation, verification, and goal iteration; Orb creates no sentinel
+loop or goal automation. It does not use OpenCode or the core model proxy.
+An objective can require a validated GB10 implementation and reproducible
+benchmarks; no elapsed wall-clock deadline is added by this adapter. Node
+job time limits still apply, and interrupted goals can be resumed.
+
+Install the native ARM64 CLI on DGX and configure the **node service** with
+`SANDBOXED_NODE_GROK_HOME=/var/lib/sandboxed-node/.grok`. Provision a separate
+cached login there as the service user using the official Grok login flow.
+Keep `auth.json` owned by that user with mode `0600`; the directory must be
+writable for token refresh and native session state. With systemd
+`ProtectSystem=strict`, allow writes to `/var/lib/sandboxed-node`. Do not
+copy refresh credentials shared by another machine. The job requests only
+`managed_auth: ["grok"]`; the node injects the trusted `GROK_HOME` after
+payload environment variables. Credential contents and the configured path
+are absent from the job payload. Job cwd and HOME remain the mission directory.
+This is service-account credential access for trusted remote jobs, not a
+filesystem isolation boundary against code executing as that same account.
+
+Deploy both core and node changes: heartbeat advertises `managed_auth`, and
+`GET /jobs/:id/log?offset=N` returns bounded incremental log chunks. Missing
+auth rejects submission; legacy nodes fail the CLI guard with exit 78.
+Interactive login output triggers cancellation. A running CLI with no
+model/tool progress for 120 seconds is cancelled with a startup diagnostic
+(the timer excludes queued time). No automatic device-login flow is started.
+
+Orb streams thought/text/tool events, suppresses the CLI's repeated final
+text snapshot, and saves emitted native session IDs under the current job
+lease. `POST /api/control/missions/:id/resume` continues on the recorded node
+using `--resume <session> -p '/goal resume'` for a goal, or passes explicit
+request `content` verbatim. It uses the same lease-before-submit fence as
+initial dispatch. If the node or native session is missing, the API returns
+`REMOTE_RESUME_REQUIRES_REPLACEMENT`: create a remote mission with
+`supersedes_mission_id` pointing to the original. Do not silently resume
+legacy remote work locally. A CLI exit alone is insufficient for goal
+success: an `end` event with `end_turn` is also required.

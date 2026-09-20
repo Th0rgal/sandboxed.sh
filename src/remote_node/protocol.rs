@@ -82,6 +82,12 @@ pub struct NodeHeartbeat {
     /// Absent on legacy receivers; additive to v4, not a new payload protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_bundle_capacity: Option<SourceBundleCapacity>,
+    /// Managed-auth profiles this node can inject into raw jobs (see
+    /// `JobPayload::RawCommand::managed_auth`), e.g. `["grok"]` when
+    /// `SANDBOXED_NODE_GROK_HOME` holds a readable `auth.json`. Empty on nodes
+    /// that predate managed auth or have none configured.
+    #[serde(default)]
+    pub managed_auth: Vec<String>,
 }
 
 /// Decoded file-byte limits enforced by the receiver for each bundle mode.
@@ -274,6 +280,16 @@ pub enum JobPayload {
         timeout_secs: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         env: Option<std::collections::HashMap<String, String>>,
+        /// Node-managed credential profiles to inject, by name only (today:
+        /// `grok`). The node resolves each name to its own operator-configured
+        /// trusted directory (`SANDBOXED_NODE_GROK_HOME`) and exports the
+        /// CLI's home override, so no credential and no path ever travels in
+        /// the payload or lands in the node's job database/logs. Unknown or
+        /// unconfigured profiles are rejected at submission. Nodes that
+        /// predate managed auth ignore the field, so commands must fail closed
+        /// when the expected environment is missing.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        managed_auth: Vec<String>,
     },
     /// Declarative Lean build: the node checks out `source` into a
     /// content-addressed checkout, restores shared elan/lake caches, runs a
@@ -347,6 +363,28 @@ pub struct NodeJobStatus {
     /// commands and for pre-artifact nodes).
     #[serde(default)]
     pub artifacts: Vec<ArtifactEntry>,
+}
+
+/// Body of `GET /jobs/:id/log?offset=N`: a bounded byte range of the job's
+/// combined stdout+stderr log starting at `offset`. A chunk that does not
+/// reach the current end of the log ends on a newline boundary, so
+/// line-oriented consumers can parse every chunk after carrying over at most
+/// one partial trailing line. Nodes that predate this route answer 404;
+/// consumers fall back to the terminal `log_tail`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobLogChunk {
+    pub job_id: Uuid,
+    /// Offset the chunk starts at (clamped to the log length).
+    pub offset: u64,
+    /// Offset to request next; equals `log_len` when the chunk reached the
+    /// current end of the log.
+    pub next_offset: u64,
+    /// Total log bytes at the time of the read.
+    pub log_len: u64,
+    /// Chunk bytes, lossily decoded as UTF-8.
+    pub data: String,
+    /// Job state at the time of the read (`queued | running | succeeded | ...`).
+    pub state: String,
 }
 
 /// Body of `POST /jobs/:id/cancel`.
@@ -599,7 +637,7 @@ mod tests {
     #[test]
     fn job_payload_round_trips_with_kind_tag() {
         let payload = JobPayload::RawCommand {
-            command: "cargo test".to_string(),
+            managed_auth: Vec::new(),            command: "cargo test".to_string(),
             timeout_secs: Some(600),
             env: Some(
                 [("RUST_LOG".to_string(), "info".to_string())]
@@ -622,6 +660,7 @@ mod tests {
         assert_eq!(
             minimal,
             JobPayload::RawCommand {
+                managed_auth: Vec::new(),
                 command: "true".to_string(),
                 timeout_secs: None,
                 env: None,
@@ -776,6 +815,7 @@ mod tests {
             cached_toolchains: vec![],
             source_bundle_capacity: None,
             lean_runtime_ready: Some(true),
+            managed_auth: Vec::new(),
         };
         let json = serde_json::to_string(&heartbeat).unwrap();
         let parsed: NodeHeartbeat = serde_json::from_str(&json).unwrap();

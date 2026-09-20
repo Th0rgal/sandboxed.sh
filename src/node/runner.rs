@@ -79,6 +79,9 @@ pub struct JobRunner {
     /// External slot provider (`SANDBOXED_NODE_SLOT_PROVIDER`); `None` means
     /// the node admits on its own.
     slot_provider: Option<Arc<super::slot::SlotProvider>>,
+    /// Operator-configured credential profiles raw jobs may request by name
+    /// (`SANDBOXED_NODE_GROK_HOME`, ...). See `super::managed_auth`.
+    managed_auth: super::managed_auth::ManagedAuth,
 }
 
 impl JobRunner {
@@ -109,6 +112,26 @@ impl JobRunner {
         max_job_secs: u64,
         admission: Arc<Semaphore>,
     ) -> Arc<Self> {
+        Self::spawn_with_options(
+            store,
+            work_root,
+            capacity,
+            max_job_secs,
+            admission,
+            super::managed_auth::ManagedAuth::from_env(),
+        )
+    }
+
+    /// [`JobRunner::spawn_with_admission`] with explicit managed-auth
+    /// configuration instead of reading it from the environment.
+    pub fn spawn_with_options(
+        store: JobStore,
+        work_root: PathBuf,
+        capacity: u32,
+        max_job_secs: u64,
+        admission: Arc<Semaphore>,
+        managed_auth: super::managed_auth::ManagedAuth,
+    ) -> Arc<Self> {
         let max_queued = std::env::var("SANDBOXED_NODE_MAX_QUEUED")
             .ok()
             .and_then(|raw| raw.trim().parse::<usize>().ok())
@@ -132,6 +155,7 @@ impl JobRunner {
                     None
                 }
             },
+            managed_auth,
         });
         let dispatcher = Arc::clone(&runner);
         tokio::spawn(async move {
@@ -326,11 +350,23 @@ impl JobRunner {
                 command,
                 timeout_secs,
                 env,
+                managed_auth,
             } => {
+                // Resolve managed-auth profiles before anything runs; a
+                // profile this node cannot honour fails the job with a clear
+                // error instead of a CLI hanging on an interactive login.
+                let managed_env = self
+                    .managed_auth
+                    .env_for(managed_auth)
+                    .map_err(|error| anyhow::anyhow!(error))?;
                 let mission_dir = self.work_root.join(job.mission_id.to_string());
                 tokio::fs::create_dir_all(&mission_dir).await?;
 
-                let cmd = crate::remote_node::raw_command(command, &mission_dir, env.as_ref());
+                let mut cmd =
+                    crate::remote_node::raw_command(command, &mission_dir, env.as_ref());
+                // Applied last: the payload env cannot redirect a managed
+                // profile to a mission-controlled path.
+                cmd.envs(managed_env);
                 let limit_secs = clamp_timeout(*timeout_secs, self.max_job_secs);
                 let outcome = run_logged_command(
                     cmd,
@@ -870,6 +906,65 @@ pub async fn read_log_tail(path: &Path) -> Option<String> {
     .flatten()
 }
 
+/// Upper bound of one `GET /jobs/:id/log` chunk.
+pub const LOG_CHUNK_MAX_BYTES: u64 = 256 * 1024;
+
+/// Read a bounded range of a job log starting at `offset`. Returns
+/// `(data, next_offset, log_len)`. A chunk that does not reach the current
+/// end of the log is cut back to its last newline so consumers can parse it
+/// line by line; a chunk with no newline at all is returned as-is (a caller
+/// must then buffer it until more arrives). `offset` past the end yields an
+/// empty chunk positioned at the end.
+pub async fn read_log_chunk(path: &Path, offset: u64, max_bytes: u64, terminal: bool) -> Option<(String, u64, u64)> {
+    let path = path.to_path_buf();
+    let max_bytes = max_bytes.clamp(4, LOG_CHUNK_MAX_BYTES);
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(&path).ok()?;
+        let len = file.metadata().ok()?.len();
+        let start = offset.min(len);
+        let want = (len - start).min(max_bytes);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut buf = vec![0u8; want as usize];
+        let mut read = 0usize;
+        while read < buf.len() {
+            match file.read(&mut buf[read..]) {
+                Ok(0) => break,
+                Ok(n) => read += n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+        }
+        buf.truncate(read);
+        let reached_end = start + read as u64 >= len;
+        if !reached_end {
+            if let Some(cut) = buf.iter().rposition(|byte| *byte == b'\n') {
+                buf.truncate(cut + 1);
+            }
+        }
+        // A UTF-8 scalar can straddle either our byte limit or a concurrent
+        // write. Leave an incomplete suffix unread; never advance past it.
+        let mut valid = 0;
+        while valid < buf.len() {
+            match std::str::from_utf8(&buf[valid..]) {
+                Ok(_) => break,
+                Err(error) => {
+                    valid += error.valid_up_to();
+                    match error.error_len() {
+                        Some(invalid) => valid += invalid,
+                        None => { if !terminal || !reached_end { buf.truncate(valid); } break; }
+                    }
+                }
+            }
+        }
+        let next = start + buf.len() as u64;
+        Some((String::from_utf8_lossy(&buf).into_owned(), next, len))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,6 +1006,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn log_chunks_preserve_unicode_and_partial_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let original = "abc🦀你好\nsecond line without newline";
+        tokio::fs::write(&path, original).await.unwrap();
+        let mut offset = 0;
+        let mut text = String::new();
+        while offset < original.len() as u64 {
+            let (data, next, len) = read_log_chunk(&path, offset, 4, false).await.unwrap();
+            assert!(next > offset);
+            assert!(data.len() <= 4);
+            assert_eq!(len, original.len() as u64);
+            text.push_str(&data);
+            offset = next;
+        }
+        assert_eq!(text, original);
+        tokio::fs::write(&path, b"abc\xf0\x9f").await.unwrap();
+        let (data, next, _) = read_log_chunk(&path, 0, 20, false).await.unwrap();
+        assert_eq!(data, "abc");
+        assert_eq!(next, 3);
+        tokio::fs::write(&path, "abc🦀").await.unwrap();
+        assert_eq!(read_log_chunk(&path, next, 20, false).await.unwrap().0, "🦀");
+        tokio::fs::write(&path, b"abc\xf0\x9f").await.unwrap();
+        let (data, next, _) = read_log_chunk(&path, 3, 20, true).await.unwrap();
+        assert_eq!(data, "�");
+        assert_eq!(next, 5);
+    }
+
+    #[tokio::test]
     async fn runs_a_job_and_captures_its_log() {
         let dir = tempfile::tempdir().unwrap();
         let store = JobStore::open(dir.path()).await.unwrap();
@@ -930,6 +1054,7 @@ mod tests {
                     command: "echo hello-from-job && pwd".to_string(),
                     timeout_secs: Some(30),
                     env: None,
+                    managed_auth: Vec::new(),
                 },
             )
             .await
@@ -965,6 +1090,7 @@ mod tests {
                     command: "sleep 30".to_string(),
                     timeout_secs: None,
                     env: None,
+                    managed_auth: Vec::new(),
                 },
             )
             .await
@@ -1009,6 +1135,7 @@ mod tests {
                         command: "sleep 30".to_string(),
                         timeout_secs: None,
                         env: None,
+                        managed_auth: Vec::new(),
                     },
                 )
                 .await
@@ -1065,6 +1192,7 @@ mod tests {
                     command: "sleep 20".to_string(),
                     timeout_secs: Some(600),
                     env: None,
+                    managed_auth: Vec::new(),
                 },
             )
             .await

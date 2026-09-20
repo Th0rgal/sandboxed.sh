@@ -5,12 +5,14 @@
 
 pub mod job_store;
 pub mod lean;
+pub mod managed_auth;
 pub mod runner;
 pub mod slot;
 
 pub use job_store::{JobRecord, JobState, JobStore};
+pub use managed_auth::ManagedAuth;
 pub use lean::{cached_toolchains, lean_runtime_ready, spawn_cache_gc};
 pub use runner::{
-    maybe_exec_cleared_scope_payload, read_log_tail, JobRunner, NodeQueueFull,
-    DEFAULT_MAX_JOB_SECS, LOG_TAIL_MAX_BYTES,
+    maybe_exec_cleared_scope_payload, read_log_chunk, read_log_tail, JobRunner, NodeQueueFull,
+    DEFAULT_MAX_JOB_SECS, LOG_CHUNK_MAX_BYTES, LOG_TAIL_MAX_BYTES,
 };

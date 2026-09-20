@@ -11,6 +11,7 @@ pub(crate) mod dispatch_admission;
 #[cfg(test)]
 pub(crate) mod dispatch_admission_tests;
 pub(crate) mod execution_ownership;
+mod remote_grok;
 #[cfg(test)]
 use dispatch_admission::admit_dispatch;
 pub use dispatch_admission::DispatchAdmission;
@@ -10567,6 +10568,11 @@ pub async fn create_mission(
         }
     }
 
+    if let (Some(node_id), Some(plan)) = (remote_node_id.as_deref(), remote_plan.as_ref()) {
+        remote_grok::require_node_managed_auth(&state, node_id, plan).await
+            .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    }
+
     let control = control_for_user(&state, &user).await;
     if request_needs_writer_lease {
         let _guard = acquire_durable_pr_writer_lock(&state.control)
@@ -11256,10 +11262,9 @@ impl RemoteMissionOwner {
 }
 
 /// Harnesses a remote node can run for a typed launch. Nodes ship the
-/// `claude` and `opencode` CLIs; Grok, Codex, Gemini and the ChatGPT UI
-/// driver have no standalone node runtime, so selecting them is rejected
+/// `claude`, `opencode`, and native `grok` CLIs. Other harnesses are rejected
 /// before the mission exists instead of being silently swapped.
-pub(crate) const REMOTE_NODE_HARNESSES: &[&str] = &["claudecode", "opencode"];
+pub(crate) const REMOTE_NODE_HARNESSES: &[&str] = &["claudecode", "opencode", "grok"];
 
 /// Stable prefixes of the plain-text `400` bodies a typed remote launch can
 /// return before any mission exists. Clients match on the prefix, not the
@@ -11292,6 +11297,11 @@ pub(crate) fn remote_launch_capabilities() -> crate::remote_node::RemoteLaunchCa
 /// from the client's selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteHarnessPlan {
+    Grok {
+        model: Option<String>,
+        prompt: String,
+        resume_session_id: Option<String>,
+    },
     /// Explicit `remote_command` compatibility: runs verbatim, own auth.
     Raw { command: String },
     /// Claude Code CLI on the node, model routed through this core's proxy.
@@ -11309,12 +11319,13 @@ pub(crate) enum RemoteHarnessPlan {
 
 impl RemoteHarnessPlan {
     pub(crate) fn uses_core_proxy(&self) -> bool {
-        !matches!(self, RemoteHarnessPlan::Raw { .. })
+        matches!(self, RemoteHarnessPlan::ClaudeCode { .. } | RemoteHarnessPlan::OpenCode { .. })
     }
 
     pub(crate) fn label(&self) -> String {
         match self {
             RemoteHarnessPlan::Raw { .. } => "raw command".to_string(),
+            RemoteHarnessPlan::Grok { model, .. } => format!("grok/{}", model.as_deref().unwrap_or("node default model")),
             RemoteHarnessPlan::ClaudeCode { model, .. } => format!(
                 "claudecode/{}",
                 model.as_deref().unwrap_or("node default model")
@@ -11355,6 +11366,7 @@ pub(crate) fn plan_remote_harness(
         .filter(|m| !m.is_empty())
         .map(str::to_string);
     match backend {
+        "grok" => Ok(remote_grok::plan(model, prompt)),
         "claudecode" => Ok(RemoteHarnessPlan::ClaudeCode {
             // Claude Code expects bare model ids.
             model: model.map(|m| {
@@ -11385,7 +11397,7 @@ pub(crate) fn plan_remote_harness(
         }
         other => Err(format!(
             "{REMOTE_HARNESS_UNSUPPORTED}: backend '{other}' cannot run on remote nodes: only {} are installed there. \
-             Pick one of those (for Grok models, OpenCode with an xai/ model routes through this core), \
+             Pick one of those, \
              or pass an explicit remote_command.",
             REMOTE_NODE_HARNESSES.join(" or ")
         )),
@@ -11396,6 +11408,7 @@ pub(crate) fn plan_remote_harness(
 /// node injects into it (proxy URL/key never appear in the command line).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteExecution {
+    pub(crate) managed_auth: Vec<String>,
     pub(crate) command: String,
     pub(crate) env: Option<HashMap<String, String>>,
     pub(crate) label: String,
@@ -11466,7 +11479,9 @@ pub(crate) fn remote_execution_for_plan(
 ) -> RemoteExecution {
     let label = plan.label();
     match plan {
+        RemoteHarnessPlan::Grok { model, prompt, resume_session_id } => remote_grok::execution(model.as_deref(), prompt, resume_session_id.as_deref(), label),
         RemoteHarnessPlan::Raw { command } => RemoteExecution {
+            managed_auth: Vec::new(),
             command: command.clone(),
             env: None,
             label,
@@ -11490,6 +11505,7 @@ pub(crate) fn remote_execution_for_plan(
                 ("GH_PROMPT_DISABLED".to_string(), "1".to_string()),
             ]);
             RemoteExecution {
+                managed_auth: Vec::new(),
                 command,
                 env: Some(env),
                 label,
@@ -11519,6 +11535,7 @@ pub(crate) fn remote_execution_for_plan(
             command.push(' ');
             command.push_str(&shell_single_quote(&positional_prompt(prompt)));
             RemoteExecution {
+                managed_auth: Vec::new(),
                 command,
                 env: Some(env),
                 label,
@@ -12546,6 +12563,7 @@ async fn submit_leased_remote_job(
             command: execution.command.clone(),
             timeout_secs: None,
             env: execution.env.clone(),
+            managed_auth: execution.managed_auth.clone(),
         },
     };
     let proxy_keys = Arc::clone(&state.proxy_api_keys);
@@ -13325,6 +13343,7 @@ async fn poll_remote_job(
             finished_at: terminal.then(chrono::Utc::now),
         }
     };
+    let mut grok = remote_grok::NativeGrokObserver::attach(&owner, &node.id, mission_id, job_id).await;
     let mut last_state = "queued".to_string();
     let mut failures = 0u32;
     // Once received, terminal proof survives a subsequent observation outage
@@ -13417,6 +13436,14 @@ async fn poll_remote_job(
             Ok(status) => {
                 failures = 0;
                 let terminal = crate::remote_node::job_state_confirms_termination(&status.state);
+                if let Some(observer) = grok.as_mut() {
+                    observer.pump(&client, &node, &shared_token).await;
+                    observer.check_startup(&status, &client, &node, &shared_token).await;
+                    if terminal && !observer.caught_up() {
+                        terminal_observation = Some(status.clone());
+                        continue;
+                    }
+                }
                 if terminal {
                     terminal_observation = Some(status.clone());
                     let success = status.state == "succeeded";
@@ -13433,6 +13460,10 @@ async fn poll_remote_job(
                             .unwrap_or_default(),
                         status.log_tail.as_deref().unwrap_or("(empty)"),
                     );
+                    let (success, content, status_reason) = if let Some(observer) = grok.as_mut() {
+                        let verdict = observer.verdict(&status, &node.id).await;
+                        (verdict.success, verdict.content, verdict.status_reason)
+                    } else { (success, content, "remote_node_job") };
                     if should_finalize_remote_job(inactive_status) {
                         if let Err(error) = finalize_remote_mission(
                             &owner,
@@ -13441,7 +13472,7 @@ async fn poll_remote_job(
                             &node.id,
                             success,
                             content,
-                            "remote_node_job",
+                            status_reason,
                         )
                         .await
                         {
@@ -15901,6 +15932,14 @@ pub async fn resume_mission(
 
     let control = control_for_user(&state, &user).await;
     tracing::info!(mission_id = %mission_id, actor = %actor, "FLEET-004 mission resume requested");
+
+    if let Some(placement) = remote_grok::placement(
+        &state.config.working_dir, &control.mission_store, mission_id,
+    ).await.map_err(internal_error)? {
+        return remote_grok::continue_on_node(
+            &state, &control, &actor, mission_id, placement, request.content,
+        ).await.map(Json);
+    }
 
     let outcome: Result<Mission, (StatusCode, String)> = async {
         let (tx, rx) = oneshot::channel();
@@ -20512,6 +20551,10 @@ async fn control_actor_loop(
         clean_workspace: bool,
     ) -> Result<(Mission, String), String> {
         let mission = load_mission_record(mission_store, mission_id).await?;
+
+        if let Some(placement) = remote_grok::placement(&config.working_dir, mission_store, mission_id).await? {
+            return Err(remote_grok::local_resume_refusal(&mission, &placement));
+        }
 
         // Check if mission can be resumed. Paused remains Paused until the
         // actor has acquired the durable writer lock and accepted the resume.
@@ -35419,13 +35462,13 @@ Investigate <service/> failures.
             no_model.starts_with("REMOTE_MODEL_REQUIRED: "),
             "{no_model}"
         );
-        let rejected = plan_remote_harness(None, "grok", Some("grok-4.6"), Some("do it"))
-            .expect_err("grok has no node runtime");
+        let rejected = plan_remote_harness(None, "unknown", Some("grok-4.6"), Some("do it"))
+            .expect_err("unknown harness");
         assert!(
             rejected.starts_with("REMOTE_HARNESS_UNSUPPORTED: "),
             "{rejected}"
         );
-        assert!(rejected.contains("'grok'"), "{rejected}");
+        assert!(rejected.contains("'unknown'"), "{rejected}");
         assert!(rejected.contains("claudecode or opencode"), "{rejected}");
         let no_prompt =
             plan_remote_harness(None, "claudecode", None, Some("   ")).expect_err("prompt");
