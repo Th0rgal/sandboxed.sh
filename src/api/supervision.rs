@@ -29,7 +29,9 @@ use super::control::MissionStatus;
 #[allow(unused_imports)]
 use super::control::*;
 use super::mission_runner::TOOL_CALL_STALL_GRACE_SECS;
-use super::mission_store::{MissionExecutionState, MissionFilter, MissionRun, MissionStore};
+use super::mission_store::{
+    Mission, MissionExecutionState, MissionFilter, MissionRun, MissionStore,
+};
 
 mod bg_autoresume;
 
@@ -90,6 +92,10 @@ pub(crate) async fn recover_server_shutdown_missions(
     };
     let mut to_resume = Vec::new();
     let mut seen = HashSet::new();
+    // Accepted raw remote mission jobs survive a restart on the node; their
+    // observer is re-attached by `spawn_remote_job_reconciler`, not by a
+    // harness resume. Read the ledger once for the whole scan.
+    let remote_job_owners = accepted_remote_mission_job_owners(&state.config.working_dir).await;
 
     match mission_store.get_all_active_missions().await {
         Ok(active_missions) => {
@@ -110,6 +116,28 @@ pub(crate) async fn recover_server_shutdown_missions(
                         "Startup recovery: leaving assistant-mode active mission idle"
                     );
                     continue;
+                }
+                match remote_job_owners.as_ref() {
+                    Ok(owners) if owners.contains(&mission.id) => {
+                        tracing::info!(
+                            mission_id = %mission.id,
+                            "Startup recovery: accepted remote job will be re-attached by the remote job reconciler"
+                        );
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        // The ledger is the only proof of remote ownership.
+                        // Without it, an active remote mission would be
+                        // marked server_shutdown and its re-attached poll
+                        // loop would cancel the node job. Defer instead.
+                        tracing::warn!(
+                            mission_id = %mission.id,
+                            %error,
+                            "Startup recovery: remote job ledger unreadable; deferring recovery"
+                        );
+                        continue;
+                    }
                 }
 
                 match mission_has_detached_durable_run(mission_store.as_ref(), mission.id).await {
@@ -498,12 +526,362 @@ async fn mission_has_detached_durable_run(
         .is_some_and(|run| detached_run_proves_durable_liveness(run.execution_state)))
 }
 
+/// Same as [`mission_has_detached_durable_run`] but a lease owned by a raw
+/// remote mission job is NOT accepted on its own. That lease is refreshed by
+/// the job's poll loop, so the durable job ledger (checked first by callers)
+/// is the authority on whether anyone still observes the node job. Without
+/// this exclusion a lease left behind by a dead observer would keep the
+/// mission Active forever.
+async fn mission_has_detached_durable_run_excluding_remote_jobs(
+    mission_store: &dyn MissionStore,
+    mission_id: Uuid,
+) -> Result<bool, String> {
+    Ok(mission_store
+        .get_active_mission_run(mission_id)
+        .await?
+        .is_some_and(|run| {
+            detached_run_proves_durable_liveness(run.execution_state)
+                && !is_remote_mission_job_owner(&run.owner_actor_id)
+        }))
+}
+
+/// How long an accepted remote mission job may go unobserved before the
+/// watchdog stops trusting its ledger handle. The poll loop refreshes the
+/// handle on every successful observation (every few seconds) and the
+/// startup reconciler re-attaches an observer within its first passes, so a
+/// handle older than this has lost its observer.
+pub(crate) const REMOTE_JOB_UNOBSERVED_SECS: i64 = 300;
+
+/// Whether an accepted raw remote mission job still owns an Active mission.
+#[derive(Debug, Clone)]
+pub(crate) enum RemoteJobLiveness {
+    /// An accepted job was observed within [`REMOTE_JOB_UNOBSERVED_SECS`].
+    Live(crate::remote_node::job_ledger::JobHandle),
+    /// An accepted job exists but nothing has observed it for `age_secs`.
+    Unobserved {
+        handle: crate::remote_node::job_ledger::JobHandle,
+        age_secs: i64,
+    },
+    /// No accepted raw remote mission job owns this mission.
+    None,
+}
+
+/// Latest proof that somebody observed the node job behind `handle`.
+fn remote_job_last_proof(
+    handle: &crate::remote_node::job_ledger::JobHandle,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    match (handle.heartbeat_at, handle.accepted_at) {
+        (Some(heartbeat), Some(accepted)) => Some(heartbeat.max(accepted)),
+        (Some(heartbeat), None) => Some(heartbeat),
+        (None, accepted) => accepted,
+    }
+}
+
+/// Pure decision over the durable job ledger and the mission's run lease.
+///
+/// Only `Mission` handles with a node acceptance count: a tentative handle
+/// proves nothing about liveness (its mission is already failed by the create
+/// request), and remote *build* handles are validated tool calls whose lease
+/// is owned by the remote-build reconciler, not by a mission poll loop. The
+/// freshest proof wins between the ledger heartbeat and a run lease owned by
+/// that same job, so a single failed ledger write cannot orphan a live job.
+pub(crate) fn remote_mission_job_liveness(
+    handles: &[crate::remote_node::job_ledger::JobHandle],
+    run: Option<&MissionRun>,
+    mission_id: Uuid,
+    now: chrono::DateTime<chrono::Utc>,
+) -> RemoteJobLiveness {
+    let mut best: Option<(
+        chrono::DateTime<chrono::Utc>,
+        &crate::remote_node::job_ledger::JobHandle,
+    )> = None;
+    for handle in handles {
+        if handle.mission_id != mission_id
+            || handle.kind != crate::remote_node::job_ledger::JobHandleKind::Mission
+            || handle.accepted_at.is_none()
+        {
+            continue;
+        }
+        let Some(mut proof) = remote_job_last_proof(handle) else {
+            continue;
+        };
+        if let Some(run) = run {
+            if run.owner_actor_id == remote_job_lease_owner(handle.job_id)
+                && !run.execution_state.is_terminal()
+            {
+                if let Ok(heartbeat) = chrono::DateTime::parse_from_rfc3339(&run.heartbeat_at) {
+                    proof = proof.max(heartbeat.with_timezone(&chrono::Utc));
+                }
+            }
+        }
+        if best.is_none_or(|(current, _)| proof > current) {
+            best = Some((proof, handle));
+        }
+    }
+    let Some((proof, handle)) = best else {
+        return RemoteJobLiveness::None;
+    };
+    let age_secs = now.signed_duration_since(proof).num_seconds().max(0);
+    if age_secs <= REMOTE_JOB_UNOBSERVED_SECS {
+        RemoteJobLiveness::Live(handle.clone())
+    } else {
+        RemoteJobLiveness::Unobserved {
+            handle: handle.clone(),
+            age_secs,
+        }
+    }
+}
+
+/// Load the durable job ledger and the mission's active run, then decide.
+/// `Err` means the ledger or the store is unreadable; callers must fail
+/// closed (defer) rather than treat that as "no remote job".
+async fn remote_mission_job_liveness_for(
+    mission_store: &dyn MissionStore,
+    working_dir: &std::path::Path,
+    mission_id: Uuid,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<RemoteJobLiveness, String> {
+    let handles = crate::remote_node::job_ledger::load(working_dir)
+        .await
+        .map_err(|error| format!("remote job ledger unreadable: {error}"))?;
+    let run = mission_store.get_active_mission_run(mission_id).await?;
+    Ok(remote_mission_job_liveness(
+        &handles,
+        run.as_ref(),
+        mission_id,
+        now,
+    ))
+}
+
+/// Mission ids that hold an accepted raw remote mission job in the ledger.
+/// Used at boot, where every heartbeat is stale by the downtime: acceptance
+/// alone proves that the remote-job reconciler will re-attach an observer,
+/// so startup recovery must not mark those missions `server_shutdown` (the
+/// re-attached poll loop would read that as an operator cancellation and
+/// cancel the node job).
+async fn accepted_remote_mission_job_owners(
+    working_dir: &std::path::Path,
+) -> Result<HashSet<Uuid>, String> {
+    let handles = crate::remote_node::job_ledger::load(working_dir)
+        .await
+        .map_err(|error| format!("remote job ledger unreadable: {error}"))?;
+    Ok(handles
+        .into_iter()
+        .filter(|handle| {
+            handle.kind == crate::remote_node::job_ledger::JobHandleKind::Mission
+                && handle.accepted_at.is_some()
+        })
+        .map(|handle| handle.mission_id)
+        .collect())
+}
+
+/// Case 2 of the stuck-mission watchdog: missions Active in the store that no
+/// runner owns. Extracted so the decision is testable against a real store
+/// and ledger without the 60 s loop. `now` is injected for the same reason.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn repair_orphaned_active_missions(
+    mission_store: &Arc<dyn MissionStore>,
+    working_dir: &std::path::Path,
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    active_missions: &[Mission],
+    running_ids: &HashSet<Uuid>,
+    auto_resumed_workers: &mut HashSet<Uuid>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    for mission in active_missions {
+        if running_ids.contains(&mission.id) {
+            continue;
+        }
+        if mission.mission_mode == super::mission_store::MissionMode::Assistant {
+            tracing::debug!(
+                mission_id = %mission.id,
+                "Stuck-mission watchdog: leaving idle assistant-mode mission active"
+            );
+            continue;
+        }
+        // A raw remote mission job never has a local runner: its poll loop
+        // owns the mission. The durable job ledger (heartbeated by that loop)
+        // is the liveness authority. Fresh → alive. Stale → nobody observes
+        // the node job any more; that is an honest interruption with its own
+        // reason, never an "orphan runner". Unreadable → defer.
+        match remote_mission_job_liveness_for(mission_store.as_ref(), working_dir, mission.id, now)
+            .await
+        {
+            Ok(RemoteJobLiveness::Live(handle)) => {
+                tracing::debug!(
+                    mission_id = %mission.id,
+                    job_id = %handle.job_id,
+                    node = %handle.node_id,
+                    "Stuck-mission watchdog: accepted remote job proves liveness"
+                );
+                continue;
+            }
+            Ok(RemoteJobLiveness::Unobserved { handle, age_secs }) => {
+                tracing::warn!(
+                    mission_id = %mission.id,
+                    job_id = %handle.job_id,
+                    node = %handle.node_id,
+                    age_secs,
+                    "Stuck-mission watchdog: remote job unobserved past threshold; marking interrupted"
+                );
+                if let Err(e) = mission_store
+                    .update_mission_status_with_reason(
+                        mission.id,
+                        MissionStatus::Interrupted,
+                        Some("remote_job_unobserved"),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "Stuck-mission watchdog: status update failed for {}: {}",
+                        mission.id,
+                        e
+                    );
+                    continue;
+                }
+                let execution = finish_remote_job_lease(
+                    mission_store.as_ref(),
+                    mission.id,
+                    handle.job_id,
+                    "remote_job_unobserved",
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        mission_id = %mission.id,
+                        %error,
+                        "Stuck-mission watchdog: remote job lease could not be finished"
+                    );
+                    None
+                });
+                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                    completion: None,
+                    execution,
+                    mission_id: mission.id,
+                    status: MissionStatus::Interrupted,
+                    summary: Some(format!(
+                        "Interrupted: remote job {} on node '{}' has not been observed for {}s; its ledger handle is retained for cancellation/recovery",
+                        handle.job_id, handle.node_id, age_secs
+                    )),
+                });
+                continue;
+            }
+            Ok(RemoteJobLiveness::None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    mission_id = %mission.id,
+                    %error,
+                    "Stuck-mission watchdog: could not inspect remote job ledger; deferring orphan reconciliation"
+                );
+                continue;
+            }
+        }
+        // A remote build deliberately outlives the harness process. The
+        // durable run lease is authoritative here: the remote-build
+        // reconciler owns its heartbeat and terminal transition after the
+        // conversational runner exits. Marking the presentation row
+        // interrupted would make that reconciler flip it back to Active on
+        // every tick, producing a false orphan/reconcile loop.
+        match mission_has_detached_durable_run_excluding_remote_jobs(
+            mission_store.as_ref(),
+            mission.id,
+        )
+        .await
+        {
+            Ok(true) => {
+                tracing::debug!(
+                    mission_id = %mission.id,
+                    "Stuck-mission watchdog: detached durable execution owns liveness"
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                // Fail closed: if execution truth is temporarily
+                // unavailable, do not write a conflicting terminal
+                // presentation status. The next watchdog tick retries.
+                tracing::warn!(
+                    mission_id = %mission.id,
+                    %error,
+                    "Stuck-mission watchdog: could not inspect active run; deferring orphan reconciliation"
+                );
+                continue;
+            }
+        }
+        tracing::warn!(
+            "Stuck-mission watchdog: orphan {} (no live runner); marking interrupted",
+            mission.id
+        );
+        if let Err(e) = mission_store
+            .update_mission_status_with_reason(
+                mission.id,
+                MissionStatus::Interrupted,
+                Some("orphan_no_runner"),
+            )
+            .await
+        {
+            tracing::warn!(
+                "Stuck-mission watchdog: status update failed for {}: {}",
+                mission.id,
+                e
+            );
+            continue;
+        }
+        let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+            completion: None,
+            execution: None,
+            mission_id: mission.id,
+            status: MissionStatus::Interrupted,
+            summary: Some(
+                "Interrupted: mission runner exited without reporting a terminal status"
+                    .to_string(),
+            ),
+        });
+
+        // One supervised auto-resume for orphaned WORKER missions. The
+        // boss used to babysit this by hand (10 manual resume_worker
+        // calls in one campaign); a runner death is environmental, so a
+        // single retry is safe. Once-only per process: a worker that dies
+        // again stays interrupted for the boss to triage.
+        if mission.parent_mission_id.is_some() && auto_resumed_workers.insert(mission.id) {
+            tracing::info!(
+                mission_id = %mission.id,
+                parent = ?mission.parent_mission_id,
+                "Stuck-mission watchdog: auto-resuming orphaned worker once"
+            );
+            let (resume_tx, resume_rx) = oneshot::channel();
+            if cmd_tx
+                .send(ControlCommand::ResumeMission {
+                    content: None,
+                    mission_id: mission.id,
+                    clean_workspace: false,
+                    skip_message: false,
+                    respond: resume_tx,
+                })
+                .await
+                .is_ok()
+            {
+                match resume_rx.await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!(
+                        mission_id = %mission.id,
+                        "Auto-resume failed: {}; leaving interrupted for the boss", e
+                    ),
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+}
+
 pub(crate) async fn stuck_mission_watchdog_loop(
     mission_store: Arc<dyn MissionStore>,
     cmd_tx: mpsc::Sender<ControlCommand>,
     events_tx: broadcast::Sender<AgentEvent>,
     tool_hub: Arc<FrontendToolHub>,
     workspaces: workspace::SharedWorkspaceStore,
+    working_dir: std::path::PathBuf,
 ) {
     use std::collections::HashSet;
 
@@ -718,109 +1096,19 @@ pub(crate) async fn stuck_mission_watchdog_loop(
         }
 
         // Case 2 — Active in DB, not in actor's running list at all.
-        // This is the "mission_runner died, row never finalized" path.
-        for mission in &active_missions {
-            if running_ids.contains(&mission.id) {
-                continue;
-            }
-            if mission.mission_mode == super::mission_store::MissionMode::Assistant {
-                tracing::debug!(
-                    mission_id = %mission.id,
-                    "Stuck-mission watchdog: leaving idle assistant-mode mission active"
-                );
-                continue;
-            }
-            // A remote build deliberately outlives the harness process. The
-            // durable run lease is authoritative here: the remote-build
-            // reconciler owns its heartbeat and terminal transition after the
-            // conversational runner exits. Marking the presentation row
-            // interrupted would make that reconciler flip it back to Active on
-            // every tick, producing a false orphan/reconcile loop.
-            match mission_has_detached_durable_run(mission_store.as_ref(), mission.id).await {
-                Ok(true) => {
-                    tracing::debug!(
-                        mission_id = %mission.id,
-                        "Stuck-mission watchdog: detached durable execution owns liveness"
-                    );
-                    continue;
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    // Fail closed: if execution truth is temporarily
-                    // unavailable, do not write a conflicting terminal
-                    // presentation status. The next watchdog tick retries.
-                    tracing::warn!(
-                        mission_id = %mission.id,
-                        %error,
-                        "Stuck-mission watchdog: could not inspect active run; deferring orphan reconciliation"
-                    );
-                    continue;
-                }
-            }
-            tracing::warn!(
-                "Stuck-mission watchdog: orphan {} (no live runner); marking interrupted",
-                mission.id
-            );
-            if let Err(e) = mission_store
-                .update_mission_status_with_reason(
-                    mission.id,
-                    MissionStatus::Interrupted,
-                    Some("orphan_no_runner"),
-                )
-                .await
-            {
-                tracing::warn!(
-                    "Stuck-mission watchdog: status update failed for {}: {}",
-                    mission.id,
-                    e
-                );
-                continue;
-            }
-            let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                completion: None,
-                execution: None,
-                mission_id: mission.id,
-                status: MissionStatus::Interrupted,
-                summary: Some(
-                    "Interrupted: mission runner exited without reporting a terminal status"
-                        .to_string(),
-                ),
-            });
-
-            // One supervised auto-resume for orphaned WORKER missions. The
-            // boss used to babysit this by hand (10 manual resume_worker
-            // calls in one campaign); a runner death is environmental, so a
-            // single retry is safe. Once-only per process: a worker that dies
-            // again stays interrupted for the boss to triage.
-            if mission.parent_mission_id.is_some() && auto_resumed_workers.insert(mission.id) {
-                tracing::info!(
-                    mission_id = %mission.id,
-                    parent = ?mission.parent_mission_id,
-                    "Stuck-mission watchdog: auto-resuming orphaned worker once"
-                );
-                let (resume_tx, resume_rx) = oneshot::channel();
-                if cmd_tx
-                    .send(ControlCommand::ResumeMission {
-                        content: None,
-                        mission_id: mission.id,
-                        clean_workspace: false,
-                        skip_message: false,
-                        respond: resume_tx,
-                    })
-                    .await
-                    .is_ok()
-                {
-                    match resume_rx.await {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => tracing::warn!(
-                            mission_id = %mission.id,
-                            "Auto-resume failed: {}; leaving interrupted for the boss", e
-                        ),
-                        Err(_) => {}
-                    }
-                }
-            }
-        }
+        // This is the "mission_runner died, row never finalized" path, plus
+        // the remote-job path where no local runner ever existed.
+        repair_orphaned_active_missions(
+            &mission_store,
+            &working_dir,
+            &cmd_tx,
+            &events_tx,
+            &active_missions,
+            &running_ids,
+            &mut auto_resumed_workers,
+            chrono::Utc::now(),
+        )
+        .await;
 
         // Case 3 — a CHILD mission parked in a non-terminal status with no
         // activity for a long time. The boss learns about terminal workers via
@@ -1203,6 +1491,149 @@ mod tests {
             "waiting_remote_job"
         ));
         assert!(!execution_state_proves_durable_liveness("waiting_tool"));
+    }
+
+    fn mission_handle(
+        mission_id: Uuid,
+        kind: crate::remote_node::job_ledger::JobHandleKind,
+        accepted: Option<chrono::DateTime<chrono::Utc>>,
+        heartbeat: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> crate::remote_node::job_ledger::JobHandle {
+        crate::remote_node::job_ledger::JobHandle {
+            mission_id,
+            node_id: "dgx-spark".to_string(),
+            job_id: Uuid::new_v4(),
+            started_at: accepted.unwrap_or_else(chrono::Utc::now),
+            submission_sequence: 0,
+            accepted_at: accepted,
+            heartbeat_at: heartbeat,
+            disk_reservation_bytes: 0,
+            kind,
+            identity: None,
+            wait_for_completion: None,
+            wake_on_terminal: false,
+        }
+    }
+
+    fn remote_job_run(
+        mission_id: Uuid,
+        owner_actor_id: &str,
+        heartbeat: chrono::DateTime<chrono::Utc>,
+        state: MissionExecutionState,
+    ) -> MissionRun {
+        MissionRun {
+            run_id: Uuid::new_v4(),
+            mission_id,
+            generation: 1,
+            execution_state: state,
+            owner_actor_id: owner_actor_id.to_string(),
+            scope_unit: Some("remote-node:dgx-spark".to_string()),
+            started_at: heartbeat.to_rfc3339(),
+            heartbeat_at: heartbeat.to_rfc3339(),
+            stopping_at: None,
+            ended_at: None,
+            terminal_reason: None,
+        }
+    }
+
+    #[test]
+    fn accepted_remote_mission_job_is_live_until_unobserved() {
+        use crate::remote_node::job_ledger::JobHandleKind;
+        let now = chrono::Utc::now();
+        let mission_id = Uuid::new_v4();
+        let fresh = now - chrono::Duration::seconds(7);
+        let stale = now - chrono::Duration::seconds(REMOTE_JOB_UNOBSERVED_SECS + 1);
+
+        // The incident shape: accepted seven seconds ago, never observed
+        // since, no lease — still live.
+        let handle = mission_handle(mission_id, JobHandleKind::Mission, Some(fresh), Some(fresh));
+        assert!(matches!(
+            remote_mission_job_liveness(std::slice::from_ref(&handle), None, mission_id, now),
+            RemoteJobLiveness::Live(_)
+        ));
+        // Other missions' handles are ignored.
+        assert!(matches!(
+            remote_mission_job_liveness(std::slice::from_ref(&handle), None, Uuid::new_v4(), now),
+            RemoteJobLiveness::None
+        ));
+        // Tentative and remote-build handles are not mission liveness.
+        for kind in [JobHandleKind::Tentative, JobHandleKind::RemoteBuild] {
+            let other = mission_handle(mission_id, kind, Some(fresh), Some(fresh));
+            assert!(matches!(
+                remote_mission_job_liveness(std::slice::from_ref(&other), None, mission_id, now),
+                RemoteJobLiveness::None
+            ));
+        }
+        // Acceptance is required.
+        let unaccepted = mission_handle(mission_id, JobHandleKind::Mission, None, Some(fresh));
+        assert!(matches!(
+            remote_mission_job_liveness(std::slice::from_ref(&unaccepted), None, mission_id, now),
+            RemoteJobLiveness::None
+        ));
+        // Stale on both proofs → unobserved, with the age reported.
+        let old = mission_handle(mission_id, JobHandleKind::Mission, Some(stale), Some(stale));
+        match remote_mission_job_liveness(std::slice::from_ref(&old), None, mission_id, now) {
+            RemoteJobLiveness::Unobserved { age_secs, .. } => {
+                assert!(age_secs > REMOTE_JOB_UNOBSERVED_SECS)
+            }
+            other => panic!("expected unobserved, got {other:?}"),
+        }
+        // A fresh lease owned by the same job rescues a stale ledger write…
+        let lease = remote_job_run(
+            mission_id,
+            &remote_job_lease_owner(old.job_id),
+            fresh,
+            MissionExecutionState::WaitingRemoteJob,
+        );
+        assert!(matches!(
+            remote_mission_job_liveness(std::slice::from_ref(&old), Some(&lease), mission_id, now),
+            RemoteJobLiveness::Live(_)
+        ));
+        // …but a lease owned by another job, or a settled lease, does not.
+        let foreign = remote_job_run(
+            mission_id,
+            &remote_job_lease_owner(Uuid::new_v4()),
+            fresh,
+            MissionExecutionState::WaitingRemoteJob,
+        );
+        assert!(matches!(
+            remote_mission_job_liveness(
+                std::slice::from_ref(&old),
+                Some(&foreign),
+                mission_id,
+                now
+            ),
+            RemoteJobLiveness::Unobserved { .. }
+        ));
+        let settled = remote_job_run(
+            mission_id,
+            &remote_job_lease_owner(old.job_id),
+            fresh,
+            MissionExecutionState::Terminal,
+        );
+        assert!(matches!(
+            remote_mission_job_liveness(
+                std::slice::from_ref(&old),
+                Some(&settled),
+                mission_id,
+                now
+            ),
+            RemoteJobLiveness::Unobserved { .. }
+        ));
+        // The freshest accepted handle for the mission decides.
+        let both = vec![old.clone(), handle.clone()];
+        assert!(matches!(
+            remote_mission_job_liveness(&both, None, mission_id, now),
+            RemoteJobLiveness::Live(live) if live.job_id == handle.job_id
+        ));
+    }
+
+    #[test]
+    fn remote_job_lease_owner_is_recognised() {
+        let job_id = Uuid::new_v4();
+        assert!(is_remote_mission_job_owner(&remote_job_lease_owner(job_id)));
+        assert!(!is_remote_mission_job_owner("remote-build:abc"));
+        assert!(!is_remote_mission_job_owner("control:test"));
     }
 
     #[test]

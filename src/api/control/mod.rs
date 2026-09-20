@@ -6060,17 +6060,29 @@ pub async fn list_missions(
         .collect();
     let wait_starts =
         user_wait_starts_for_runs(control.mission_store.as_ref(), active_runs.values()).await;
+    let (remote_handles, remote_outcomes) = remote_job_projection_inputs(&state).await;
+    let now = chrono::Utc::now();
     let values = missions
         .into_iter()
         .map(|mission| {
             let value = serde_json::to_value(&mission).unwrap_or(serde_json::Value::Null);
-            attach_execution_to_mission_value(
+            let value = attach_execution_to_mission_value(
                 value,
                 &mission,
                 active_runs.get(&mission.id),
                 wait_starts
                     .get(&mission.id)
                     .and_then(|started| started.as_deref()),
+            );
+            attach_remote_job_to_mission_value(
+                value,
+                remote_job_projection(
+                    &remote_handles,
+                    &remote_outcomes,
+                    active_runs.get(&mission.id),
+                    mission.id,
+                    now,
+                ),
             )
         })
         .collect();
@@ -7061,6 +7073,28 @@ pub async fn get_mission(
                 &mission,
                 active_run.as_ref(),
                 wait_started_at.as_deref(),
+            );
+            // Remote placement must be visible on the read model: the row's
+            // workspace/backend describe a local harness that a raw remote
+            // mission never runs.
+            let placement_run = match active_run.clone() {
+                Some(run) => Some(run),
+                None => control
+                    .mission_store
+                    .get_latest_mission_run(mission.id)
+                    .await
+                    .map_err(internal_error)?,
+            };
+            let (handles, outcomes) = remote_job_projection_inputs(&state).await;
+            value = attach_remote_job_to_mission_value(
+                value,
+                remote_job_projection(
+                    &handles,
+                    &outcomes,
+                    placement_run.as_ref(),
+                    mission.id,
+                    chrono::Utc::now(),
+                ),
             );
             let host_configured =
                 state.config.spark_arbiter_url.is_some() || state.config.spark_ssh_target.is_some();
@@ -10917,6 +10951,9 @@ pub async fn create_mission(
     // deferred goal as soon as parallel capacity allows, honoring `not_before`
     // when set. Unlike the old create-then-message pattern, this cannot be
     // dropped at capacity.
+    // The initial prompt, keyed by the id of its queued broadcast so a later
+    // non-queued event for the same message replaces it in live clients.
+    let mut initial_prompt: Option<(Uuid, String)> = None;
     if let Some(prompt) = nonblank(&req.prompt) {
         // Canonicalise `/goal\n…` to the space form before storing: the
         // deferred goal is later re-injected verbatim, and the backend goal
@@ -10942,13 +10979,15 @@ pub async fn create_mission(
             mission.goal_objective = Some(objective);
         }
         // Surface the queued goal so UIs show it as pending until dispatch.
+        let prompt_event_id = Uuid::new_v4();
         let _ = control.events_tx.send(AgentEvent::UserMessage {
-            id: Uuid::new_v4(),
-            content: prompt,
+            id: prompt_event_id,
+            content: prompt.clone(),
             queued: true,
             mission_id: Some(mission.id),
             source: Some(format!("api:{}", user.id)),
         });
+        initial_prompt = Some((prompt_event_id, prompt));
     }
 
     if let (Some(remote_node_id), Some(remote_command)) =
@@ -10959,8 +10998,27 @@ pub async fn create_mission(
         // wait expires, so routing `remote_async=false` through it could orphan
         // a process on the node. The response contract here is unchanged: the
         // mission is returned Active while its durable poller owns completion.
-        let dispatch =
-            dispatch_remote_job(&state, &control, &mission, remote_node_id, remote_command).await;
+        //
+        // A raw remote mission never starts a local harness, so nothing else
+        // would ever persist its prompt: the queued broadcast above is
+        // deliberately dropped by the store until a runner starts the turn.
+        // Persist it here, before dispatch and before the response, so the
+        // mission's history and event replay carry the user's mandate even
+        // when dispatch fails.
+        let dispatch = match persist_remote_mission_prompt(
+            &control,
+            mission.id,
+            &user.id,
+            initial_prompt.take(),
+        )
+        .await
+        {
+            Ok(()) => {
+                dispatch_remote_job(&state, &control, &mission, remote_node_id, remote_command)
+                    .await
+            }
+            Err(message) => Err(message),
+        };
         match dispatch {
             Ok(updated) => return Ok((headers, Json(updated))),
             Err(message) => {
@@ -11064,6 +11122,7 @@ async fn dispatch_remote_mission_mvp(
     finalize_remote_mission(
         &owner,
         mission.id,
+        None,
         &node.id,
         success,
         content,
@@ -11118,6 +11177,260 @@ impl RemoteMissionOwner {
             let _ = events_tx.send(event);
         }
     }
+}
+
+/// Owner id of the run lease held by a raw remote mission job's poll loop.
+pub(crate) fn remote_job_lease_owner(job_id: Uuid) -> String {
+    format!("remote-job:{job_id}")
+}
+
+/// Whether a run lease belongs to a raw remote mission job observer.
+pub(crate) fn is_remote_mission_job_owner(owner_actor_id: &str) -> bool {
+    owner_actor_id.starts_with("remote-job:")
+}
+
+/// Scope label recorded on a remote job lease so placement survives in the
+/// durable run row after the ledger handle is retired.
+fn remote_job_lease_scope(node_id: &str) -> String {
+    format!("remote-node:{node_id}")
+}
+
+/// Persist the initial prompt of a raw remote mission as a real (non-queued)
+/// user message. Returns an error message shaped for the dispatch-failure
+/// path: a remote mission whose prompt cannot be persisted must not be
+/// dispatched, because nothing later would ever record what the user asked.
+async fn persist_remote_mission_prompt(
+    control: &ControlState,
+    mission_id: Uuid,
+    user_id: &str,
+    prompt: Option<(Uuid, String)>,
+) -> Result<(), String> {
+    let Some((id, content)) = prompt else {
+        return Ok(());
+    };
+    let event = AgentEvent::UserMessage {
+        id,
+        content,
+        queued: false,
+        mission_id: Some(mission_id),
+        source: Some(format!("api:{user_id}")),
+    };
+    control
+        .mission_store
+        .log_event(mission_id, &event)
+        .await
+        .map_err(|error| format!("remote mission prompt could not be persisted: {error}"))?;
+    let _ = control.events_tx.send(event);
+    Ok(())
+}
+
+/// Make an accepted raw remote mission job authoritative execution evidence.
+///
+/// Raw remote missions never start a local harness, so without this lease the
+/// mission is an Active row with no runner and no run — exactly what the
+/// stuck-mission watchdog repairs as an orphan (incident ab1792b4,
+/// 2026-09-20: the watchdog interrupted a freshly dispatched dgx-spark
+/// mission seven seconds after acceptance and the poll loop then cancelled
+/// the node job as if an operator had asked for it). The poll loop refreshes
+/// this lease on every successful observation and finishes it with the
+/// job's terminal reason.
+///
+/// Returns the lease when this job owns it. A lease owned by anyone else is
+/// left untouched; a mission that already left Active/Pending gets none.
+async fn ensure_remote_job_lease(
+    mission_store: &dyn MissionStore,
+    mission_id: Uuid,
+    job_id: Uuid,
+    node_id: &str,
+) -> Result<Option<MissionRun>, String> {
+    let owner_actor_id = remote_job_lease_owner(job_id);
+    if let Some(run) = mission_store.get_active_mission_run(mission_id).await? {
+        if run.owner_actor_id != owner_actor_id {
+            return Ok(None);
+        }
+        mission_store
+            .heartbeat_mission_run(
+                run.run_id,
+                run.generation,
+                MissionExecutionState::WaitingRemoteJob,
+                None,
+            )
+            .await?;
+        return mission_store.get_active_mission_run(mission_id).await;
+    }
+    let Some(mission) = mission_store.get_mission(mission_id).await? else {
+        return Ok(None);
+    };
+    if !matches!(
+        mission.status,
+        MissionStatus::Active | MissionStatus::Pending
+    ) {
+        return Ok(None);
+    }
+    let run = mission_store
+        .begin_mission_run(
+            mission_id,
+            &owner_actor_id,
+            Some(&remote_job_lease_scope(node_id)),
+        )
+        .await?;
+    mission_store
+        .heartbeat_mission_run(
+            run.run_id,
+            run.generation,
+            MissionExecutionState::WaitingRemoteJob,
+            None,
+        )
+        .await?;
+    mission_store.get_active_mission_run(mission_id).await
+}
+
+/// Finish the run lease held by `job_id`'s observer. Returns the settled run
+/// (for the terminal status event) when this job owned the lease.
+pub(crate) async fn finish_remote_job_lease(
+    mission_store: &dyn MissionStore,
+    mission_id: Uuid,
+    job_id: Uuid,
+    terminal_reason: &str,
+) -> Result<Option<MissionRun>, String> {
+    let Some(run) = mission_store.get_active_mission_run(mission_id).await? else {
+        return Ok(None);
+    };
+    if run.owner_actor_id != remote_job_lease_owner(job_id) {
+        return Ok(None);
+    }
+    mission_store
+        .finish_mission_run(run.run_id, run.generation, Some(terminal_reason))
+        .await?;
+    Ok(mission_store
+        .get_latest_mission_run(mission_id)
+        .await?
+        .filter(|latest| latest.run_id == run.run_id))
+}
+
+/// Placement metadata of a raw remote mission job for mission read models.
+///
+/// While the job is in flight the durable ledger handle is the source; after
+/// it is retired the run lease (owner `remote-job:<id>`, scope
+/// `remote-node:<id>`) still names the placement. The fleet monitor's bounded
+/// in-memory outcome adds the last node-reported state when it is known.
+/// `None` means the mission never dispatched a raw remote job.
+fn remote_job_projection(
+    handles: &[crate::remote_node::job_ledger::JobHandle],
+    outcomes: &[crate::remote_node::DispatchOutcome],
+    run: Option<&MissionRun>,
+    mission_id: Uuid,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<serde_json::Value> {
+    use crate::remote_node::job_ledger::JobHandleKind;
+    let handle = handles
+        .iter()
+        .filter(|handle| {
+            // Remote-build submissions also write tentative handles; those
+            // carry a validation identity and belong to a harness tool call,
+            // not to a raw remote mission.
+            handle.mission_id == mission_id
+                && (handle.kind == JobHandleKind::Mission
+                    || (handle.kind == JobHandleKind::Tentative && handle.identity.is_none()))
+        })
+        .max_by_key(|handle| (handle.submission_sequence, handle.started_at));
+    let lease = run.filter(|run| is_remote_mission_job_owner(&run.owner_actor_id));
+    let (job_id, node_id) = match (handle, lease) {
+        (Some(handle), _) => (handle.job_id, handle.node_id.clone()),
+        (None, Some(run)) => {
+            let job_id = run
+                .owner_actor_id
+                .strip_prefix("remote-job:")
+                .and_then(|id| Uuid::parse_str(id).ok())?;
+            let node_id = run
+                .scope_unit
+                .as_deref()
+                .and_then(|scope| scope.strip_prefix("remote-node:"))
+                .unwrap_or("unknown")
+                .to_string();
+            (job_id, node_id)
+        }
+        (None, None) => return None,
+    };
+    let outcome = outcomes
+        .iter()
+        .find(|outcome| outcome.job_id == Some(job_id));
+    let last_proof = handle.and_then(|handle| match (handle.heartbeat_at, handle.accepted_at) {
+        (Some(heartbeat), Some(accepted)) => Some(heartbeat.max(accepted)),
+        (Some(heartbeat), None) => Some(heartbeat),
+        (None, accepted) => accepted,
+    });
+    let observed_age_secs =
+        last_proof.map(|proof| now.signed_duration_since(proof).num_seconds().max(0));
+    let phase = match handle {
+        Some(handle) if handle.kind == JobHandleKind::Tentative => "submit_ambiguous",
+        Some(handle) if handle.accepted_at.is_none() => "submit_ambiguous",
+        Some(_) => {
+            if observed_age_secs
+                .is_some_and(|age| age <= super::supervision::REMOTE_JOB_UNOBSERVED_SECS)
+            {
+                "observed"
+            } else {
+                "unobserved"
+            }
+        }
+        None => match lease {
+            Some(run) if run.execution_state.is_terminal() => "finished",
+            _ => "lease_only",
+        },
+    };
+    Some(serde_json::json!({
+        "job_id": job_id,
+        "node_id": node_id,
+        "phase": phase,
+        "node_state": outcome.map(|outcome| outcome.state.clone()),
+        "exit_code": outcome.and_then(|outcome| outcome.exit_code),
+        "error": outcome.and_then(|outcome| outcome.error.clone()),
+        "accepted_at": handle.and_then(|handle| handle.accepted_at),
+        "heartbeat_at": handle.and_then(|handle| handle.heartbeat_at),
+        "observed_age_secs": observed_age_secs,
+        "started_at": handle
+            .map(|handle| handle.started_at)
+            .or_else(|| outcome.map(|outcome| outcome.started_at)),
+        "finished_at": outcome.and_then(|outcome| outcome.finished_at),
+        "lease_state": lease.map(|run| run.execution_state),
+        "terminal_reason": lease.and_then(|run| run.terminal_reason.clone()),
+    }))
+}
+
+/// Ledger handles and recent fleet outcomes for [`remote_job_projection`].
+/// An unreadable ledger degrades to "no in-flight handle" for read models;
+/// liveness decisions never go through this path.
+async fn remote_job_projection_inputs(
+    state: &AppState,
+) -> (
+    Vec<crate::remote_node::job_ledger::JobHandle>,
+    Vec<crate::remote_node::DispatchOutcome>,
+) {
+    let handles = match crate::remote_node::job_ledger::load(&state.config.working_dir).await {
+        Ok(handles) => handles,
+        Err(error) => {
+            tracing::debug!(
+                ?error,
+                "remote job ledger unreadable for mission read model"
+            );
+            Vec::new()
+        }
+    };
+    (handles, state.fleet.recent_outcomes(256))
+}
+
+fn attach_remote_job_to_mission_value(
+    mut value: serde_json::Value,
+    remote_job: Option<serde_json::Value>,
+) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "remote_job".to_string(),
+            remote_job.unwrap_or(serde_json::Value::Null),
+        );
+    }
+    value
 }
 
 async fn remote_build_wait_owner(
@@ -11637,6 +11950,7 @@ pub(crate) async fn deliver_pending_remote_build_wakes(state: &AppState) {
 async fn finalize_remote_mission(
     owner: &RemoteMissionOwner,
     mission_id: Uuid,
+    job_id: Option<Uuid>,
     node_id: &str,
     success: bool,
     content: String,
@@ -11667,9 +11981,30 @@ async fn finalize_remote_mission(
         .mission_store
         .update_mission_status_with_reason(mission_id, status, Some(status_reason))
         .await?;
+    // Settle the observer's run lease with the same reason so execution
+    // truth and presentation status agree; the terminal event carries it.
+    let execution = match job_id {
+        Some(job_id) => finish_remote_job_lease(
+            owner.mission_store.as_ref(),
+            mission_id,
+            job_id,
+            status_reason,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                %mission_id,
+                %job_id,
+                %error,
+                "remote job run lease could not be finished after mission finalization"
+            );
+            None
+        }),
+        None => None,
+    };
     owner.send(AgentEvent::MissionStatusChanged {
         completion: None,
-        execution: None,
+        execution,
         mission_id,
         status,
         summary: Some(format!("Remote node '{node_id}' finished")),
@@ -11817,6 +12152,32 @@ async fn dispatch_remote_job(
         ));
     }
 
+    // Durable execution truth BEFORE the presentation status flips to Active.
+    // A raw remote mission has no local runner, so this lease (refreshed by
+    // the poll loop) and the ledger handle above are what the stuck-mission
+    // watchdog and startup recovery consult instead of the runner list. The
+    // ledger handle alone already fences liveness, so a lease failure is
+    // logged rather than treated as a dispatch failure.
+    let lease = match ensure_remote_job_lease(
+        control.mission_store.as_ref(),
+        mission.id,
+        job_id,
+        &node.id,
+    )
+    .await
+    {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(
+                mission_id = %mission.id,
+                job_id = %job_id,
+                %error,
+                "remote job run lease could not be acquired; the ledger handle remains the liveness proof"
+            );
+            None
+        }
+    };
+
     if let Err(err) = control
         .mission_store
         .update_mission_status(mission.id, MissionStatus::Active)
@@ -11856,12 +12217,12 @@ async fn dispatch_remote_job(
     }
     let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
         completion: None,
-        execution: None,
+        execution: lease,
         mission_id: mission.id,
         status: MissionStatus::Active,
         summary: Some(format!(
-            "Dispatched job {} to remote node '{}'",
-            job_id, node.id
+            "Dispatched job {} to remote node '{}' (node state: {})",
+            job_id, node.id, accepted.state
         )),
     });
 
@@ -12372,6 +12733,9 @@ async fn poll_remote_job(
     // Once received, terminal proof survives a subsequent observation outage
     // while mission/ledger persistence is retried.
     let mut terminal_observation: Option<crate::remote_node::NodeJobStatus> = None;
+    // The preserved-status terminal note is durable once; retries of the
+    // ledger cleanup must not duplicate it.
+    let mut preserved_terminal_noted = false;
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
 
@@ -12432,6 +12796,7 @@ async fn poll_remote_job(
                     let _ = finalize_remote_mission(
                         &owner,
                         mission_id,
+                        Some(job_id),
                         &node.id,
                         false,
                         content,
@@ -12475,6 +12840,7 @@ async fn poll_remote_job(
                         if let Err(error) = finalize_remote_mission(
                             &owner,
                             mission_id,
+                            Some(job_id),
                             &node.id,
                             success,
                             content,
@@ -12494,6 +12860,62 @@ async fn poll_remote_job(
                             state = %status.state,
                             "remote job reached a terminal state after operator interruption; preserving mission status"
                         );
+                        // The status is preserved, but the outcome must still
+                        // be visible in the mission's durable history; the
+                        // incident mission had no record at all of what
+                        // happened to its node job. Log once, then settle
+                        // the observer's lease with the node's verdict.
+                        if !preserved_terminal_noted {
+                            let note = AgentEvent::AssistantMessage {
+                                id: Uuid::new_v4(),
+                                content: format!(
+                                    "Remote node '{}' job {} reached state '{}' (exit {:?}) after the mission left Active ({}); the mission status is preserved.{}\n\nlog tail:\n{}",
+                                    node.id,
+                                    job_id,
+                                    status.state,
+                                    status.exit_code,
+                                    inactive_status
+                                        .map(|status| status.to_string())
+                                        .unwrap_or_else(|| "unknown".to_string()),
+                                    status
+                                        .error
+                                        .as_deref()
+                                        .map(|e| format!("\nerror: {e}"))
+                                        .unwrap_or_default(),
+                                    status.log_tail.as_deref().unwrap_or("(empty)"),
+                                ),
+                                success: true,
+                                cost_cents: 0,
+                                cost_source: crate::agents::CostSource::Unknown,
+                                usage: None,
+                                model: None,
+                                model_normalized: None,
+                                mission_id: Some(mission_id),
+                                shared_files: None,
+                                resumable: false,
+                                completion_evidence: None,
+                            };
+                            if let Err(error) =
+                                owner.mission_store.log_event(mission_id, &note).await
+                            {
+                                tracing::warn!(%mission_id, %job_id, %error,
+                                    "remote terminal note persistence failed; retaining ownership and retrying");
+                                continue;
+                            }
+                            owner.send(note);
+                            preserved_terminal_noted = true;
+                        }
+                        if let Err(error) = finish_remote_job_lease(
+                            owner.mission_store.as_ref(),
+                            mission_id,
+                            job_id,
+                            &format!("remote_job_{}", status.state),
+                        )
+                        .await
+                        {
+                            tracing::warn!(%mission_id, %job_id, %error,
+                                "remote job run lease could not be finished after preserved interruption");
+                        }
                     }
                     if let Err(error) = crate::remote_node::job_ledger::finalize_with_artifacts(
                         ledger_dir,
@@ -12517,6 +12939,30 @@ async fn poll_remote_job(
                         true,
                     ));
                     return;
+                }
+                // A successful non-terminal observation is the liveness proof
+                // the watchdog and startup recovery consult: refresh both the
+                // durable ledger handle and the mission's run lease. Either
+                // one being fresh is enough, so a single failed write cannot
+                // orphan a live job.
+                if let Err(error) =
+                    crate::remote_node::job_ledger::heartbeat(ledger_dir, job_id).await
+                {
+                    tracing::warn!(%mission_id, %job_id, %error,
+                        "remote job ledger heartbeat failed; run lease heartbeat still proves liveness");
+                }
+                if inactive_status.is_none() {
+                    if let Err(error) = ensure_remote_job_lease(
+                        owner.mission_store.as_ref(),
+                        mission_id,
+                        job_id,
+                        &node.id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%mission_id, %job_id, %error,
+                            "remote job run lease heartbeat failed; ledger heartbeat still proves liveness");
+                    }
                 }
                 if status.state != last_state {
                     // Sparse progress note: only on job state changes.
@@ -16755,6 +17201,7 @@ fn spawn_control_session(
             events_tx.clone(),
             Arc::clone(&tool_hub),
             workspaces.clone(),
+            config.working_dir.clone(),
         ));
         tokio::spawn(ack_promotion_loop(
             Arc::clone(&state.mission_store),
@@ -34347,6 +34794,7 @@ Investigate <service/> failures.
         finalize_remote_mission(
             &owner,
             mission.id,
+            None,
             "node-a",
             true,
             "remote result".to_string(),

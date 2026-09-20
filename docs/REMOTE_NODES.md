@@ -282,6 +282,51 @@ loop cancels the node job on its next tick. There is no dedicated
 mission-cancel -> job-cancel plumbing yet; wiring an explicit cancel hook is a
 follow-up.
 
+### Raw remote mission lifecycle (durable ownership)
+
+A raw remote mission never starts a local harness, so its liveness cannot be
+read from the runner list. The create request therefore establishes durable
+ownership before it responds, and every supervisor consults that ownership
+instead of treating the mission as an orphan (incident ab1792b4, 2026-09-20:
+the stuck-mission watchdog interrupted a freshly accepted dgx-spark mission
+seven seconds after dispatch with `orphan_no_runner`, the poll loop read that
+as an operator cancellation and cancelled the node job, and the mission kept
+no prompt, no run and no record of the outcome).
+
+- **Prompt.** `prompt` is persisted as a real `user_message` event before the
+  job is submitted and before the response. It appears in `history`,
+  `get_initial_user_message` and event replay even when dispatch fails.
+- **Run lease.** After node acceptance and the ledger handle, core acquires a
+  mission run lease owned by `remote-job:<job_id>` with scope
+  `remote-node:<node_id>` in state `waiting_remote_job`, then marks the
+  mission Active. The poll loop refreshes the ledger heartbeat and the lease on
+  every successful observation and finishes the lease with the terminal
+  reason. `GET /api/control/missions/:id` exposes it as `execution`.
+- **Placement read model.** Mission reads carry a `remote_job` block:
+  `job_id`, `node_id`, `phase` (`observed`, `unobserved`, `submit_ambiguous`,
+  `finished`, `lease_only`), the last node-reported `node_state`/`exit_code`
+  when known, `accepted_at`/`heartbeat_at`/`observed_age_secs` from the ledger
+  and `terminal_reason` from the settled lease. `null` means the mission never
+  dispatched a raw remote job. The row's `workspace`/`backend` still describe
+  the local harness a resume would run, not the remote placement.
+- **Watchdog.** An Active mission with no runner is left alone while its
+  accepted `mission` ledger handle (or a lease owned by the same job) was
+  observed within `REMOTE_JOB_UNOBSERVED_SECS` (300 s). Past that window the
+  mission is interrupted with reason `remote_job_unobserved` and the handle is
+  retained as a cancellation fence; a mission with no accepted handle keeps
+  the ordinary `orphan_no_runner` repair. An unreadable ledger defers the
+  decision. Remote *build* leases (`remote-build:*`) keep their existing
+  protection; a `remote-job:*` lease without a ledger handle is not liveness.
+- **Restart.** Startup recovery skips missions that hold an accepted
+  `mission` handle instead of marking them `server_shutdown`; the remote job
+  reconciler re-attaches the poll loop, which rebuilds the lease. If the
+  reconciler cannot re-attach (node config or token missing) the watchdog's
+  unobserved rule eventually surfaces it instead of leaving it Active forever.
+- **Interrupted before terminal.** When the job reaches a terminal state after
+  the mission already left Active, the status is preserved but a durable
+  assistant note records the node verdict and log tail, and the lease is
+  finished with `remote_job_<state>`.
+
 ## Lean Build Jobs
 
 `lean_build` is a declarative job payload: no workspace sync, no shell. The
