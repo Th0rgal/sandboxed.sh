@@ -73,6 +73,9 @@ export function LiveProjectsSection(p: {
   const [cronName, setCronName] = createSignal("");
   const [cronPrompt, setCronPrompt] = createSignal("");
   const [cronSchedule, setCronSchedule] = createSignal("every 1h");
+  const [cronDeliver, setCronDeliver] = createSignal("local");
+  const [cronModel, setCronModel] = createSignal("");
+  const [cronProvider, setCronProvider] = createSignal("");
   const [cronError, setCronError] = createSignal<string | null>(null);
   const [makingCron, setMakingCron] = createSignal(false);
   const loadController = (slug: string) => {
@@ -168,7 +171,7 @@ export function LiveProjectsSection(p: {
     { kind: "item", label: "New agent", icon: Ic.NewAgentIcon, onClick: () => p.onNewAgent(slug) },
     { kind: "item", label: "New cron", icon: Ic.BellIcon, onClick: () => {
       setActionMenu(null);
-      setCronName(""); setCronPrompt(""); setCronSchedule("every 1h"); setCronError(null); setNewCron(slug);
+      setCronName(""); setCronPrompt(""); setCronSchedule("every 1h"); setCronDeliver("local"); setCronModel(""); setCronProvider(""); setCronError(null); setNewCron(slug);
     } },
   ];
   const createCron = async () => {
@@ -180,7 +183,7 @@ export function LiveProjectsSection(p: {
     }
     setMakingCron(true); setCronError(null);
     try {
-      await createProjectCron(slug, { name: cronName().trim(), prompt: cronPrompt().trim(), schedule: cronSchedule().trim() });
+      await createProjectCron(slug, { name: cronName().trim(), prompt: cronPrompt().trim(), schedule: cronSchedule().trim(), deliver: cronDeliver().trim() || undefined, model: cronModel().trim() || undefined, provider: cronProvider().trim() || undefined });
       loadController(slug);
       loadCrons(slug);
       setNewCron(null);
@@ -402,6 +405,9 @@ export function LiveProjectsSection(p: {
           <Field label={`Project: ${slug()}`}><input autofocus class="s-input" value={cronName()} placeholder="Cron name" onInput={(e) => setCronName(e.currentTarget.value)} /></Field>
           <Field label="Runs"><SchedulePicker value={cronSchedule()} onChange={setCronSchedule} /></Field>
           <Field label="Instruction"><textarea class="cs-prompt" value={cronPrompt()} placeholder="What should Hermes do on each run?" onInput={(e) => setCronPrompt(e.currentTarget.value)} /></Field>
+          <Field label="Delivery"><input class="s-input" value={cronDeliver()} placeholder="local" onInput={(e) => setCronDeliver(e.currentTarget.value)} /></Field>
+          <Field label="Model override"><input class="s-input" value={cronModel()} placeholder="Hermes default" onInput={(e) => setCronModel(e.currentTarget.value)} /></Field>
+          <Field label="Provider override"><input class="s-input" value={cronProvider()} placeholder="Hermes default" onInput={(e) => setCronProvider(e.currentTarget.value)} /></Field>
           <Show when={cronError()}><p class="st-error">{cronError()}</p></Show>
         </Dialog>}
       </Show>

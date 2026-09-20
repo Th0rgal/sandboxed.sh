@@ -425,7 +425,7 @@ export async function listProjectCrons(slug: string): Promise<ControllerJob[]> {
   return data.jobs ?? [];
 }
 
-export type ProjectCronDraft = Pick<ControllerPatch, "name" | "schedule" | "prompt" | "skills" | "deliver"> & { repeat?: number };
+export type ProjectCronDraft = Pick<ControllerPatch, "name" | "schedule" | "prompt" | "skills" | "deliver" | "model" | "provider"> & { repeat?: number };
 
 export async function createProjectCron(slug: string, draft: ProjectCronDraft): Promise<ControllerJob> {
   const data = await api<{ job: ControllerJob }>(`/api/projects/${encodeURIComponent(slug)}/crons`, {

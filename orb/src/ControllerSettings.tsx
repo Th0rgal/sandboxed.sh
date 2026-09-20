@@ -208,6 +208,18 @@ export function ControllerSettingsPanel(p: { slug: string; view: ControllerView;
         </div>
       </Section>
 
+      <Section title="Advanced" hint="Optional Hermes execution and delivery overrides.">
+        <Row title="Deliver to">
+          <input class="s-input cs-input" placeholder="local" value={draft.deliver} onInput={(e) => setDraft("deliver", e.currentTarget.value)} />
+        </Row>
+        <Row title="Model">
+          <input class="s-input cs-input" placeholder="Hermes default" value={draft.model} onInput={(e) => setDraft("model", e.currentTarget.value)} />
+        </Row>
+        <Row title="Provider">
+          <input class="s-input cs-input" placeholder="Hermes default" value={draft.provider} onInput={(e) => setDraft("provider", e.currentTarget.value)} />
+        </Row>
+      </Section>
+
       <Show when={dirtyCount() > 0 || error()}>
         <div class="cs-savebar">
           <span class={error() ? "cs-warn" : ""}>
