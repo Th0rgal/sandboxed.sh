@@ -6406,7 +6406,7 @@ async fn native_grok_remote_goal_streams_resumes_and_never_creates_host_loop() {
     let mut events = h.control.events_tx.subscribe();
     let objective = "/goal Validate the GB10 implementation and reproducible benchmarks";
     let response = h.state.http_client.post(format!("{}/missions", h.url)).json(&json!({
-        "backend":"grok", "model_override":"grok-4.6", "remote_node_id":"native-grok", "prompt":objective
+        "project":"lido", "writer":false, "backend":"grok", "model_override":"grok-4.6", "remote_node_id":"native-grok", "prompt":objective
     })).send().await.unwrap();
     assert_eq!(
         response.status(),
@@ -6417,6 +6417,11 @@ async fn native_grok_remote_goal_streams_resumes_and_never_creates_host_loop() {
     let created: Value = response.json().await.unwrap();
     let id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
     let store = h.control.mission_store.clone();
+    let auto_track = crate::api::track_leases::generated_track_key(&id.to_string());
+    let mission = store.get_mission(id).await.unwrap().unwrap();
+    assert_eq!(mission.project.track.as_deref(), Some(auto_track.as_str()));
+    assert_eq!(mission.project.tags, vec!["pr-readonly"]);
+    assert!(mission.project.github_pr.is_none());
     let payload = fixture.submissions.lock().unwrap()[0]["payload"].clone();
     assert_eq!(payload["managed_auth"], json!(["grok"]));
     assert_eq!(payload["env"], json!({"NO_COLOR":"1"}));
@@ -6588,6 +6593,73 @@ async fn native_grok_remote_goal_streams_resumes_and_never_creates_host_loop() {
     })
     .await;
 
+    // Full create supplied no track: exercise fail-closed admission with the
+    // real generated identity before accepting its ordinary composer follow-up.
+    for patch in [
+        crate::api::mission_store::MissionProjectPatch {
+            tags: Some(vec![]),
+            ..Default::default()
+        },
+        crate::api::mission_store::MissionProjectPatch {
+            github_pr: Some(Some("owner/repo#42".into())),
+            ..Default::default()
+        },
+        crate::api::mission_store::MissionProjectPatch {
+            tags: Some(vec!["pr-readonly".into(), "pr-writer".into()]),
+            ..Default::default()
+        },
+        crate::api::mission_store::MissionProjectPatch {
+            track: Some(Some("explicit-track".into())),
+            ..Default::default()
+        },
+    ] {
+        store.update_mission_project(id, patch).await.unwrap();
+        let rejected = h.request(false, id, json!({"content":"continue"})).await;
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        assert!(rejected
+            .text()
+            .await
+            .unwrap()
+            .contains(remote_grok::REMOTE_RESUME_REQUIRES_REPLACEMENT));
+        store
+            .update_mission_project(
+                id,
+                crate::api::mission_store::MissionProjectPatch {
+                    github_pr: Some(None),
+                    track: Some(Some(auto_track.clone())),
+                    tags: Some(vec!["pr-readonly".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let conflicting = h
+        .state
+        .projects
+        .acquire_track_lease(&crate::api::track_leases::lease_request(
+            "lido",
+            &auto_track,
+            &Uuid::new_v4().to_string(),
+            "writer",
+            None,
+        ))
+        .unwrap();
+    let rejected = h.request(false, id, json!({"content":"continue"})).await;
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    assert!(rejected
+        .text()
+        .await
+        .unwrap()
+        .contains(remote_grok::REMOTE_RESUME_REQUIRES_REPLACEMENT));
+    h.state.projects.expire_lease(&conflicting.id).unwrap();
+    assert_eq!(fixture.submissions.lock().unwrap().len(), 2);
+    // Simulate the terminal lease sweep; continuation must restore a reader.
+    h.state
+        .projects
+        .release_leases_for_attempt(&id.to_string())
+        .unwrap();
+
     // Orb/MCP use the ordinary composer endpoint after a goal finishes.
     fixture.set_state("running");
     fixture.log.lock().unwrap().clear();
@@ -6645,6 +6717,10 @@ async fn native_grok_remote_goal_streams_resumes_and_never_creates_host_loop() {
         "{command}"
     );
     assert!(command.ends_with("-p 'keep optimizing'"), "{command}");
+    let claims = h.state.projects.live_leases(Some("lido")).unwrap();
+    assert!(claims.iter().any(|lease| lease.attempt_id == id.to_string()
+        && lease.track == auto_track
+        && lease.mode == "reader"));
     let run = store.get_active_mission_run(id).await.unwrap().unwrap();
     assert!(run.owner_actor_id.starts_with("remote-job:"));
     assert!(

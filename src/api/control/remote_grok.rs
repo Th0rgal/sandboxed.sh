@@ -1031,12 +1031,57 @@ pub(crate) async fn continue_on_node(
                 format!("Mission {mission_id} not found"),
             )
         })?;
-    // PR/track writer re-admission is intentionally outside this bounded
-    // native continuation path. Preserve its existing identity checks by
-    // requiring a linked replacement through normal create admission.
-    if mission.project.github_pr.is_some() || mission.project.track.is_some() {
-        return Err((StatusCode::CONFLICT, format!("{REMOTE_RESUME_REQUIRES_REPLACEMENT}: tracked/PR writer missions need create admission; create a remote replacement with supersedes_mission_id={mission_id}")));
+    // Create absorbs even writer:false project missions under a generated
+    // track. Only that narrow read-only identity can skip writer re-admission.
+    // A generated-looking name alone is not a capability.
+    let replacement = || {
+        (StatusCode::CONFLICT, format!("{REMOTE_RESUME_REQUIRES_REPLACEMENT}: tracked/PR writer missions need create admission; create a remote replacement with supersedes_mission_id={mission_id}"))
+    };
+    if mission.project.github_pr.is_some()
+        || mission.project.tags.iter().any(|tag| tag == "pr-writer")
+    {
+        return Err(replacement());
     }
+    let reader_claim = if let Some(track) = mission.project.track.as_deref() {
+        let slug = mission
+            .project
+            .project
+            .as_deref()
+            .ok_or_else(&replacement)?;
+        if track != crate::api::track_leases::generated_track_key(&mission_id.to_string())
+            || !mission.project.tags.iter().any(|tag| tag == "pr-readonly")
+        {
+            return Err(replacement());
+        }
+        let canonical = state
+            .projects
+            .track(slug, track)
+            .map_err(internal)?
+            .ok_or_else(&replacement)?;
+        if canonical.track != track {
+            return Err(replacement());
+        }
+        // Readers normally coexist with writers. This compatibility exception
+        // is stricter: a generated track claimed as a writer needs full admission.
+        if state
+            .projects
+            .live_leases(Some(slug))
+            .map_err(internal)?
+            .iter()
+            .any(|lease| lease.track_id == canonical.id && lease.mode == "writer")
+        {
+            return Err(replacement());
+        }
+        Some(crate::api::track_leases::lease_request(
+            slug,
+            track,
+            &mission_id.to_string(),
+            "reader",
+            None,
+        ))
+    } else {
+        None
+    };
     if mission.backend != GROK_BACKEND {
         return Err((
             StatusCode::CONFLICT,
@@ -1124,6 +1169,14 @@ pub(crate) async fn continue_on_node(
     require_node_managed_auth(state, &placement.node_id, &plan)
         .await
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    // Terminal cleanup may have released the original reader claim. Reacquire
+    // it under the same admission locks before making the mission runnable.
+    if let Some(request) = reader_claim.as_ref() {
+        state
+            .projects
+            .acquire_track_lease(request)
+            .map_err(|_| replacement())?;
+    }
     // Acquiring a run requires Pending/Active. Under admission locks, mark
     // the mission remote before moving it to Pending so no local scheduler
     // can claim the activation window. Dispatch then fences before submit.
