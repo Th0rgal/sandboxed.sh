@@ -9824,7 +9824,7 @@ pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     body: Option<Json<CreateMissionRequest>>,
-) -> Result<(axum::http::HeaderMap, Json<Mission>), (StatusCode, String)> {
+) -> Result<(axum::http::HeaderMap, Json<serde_json::Value>), (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
 
     let mut req = body.map(|b| b.0).unwrap_or(CreateMissionRequest {
@@ -9916,15 +9916,24 @@ pub async fn create_mission(
                 if let Ok(Some(existing)) =
                     control_state.mission_store.get_mission(mission_id).await
                 {
-                    tracing::info!(
-                        mission_id = %existing.id,
-                        idempotency_key = key,
-                        "create_mission coalesced onto the mission holding this dispatch key"
-                    );
-                    if let Ok(value) = axum::http::HeaderValue::from_str(&existing.id.to_string()) {
-                        headers.insert("x-coalesced-with", value);
+                    // A dispatch that already failed closed (for example a
+                    // rejected remote submission) is not the work the retry
+                    // asks for; only live or finished attempts coalesce.
+                    if existing.status != MissionStatus::Failed {
+                        tracing::info!(
+                            mission_id = %existing.id,
+                            idempotency_key = key,
+                            "create_mission coalesced onto the mission holding this dispatch key"
+                        );
+                        if let Ok(value) =
+                            axum::http::HeaderValue::from_str(&existing.id.to_string())
+                        {
+                            headers.insert("x-coalesced-with", value);
+                        }
+                        let value =
+                            mission_create_response(&state, &control_state, existing).await?;
+                        return Ok((headers, Json(value)));
                     }
-                    return Ok((headers, Json(existing)));
                 }
             }
         }
@@ -9953,7 +9962,8 @@ pub async fn create_mission(
             if let Ok(value) = axum::http::HeaderValue::from_str(&existing.id.to_string()) {
                 headers.insert("x-coalesced-with", value);
             }
-            return Ok((headers, Json(existing)));
+            let value = mission_create_response(&state, &control_state, existing).await?;
+            return Ok((headers, Json(value)));
         }
     }
 
@@ -10468,13 +10478,23 @@ pub async fn create_mission(
         .map(str::trim)
         .filter(|command| !command.is_empty())
         .map(str::to_string);
+    // Server-owned remote execution: the selected harness/model decide what
+    // runs on the node (an explicit raw `remote_command` stays supported).
+    // Planned before the mission exists so an unsupported selection is a
+    // clean 400, never a failed mission.
+    let remote_plan = match remote_node_id.as_deref() {
+        Some(_) => Some(
+            plan_remote_harness(
+                remote_command.as_deref(),
+                backend.as_deref().unwrap_or(""),
+                model_override.as_deref(),
+                req.prompt.as_deref(),
+            )
+            .map_err(|message| (StatusCode::BAD_REQUEST, message))?,
+        ),
+        None => None,
+    };
     if let Some(node_id) = remote_node_id.as_deref() {
-        if remote_command.is_none() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "remote_command is required when remote_node_id is set".to_string(),
-            ));
-        }
         if remote_dispatch_is_scheduled_for_future(
             Some(node_id),
             req.not_before,
@@ -10990,8 +11010,8 @@ pub async fn create_mission(
         initial_prompt = Some((prompt_event_id, prompt));
     }
 
-    if let (Some(remote_node_id), Some(remote_command)) =
-        (remote_node_id.as_deref(), remote_command.as_deref())
+    if let (Some(remote_node_id), Some(remote_plan)) =
+        (remote_node_id.as_deref(), remote_plan.as_ref())
     {
         // All remote commands use the durable node job API. The legacy
         // synchronous `/execute` path has no cancellation handle if its HTTP
@@ -11014,13 +11034,15 @@ pub async fn create_mission(
         .await
         {
             Ok(()) => {
-                dispatch_remote_job(&state, &control, &mission, remote_node_id, remote_command)
-                    .await
+                dispatch_remote_job(&state, &control, &mission, remote_node_id, remote_plan).await
             }
             Err(message) => Err(message),
         };
         match dispatch {
-            Ok(updated) => return Ok((headers, Json(updated))),
+            Ok(updated) => {
+                let value = mission_create_response(&state, &control, updated).await?;
+                return Ok((headers, Json(value)));
+            }
             Err(message) => {
                 let _ = control
                     .mission_store
@@ -11042,7 +11064,49 @@ pub async fn create_mission(
         }
     }
 
-    Ok((headers, Json(mission)))
+    let value = mission_create_response(&state, &control, mission).await?;
+    Ok((headers, Json(value)))
+}
+
+/// Create/coalesce responses carry the same execution and remote placement
+/// projection as mission reads, so a client can render an honest state from
+/// the response alone (the Orb treats `remote_job.node_id`/`phase` as the
+/// authoritative placement of a typed remote launch).
+async fn mission_create_response(
+    state: &Arc<AppState>,
+    control: &ControlState,
+    mission: Mission,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let active_run = control
+        .mission_store
+        .get_active_mission_run(mission.id)
+        .await
+        .map_err(internal_error)?;
+    let placement_run = match active_run.clone() {
+        Some(run) => Some(run),
+        None => control
+            .mission_store
+            .get_latest_mission_run(mission.id)
+            .await
+            .map_err(internal_error)?,
+    };
+    let value = attach_execution_to_mission_value(
+        serde_json::to_value(&mission).map_err(internal_error)?,
+        &mission,
+        active_run.as_ref(),
+        None,
+    );
+    let (handles, outcomes) = remote_job_projection_inputs(state).await;
+    Ok(attach_remote_job_to_mission_value(
+        value,
+        remote_job_projection(
+            &handles,
+            &outcomes,
+            placement_run.as_ref(),
+            mission.id,
+            chrono::Utc::now(),
+        ),
+    ))
 }
 
 fn remote_dispatch_is_scheduled_for_future(
@@ -11175,6 +11239,183 @@ impl RemoteMissionOwner {
     fn send(&self, event: AgentEvent) {
         if let Some(events_tx) = &self.events_tx {
             let _ = events_tx.send(event);
+        }
+    }
+}
+
+/// Harnesses a remote node can run for a typed launch. Nodes ship the
+/// `claude` and `opencode` CLIs; Grok, Codex, Gemini and the ChatGPT UI
+/// driver have no standalone node runtime, so selecting them is rejected
+/// before the mission exists instead of being silently swapped.
+pub(crate) const REMOTE_NODE_HARNESSES: &[&str] = &["claudecode", "opencode"];
+
+/// What a remote mission will execute on its node, decided by the server
+/// from the client's selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteHarnessPlan {
+    /// Explicit `remote_command` compatibility: runs verbatim, own auth.
+    Raw { command: String },
+    /// Claude Code CLI on the node, model routed through this core's proxy.
+    ClaudeCode {
+        model: Option<String>,
+        prompt: String,
+    },
+    /// OpenCode CLI on the node, model routed through this core's
+    /// OpenAI-compatible proxy endpoint.
+    OpenCode {
+        model: Option<String>,
+        prompt: String,
+    },
+}
+
+impl RemoteHarnessPlan {
+    pub(crate) fn uses_core_proxy(&self) -> bool {
+        !matches!(self, RemoteHarnessPlan::Raw { .. })
+    }
+
+    pub(crate) fn label(&self) -> String {
+        match self {
+            RemoteHarnessPlan::Raw { .. } => "raw command".to_string(),
+            RemoteHarnessPlan::ClaudeCode { model, .. } => format!(
+                "claudecode/{}",
+                model.as_deref().unwrap_or("node default model")
+            ),
+            RemoteHarnessPlan::OpenCode { model, .. } => format!(
+                "opencode/{}",
+                model.as_deref().unwrap_or("node default model")
+            ),
+        }
+    }
+}
+
+/// Decide the node execution for a remote launch. An explicit raw command
+/// wins (compatibility with scripted callers). Otherwise the selected
+/// backend must be one nodes can run and the prompt must be present; a
+/// selection nodes cannot honour is an explicit error naming what is
+/// supported, never a fallback to a different harness.
+pub(crate) fn plan_remote_harness(
+    remote_command: Option<&str>,
+    backend: &str,
+    model_override: Option<&str>,
+    prompt: Option<&str>,
+) -> Result<RemoteHarnessPlan, String> {
+    if let Some(command) = remote_command.map(str::trim).filter(|c| !c.is_empty()) {
+        return Ok(RemoteHarnessPlan::Raw {
+            command: command.to_string(),
+        });
+    }
+    let prompt = prompt
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            "a remote launch needs a prompt (or an explicit remote_command)".to_string()
+        })?
+        .to_string();
+    let model = model_override
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
+    match backend {
+        "claudecode" => Ok(RemoteHarnessPlan::ClaudeCode {
+            // Claude Code expects bare model ids.
+            model: model.map(|m| {
+                m.strip_prefix("anthropic/")
+                    .map(str::to_string)
+                    .unwrap_or(m)
+            }),
+            prompt,
+        }),
+        "opencode" => Ok(RemoteHarnessPlan::OpenCode { model, prompt }),
+        other => Err(format!(
+            "backend '{other}' cannot run on remote nodes: only {} are installed there. \
+             Pick one of those (for Grok models, OpenCode with an xai/ model routes through this core), \
+             or pass an explicit remote_command.",
+            REMOTE_NODE_HARNESSES.join(" or ")
+        )),
+    }
+}
+
+/// Concrete node job for a plan: the shell command plus the environment the
+/// node injects into it (proxy URL/key never appear in the command line).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteExecution {
+    pub(crate) command: String,
+    pub(crate) env: Option<HashMap<String, String>>,
+    pub(crate) label: String,
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// OpenCode reaches this core through its `openai` provider
+/// (`OPENAI_BASE_URL`), so the proxy sees the bare model id and resolves it
+/// exactly as it does for local OpenCode missions.
+fn opencode_proxy_model(model: &str) -> String {
+    let bare = model.split_once('/').map(|(_, id)| id).unwrap_or(model);
+    format!("openai/{bare}")
+}
+
+pub(crate) fn remote_execution_for_plan(
+    plan: &RemoteHarnessPlan,
+    api_base_url: &str,
+    proxy_key: &str,
+) -> RemoteExecution {
+    let label = plan.label();
+    match plan {
+        RemoteHarnessPlan::Raw { command } => RemoteExecution {
+            command: command.clone(),
+            env: None,
+            label,
+        },
+        RemoteHarnessPlan::ClaudeCode { model, prompt } => {
+            let mut command = String::from(
+                "command -v claude >/dev/null 2>&1 || { echo 'claude is not installed on this node' >&2; exit 127; }; \
+                 claude -p --dangerously-skip-permissions",
+            );
+            if let Some(model) = model {
+                command.push_str(" --model ");
+                command.push_str(&shell_single_quote(model));
+            }
+            command.push(' ');
+            command.push_str(&shell_single_quote(prompt));
+            let env = HashMap::from([
+                ("ANTHROPIC_BASE_URL".to_string(), api_base_url.to_string()),
+                ("ANTHROPIC_AUTH_TOKEN".to_string(), proxy_key.to_string()),
+                ("NO_COLOR".to_string(), "1".to_string()),
+                ("GH_NO_PAGER".to_string(), "1".to_string()),
+                ("GH_PROMPT_DISABLED".to_string(), "1".to_string()),
+            ]);
+            RemoteExecution {
+                command,
+                env: Some(env),
+                label,
+            }
+        }
+        RemoteHarnessPlan::OpenCode { model, prompt } => {
+            let mut command = String::from(
+                "command -v opencode >/dev/null 2>&1 || { echo 'opencode is not installed on this node' >&2; exit 127; }; \
+                 opencode run --format json",
+            );
+            if let Some(model) = model {
+                command.push_str(" --model ");
+                command.push_str(&shell_single_quote(&opencode_proxy_model(model)));
+            }
+            command.push(' ');
+            command.push_str(&shell_single_quote(prompt));
+            let env = HashMap::from([
+                (
+                    "OPENAI_BASE_URL".to_string(),
+                    format!("{}/v1", api_base_url.trim_end_matches('/')),
+                ),
+                ("OPENAI_API_KEY".to_string(), proxy_key.to_string()),
+                ("NO_COLOR".to_string(), "1".to_string()),
+            ]);
+            RemoteExecution {
+                command,
+                env: Some(env),
+                label,
+            }
         }
     }
 }
@@ -12021,7 +12262,7 @@ async fn dispatch_remote_job(
     control: &ControlState,
     mission: &Mission,
     remote_node_id: &str,
-    remote_command: &str,
+    plan: &RemoteHarnessPlan,
 ) -> Result<Mission, String> {
     let node = crate::remote_node::placement_for_selected_node(
         &state.config.remote_nodes,
@@ -12040,6 +12281,26 @@ async fn dispatch_remote_job(
             )
         })?;
     let job_id = Uuid::new_v4();
+    // A harness launch talks back to this core through the model proxy with
+    // a key minted for this mission only; the key travels in the job env,
+    // never in the logged command line. Raw commands carry their own auth.
+    let (execution, proxy_key_id) = if plan.uses_core_proxy() {
+        let api_base_url = super::mission_runner::public_api_base_url_from_env()
+            .ok_or_else(|| {
+                "SANDBOXED_PUBLIC_URL is not configured; a remote harness launch needs a core URL the node can reach".to_string()
+            })?;
+        let key = state
+            .proxy_api_keys
+            .create(format!("remote-launch:{}:{}", node.id, mission.id))
+            .await
+            .map_err(|error| format!("remote launch proxy key could not be minted: {error}"))?;
+        (
+            remote_execution_for_plan(plan, &api_base_url, &key.key),
+            Some(key.id),
+        )
+    } else {
+        (remote_execution_for_plan(plan, "", ""), None)
+    };
     let claims = crate::remote_node::LeaseClaims {
         mission_id: mission.id,
         node_id: node.id.clone(),
@@ -12054,10 +12315,18 @@ async fn dispatch_remote_job(
         mission_id: mission.id,
         lease_token,
         payload: crate::remote_node::JobPayload::RawCommand {
-            command: remote_command.to_string(),
+            command: execution.command.clone(),
             timeout_secs: None,
-            env: None,
+            env: execution.env.clone(),
         },
+    };
+    let proxy_keys = Arc::clone(&state.proxy_api_keys);
+    // Best-effort key retirement once this process's observer is done; a
+    // re-attached observer after restart leaves the key to `cleanup_keys`.
+    let retire_proxy_key = move || async move {
+        if let Some(id) = proxy_key_id {
+            let _ = proxy_keys.delete(id).await;
+        }
     };
 
     let client = crate::remote_node::RemoteNodeClient::default();
@@ -12212,6 +12481,7 @@ async fn dispatch_remote_job(
                 started_at,
             )
             .await;
+            retire_proxy_key().await;
         });
         return Err(err);
     }
@@ -12221,8 +12491,8 @@ async fn dispatch_remote_job(
         mission_id: mission.id,
         status: MissionStatus::Active,
         summary: Some(format!(
-            "Dispatched job {} to remote node '{}' (node state: {})",
-            job_id, node.id, accepted.state
+            "Dispatched job {} to remote node '{}' ({}; node state: {})",
+            job_id, node.id, execution.label, accepted.state
         )),
     });
 
@@ -12261,6 +12531,7 @@ async fn dispatch_remote_job(
                     started_at,
                 )
                 .await;
+                retire_proxy_key().await;
             });
         },
     )
@@ -15232,8 +15503,10 @@ pub async fn clone_mission(
         extra: Default::default(),
     };
 
-    let (_headers, cloned) = create_mission(State(state), Extension(user), Some(Json(req))).await?;
-    let clone_id = cloned.0.id;
+    let (_headers, Json(cloned)) =
+        create_mission(State(state), Extension(user), Some(Json(req))).await?;
+    let cloned: Mission = serde_json::from_value(cloned).map_err(internal_error)?;
+    let clone_id = cloned.id;
 
     // Optionally seed the clone with the source's conversation history
     // (retry-with-context). `control` still holds the store handle after the
@@ -15255,7 +15528,7 @@ pub async fn clone_mission(
         "FLEET-002 mission cloned"
     );
 
-    Ok(cloned)
+    Ok(Json(cloned))
 }
 
 /// Request body for resuming a mission
@@ -34734,6 +35007,96 @@ Investigate <service/> failures.
                 &mission_store::TriggerType::Interval { seconds: 120 }
             )
         );
+    }
+
+    #[test]
+    fn remote_harness_plan_is_explicit_about_node_support() {
+        // Explicit raw command wins regardless of backend.
+        assert_eq!(
+            plan_remote_harness(Some(" hostname "), "grok", None, Some("p")).unwrap(),
+            RemoteHarnessPlan::Raw {
+                command: "hostname".into()
+            }
+        );
+        assert_eq!(
+            plan_remote_harness(
+                None,
+                "claudecode",
+                Some("anthropic/claude-opus-5"),
+                Some("do it")
+            )
+            .unwrap(),
+            RemoteHarnessPlan::ClaudeCode {
+                model: Some("claude-opus-5".into()),
+                prompt: "do it".into()
+            }
+        );
+        assert_eq!(
+            plan_remote_harness(None, "opencode", Some("xai/grok-4.6"), Some("do it")).unwrap(),
+            RemoteHarnessPlan::OpenCode {
+                model: Some("xai/grok-4.6".into()),
+                prompt: "do it".into()
+            }
+        );
+        let rejected = plan_remote_harness(None, "grok", Some("grok-4.6"), Some("do it"))
+            .expect_err("grok has no node runtime");
+        assert!(rejected.contains("'grok'"), "{rejected}");
+        assert!(rejected.contains("claudecode or opencode"), "{rejected}");
+        let no_prompt =
+            plan_remote_harness(None, "claudecode", None, Some("   ")).expect_err("prompt");
+        assert!(no_prompt.contains("prompt"), "{no_prompt}");
+    }
+
+    #[test]
+    fn remote_execution_routes_selected_model_through_core_proxy_env() {
+        let plan = RemoteHarnessPlan::ClaudeCode {
+            model: Some("claude-opus-5".into()),
+            prompt: "say 'hi'".into(),
+        };
+        let exec = remote_execution_for_plan(&plan, "https://core.example", "sk-proxy-abc");
+        assert!(
+            exec.command
+                .contains("claude -p --dangerously-skip-permissions --model 'claude-opus-5' "),
+            "{}",
+            exec.command
+        );
+        // Single quotes inside the prompt are shell-escaped.
+        assert!(
+            exec.command.ends_with(&shell_single_quote("say 'hi'")),
+            "{}",
+            exec.command
+        );
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+        assert!(!exec.command.contains("sk-proxy-abc"));
+        let env = exec.env.unwrap();
+        assert_eq!(env["ANTHROPIC_BASE_URL"], "https://core.example");
+        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "sk-proxy-abc");
+        assert_eq!(exec.label, "claudecode/claude-opus-5");
+
+        let plan = RemoteHarnessPlan::OpenCode {
+            model: Some("xai/grok-4.6".into()),
+            prompt: "build".into(),
+        };
+        let exec = remote_execution_for_plan(&plan, "https://core.example/", "sk-proxy-abc");
+        assert!(
+            exec.command
+                .contains("opencode run --format json --model 'openai/grok-4.6' 'build'"),
+            "{}",
+            exec.command
+        );
+        let env = exec.env.unwrap();
+        assert_eq!(env["OPENAI_BASE_URL"], "https://core.example/v1");
+        assert_eq!(env["OPENAI_API_KEY"], "sk-proxy-abc");
+
+        let raw = remote_execution_for_plan(
+            &RemoteHarnessPlan::Raw {
+                command: "hostname".into(),
+            },
+            "",
+            "",
+        );
+        assert_eq!(raw.env, None);
+        assert_eq!(raw.command, "hostname");
     }
 
     #[test]

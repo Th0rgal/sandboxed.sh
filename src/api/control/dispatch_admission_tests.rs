@@ -5649,3 +5649,154 @@ async fn restart_keeps_accepted_remote_job_active_and_reattaches_its_observer() 
     assert!(settled_run.execution_state.is_terminal());
     assert_eq!(fixture.cancels(), 0);
 }
+
+#[tokio::test]
+async fn typed_remote_launch_is_server_planned_idempotent_and_explicit_about_support() {
+    let fixture = spawn_fixture_node("typed-fixture", "REMOTE_TYPED_FIXTURE_TOKEN", "queued").await;
+    std::env::set_var("SANDBOXED_PUBLIC_URL", "http://127.0.0.1:9");
+    let h = Harness::with_nodes(vec![fixture.node.clone()]).await;
+    {
+        let mut registry = h.state.backend_registry.write().await;
+        registry.register(Arc::new(crate::backend::opencode::OpenCodeBackend::new(
+            "http://127.0.0.1:9".into(),
+            None,
+            false,
+        )));
+        registry.register(Arc::new(crate::backend::grok::GrokBackend::new()));
+    }
+    let store = h.control.mission_store.clone();
+
+    // The Orb shape after 9a39ef1d: no raw command, no client-minted key.
+    let body = json!({
+        "title": "typed launch",
+        "prompt": "find the fastest kernel",
+        "project": "lido",
+        "backend": "opencode",
+        "model_override": "grok-4.6",
+        "remote_node_id": "typed-fixture",
+        "idempotency_key": "orb-launch-attempt-1",
+    });
+    let response = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        response.text().await.unwrap()
+    );
+    let created: Value = response.json().await.unwrap();
+    let mission_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    assert_eq!(created["status"], "active");
+    assert_eq!(created["backend"], "opencode");
+    assert_eq!(created["model_override"], "xai/grok-4.6");
+    assert_eq!(created["remote_job"]["node_id"], "typed-fixture");
+    assert_eq!(created["remote_job"]["phase"], "observed");
+    assert_eq!(created["execution"]["state"], "waiting_remote_job");
+
+    // Server-owned execution: selected harness + model, proxy auth in env.
+    let submissions = fixture.submissions.lock().unwrap().clone();
+    assert_eq!(submissions.len(), 1);
+    let payload = &submissions[0]["payload"];
+    let command = payload["command"].as_str().unwrap();
+    assert!(
+        command.contains(
+            "opencode run --format json --model 'openai/grok-4.6' 'find the fastest kernel'"
+        ),
+        "{command}"
+    );
+    assert_eq!(payload["env"]["OPENAI_BASE_URL"], "http://127.0.0.1:9/v1");
+    let key = payload["env"]["OPENAI_API_KEY"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(key.starts_with("sk-proxy-"));
+    assert!(
+        !command.contains(&key),
+        "proxy key must not be in the command line"
+    );
+    assert!(h.state.proxy_api_keys.verify(&key).await);
+    let dispatched = store
+        .get_events(mission_id, Some(&["mission_status_changed"]), None, None)
+        .await
+        .unwrap();
+    assert!(
+        dispatched
+            .iter()
+            .any(|e| e.content.contains("opencode/xai/grok-4.6")),
+        "{dispatched:?}"
+    );
+
+    // Retry with the same idempotency key coalesces onto the same mission
+    // and never submits a second node job.
+    let retry = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(
+        retry
+            .headers()
+            .get("x-coalesced-with")
+            .and_then(|v| v.to_str().ok()),
+        Some(mission_id.to_string().as_str())
+    );
+    let coalesced: Value = retry.json().await.unwrap();
+    assert_eq!(coalesced["id"], json!(mission_id));
+    assert_eq!(coalesced["remote_job"]["node_id"], "typed-fixture");
+    assert_eq!(fixture.submissions.lock().unwrap().len(), 1);
+
+    // A harness nodes cannot run is refused before any mission exists.
+    let before = store
+        .list_missions_filtered(&crate::api::mission_store::MissionFilter::default(), 50, 0)
+        .await
+        .unwrap()
+        .len();
+    let refused = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&json!({
+            "prompt": "find the fastest kernel",
+            "project": "lido",
+            "backend": "grok",
+            "model_override": "grok-4.6",
+            "remote_node_id": "typed-fixture",
+            "idempotency_key": "orb-launch-attempt-2",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let detail = refused.text().await.unwrap();
+    assert!(detail.contains("claudecode or opencode"), "{detail}");
+    assert_eq!(
+        store
+            .list_missions_filtered(&crate::api::mission_store::MissionFilter::default(), 50, 0)
+            .await
+            .unwrap()
+            .len(),
+        before
+    );
+    assert_eq!(fixture.submissions.lock().unwrap().len(), 1);
+
+    // Terminal: the launch key is retired with the observer.
+    fixture.set_state("succeeded");
+    wait_until("typed launch completion", 20, || async {
+        store.get_mission(mission_id).await.unwrap().unwrap().status == MissionStatus::Completed
+    })
+    .await;
+    wait_until("proxy key retirement", 10, || async {
+        !h.state.proxy_api_keys.verify(&key).await
+    })
+    .await;
+}

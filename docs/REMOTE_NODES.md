@@ -282,6 +282,35 @@ loop cancels the node job on its next tick. There is no dedicated
 mission-cancel -> job-cancel plumbing yet; wiring an explicit cancel hook is a
 follow-up.
 
+### Typed remote launches (server-owned harness)
+
+Clients that select a machine in a picker send the Orb shape instead of a
+raw command:
+
+```json
+{"prompt": "...", "remote_node_id": "dgx-spark", "backend": "opencode",
+ "model_override": "xai/grok-4.6", "project": "test",
+ "idempotency_key": "<per-attempt key>"}
+```
+
+- The server plans the node execution from `backend` + `model_override`.
+  Nodes run `claude` and `opencode` only (`REMOTE_NODE_HARNESSES`); selecting
+  `grok`, `codex`, `gemini` or `chatgpt_ui` is a `400` naming the supported
+  harnesses **before** any mission exists. Nothing is silently swapped.
+- The harness talks back to this core's model proxy with a key minted for the
+  mission (`remote-launch:<node>:<mission>`), delivered in the job env
+  (`ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` for Claude Code,
+  `OPENAI_BASE_URL`/`OPENAI_API_KEY` for OpenCode with `--model openai/<id>`)
+  and never on the command line. `SANDBOXED_PUBLIC_URL` must be reachable
+  from the node. The key is retired when the observer finishes.
+- `remote_command` still works verbatim (raw compatibility, own auth).
+- A retry with the same `idempotency_key` (and project) coalesces onto the
+  mission holding the dispatch key (`x-coalesced-with`) and never submits a
+  second node job; a dispatch that already failed closed is not reused.
+- The create response carries `execution` and `remote_job`; clients treat
+  `remote_job.node_id`/`phase` as the authoritative placement.
+- `scripts/remote-launch-canary.sh` exercises this shape against a real node.
+
 ### Raw remote mission lifecycle (durable ownership)
 
 A raw remote mission never starts a local harness, so its liveness cannot be
