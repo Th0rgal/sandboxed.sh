@@ -836,3 +836,20 @@ mod tests {
 pub fn job_state_confirms_termination(state: &str) -> bool {
     matches!(state, "succeeded" | "failed" | "cancelled")
 }
+
+/// Status used when the node answers 404 for a job we were still fencing.
+/// The process is already gone; looping on cancel would never terminate.
+pub fn missing_job_cancelled(mission_id: Uuid, job_id: Uuid) -> NodeJobStatus {
+    NodeJobStatus {
+        job_id,
+        mission_id,
+        state: "cancelled".to_string(),
+        exit_code: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        started_at: None,
+        finished_at: Some(chrono::Utc::now().to_rfc3339()),
+        error: Some("job not found on node".to_string()),
+        log_tail: None,
+        artifacts: Vec::new(),
+    }
+}

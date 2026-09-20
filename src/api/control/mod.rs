@@ -12950,13 +12950,29 @@ async fn observe_untracked_remote_job_cancellation(
     let mut terminal: Option<crate::remote_node::NodeJobStatus> = None;
     loop {
         if terminal.is_none() {
-            if let Err(error) = client.cancel_job(&node, &shared_token, job_id).await {
-                tracing::warn!(%mission_id, %job_id, node_id = %node.id, ?error,
-                    "untracked remote job cancellation failed; retaining fence and retrying");
+            match client.cancel_job(&node, &shared_token, job_id).await {
+                Err(error) if error.is_not_found() => {
+                    terminal = Some(crate::remote_node::missing_job_cancelled(
+                        mission_id, job_id,
+                    ));
+                }
+                Err(error) => tracing::warn!(%mission_id, %job_id, node_id = %node.id, ?error,
+                    "untracked remote job cancellation failed; retaining fence and retrying"),
+                Ok(_) => {}
             }
-            if let Ok(status) = client.get_job(&node, &shared_token, job_id).await {
-                if crate::remote_node::job_state_confirms_termination(&status.state) {
-                    terminal = Some(status);
+            if terminal.is_none() {
+                match client.get_job(&node, &shared_token, job_id).await {
+                    Ok(status)
+                        if crate::remote_node::job_state_confirms_termination(&status.state) =>
+                    {
+                        terminal = Some(status);
+                    }
+                    Err(error) if error.is_not_found() => {
+                        terminal = Some(crate::remote_node::missing_job_cancelled(
+                            mission_id, job_id,
+                        ));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -13352,6 +13368,38 @@ async fn poll_recovered_remote_build(
             None => client.get_job(&node, &shared_token, job_id).await,
         };
         match observation {
+            Err(error) if error.is_not_found() => {
+                let status = crate::remote_node::missing_job_cancelled(mission_id, job_id);
+                terminal = Some(status.clone());
+                state
+                    .fleet
+                    .record_outcome(crate::remote_node::DispatchOutcome {
+                        mission_id,
+                        node_id: node.id.clone(),
+                        job_id: Some(job_id),
+                        state: status.state.clone(),
+                        exit_code: status.exit_code,
+                        error: status.error.clone(),
+                        started_at,
+                        finished_at: Some(chrono::Utc::now()),
+                    });
+                match crate::remote_node::job_ledger::finalize_with_artifacts(
+                    &working_dir,
+                    job_id,
+                    &status.state,
+                    status.exit_code,
+                    status.artifacts.clone(),
+                )
+                .await
+                {
+                    Ok(_) => return,
+                    Err(error) => tracing::warn!(
+                        %job_id,
+                        ?error,
+                        "missing remote job cleanup failed; retrying"
+                    ),
+                }
+            }
             Ok(status) if crate::remote_node::job_state_confirms_termination(&status.state) => {
                 terminal = Some(status.clone());
                 let terminal_state = status.state.clone();
