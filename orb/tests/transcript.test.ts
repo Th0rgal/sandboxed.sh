@@ -28,7 +28,16 @@ describe("producer transcript contract",()=>{
   const items=buildTranscript([snap("A"),ev("text_delta",{content:"B",mode:"delta"}),tool,ev("text_op",{bubble_id:"text_delta_latest",ops:[{type:"insert",pos:0,text:"AB updated"}]})]);
   expect(texts(items)).toMatchObject([{text:"AB updated"}]);
  });
- it("preserves stored identities and rejects stale sequenced snapshots",()=>{
+  it("hides generated remote-job status rows and keeps ordinary Remote job prose",()=>{
+    const row=(content:string,metadata?:Record<string,unknown>)=>({id:1,sequence:1,event_type:"assistant_message",content,timestamp:"",metadata});
+    expect(storedToStream(row("Remote job e14b14a3-bce7-4d80-8d81-ad7ad239fd82 on node 'dgx-spark' is now running"))).toBeNull();
+    expect(storedToStream(row("Dispatched job e14b14a3-bce7-4d80-8d81-ad7ad239fd82 to remote node 'dgx-spark' (grok/grok-4.6; node state: queued)"))).toBeNull();
+    expect(storedToStream(row("Remote job scheduling is now fixed on the node."))).toMatchObject({type:"assistant_message",data:{content:"Remote job scheduling is now fixed on the node."}});
+    expect(storedToStream(row("Remote job e14b14a3-bce7-4d80-8d81-ad7ad239fd82 on node 'dgx-spark' is now running\nAlso explain the queue."))).toMatchObject({type:"assistant_message"});
+    expect(storedToStream(row("Dispatched job scheduling is now documented."))).toMatchObject({type:"assistant_message"});
+    expect(storedToStream(row("Remote job scheduling is now fixed.",{kind:"remote_job_status"}))).toBeNull();
+  });
+  it("preserves stored identities and rejects stale sequenced snapshots",()=>{
   const stored=storedToStream({id:7,event_id:"uuid",sequence:12,event_type:"text_delta",content:"Latest",timestamp:""})!;
   expect(stored).toMatchObject({storedId:7,eventId:"uuid",sequence:12});
   const items=buildTranscript([stored,{...snap("Stale"),sequence:11}]);expect(texts(items)[0].text).toBe("Latest");

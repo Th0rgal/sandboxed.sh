@@ -12,6 +12,16 @@ export interface StoredEvent {
   metadata?: Record<string, unknown>;
 }
 
+const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const REMOTE_JOB_RUNNING = new RegExp(`^Remote job ${UUID} on node '[^']+' is now (queued|running|finished)$`);
+const DISPATCHED_JOB = new RegExp(`^Dispatched job ${UUID} to remote node '[^']+'(?: \\([^\\n]*\\))?$`);
+
+export function isGeneratedRemoteJobStatus(ev: StoredEvent): boolean {
+  const meta = ev.metadata ?? {};
+  if (meta.kind === "remote_job_status" || meta.remote_job_status === true) return true;
+  return REMOTE_JOB_RUNNING.test(ev.content) || DISPATCHED_JOB.test(ev.content);
+}
+
 export interface StreamEvent {
   eventId?: string;
   sequence?: number;
@@ -51,9 +61,8 @@ export function storedToStream(ev: StoredEvent): StreamEvent | null {
       return d({ content: ev.content });
     case "assistant_message":
     case "assistant_message_canonical":
-      // Remote-job status is also stored as assistant_message; keep it out of
-      // the transcript so LaunchStatus remains the placement source of truth.
-      if (/^(Remote job |Dispatched job )/i.test(ev.content)) return null;
+      // Exact generated remote-job status rows, not ordinary assistant prose.
+      if (isGeneratedRemoteJobStatus(ev)) return null;
       // Canonical rows are the finalized text_op bubble; treat both as the
       // turn's final message (the reducer dedupes identical text).
       return { ...d({ content: ev.content, success: ev.metadata?.success !== false, canonical: ev.event_type === "assistant_message_canonical", bubble_id: ev.metadata?.bubble_id }), type: "assistant_message" };
