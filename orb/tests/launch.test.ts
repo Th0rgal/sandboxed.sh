@@ -41,7 +41,7 @@ it("uses node evidence for queued/running and preserves terminal failures",()=>{
  expect(missionPhase(m,true)).toMatchObject({label:"Failed",detail:"The backend could not find an active runner."});
 });
 
-import { remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, TYPED_LAUNCH_UNSUPPORTED } from "../src/missionLaunch";
+import { remoteLaunchPreflight, remoteHarnessSupport, remoteHarnessNeedsProxy, remoteLaunchUnconfirmed, TYPED_LAUNCH_UNSUPPORTED } from "../src/missionLaunch";
 import type { RemoteNodesResponse, RemoteLaunchCapability } from "../src/api";
 const node={id:"dgx-spark",base_url:"",token_env:"",status:"online",labels:[],version:null,capacity_total:null,capacity_available:null,active_jobs:null,queued_jobs:null,last_seen:null,error:null,cordoned:false};
 const fleet=(remote_launch?:RemoteLaunchCapability|null,extra:Partial<RemoteNodesResponse>={}):RemoteNodesResponse=>({enabled:true,nodes:[node],...(remote_launch===undefined?{}:{remote_launch}),...extra});
@@ -66,9 +66,21 @@ describe("remote launch preflight follows the server-advertised capability",()=>
   expect(remoteLaunchPreflight(fleet({typed:false,harnesses:["claudecode"]}),"dgx-spark",{backend:"claudecode",model:"m"})).toBe(TYPED_LAUNCH_UNSUPPORTED);
   expect(remoteHarnessSupport(undefined,"claudecode")).toBe("unknown");expect(remoteHarnessSupport({typed:true},"claudecode")).toBe("unknown");
  });
- it("refuses when the server cannot be reached from the node or the node is unavailable",()=>{
-  expect(remoteLaunchPreflight(fleet({...typed,proxy_url_configured:false}),"dgx-spark",{backend:"claudecode",model:"m"})).toContain("SANDBOXED_PUBLIC_URL");
-  expect(remoteLaunchPreflight(fleet(typed,{enabled:false}),"dgx-spark",{backend:"claudecode",model:"m"})).toContain("DGX Spark is unavailable");
+ it("proxy_url_configured=false blocks only Claude Code/OpenCode, never native Grok OAuth",()=>{
+   const noProxy={...typed,harnesses:["claudecode","opencode","grok"],proxy_url_configured:false};
+   const claude=remoteLaunchPreflight(fleet(noProxy),"dgx-spark",{backend:"claudecode",model:"m"});
+   expect(claude).toContain("cannot reach this backend's model proxy");
+   expect(claude).not.toContain("SANDBOXED_PUBLIC_URL");
+   expect(remoteLaunchPreflight(fleet(noProxy),"dgx-spark",{backend:"opencode",model:"m"})).toContain("model proxy");
+   expect(remoteLaunchPreflight(fleet(noProxy),"dgx-spark",{backend:"grok",model:"grok-4.6"})).toBeNull();
+   expect(remoteHarnessNeedsProxy(noProxy,"grok")).toBe(false);
+   expect(remoteHarnessNeedsProxy(noProxy,"claudecode")).toBe(true);
+   const listed={...noProxy,requires_proxy_harnesses:["grok"]};
+   expect(remoteLaunchPreflight(fleet(listed),"dgx-spark",{backend:"grok",model:"grok-4.6"})).toContain("model proxy");
+   expect(remoteLaunchPreflight(fleet(listed),"dgx-spark",{backend:"claudecode",model:"m"})).toBeNull();
+  });
+  it("refuses when the node is unavailable",()=>{
+   expect(remoteLaunchPreflight(fleet(typed,{enabled:false}),"dgx-spark",{backend:"claudecode",model:"m"})).toContain("DGX Spark is unavailable");
   expect(remoteLaunchPreflight(fleet(typed,{nodes:[{...node,status:"offline"}]}),"dgx-spark",{backend:"claudecode",model:"m"})).toContain("unavailable");
   expect(remoteLaunchPreflight(fleet(typed,{nodes:[{...node,cordoned:true}]}),"dgx-spark",{backend:"claudecode",model:"m"})).toContain("unavailable");
   expect(remoteLaunchPreflight(fleet(typed),"other",{backend:"claudecode",model:"m"})).toContain("other is unavailable");

@@ -27,6 +27,8 @@ export function goalObjective(text: string | null | undefined): string | null {
 /** Canonical goal prompt, identical to the server's `canonical_goal_message`. */
 export const goalPrompt = (objective: string) => `/goal ${objective}`;
 
+export const EMPTY_GOAL_ERROR = "Add an objective after /goal, for example “/goal Make the test suite pass”. Your draft is kept.";
+
 const TITLE_MAX = 42;
 
 /** First line, at most 42 characters, with an ellipsis when cut. */

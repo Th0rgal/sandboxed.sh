@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { render } from "@solidjs/testing-library";
-import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle } from "../src/goal";
+import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, EMPTY_GOAL_ERROR } from "../src/goal";
 import { UserTurn } from "../src/Transcript";
 import { LaunchStatus, missionGoal, type LaunchReceipt } from "../src/missionLaunch";
 import type { Mission } from "../src/api";
@@ -20,6 +20,10 @@ describe("goal draft parsing mirrors the server", () => {
   it.each(["/goal", "/goal   ", "/goal\n"])("%j needs an objective", (text) => {
     expect(goalDraft(text)).toEqual({ kind: "empty" });
     expect(goalObjective(text)).toBeNull();
+  });
+  it("names the empty-goal composer error so a valid edit can clear only that alert", () => {
+    expect(EMPTY_GOAL_ERROR).toContain("Add an objective after /goal");
+    expect(goalDraft("/goal Ship it").kind).toBe("goal");
   });
   it.each(["/goals are nice", "plain message", "please run /goal literally", "", "goal: x"])("%j is not a goal", (text) => {
     expect(goalDraft(text)).toEqual({ kind: "none" });

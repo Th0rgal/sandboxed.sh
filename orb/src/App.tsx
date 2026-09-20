@@ -1,5 +1,5 @@
 import { LaunchStatus, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, type LaunchReceipt, type RemoteSupport } from "./missionLaunch";
-import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, GoalTag } from "./goal";
+import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, GoalTag, EMPTY_GOAL_ERROR } from "./goal";
 import { ProjectPicker, ProjectCreation } from "./ProjectPicker";
 import { hasFocusScope } from "./focusScope";
 import { For, Show, Switch, Match, createMemo, createSignal, createEffect, on, onCleanup, onMount, batch } from "solid-js";
@@ -221,6 +221,7 @@ function Composer(p: {
   picker?: boolean;
   /** Server-confirmed remote support for a harness on the selected machine (new agents only). */
   remoteSupport?: (backend: string) => { state: RemoteSupport; note: string };
+  onDraft?: (text: string) => void;
 }) {
   const [text, setText] = createSignal("");
   // `/goal <objective>` is recognised exactly like the server does it, so the
@@ -425,7 +426,9 @@ function Composer(p: {
         rows={1}
         placeholder={p.placeholder}
         onInput={(e) => {
-          setText(e.currentTarget.value);
+          const next = e.currentTarget.value;
+          setText(next);
+          p.onDraft?.(next);
           resize();
         }}
         onKeyDown={(e) => {
@@ -716,7 +719,7 @@ export default function App() {
     if (isConnected()) {
       if (creating()) return false;
       const goal = goalDraft(text);
-      if (goal.kind === "empty") { setCreateError("Add an objective after /goal, for example “/goal Make the test suite pass”. Your draft is kept."); return false; }
+      if (goal.kind === "empty") { setCreateError(EMPTY_GOAL_ERROR); return false; }
       // Goal mode rides on the prompt (server contract): the canonical
       // `/goal <objective>` enters goal mode; the title is the objective.
       const prompt = goal.kind === "goal" ? goalPrompt(goal.objective) : text;
@@ -1249,6 +1252,7 @@ export default function App() {
                   busy={creating()}
                   onSend={create}
                   onStop={stop}
+                  onDraft={(text) => { if (createError() === EMPTY_GOAL_ERROR && goalDraft(text).kind !== "empty") setCreateError(null); }}
                   autofocus
                   tall
                   remoteSupport={remoteSupport}
