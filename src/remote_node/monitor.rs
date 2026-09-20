@@ -12,7 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::client::RemoteNodeClient;
@@ -781,6 +781,26 @@ pub struct RemoteNodesResponse {
     /// `src/api/spark.rs`); surfaced here so placement decisions can see the
     /// whole picture instead of only `nodes`.
     pub spark_offload: SparkOffloadStatus,
+    /// How `POST /api/control/missions` treats `remote_node_id` on this
+    /// backend. Absent on backends that still require a raw `remote_command`.
+    pub remote_launch: RemoteLaunchCapabilities,
+}
+
+/// Typed remote-launch contract (see `docs/REMOTE_NODES.md`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteLaunchCapabilities {
+    /// `prompt` + `remote_node_id` + `backend` (+ `model_override`) is
+    /// planned server-side; no client-built command or client-minted key.
+    pub typed: bool,
+    /// Backend ids nodes can run (`claudecode`, `opencode`).
+    pub harnesses: Vec<String>,
+    /// An explicit `remote_command` is still accepted verbatim.
+    pub raw_command: bool,
+    /// `SANDBOXED_PUBLIC_URL` is set, so node harnesses can reach the proxy.
+    /// When false a typed launch fails at dispatch (502), not at planning.
+    pub proxy_url_configured: bool,
+    /// Prefixes of the plain-text 400 bodies returned before a mission exists.
+    pub error_prefixes: Vec<String>,
 }
 
 /// Status of the Spark offload lane for fleet/placement consumers.

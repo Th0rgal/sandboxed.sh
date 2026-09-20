@@ -282,6 +282,123 @@ loop cancels the node job on its next tick. There is no dedicated
 mission-cancel -> job-cancel plumbing yet; wiring an explicit cancel hook is a
 follow-up.
 
+### Typed remote launches (server-owned harness)
+
+Clients that select a machine in a picker send the Orb shape instead of a
+raw command:
+
+```json
+{"prompt": "...", "remote_node_id": "dgx-spark", "backend": "opencode",
+ "model_override": "xai/grok-4.6", "project": "test",
+ "idempotency_key": "<per-attempt key>"}
+```
+
+- The server plans the node execution from `backend` + `model_override`.
+  Nodes run `claude` and `opencode` only (`REMOTE_NODE_HARNESSES`); selecting
+  `grok`, `codex`, `gemini` or `chatgpt_ui` is a `400` naming the supported
+  harnesses **before** any mission exists. Nothing is silently swapped.
+- The harness talks back to this core's model proxy with a key minted for the
+  mission (`remote-launch:<node>:<mission>`), delivered in the job env and
+  never on the command line. Claude Code: `ANTHROPIC_BASE_URL` +
+  `ANTHROPIC_AUTH_TOKEN`, `--model <bare id>`. OpenCode: the job env carries
+  an inline config in `OPENCODE_CONFIG_CONTENT` (nothing is written into the
+  cwd) declaring a `builtin` provider (`@ai-sdk/openai-compatible`,
+  `baseURL <core>/v1`, `apiKey {env:SANDBOXED_PROXY_API_KEY}`) whose model
+  map carries the exact requested id, and runs `--model builtin/<id>` — the
+  same shape local OpenCode missions use, so the proxy receives e.g.
+  `xai/grok-4.6` unchanged and applies its own chain/passthrough routing.
+  The stock `openai` provider only lists OpenAI's catalog and would refuse
+  such ids before any request. `model_override` is therefore required for
+  OpenCode launches (`REMOTE_MODEL_REQUIRED` otherwise): nodes have no
+  authenticated default model. A client-sent `builtin/` prefix is stripped
+  so the map key and `--model` always agree. Prompts starting with `-` get a
+  leading space so they stay positional (`--` is not safe on `opencode run`).
+  The job's cwd is the node's per-mission directory (also its `HOME`), so
+  nothing depends on the service user's home. `SANDBOXED_PUBLIC_URL` must be
+  reachable from the node. Verified against the installed OpenCode 1.18 with
+  a local mock `/v1/chat/completions`: the CLI resolves `builtin/xai/grok-4.6`
+  and sends `model: "xai/grok-4.6"` with the env key as bearer (test
+  `remote_opencode_execution_resolves_model_against_mock_proxy`).
+- **Proxy key lifecycle.** The key is named `remote-launch:<mission id>`. It
+  is deleted on every dispatch failure after minting, when the observer
+  finishes (also after a restart re-attach), and at the reconciler's first
+  pass for any key whose mission holds no ledger handle (a job on a node
+  always has one: submission follows the tentative record). Nothing relies
+  on the periodic `cleanup_keys`.
+- `remote_command` still works verbatim (raw compatibility, own auth).
+- A retry with the same `idempotency_key` (and project) coalesces onto the
+  mission holding the dispatch key (`x-coalesced-with`) and never submits a
+  second node job; a dispatch that already failed closed is not reused.
+- The create response carries `execution` and `remote_job`; clients treat
+  `remote_job.node_id`/`phase` as the authoritative placement.
+- **Capability detection.** `GET /api/remote-nodes` carries
+  `remote_launch: {typed: true, harnesses: ["claudecode","opencode"],
+  raw_command: true, proxy_url_configured: bool, error_prefixes: [...]}`.
+  The field is absent on older backends, which still require a raw
+  `remote_command`; clients must keep their guard there.
+- **Rejections before a mission exists** are plain-text `400` bodies with a
+  stable prefix: `REMOTE_HARNESS_UNSUPPORTED: backend '<id>' cannot run on
+  remote nodes: only claudecode or opencode are installed there …` and
+  `REMOTE_PROMPT_REQUIRED: …`, `REMOTE_MODEL_REQUIRED: …` (OpenCode without
+  `model_override`). Unknown node / disabled fleet keep their
+  existing 400 text. Dispatch failures after creation (node rejected, token
+  missing, `SANDBOXED_PUBLIC_URL` unset) are `502` with the mission marked
+  `failed`/`remote_dispatch_failed` and its prompt persisted.
+- **Success response** (`200`) is the mission JSON plus `execution`
+  (`{state: "waiting_remote_job", run_id, generation, heartbeat_at, scope_unit:
+  "remote-node:<id>", …}`) and `remote_job`
+  (`{job_id, node_id, phase: "observed", node_state: "queued"|"running"|…,
+  accepted_at, heartbeat_at, observed_age_secs, …}`). `remote_job.node_state`
+  is the node's last reported job state (queued until the node starts it);
+  `phase` is core's observation health. A coalesced retry answers `200` with
+  header `x-coalesced-with: <mission id>` and the same shape.
+- `scripts/remote-launch-canary.sh` exercises this shape against a real node.
+
+### Raw remote mission lifecycle (durable ownership)
+
+A raw remote mission never starts a local harness, so its liveness cannot be
+read from the runner list. The create request therefore establishes durable
+ownership before it responds, and every supervisor consults that ownership
+instead of treating the mission as an orphan (incident ab1792b4, 2026-09-20:
+the stuck-mission watchdog interrupted a freshly accepted dgx-spark mission
+seven seconds after dispatch with `orphan_no_runner`, the poll loop read that
+as an operator cancellation and cancelled the node job, and the mission kept
+no prompt, no run and no record of the outcome).
+
+- **Prompt.** `prompt` is persisted as a real `user_message` event before the
+  job is submitted and before the response. It appears in `history`,
+  `get_initial_user_message` and event replay even when dispatch fails.
+- **Run lease.** After node acceptance and the ledger handle, core acquires a
+  mission run lease owned by `remote-job:<job_id>` with scope
+  `remote-node:<node_id>` in state `waiting_remote_job`, then marks the
+  mission Active. The poll loop refreshes the ledger heartbeat and the lease on
+  every successful observation and finishes the lease with the terminal
+  reason. `GET /api/control/missions/:id` exposes it as `execution`.
+- **Placement read model.** Mission reads carry a `remote_job` block:
+  `job_id`, `node_id`, `phase` (`observed`, `unobserved`, `submit_ambiguous`,
+  `finished`, `lease_only`), the last node-reported `node_state`/`exit_code`
+  when known, `accepted_at`/`heartbeat_at`/`observed_age_secs` from the ledger
+  and `terminal_reason` from the settled lease. `null` means the mission never
+  dispatched a raw remote job. The row's `workspace`/`backend` still describe
+  the local harness a resume would run, not the remote placement.
+- **Watchdog.** An Active mission with no runner is left alone while its
+  accepted `mission` ledger handle (or a lease owned by the same job) was
+  observed within `REMOTE_JOB_UNOBSERVED_SECS` (300 s). Past that window the
+  mission is interrupted with reason `remote_job_unobserved` and the handle is
+  retained as a cancellation fence; a mission with no accepted handle keeps
+  the ordinary `orphan_no_runner` repair. An unreadable ledger defers the
+  decision. Remote *build* leases (`remote-build:*`) keep their existing
+  protection; a `remote-job:*` lease without a ledger handle is not liveness.
+- **Restart.** Startup recovery skips missions that hold an accepted
+  `mission` handle instead of marking them `server_shutdown`; the remote job
+  reconciler re-attaches the poll loop, which rebuilds the lease. If the
+  reconciler cannot re-attach (node config or token missing) the watchdog's
+  unobserved rule eventually surfaces it instead of leaving it Active forever.
+- **Interrupted before terminal.** When the job reaches a terminal state after
+  the mission already left Active, the status is preserved but a durable
+  assistant note records the node verdict and log tail, and the lease is
+  finished with `remote_job_<state>`.
+
 ## Lean Build Jobs
 
 `lean_build` is a declarative job payload: no workspace sync, no shell. The
@@ -735,3 +852,53 @@ memory shared with vLLM and a GitHub CI runner — is handled by an external
   (91 = fleet unavailable). Other commands still use the legacy
   `/api/spark/offload` path until it is retired (step 9).
 >>>>>>> 7d8a390e (Step 8: DGX Spark as a fleet node — arbiter slot provider on the node, spark-build via remote-lean-build)
+
+### Native Grok goals (CLI 1.0.34)
+
+A typed launch with `backend: "grok"`, `model_override: "grok-4.6"`,
+`remote_node_id`, and a prompt beginning `/goal ` runs the native Grok CLI.
+The command uses `--cwd "$PWD" --always-approve --no-plan --output-format
+streaming-json -p '<literal prompt>'`. Native Grok owns planning,
+implementation, verification, and goal iteration; Orb creates no sentinel
+loop or goal automation. It does not use OpenCode or the core model proxy.
+An objective can require a validated GB10 implementation and reproducible
+benchmarks; no elapsed wall-clock deadline is added by this adapter. Node
+job time limits still apply, and interrupted goals can be resumed.
+
+Install the native ARM64 CLI on DGX and configure the **node service** with
+`SANDBOXED_NODE_GROK_HOME=/var/lib/sandboxed-node/.grok`. Provision a separate
+cached login there as the service user using the official Grok login flow.
+Keep `auth.json` owned by that user with mode `0600`; the directory must be
+writable for token refresh and native session state. With systemd
+`ProtectSystem=strict`, allow writes to `/var/lib/sandboxed-node`. Do not
+copy refresh credentials shared by another machine. The job requests only
+`managed_auth: ["grok"]`; the node injects the trusted `GROK_HOME` after
+payload environment variables. Credential contents and the configured path
+are absent from the job payload. Job cwd and HOME remain the mission directory.
+This is service-account credential access for trusted remote jobs, not a
+filesystem isolation boundary against code executing as that same account.
+
+Deploy both core and node changes: heartbeat advertises `managed_auth`, and
+`GET /jobs/:id/log?offset=N` returns bounded incremental log chunks. Missing
+auth rejects submission; legacy nodes fail the CLI guard with exit 78.
+Interactive login output triggers cancellation. A running CLI with no
+model/tool progress for 120 seconds is cancelled with a startup diagnostic
+(the timer excludes queued time). No automatic device-login flow is started.
+
+Orb streams thought/text/tool events, suppresses the CLI's repeated final
+text snapshot, and coalesces text/thought deltas into snapshots at chunk and
+tool boundaries. Before submitting a new job, Core persists a preallocated
+native session UUID under the current run generation and passes it with
+`--session-id`. An interruption before the final stream event therefore
+retains the native identity. `POST /api/control/missions/:id/resume` continues on the recorded node
+using `--resume <session> -p '/goal resume'` for a goal, or passes explicit
+request `content` verbatim. New sessions use only `--session-id`; continuation
+uses only `--resume`. `/api/control/message` and targeted actor messages reject
+remote follow-ups with a conflict directing callers to the node resume route;
+they never start a local harness. PR/track writers and requests changing workspace or
+writer identity require a linked replacement through normal create admission. It uses the same lease-before-submit fence as
+initial dispatch. If the node or native session is missing, the API returns
+`REMOTE_RESUME_REQUIRES_REPLACEMENT`: create a remote mission with
+`supersedes_mission_id` pointing to the original. Do not silently resume
+legacy remote work locally. A CLI exit alone is insufficient for goal
+success: an `end` event with `end_turn` is also required.

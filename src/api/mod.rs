@@ -58,6 +58,7 @@ pub mod opencode;
 pub(crate) mod operator_attention;
 pub mod paloma;
 pub mod project_controller;
+pub mod project_crons;
 pub mod project_files;
 pub mod project_health;
 pub mod projects_overview;

@@ -37,6 +37,8 @@ struct NodeState {
     active_leases: AtomicU32,
     jobs: JobStore,
     runner: Arc<JobRunner>,
+    /// Operator-configured credential profiles (`SANDBOXED_NODE_GROK_HOME`).
+    managed_auth: sandboxed_sh::node::ManagedAuth,
 }
 
 #[tokio::main]
@@ -109,12 +111,23 @@ async fn main() -> anyhow::Result<()> {
         warn!("marked {recovered} in-flight job(s) from a previous run as lost");
     }
     let admission = Arc::new(Semaphore::new(capacity_total as usize));
-    let runner = JobRunner::spawn_with_admission(
+    // Managed auth: profiles raw jobs may request by name. The path is the
+    // node's own configuration; payloads never carry it. Advertised in the
+    // heartbeat only while the credential file is actually readable.
+    let managed_auth = sandboxed_sh::node::ManagedAuth::from_env();
+    match managed_auth.advertised().as_slice() {
+        [] => info!(
+            "managed auth: no profiles ready (SANDBOXED_NODE_GROK_HOME unset or not logged in)"
+        ),
+        ready => info!(profiles = ?ready, "managed auth profiles ready"),
+    }
+    let runner = JobRunner::spawn_with_options(
         jobs.clone(),
         work_root.clone(),
         capacity_total,
         max_job_secs,
         Arc::clone(&admission),
+        managed_auth.clone(),
     );
 
     // Periodic disk GC for lean-build checkouts and lake cache slots
@@ -132,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
         active_leases: AtomicU32::new(0),
         jobs,
         runner,
+        managed_auth,
     });
     let app = Router::new()
         .route("/heartbeat", get(heartbeat))
@@ -148,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
                 .get(list_jobs),
         )
         .route("/jobs/:id", get(get_job))
+        .route("/jobs/:id/log", get(get_job_log))
         .route("/jobs/:id/cancel", post(cancel_job))
         .with_state(state);
 
@@ -247,6 +262,7 @@ async fn heartbeat(
         cached_toolchains: sandboxed_sh::node::cached_toolchains(&state.work_root),
         source_bundle_capacity: Some(sandboxed_sh::node::lean::source_bundle_capacity()),
         lean_runtime_ready: Some(lean_runtime_ready),
+        managed_auth: state.managed_auth.advertised(),
     }))
 }
 
@@ -370,7 +386,7 @@ async fn submit_job(
             "lease is scoped to a different job".to_string(),
         ));
     }
-    validate_job_payload(&request.payload, &state.work_root)
+    validate_job_payload(&request.payload, &state.work_root, &state.managed_auth)
         .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
     if state
         .jobs
@@ -407,7 +423,15 @@ async fn submit_job(
 fn validate_job_payload(
     payload: &sandboxed_sh::remote_node::JobPayload,
     work_root: &Path,
+    managed_auth: &sandboxed_sh::node::ManagedAuth,
 ) -> Result<(), String> {
+    if let sandboxed_sh::remote_node::JobPayload::RawCommand {
+        managed_auth: requested,
+        ..
+    } = payload
+    {
+        managed_auth.validate_request(requested)?;
+    }
     if let sandboxed_sh::remote_node::JobPayload::LeanBuild {
         source,
         cwd_rel,
@@ -450,6 +474,52 @@ async fn get_job(
         None => None,
     };
     Ok(Json(job_status_from_record(&record, log_tail)))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct JobLogQuery {
+    #[serde(default)]
+    offset: u64,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+}
+
+/// `GET /jobs/:id/log?offset=N` — bounded log range for live streaming.
+async fn get_job_log(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<JobLogQuery>,
+) -> Result<Json<sandboxed_sh::remote_node::JobLogChunk>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    let record = state
+        .jobs
+        .get(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("job {id} not found")))?;
+    let max_bytes = query
+        .max_bytes
+        .unwrap_or(sandboxed_sh::node::LOG_CHUNK_MAX_BYTES);
+    let (data, next_offset, log_len) = match record.log_path.as_deref() {
+        Some(path) => sandboxed_sh::node::read_log_chunk(
+            Path::new(path),
+            query.offset,
+            max_bytes,
+            sandboxed_sh::remote_node::job_state_confirms_termination(record.state.as_str()),
+        )
+        .await
+        .unwrap_or((String::new(), query.offset, query.offset)),
+        None => (String::new(), query.offset, query.offset),
+    };
+    Ok(Json(sandboxed_sh::remote_node::JobLogChunk {
+        job_id: id,
+        offset: query.offset.min(log_len),
+        next_offset,
+        log_len,
+        data,
+        state: record.state.as_str().to_string(),
+    }))
 }
 
 /// `POST /jobs/:id/cancel` — request cancellation of a queued/running job.
@@ -538,6 +608,7 @@ mod tests {
             active_leases: AtomicU32::new(0),
             jobs,
             runner,
+            managed_auth: sandboxed_sh::node::ManagedAuth::default(),
         })
     }
 
@@ -685,6 +756,7 @@ mod tests {
                     command: "while [ ! -e release ]; do sleep 0.01; done".to_string(),
                     timeout_secs: Some(30),
                     env: None,
+                    managed_auth: Vec::new(),
                 },
             }),
         )
@@ -750,6 +822,7 @@ mod tests {
             command: "echo job-ok".to_string(),
             timeout_secs: Some(30),
             env: None,
+            managed_auth: Vec::new(),
         };
 
         // A mission:execute lease must be rejected for job submission.

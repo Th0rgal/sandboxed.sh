@@ -144,6 +144,17 @@ CREATE TABLE IF NOT EXISTS projects (
     mode_signal_at     TEXT
 );
 
+-- Project ownership is local control-plane data. Hermes owns the job itself;
+-- this only records which Hermes job ids Orb is allowed to surface under a
+-- project (and deliberately does not replace controller_cron_id).
+CREATE TABLE IF NOT EXISTS project_crons (
+    slug TEXT NOT NULL REFERENCES projects(slug) ON DELETE CASCADE,
+    job_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (slug, job_id),
+    UNIQUE (job_id)
+);
+
 -- The autonomy grant, structured so it survives a controller rewriting its own
 -- prompt: merge authority, budget, and the machine-checkable PAUSED() live here,
 -- not in prose the next rollover can drop.
@@ -1139,6 +1150,43 @@ impl ProjectsStore {
         self.connection
             .lock()
             .map_err(|_| "projects database lock poisoned".to_string())
+    }
+
+    pub fn bind_project_cron(&self, slug: &str, job_id: &str) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO project_crons (slug, job_id, created_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(slug, job_id) DO NOTHING",
+                params![slug, job_id, now],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn project_cron_ids(&self, slug: &str) -> Result<Vec<String>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare("SELECT job_id FROM project_crons WHERE slug = ?1 ORDER BY created_at, job_id")
+            .map_err(|e| e.to_string())?;
+        let ids = statement
+            .query_map(params![slug], |row| row.get(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(ids)
+    }
+
+    pub fn owns_project_cron(&self, slug: &str, job_id: &str) -> Result<bool, String> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM project_crons WHERE slug = ?1 AND job_id = ?2)",
+                params![slug, job_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())
     }
 
     /// Every explicit binding, keyed by project slug. Read once per overview
@@ -7325,5 +7373,24 @@ mod tests {
             normalize_track_key("ux1"),
             normalize_track_key("ux1-pr229-cert")
         );
+    }
+
+    #[test]
+    fn project_cron_bindings_are_scoped_and_idempotent() {
+        let store = ProjectsStore::open_in_memory().unwrap();
+        store
+            .upsert_project("orbit", Some("Orbit"), None, None, None)
+            .unwrap();
+        store
+            .upsert_project("other", Some("Other"), None, None, None)
+            .unwrap();
+        store.bind_project_cron("orbit", "abc123def456").unwrap();
+        store.bind_project_cron("orbit", "abc123def456").unwrap();
+        assert_eq!(
+            store.project_cron_ids("orbit").unwrap(),
+            vec!["abc123def456"]
+        );
+        assert!(store.owns_project_cron("orbit", "abc123def456").unwrap());
+        assert!(!store.owns_project_cron("other", "abc123def456").unwrap());
     }
 }
