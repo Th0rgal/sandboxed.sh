@@ -19,8 +19,8 @@ describe("mission launch projection",()=>{
  it.each(["pending","resuming","interrupted","failed","completed"])("renders honest %s status without text",status=>{
   const phase=missionPhase(mission({status}),false);expect(phase.label).toBeTruthy();expect(phase.detail).toBeTruthy();expect(phase.moving).toBe(["pending","resuming"].includes(status));
  });
- it("explains a missing remote command without promising a backend upgrade",()=>{
-  expect(launchError(new ApiError(400,"remote_command is required when remote_node_id is set"))).toContain("requires a supported harness command");
+ it("explains an older server that requires a remote command",()=>{
+  expect(launchError(new ApiError(400,"remote_command is required when remote_node_id is set"))).toContain("does not support structured remote launches");
  });
 });
 

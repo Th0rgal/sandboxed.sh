@@ -563,13 +563,9 @@ export async function getMission(id: string): Promise<Mission> {
 }
 
 export async function createMission(body: CreateMissionBody): Promise<Mission> {
-  // The node API executes remote_command verbatim. backend/model_override are
-  // local resume metadata, not remote argv or credential provisioning. No
-  // verified remote harness adapter exists yet; never substitute an installed
-  // CLI or submit a mission we cannot launch with the user's exact selection.
-  if (body.remote_node_id) {
-    throw new Error(`Remote launch for ${body.backend ?? "the selected harness"}${body.model_override ? ` (${body.model_override})` : ""} is not supported on ${body.remote_node_id} from Orb yet. Your draft and selection are kept. No mission was submitted.`);
-  }
+  // The typed remote contract owns harness validation and provisioning on the
+  // server. Send the exact selection; never generate shell or proxy credentials
+  // here. Unsupported/older servers reject explicitly without client fallback.
   return api("/api/control/missions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

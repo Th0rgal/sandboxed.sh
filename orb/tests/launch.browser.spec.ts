@@ -3,11 +3,11 @@ import { writeFileSync } from "node:fs";
 const prompt="/goal Check remote startup without losing this draft";
 const base={id:"accepted",title:"Remote task",status:"pending",history:[],workspace_name:"host",created_at:"",updated_at:""};
 const node={id:"dgx-spark",status:"online",cordoned:false};
-async function setup(page:Page, options:{reject?:boolean;missing?:boolean;failed?:boolean;remoteJob?:{phase:string;node_state?:string};emptyStatus?:string}={}){
+async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteSuccess?:boolean;missing?:boolean;failed?:boolean;remoteJob?:{phase:string;node_state?:string};emptyStatus?:string}={}){
  let posts:any[]=[], releasePost!:()=>void,releaseHistory!:()=>void;
  const postGate=new Promise<void>(resolve=>releasePost=resolve),historyGate=new Promise<void>(resolve=>releaseHistory=resolve);
  let fail=!!options.reject;let fleetReads=0;let listReads=0;
- const m={...base,...(options.remoteJob?{remote_job:{job_id:"job-123",node_id:"dgx-spark",...options.remoteJob},execution:{state:"waiting_remote_job"}}:{}),...(options.failed?{status:options.emptyStatus??"interrupted",goal_mode:true,goal_objective:"Original saved objective",terminal_reason:"orphan_no_runner",remote_node_id:"dgx-spark"}:{})};
+ const m={...base,...(options.remoteSuccess?{status:"active",remote_job:{job_id:"job-123",node_id:"dgx-spark",phase:"observed"},execution:{state:"waiting_remote_job"}}:{}),...(options.remoteJob?{remote_job:{job_id:"job-123",node_id:"dgx-spark",...options.remoteJob},execution:{state:"waiting_remote_job"}}:{}),...(options.failed?{status:options.emptyStatus??"interrupted",goal_mode:true,goal_objective:"Original saved objective",terminal_reason:"orphan_no_runner",remote_node_id:"dgx-spark"}:{})};
  await page.addInitScript(()=>{
   localStorage.setItem("orb.apiUrl",location.origin);localStorage.setItem("orb.jwt","test");localStorage.setItem("orb-theme","dark");
   localStorage.setItem("orb.harnessPick",JSON.stringify({backend:"grok",model:"grok-4.6"}));
@@ -25,6 +25,8 @@ async function setup(page:Page, options:{reject?:boolean;missing?:boolean;failed
   if(path.includes("proxy-keys"))throw new Error("Frontend must not mint remote credentials");
   if(path==="/api/control/missions"&&request.method()==="POST"){
    posts.push(request.postDataJSON());await postGate;
+   if(options.legacy)return route.fulfill({status:400,body:"remote_command is required when remote_node_id is set"});
+   if(request.postDataJSON().remote_node_id && !options.remoteSuccess)return route.fulfill({status:400,body:`Selected remote harness ${request.postDataJSON().backend} is not supported on dgx-spark`});
    if(fail)return route.fulfill({status:503,body:"Runner admission unavailable"});return route.fulfill({json:m});
   }
   if(path==="/api/control/missions"&&!url.searchParams.has("project")){
@@ -33,7 +35,7 @@ async function setup(page:Page, options:{reject?:boolean;missing?:boolean;failed
   if(path.endsWith("/events")) {if(!options.failed)await historyGate;return route.fulfill({json:options.failed?[]:[{id:1,event_id:"initial",sequence:1,event_type:"user_message",content:prompt,timestamp:""}]});}
   if(path==="/api/control/stream"){await historyGate;if(options.failed)return route.fulfill({contentType:"text/event-stream",body:""});return route.fulfill({contentType:"text/event-stream",body:`event: user_message\ndata: ${JSON.stringify({id:"initial",content:prompt})}\n\n`});}
   if(path==="/api/control/missions/accepted")return route.fulfill({json:m});
-  const json=path==="/api/projects"?{projects:[{slug:"test",title:"Test"}]}:path==="/api/backends"?[{id:"grok",name:"Grok"},{id:"codex",name:"Codex"}]:path==="/api/providers/backend-models"?{backends:{grok:[{value:"grok-4.6",label:"Grok 4.6"}],codex:[{value:"codex-model",label:"Codex model"}]}}:path==="/api/remote-nodes"?{enabled:true,nodes:options.missing&&++fleetReads>1?[]:[node]}:path==="/api/control/missions"?options.failed?[m]:[]:path.endsWith("/files")?{entries:[]}:path.endsWith("/crons")?{jobs:[]}:{job:null,runs:[]};
+  const json=path==="/api/projects"?{projects:[{slug:"test",title:"Test"}]}:path==="/api/backends"?[{id:"grok",name:"Grok"},{id:"codex",name:"Codex"},{id:"opencode",name:"OpenCode"}]:path==="/api/providers/backend-models"?{backends:{grok:[{value:"grok-4.6",label:"Grok 4.6"}],codex:[{value:"codex-model",label:"Codex model"}],opencode:[{value:"xai/grok-4.6",label:"Grok 4.6"}]}}:path==="/api/remote-nodes"?{enabled:true,nodes:options.missing&&++fleetReads>1?[]:[node]}:path==="/api/control/missions"?options.failed?[m]:[]:path.endsWith("/files")?{entries:[]}:path.endsWith("/crons")?{jobs:[]}:{job:null,runs:[]};
   return route.fulfill({json});
  });
  await page.goto("/");
@@ -66,11 +68,13 @@ test("missing selected node never silently launches on Core",async({page})=>{
  const state=await setup(page,{missing:true});await chooseRemote(page);const input=page.getByPlaceholder("Plan, Build, / for commands, @ for context");await input.fill(prompt);await input.press("Enter");await expect(page.getByRole("alert")).toContainText("DGX Spark is unavailable");await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(0);
 });
 
-test("Grok remote launch fails before POST and keeps the exact selection and draft",async({page})=>{
- const state=await setup(page);await chooseRemote(page);
+test("server rejects unsupported Grok remote launch and keeps the exact selection and draft",async({page})=>{
+ const state=await setup(page);state.releasePost();await chooseRemote(page);
  const input=page.getByPlaceholder("Plan, Build, / for commands, @ for context");await input.fill(prompt);await input.press("Enter");
- await expect(page.getByRole("alert")).toContainText("Remote launch for grok (grok-4.6) is not supported on dgx-spark");
- await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(0);
+ await expect(page.getByRole("alert")).toContainText("Selected remote harness grok is not supported on dgx-spark");
+ await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(1);
+ expect(state.posts[0]).toMatchObject({backend:"grok",model_override:"grok-4.6",remote_node_id:"dgx-spark"});
+ expect(state.posts[0]).not.toHaveProperty("remote_command");
  await expect(page.getByRole("button",{name:"Grok",exact:true})).toBeVisible();
  await expect(page.getByRole("button",{name:/DGX Spark/})).toBeVisible();
  await expect(page.getByPlaceholder("Send follow-up")).toHaveCount(0);
@@ -86,8 +90,8 @@ test("unsupported remote harness is explicit and never changed to Claude",async(
  const state=await setup(page);state.releasePost();await chooseRemote(page);
  await page.getByRole("button",{name:"Grok",exact:true}).click();await page.getByRole("button",{name:"Codex 1",exact:true}).click();
  const input=page.getByPlaceholder("Plan, Build, / for commands, @ for context");await input.fill(prompt);await input.press("Enter");
- await expect(page.getByRole("alert")).toContainText("codex (codex-model) is not supported");await expect(input).toHaveValue(prompt);
- expect(state.posts).toHaveLength(0);
+ await expect(page.getByRole("alert")).toContainText("codex is not supported");await expect(input).toHaveValue(prompt);
+ expect(state.posts).toHaveLength(1);expect(state.posts[0]).toMatchObject({backend:"codex",model_override:"codex-model",remote_node_id:"dgx-spark"});
 });
 
 test("startup timing benchmark: repeated explicit launches get distinct request identities",async({page})=>{
@@ -122,4 +126,29 @@ for(const [phase,node_state,label] of [["observed",undefined,"Remote job accepte
  await page.getByRole("button",{name:/Remote task/}).click();
  await expect(page.getByRole("status")).toContainText(`${label} on DGX Spark`);
  await expect(page.locator(".user")).toHaveText("/goal Original saved objective");
+});
+
+
+test("server-supported remote launch preserves harness/model and opens durable job immediately",async({page})=>{
+ const state=await setup(page,{remoteSuccess:true});await chooseRemote(page);
+ await page.getByRole("button",{name:"Grok",exact:true}).click();await page.getByRole("button",{name:"OpenCode 1",exact:true}).click();
+ const input=page.getByPlaceholder("Plan, Build, / for commands, @ for context");await input.fill(prompt);await input.press("Enter");
+ await expect(page.locator(".launch-preview .user")).toHaveText(prompt);
+ await expect(page.getByRole("status")).toContainText("Starting on DGX Spark");
+ await expect.poll(()=>state.posts.length).toBe(1);
+ expect(state.posts[0]).toMatchObject({backend:"opencode",model_override:"xai/grok-4.6",remote_node_id:"dgx-spark",prompt});
+ expect(state.posts[0]).not.toHaveProperty("remote_command");expect(state.posts[0]).not.toHaveProperty("remote_async");
+ state.releasePost();await expect(page.getByPlaceholder("Send follow-up")).toBeVisible({timeout:1500});
+ await expect(page.getByRole("status")).toContainText("Remote job accepted on DGX Spark");
+ await expect(page.locator(".user")).toHaveText(prompt);state.releaseHistory();await expect(page.locator(".user")).toHaveCount(1);
+ await page.screenshot({path:"test-results/orb-remote-accepted.png"});
+});
+
+test("old raw-command server rejects explicitly without retry or fallback",async({page})=>{
+ const state=await setup(page,{legacy:true});state.releasePost();await chooseRemote(page);
+ const input=page.getByPlaceholder("Plan, Build, / for commands, @ for context");await input.fill(prompt);await input.press("Enter");
+ await expect(page.getByRole("alert")).toContainText("does not support structured remote launches");
+ await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(1);
+ expect(state.posts[0]).toMatchObject({backend:"grok",model_override:"grok-4.6",remote_node_id:"dgx-spark"});
+ expect(state.posts[0]).not.toHaveProperty("remote_command");
 });

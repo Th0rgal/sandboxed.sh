@@ -19,22 +19,27 @@ precedence over a bookkeeping workspace named `host`.
 
 ## Remote contract and integration
 
-The supported local create path sends the exact `backend`, `model_override`,
-`prompt`, project and `idempotency_key`. Remote selection is validated against
-the fleet, but Orb rejects remote agent creation before POST: the actual node
-contract requires a `remote_command`, and backend/model fields only hold local
-resume metadata. There is no verified remote harness/credential provisioning
-adapter in this client. Installed Claude/OpenCode executables are not a
-substitute for Grok Build. The draft, harness/model and node selection remain
-intact; no fallback machine, command or credential request is issued.
+Orb sends the exact `backend`, `model_override`, `prompt`, `remote_node_id`,
+project and `idempotency_key` to the server-owned typed create path. It contains
+no client-generated shell, proxy-key provisioning, supported-harness allowlist,
+or fallback machine/harness. A missing/cordoned/offline node is still refused
+before POST. Server validation errors keep the draft and selection. Older
+raw-only backends reject missing `remote_command`; Orb explains that they do not
+support typed launches and does not retry with a raw command or local machine.
 
-Contract checked against `fix/orb-remote-mission-launch` at `1b292c9c`:
-`src/api/control/mod.rs` CreateMissionRequest and remote_job_projection. Existing
-remote missions use `remote_job.node_id` for placement and the durable job phase
-and node state for status. Active/observed alone means accepted, not running;
-only node_state=running confirms running. Ambiguous or unobserved jobs explicitly
-show that the backend is checking their state. Terminal mission status remains
-authoritative. No live mission or user goal was retried.
+Contract verified against `fix/orb-remote-mission-launch` at `8271a0e8` (unchanged
+at `488d0a4e`), `docs/REMOTE_NODES.md` and the typed remote admission test in
+`src/api/control/dispatch_admission_tests.rs`. There is no capability endpoint
+in this checkpoint: the typed POST is the authority for harness/model validation.
+The server currently supports Claude Code and OpenCode. Native Grok Build is
+explicitly rejected; its node provisioning remains a separate backend task.
+OpenCode with a Grok model is never substituted for a Grok Build selection.
+
+Existing and newly accepted remote missions use `remote_job.node_id` for
+placement and job phase/node state for status. Active/observed means accepted,
+not running. Node_state=running confirms running. Ambiguous or unobserved jobs
+show that the backend is checking status. Terminal mission status remains
+authoritative. No live mission, DGX goal, deployment or provisioning ran here.
 
 Voice integration: Composer's existing `onSend` now accepts an async boolean
 result. Preserve its `sending` guard and only-clear-on-success behavior when
@@ -55,7 +60,7 @@ Run `pnpm test`, `pnpm build` and `pnpm test:browser` in orb. The launch browser
 suite mounts the actual App with intercepted APIs; it tests a POST held for over
 one second, a three-second mission-list refresh, request rejection, empty failed
 and interrupted history, pending/resuming status, late user-event reconciliation,
-missing nodes, pre-POST unsupported remote harness rejection, and durable remote
+missing nodes, server-side unsupported remote harness rejection, and durable remote
 job status. All outbound local
 launches are mocked; a proxy-key request fails the test.
 
@@ -85,17 +90,19 @@ case explicitly checks page visibility and waits for the request count with
 `expect.poll`. No native or voice code changed.
 
 
-## Verified remote contract correction
+## Typed contract integration verification
 
-The launch timing and slow-POST success fixtures now use the supported local
-create path. Previous remote success mocks assumed command synthesis that the
-backend does not implement; they are not evidence of working remote harness
-launches. Remote Grok and Codex browser tests instead assert zero POSTs, retained
-draft and selection, and an explicit error. API tests also cover Claude,
-OpenCode and Gemini rejection without network requests. Read-only mission views
-cover observed, queued, running, unobserved and ambiguous remote job states.
+The blanket interim guard from 73181f46 is removed. The supported remote browser
+fixture uses the published server contract: an explicitly selected OpenCode
+harness and xai/grok-4.6 model receive an Active mission with remote_job and
+waiting_remote_job execution metadata. The accepted view opens without waiting
+for the slow mission-list refresh, and durable user history replaces the
+optimistic prompt without duplication. Grok/Codex rejection tests retain their
+exact selection and assert one POST with no command or credential requests.
+The old-server test asserts an explicit rejection and no retry/fallback.
 
-This correction passes 50 unit/component tests, 14 targeted launch browser tests,
-and the production frontend build. Local launch benchmark: optimistic feedback
-0.7 ms median / 1.3 ms p95; accepted-view transition 2.8 / 4.0 ms. Screenshot:
-`test-results/orb-remote-unsupported.png`.
+51 unit/component tests, 16 targeted launch browser tests, and the production
+frontend build pass. These are mocked client contract tests, not proof of DGX
+execution. Backend fixture admission tests are present in the referenced server
+checkpoint. Actual node startup needs the approved backend rollout and canary.
+Screenshot: `test-results/orb-remote-accepted.png`.
