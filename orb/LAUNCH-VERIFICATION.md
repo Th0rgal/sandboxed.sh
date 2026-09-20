@@ -22,12 +22,17 @@ precedence over a bookkeeping workspace named `host`.
 Orb sends the exact `backend`, `model_override`, `prompt`, `remote_node_id`,
 project and `idempotency_key` to the server-owned typed create path. It contains
 no client-generated shell, proxy-key provisioning, or fallback machine/harness.
-Preflight mirrors the verified server harness list: `claudecode` and `opencode`
-are permitted; Grok Build, Codex, Gemini, ChatGPT UI and unknown/missing harnesses
-are rejected before POST while retaining the draft and selection. A missing/cordoned/offline node is still refused
-before POST. Server validation errors keep the draft and selection. Older
-raw-only backends reject missing `remote_command`; Orb explains that they do not
-support typed launches and does not retry with a raw command or local machine.
+Preflight no longer carries a client-side harness list. Every remote launch
+re-reads `GET /api/remote-nodes` and follows its `remote_launch` capability
+(`{typed, harnesses, raw_command, proxy_url_configured}`; production release
+`21e29373` advertises `claudecode` and `opencode`). A harness the server has not
+advertised, a missing or untyped capability (older backend), an unset proxy URL,
+a failed capability read, and a missing/cordoned/offline node are all refused
+before POST while retaining the draft and selection. Grok is therefore sent
+unchanged as soon as a backend advertises `grok`, and never before. Server
+validation errors keep the draft and selection. A typed-capable backend that still
+answers `remote_command is required` is explained the same way, without a raw
+command or local-machine retry.
 
 Contract verified against `fix/orb-remote-mission-launch` at `8271a0e8` (unchanged
 at `488d0a4e`), `docs/REMOTE_NODES.md` and the typed remote admission test in
@@ -112,3 +117,42 @@ execution. Backend fixture admission tests are present in the referenced server
 checkpoint. Actual node startup needs the approved backend rollout and canary.
 Screenshots: `test-results/orb-remote-claudecode-accepted.png` and
 `test-results/orb-remote-opencode-accepted.png`.
+
+
+## Goal composer and capability preflight verification
+
+`/goal` has no dedicated create field on the backend: `POST /api/control/missions`
+(`CreateMissionRequest`) persists `goal_mode` and `goal_objective` from a prompt of
+the form `/goal <objective>` (`parse_goal_objective` / `canonical_goal_message` in
+`src/api/control/mod.rs`). Orb keeps that contract. The composer recognises the
+same grammar (`/goal` plus whitespace; `/goals …` is chat), shows a compact Goal
+tag beside the harness picker while the draft is a goal, refuses an empty
+`/goal` with the draft kept, and sends the canonical `/goal <objective>` prompt
+with the objective (first line, 42 characters) as the title instead of the raw
+slash command. The launch preview, transcript user turn, status line and title bar
+render goal turns as a Goal tag plus the exact objective. Stored raw `/goal …`
+titles from older clients display as their objective. The empty-history fallback
+to the persisted `goal_objective` is unchanged (`initialPrompt`).
+
+The harness menu shows the server-advertised remote support for the selected
+machine (`not on DGX Spark`, `no typed remote launch`, `remote support unknown`,
+`checking …`); the machine menu lists the advertised harnesses per node, marked
+`(last known)` after a failed read. The tag is `role="status"` with an
+`aria-label`, is not focusable, and Escape still closes the pickers.
+
+Verification in this checkout: 82 unit/component tests, 23 launch browser tests
+plus the existing cron, sidebar, project-picker and transcript browser suites, and
+the production frontend build. Browser coverage includes the goal indicator and
+canonical POST, Grok accepted once advertised (`screenshots/orb-remote-grok-accepted.png`),
+Grok refused while unadvertised (`orb-remote-unsupported.png`, `orb-harness-menu-remote.png`),
+missing capability, capability read failure, proxy URL unset, and the persisted
+goal fallback (`orb-launch-interrupted.png`). Those screenshots and the composer
+views (`orb-goal-composer.png`, `orb-goal-accepted.png`, `orb-goal-accepted-light.png`)
+are copied into `screenshots/` because `test-results/` is git-ignored. `benchmarks/goal-composer-timings.json`
+measures the per-keystroke cost of the indicator (input event through forced
+layout, 60 samples each): plain text 0.4 ms median / 0.6 ms p95, goal draft
+0.5 / 0.8 ms, editing an existing goal 0.5 / 0.7 ms. The 12-launch startup
+benchmark stayed at 0.9 ms median / 2.6 ms p95 optimistic and 2.3 / 4.8 ms
+accepted view; the held-POST case showed the goal preview after 2.7 ms and the
+accepted view 4.7 ms after the response. These are mocked client checks; no production backend, DGX node or
+native Tauri build was exercised.
