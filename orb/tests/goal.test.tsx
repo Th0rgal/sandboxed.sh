@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { render } from "@solidjs/testing-library";
-import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, EMPTY_GOAL_ERROR } from "../src/goal";
+import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, EMPTY_GOAL_ERROR, absorbGoalPrefix, composerModes, filterSlash, slashQuery, modePrompt } from "../src/goal";
 import { UserTurn } from "../src/Transcript";
 import { LaunchStatus, missionGoal, type LaunchReceipt } from "../src/missionLaunch";
 import type { Mission } from "../src/api";
@@ -51,6 +51,39 @@ describe("mission titles", () => {
     expect(displayTitle("/goal Original saved objective")).toBe("Original saved objective");
     expect(displayTitle("Remote task")).toBe("Remote task");
     expect(displayTitle(null)).toBeNull();
+  });
+});
+
+describe("slash palette and in-input mode", () => {
+  it("opens on a leading slash with no spaces", () => {
+    expect(slashQuery("/")).toEqual({ open: true, query: "" });
+    expect(slashQuery("/go")).toEqual({ open: true, query: "go" });
+    expect(slashQuery("/goal")).toEqual({ open: true, query: "goal" });
+    expect(slashQuery("/goal ")).toEqual({ open: false, query: "" });
+    expect(slashQuery(" /")).toEqual({ open: false, query: "" });
+  });
+  it("lists Goal for grok/claude/codex/opencode and hides it for gemini", () => {
+    expect(composerModes("grok").map((i) => i.id)).toEqual(["goal"]);
+    expect(composerModes("claudecode").map((i) => i.id)).toEqual(["goal"]);
+    expect(composerModes(null).map((i) => i.id)).toEqual(["goal"]);
+    expect(composerModes("gemini")).toEqual([]);
+  });
+  it("filters modes by the slash query", () => {
+    const items = composerModes("grok");
+    expect(filterSlash(items, "g").map((i) => i.id)).toEqual(["goal"]);
+    expect(filterSlash(items, "plan")).toEqual([]);
+  });
+  it("absorbs a typed /goal prefix into the visible objective", () => {
+    expect(absorbGoalPrefix("/goal")).toBe("");
+    expect(absorbGoalPrefix("/goal   ")).toBe("");
+    expect(absorbGoalPrefix("/goal Ship it")).toBe("Ship it");
+    expect(absorbGoalPrefix("/goals are nice")).toBeNull();
+    expect(absorbGoalPrefix("plain")).toBeNull();
+  });
+  it("rebuilds the canonical /goal prompt from the chip + visible text", () => {
+    expect(modePrompt("goal", "Ship it")).toBe("/goal Ship it");
+    expect(modePrompt("goal", "  ")).toBe("/goal");
+    expect(modePrompt(null, "plain")).toBe("plain");
   });
 });
 

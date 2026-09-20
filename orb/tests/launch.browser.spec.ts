@@ -77,27 +77,34 @@ test("slow local POST shows prompt immediately; accepted mission opens before sl
 
 test("/goal draft shows a Goal indicator, needs an objective, and is sent as the canonical goal prompt with an objective title",async({page})=>{
  const state=await setup(page);state.releasePost();state.releaseHistory();
- const input=composerInput(page);const chip=page.locator(".composer .goal-mode");
- await input.fill("/goal");await expect(chip).toHaveAttribute("role","status");await expect(chip).toContainText("Goal");await expect(chip).toContainText("add an objective");
- await input.press("Enter");await expect(page.getByRole("alert")).toContainText("Add an objective after /goal");expect(state.posts).toHaveLength(0);await expect(input).toHaveValue("/goal");await expect(input).toBeFocused();
+ const input=composerInput(page);const chip=page.locator(".composer .mode-chip");
+ await input.pressSequentially("/");
+ await expect(page.locator(".slash-menu")).toContainText("Goal");
+ await input.press("Enter");
+ await expect(page.locator(".slash-menu")).toHaveCount(0);
+ await expect(chip).toHaveAttribute("role","status");await expect(chip).toContainText("Goal");
+ await expect(input).toHaveValue("");
+ await input.press("Enter");await expect(page.getByRole("alert")).toContainText("Add an objective after /goal");expect(state.posts).toHaveLength(0);await expect(input).toHaveValue("");await expect(chip).toBeVisible();await expect(input).toBeFocused();
+ await chip.getByRole("button",{name:"Remove Goal"}).click();
+ await expect(chip).toHaveCount(0);
  await input.fill("/goals are nice");await expect(chip).toHaveCount(0);
- await input.fill(`  /goal   ${objective}`);await expect(chip).toHaveText("Goal");
+ await input.fill(`  /goal   ${objective}`);await expect(chip).toContainText("Goal");
+ await expect(input).toHaveValue(objective);
  await expect(page.getByRole("alert")).toHaveCount(0);
  await expect(chip).toHaveAttribute("aria-label",/keeps iterating/);
  const align=await page.evaluate(()=>{
-  const tag=document.querySelector(".composer .goal-tag");
-  const model=document.querySelector(".composer .model");
-  const send=document.querySelector(".composer .send");
-  if(!tag||!model||!send)return null;
-  const t=tag.getBoundingClientRect(),m=model.getBoundingClientRect(),s=send.getBoundingClientRect();
-  const mid=(r:DOMRect)=>r.top+r.height/2;
-  return {tagMid:mid(t),modelMid:mid(m),sendMid:mid(s),tagH:t.height,modelH:m.height,sendH:s.height};
+  const tag=document.querySelector(".composer .mode-chip");
+  const field=document.querySelector(".composer-field");
+  const ta=document.querySelector(".composer textarea");
+  if(!tag||!field||!ta)return null;
+  const t=tag.getBoundingClientRect(),f=field.getBoundingClientRect(),a=ta.getBoundingClientRect();
+  return {tagH:t.height,inField:t.left>=f.left&&t.right<=f.right+1,topDelta:Math.abs(t.top-a.top)};
  });
  expect(align).not.toBeNull();
  expect(align!.tagH).toBe(24);
- expect(Math.abs(align!.tagMid-align!.modelMid)).toBeLessThan(1);
- expect(Math.abs(align!.tagMid-align!.sendMid)).toBeLessThan(1);
- await input.press("Tab");expect(await page.evaluate(()=>!!document.activeElement?.closest(".goal-mode"))).toBe(false);
+ expect(align!.inField).toBe(true);
+ expect(align!.topDelta).toBeLessThan(4);
+ await input.press("Tab");expect(await page.evaluate(()=>!!document.activeElement?.closest(".mode-chip"))).toBe(false);
  await page.screenshot({path:"test-results/orb-goal-composer.png"});
  await input.focus();await input.press("Enter");
  await expect(page.getByPlaceholder("Send follow-up")).toBeVisible();
@@ -122,7 +129,7 @@ test("goal indicator overhead per keystroke stays negligible",async({page})=>{
     ta.value="";ta.dispatchEvent(new Event("input",{bubbles:true}));document.body.offsetHeight;
     const start=performance.now();ta.value=`${text}${i}`;ta.dispatchEvent(new Event("input",{bubbles:true}));document.body.offsetHeight;
     samples.push(performance.now()-start);
-    if(!!document.querySelector(".composer .goal-mode")!==chip)throw new Error(`indicator mismatch for ${text}`);
+    if(!!document.querySelector(".composer .mode-chip")!==chip)throw new Error(`indicator mismatch for ${text}`);
    }
    samples.sort((a,b)=>a-b);return {median:samples[29],p95:samples[56],max:samples[59]};
   };

@@ -1,5 +1,5 @@
 import { LaunchStatus, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, type LaunchReceipt, type RemoteSupport } from "./missionLaunch";
-import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, GoalTag, EMPTY_GOAL_ERROR } from "./goal";
+import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, GoalTag, EMPTY_GOAL_ERROR, absorbGoalPrefix, composerModes, filterSlash, slashQuery, modePrompt, ModeChip, type ComposerMode } from "./goal";
 import { ProjectPicker, ProjectCreation } from "./ProjectPicker";
 import { hasFocusScope } from "./focusScope";
 import { For, Show, Switch, Match, createMemo, createSignal, createEffect, on, onCleanup, onMount, batch } from "solid-js";
@@ -229,42 +229,78 @@ function Composer(p: {
   scope?: string;
   /** Server-confirmed remote support for a harness on the selected machine (new agents only). */
   remoteSupport?: (backend: string) => { state: RemoteSupport; note: string };
+  /** Follow-up: the mission's harness. New agent uses the picker. */
+  backend?: string;
   onDraft?: (text: string) => void;
 }) {
   const [text, setText] = createSignal("");
   // Local voice input (macOS): dictated text lands at the caret, never sends.
   const [voiceActive, setVoiceActive] = createSignal(false);
   ensureVoiceProbe();
-  // Recognize goal drafts exactly as the server does.
-  const goal = createMemo(() => goalDraft(text()));
+  const [mode, setMode] = createSignal<ComposerMode | null>(null);
+  const [slashHi, setSlashHi] = createSignal(0);
   const [model, setModel] = createSignal(MODELS[0]);
   const live = () => isConnected() && harnessChoices().length > 0;
   const [menu, setMenu] = createSignal(false);
   const [ctx, setCtx] = createSignal(false);
   const [which, setWhich] = createSignal<"harness" | "model" | null>(null);
+  const [slashOff, setSlashOff] = createSignal(false);
   let ta!: HTMLTextAreaElement;
+  const pick = () => effectivePick();
+  const backend = () => p.backend ?? pick()?.backend ?? null;
+  const modes = createMemo(() => composerModes(backend()));
+  const slash = createMemo(() => {
+    if (mode() || voiceActive() || slashOff()) return null;
+    const q = slashQuery(text());
+    if (!q.open) return null;
+    const items = filterSlash(modes(), q.query);
+    return items.length ? { query: q.query, items } : null;
+  });
+  createEffect(() => {
+    slash();
+    setSlashHi(0);
+  });
   const resize = () => {
     ta.style.height = "auto";
     ta.style.height = Math.min(ta.scrollHeight, 220) + "px";
   };
+  const draftOf = (visible: string, m = mode()) => modePrompt(m, visible);
+  const write = (visible: string, nextMode = mode()) => {
+    ta.value = visible;
+    setText(visible);
+    p.onDraft?.(draftOf(visible, nextMode));
+    resize();
+  };
+  const enterMode = (next: ComposerMode, visible: string) => {
+    setMode(next);
+    write(visible, next);
+    ta.focus();
+  };
+  const clearMode = () => {
+    setMode(null);
+    p.onDraft?.(text());
+    ta.focus();
+  };
+  const pickSlash = (item: { id: ComposerMode }) => enterMode(item.id, "");
   const [sending, setSending] = createSignal(false);
   const send = async () => {
-    const t = text().trim();
-    if (!t || p.busy || sending()) return;
+    const payload = draftOf(text());
+    if (!payload || p.busy || sending()) return;
     setSending(true);
     try {
-      const accepted = await p.onSend(t);
-      if (accepted !== false && text().trim() === t) { setText(""); ta.value = ""; resize(); }
-      else if (accepted === false && ta.isConnected) ta.focus();
+      const accepted = await p.onSend(payload);
+      if (accepted !== false && draftOf(text()) === payload) {
+        setMode(null);
+        setText("");
+        ta.value = "";
+        resize();
+      } else if (accepted === false && ta.isConnected) ta.focus();
     } finally { setSending(false); }
   };
   const insertDictation = (t: string) => {
     const cur = ta.value;
     const { value, caret } = insertAtCaret(cur, ta.selectionStart ?? cur.length, ta.selectionEnd ?? cur.length, t);
-    ta.value = value;
-    setText(value);
-    p.onDraft?.(value);
-    resize();
+    write(value);
     ta.setSelectionRange(caret, caret);
     ta.focus();
   };
@@ -273,10 +309,11 @@ function Composer(p: {
     setMenu(false);
     setCtx(false);
     setWhich(null);
+    if (slash()) setSlashOff(true);
   };
   const onEsc = (e: KeyboardEvent) => {
     if (e.defaultPrevented || hasFocusScope()) return;
-    if (e.key === "Escape" && (menu() || ctx() || which())) {
+    if (e.key === "Escape" && (menu() || ctx() || which() || slash())) {
       e.stopPropagation();
       close();
     }
@@ -315,24 +352,14 @@ function Composer(p: {
   );
   // Two pickers, Cursor-style: harness first (Claude Code, Codex, …), then
   // the model that harness can run. Changing the harness resets the model.
-  const pick = () => effectivePick();
   const choice = () => harnessChoices().find((c) => c.backend.id === pick()?.backend);
   const modelLabel = () => {
     const m = choice()?.models.find((x) => x.value === pick()?.model);
     return m ? shortModelLabel(m.label) : (pick()?.model ?? "Model");
   };
-  const goalChip = (
-    <Show when={goal().kind !== "none"}>
-      <span class="goal-mode" role="status" aria-live="polite" aria-label={goal().kind === "goal" ? "Goal mode: the agent keeps iterating until the objective is met" : "Goal mode needs an objective after /goal"}>
-        <GoalTag detail={goal().kind === "empty" ? "add an objective" : undefined} />
-      </span>
-    </Show>
-  );
   const modelBtn = (
-    <Show when={p.picker !== false || goal().kind !== "none"}>
+    <Show when={p.picker !== false}>
       <div class="picks" onPointerDown={(e) => e.stopPropagation()}>
-        {goalChip}
-        <Show when={p.picker !== false}>
         <Show
           when={live()}
           fallback={
@@ -418,7 +445,6 @@ function Composer(p: {
             </Show>
           </div>
         </Show>
-        </Show>
       </div>
     </Show>
   );
@@ -428,7 +454,7 @@ function Composer(p: {
     <Show
       when={p.busy}
       fallback={
-        <Show when={text().trim() && !voiceActive()}>
+        <Show when={text().trim() && !slash() && !voiceActive()}>
           <button class="send" onClick={send} title="Send">
             <Ic.ArrowUpIcon size={14} />
           </button>
@@ -447,26 +473,86 @@ function Composer(p: {
       </div>
     </Show>
   );
+  const slashMenu = (
+    <Show when={slash()}>
+      {(s) => (
+        <div class="menu slash-menu" role="listbox" aria-label="Commands" onPointerDown={(e) => e.stopPropagation()}>
+          <div class="slash-head">Modes</div>
+          <For each={s().items}>
+            {(it, i) => (
+              <button
+                type="button"
+                role="option"
+                aria-selected={slashHi() === i()}
+                class={`menu-item ${slashHi() === i() ? "on" : ""}`}
+                title={it.title}
+                onMouseEnter={() => setSlashHi(i())}
+                onClick={() => pickSlash(it)}
+              >
+                <span class="menu-ico"><Ic.TargetIcon size={14} /></span>
+                {it.label}
+              </button>
+            )}
+          </For>
+        </div>
+      )}
+    </Show>
+  );
   return (
-    <div class={`composer ${p.tall ? "tall" : ""} ${voiceActive() ? "voice-on" : ""}`} onClick={() => !voiceActive() && ta.focus()}>
+    <div class={`composer ${p.tall ? "tall" : ""} ${voiceActive() ? "voice-on" : ""} ${mode() ? "has-mode" : ""}`} data-mode={mode() ?? ""} onClick={() => !voiceActive() && ta.focus()}>
       {plus}
-      <textarea
-        ref={ta}
-        rows={1}
-        placeholder={p.placeholder}
-        onInput={(e) => {
-          const next = e.currentTarget.value;
-          setText(next);
-          p.onDraft?.(next);
-          resize();
-        }}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
-            e.preventDefault();
-            send();
-          }
-        }}
-      />
+      {slashMenu}
+      <div class="composer-field">
+        <Show when={mode() === "goal"}><ModeChip mode="goal" onClear={clearMode} /></Show>
+        <Show when={mode()}><span class="mode-sep" aria-hidden="true" /></Show>
+        <textarea
+          ref={ta}
+          rows={1}
+          placeholder={mode() === "goal" ? "Describe the objective" : p.placeholder}
+          onInput={(e) => {
+            const next = e.currentTarget.value;
+            setSlashOff(false);
+            if (!mode()) {
+              const absorbed = absorbGoalPrefix(next);
+              if (absorbed !== null && modes().some((it) => it.id === "goal")) {
+                enterMode("goal", absorbed);
+                return;
+              }
+            }
+            write(next);
+          }}
+          onKeyDown={(e) => {
+            const items = slash()?.items;
+            if (items) {
+              if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                e.preventDefault();
+                const n = items.length;
+                setSlashHi((i) => (e.key === "ArrowDown" ? (i + 1) % n : (i - 1 + n) % n));
+                return;
+              }
+              if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+                e.preventDefault();
+                pickSlash(items[Math.min(slashHi(), items.length - 1)]);
+                return;
+              }
+              if (e.key === "Tab") {
+                e.preventDefault();
+                pickSlash(items[Math.min(slashHi(), items.length - 1)]);
+                return;
+              }
+            }
+            if (e.key === "Backspace" && mode() === "goal" && !text() && ta.selectionStart === 0 && ta.selectionEnd === 0) {
+              e.preventDefault();
+              clearMode();
+              return;
+            }
+            if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+              e.preventDefault();
+              send();
+            }
+          }}
+        />
+      </div>
       {modelBtn}
       {voice}
       {sendBtn}
@@ -1597,7 +1683,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
       </div>
       <div class="dock">
         <div class="col">
-          <Composer placeholder="Send follow-up" picker={false} busy={busy()} onSend={sendMsg} onStop={stopM} scope={`m:${p.id}`} />
+          <Composer placeholder="Send follow-up" picker={false} busy={busy()} onSend={sendMsg} onStop={stopM} scope={`m:${p.id}`} backend={mission()?.backend} />
           <MissionDock mission={mission()} items={viewItems()} destination={missionDestination(mission(), receipt)} />
         </div>
       </div>

@@ -58,3 +58,64 @@ export function GoalTag(p: { detail?: string; class?: string }) {
     </span>
   );
 }
+
+/** Native `/goal` loop — same harness ids as `native_loops.rs`. */
+export const GOAL_HARNESSES = new Set(["claudecode", "codex", "grok", "opencode"]);
+
+export type ComposerMode = "goal";
+
+export type SlashItem = {
+  id: ComposerMode;
+  section: "Modes";
+  label: string;
+  title: string;
+};
+
+export function composerModes(backend?: string | null): SlashItem[] {
+  if (backend && !GOAL_HARNESSES.has(backend)) return [];
+  return [{ id: "goal", section: "Modes", label: "Goal", title: "Keep iterating until this objective is met" }];
+}
+
+/** `/` plus a query with no whitespace — the Cursor slash palette trigger. */
+export function slashQuery(text: string): { open: boolean; query: string } {
+  const m = /^\/([^\s]*)$/.exec(text);
+  return m ? { open: true, query: m[1].toLowerCase() } : { open: false, query: "" };
+}
+
+export function filterSlash(items: SlashItem[], query: string): SlashItem[] {
+  if (!query) return items;
+  return items.filter((it) => it.id.startsWith(query) || it.label.toLowerCase().startsWith(query));
+}
+
+/** Turn a typed `/goal …` draft into the visible objective, or null if it is not a goal. */
+export function absorbGoalPrefix(text: string): string | null {
+  const draft = goalDraft(text);
+  if (draft.kind === "goal") return draft.objective;
+  if (draft.kind === "empty") return "";
+  return null;
+}
+
+export function modePrompt(mode: ComposerMode | null, visible: string): string {
+  const body = visible.trim();
+  if (mode === "goal") return body ? goalPrompt(body) : "/goal";
+  return body;
+}
+
+/** In-input Cursor-style mode chip: icon, name, dismiss. */
+export function ModeChip(p: { mode: ComposerMode; onClear: () => void }) {
+  return (
+    <span
+      class="mode-chip goal-mode"
+      role="status"
+      aria-live="polite"
+      aria-label="Goal mode: the agent keeps iterating until the objective is met"
+      title="Goal mode: the agent keeps iterating until this objective is met."
+    >
+      <Ic.TargetIcon size={12} />
+      <span class="mode-chip-label">Goal</span>
+      <button type="button" class="mode-chip-x" tabIndex={-1} title="Remove Goal" aria-label="Remove Goal" onClick={(e) => { e.preventDefault(); e.stopPropagation(); p.onClear(); }}>
+        <Ic.CloseIcon size={10} />
+      </button>
+    </span>
+  );
+}

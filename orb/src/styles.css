@@ -514,6 +514,7 @@ code {
 .pill:hover, .pill.on { background: var(--bg-active); color: var(--fg); }
 .pill.round { width: 28px; padding: 0; justify-content: center; }
 .composer {
+  position: relative;
   display: grid;
   grid-template-columns: auto 1fr auto auto auto;
   align-items: end;
@@ -523,8 +524,8 @@ code {
   cursor: text;
 }
 .composer:focus-within { border-color: var(--stroke-strong); }
-.composer textarea { grid-column: 2; }
 .composer .plus-wrap { grid-column: 1; }
+.composer .composer-field { grid-column: 2; }
 .composer .picks { grid-column: 3; }
 .composer .voice-slot { grid-column: 4; }
 .composer .send { grid-column: 5; }
@@ -535,10 +536,11 @@ code {
   border-radius: 16px; min-height: 112px;
   padding: 12px 14px 10px; gap: 6px 8px;
 }
-.composer.tall textarea {
+.composer.tall .composer-field {
   grid-column: 1 / -1; grid-row: 1;
-  min-height: 56px; padding-left: 2px; align-self: stretch;
+  align-items: flex-start; align-self: stretch; min-height: 56px;
 }
+.composer.tall .composer-field textarea { min-height: 56px; padding-left: 2px; align-self: stretch; }
 .composer.tall .plus-wrap { grid-column: 1; grid-row: 2; align-self: center; }
 .composer.tall .picks { grid-column: 2; grid-row: 2; justify-self: start; align-self: center; }
 .composer.tall .voice-slot { grid-column: 3; grid-row: 2; align-self: center; }
@@ -553,7 +555,7 @@ code {
   gap: 8px;
 }
 .composer.voice-on.tall { min-height: 42px; padding: 7px 10px 7px 11px; }
-.composer.voice-on textarea,
+.composer.voice-on .composer-field,
 .composer.voice-on .picks,
 .composer.voice-on .send { display: none; }
 .composer.voice-on .plus-wrap { grid-column: 1; grid-row: 1; }
@@ -561,6 +563,10 @@ code {
   grid-column: 2; grid-row: 1;
   width: 100%; min-width: 0; display: flex;
 }
+.composer-field {
+  display: flex; align-items: center; gap: 8px; min-width: 0;
+}
+.composer-field textarea { flex: 1; min-width: 0; }
 .plus { width: 24px; height: 24px; border-radius: 50%; background: var(--plus-bg); color: var(--fg-3); display: grid; place-items: center; flex: none; }
 .plus:hover { background: var(--hover-2); color: var(--fg); }
 textarea {
@@ -1083,9 +1089,32 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 .goal-tag.small svg { width: 10px; height: 10px; }
 .goal-tag-detail { color: var(--fg-3); font-weight: 400; line-height: 1; transform: translateY(0.5px); }
 .goal-tag-detail::before { content: "·"; margin: 0 4px 0 1px; color: var(--fg-4); }
-.goal-mode { display: flex; align-items: center; height: 24px; margin-right: 6px; }
+.goal-mode { display: flex; align-items: center; height: 24px; }
 .composer .goal-tag { height: 24px; padding: 0 9px 0 8px; }
-.picks .goal-mode + .model-wrap { margin-left: 2px; }
+.mode-chip {
+  display: flex; align-items: center; gap: 5px; flex: none;
+  height: 24px; padding: 0 4px 0 8px; border-radius: 999px;
+  font-size: 12px; line-height: 1; font-weight: 500; letter-spacing: .01em;
+  color: var(--blue); background: color-mix(in srgb, var(--blue) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--blue) 32%, transparent);
+  white-space: nowrap;
+}
+.mode-chip svg { display: block; flex: none; width: 12px; height: 12px; }
+.mode-chip-label { display: block; line-height: 1; transform: translateY(0.5px); }
+.mode-chip-x {
+  width: 16px; height: 16px; border-radius: 50%; flex: none;
+  display: grid; place-items: center; color: var(--blue); opacity: .7;
+}
+.mode-chip-x:hover { opacity: 1; background: color-mix(in srgb, var(--blue) 18%, transparent); }
+.mode-chip-x svg { width: 10px; height: 10px; }
+.mode-sep { width: 1px; height: 14px; background: var(--stroke-strong); flex: none; }
+.slash-menu {
+  left: 8px; right: auto; bottom: calc(100% + 8px); min-width: 240px; max-width: 280px;
+  padding: 6px; z-index: 20;
+}
+.slash-head {
+  padding: 6px 8px 4px; font-size: 11px; font-weight: 500; color: var(--fg-4);
+}
 .user.goal { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
 .user.goal > span:last-child { white-space: pre-wrap; }
 .launch-status .goal-tag { margin-right: 2px; }
