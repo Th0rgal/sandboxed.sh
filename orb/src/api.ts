@@ -562,7 +562,14 @@ export async function getMission(id: string): Promise<Mission> {
   return api(`/api/control/missions/${id}`);
 }
 
+// Mirrors the verified server REMOTE_NODE_HARNESSES contract. Provisioning and
+// model validation remain server-owned; these are harness IDs, not model IDs.
+const REMOTE_NODE_HARNESSES = new Set(["claudecode", "opencode"]);
+
 export async function createMission(body: CreateMissionBody): Promise<Mission> {
+  if (body.remote_node_id && !REMOTE_NODE_HARNESSES.has(body.backend ?? "")) {
+    throw new Error(`Remote launch for ${body.backend ?? "the selected harness"}${body.model_override ? ` (${body.model_override})` : ""} is not supported on ${body.remote_node_id}. Remote launches currently support Claude Code and OpenCode. Your draft and selection are kept; no mission was submitted.`);
+  }
   // The typed remote contract owns harness validation and provisioning on the
   // server. Send the exact selection; never generate shell or proxy credentials
   // here. Unsupported/older servers reject explicitly without client fallback.

@@ -29,7 +29,15 @@ it("a previous connection's delayed 401 cannot log out the new connection", asyn
 });
 
 
-it.each(["grok", "claudecode", "opencode", "codex", "gemini"])("lets the server validate remote %s without changing selection or retrying", async backend => {
+it.each(["grok", "codex", "gemini", "chatgpt_ui", "unknown", undefined])("rejects unsupported remote %s before POST while keeping the input unchanged", async backend => {
+  const fetcher = vi.fn(); vi.stubGlobal("fetch", fetcher);
+  const body = {remote_node_id:"dgx-spark",backend,model_override:"chosen-model",prompt:"Keep my draft"};
+  const original = {...body};
+  await expect(createMission(body)).rejects.toThrow("Remote launches currently support Claude Code and OpenCode");
+  expect(fetcher).not.toHaveBeenCalled();expect(body).toEqual(original);
+});
+
+it.each(["claudecode", "opencode"])("lets the server validate remote %s without changing selection or retrying", async backend => {
   const fetcher = vi.fn(async (_url: string, _init?: RequestInit) => new Response(`Selected ${backend} is unavailable on the node`, {status:400}));
   vi.stubGlobal("fetch", fetcher);
   const body = {remote_node_id:"dgx-spark",backend,model_override:"chosen-model",prompt:"Keep my draft"};
@@ -38,11 +46,11 @@ it.each(["grok", "claudecode", "opencode", "codex", "gemini"])("lets the server 
   expect(JSON.parse(fetcher.mock.calls[0][1]!.body as string)).toEqual(body);
 });
 
-it("accepts server-provisioned remote execution without shell or credential requests", async () => {
+it.each(["claudecode", "opencode"])("accepts server-provisioned remote %s without shell or credential requests", async backend => {
   const mission = {id:"accepted",status:"active",remote_job:{node_id:"dgx-spark",job_id:"job",phase:"observed"},execution:{state:"waiting_remote_job"}};
   const fetcher = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(mission)));
   vi.stubGlobal("fetch", fetcher);
-  const body = {remote_node_id:"dgx-spark",backend:"opencode",model_override:"xai/grok-4.6",prompt:"Build it",idempotency_key:"attempt"};
+  const body = {remote_node_id:"dgx-spark",backend,model_override:backend === "claudecode" ? "claude-sonnet-4-6" : "xai/grok-4.6",prompt:"Build it",idempotency_key:"attempt"};
   await expect(createMission(body)).resolves.toEqual(mission);
   expect(fetcher).toHaveBeenCalledTimes(1);
   expect(fetcher.mock.calls[0][0]).toContain("/api/control/missions");

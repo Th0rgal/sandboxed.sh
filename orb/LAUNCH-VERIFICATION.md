@@ -21,8 +21,10 @@ precedence over a bookkeeping workspace named `host`.
 
 Orb sends the exact `backend`, `model_override`, `prompt`, `remote_node_id`,
 project and `idempotency_key` to the server-owned typed create path. It contains
-no client-generated shell, proxy-key provisioning, supported-harness allowlist,
-or fallback machine/harness. A missing/cordoned/offline node is still refused
+no client-generated shell, proxy-key provisioning, or fallback machine/harness.
+Preflight mirrors the verified server harness list: `claudecode` and `opencode`
+are permitted; Grok Build, Codex, Gemini, ChatGPT UI and unknown/missing harnesses
+are rejected before POST while retaining the draft and selection. A missing/cordoned/offline node is still refused
 before POST. Server validation errors keep the draft and selection. Older
 raw-only backends reject missing `remote_command`; Orb explains that they do not
 support typed launches and does not retry with a raw command or local machine.
@@ -30,7 +32,8 @@ support typed launches and does not retry with a raw command or local machine.
 Contract verified against `fix/orb-remote-mission-launch` at `8271a0e8` (unchanged
 at `488d0a4e`), `docs/REMOTE_NODES.md` and the typed remote admission test in
 `src/api/control/dispatch_admission_tests.rs`. There is no capability endpoint
-in this checkpoint: the typed POST is the authority for harness/model validation.
+in this checkpoint: the typed POST remains the authority for model/provisioning validation after
+the client checks the confirmed harness list.
 The server currently supports Claude Code and OpenCode. Native Grok Build is
 explicitly rejected; its node provisioning remains a separate backend task.
 OpenCode with a Grok model is never substituted for a Grok Build selection.
@@ -93,16 +96,19 @@ case explicitly checks page visibility and waits for the request count with
 ## Typed contract integration verification
 
 The blanket interim guard from 73181f46 is removed. The supported remote browser
-fixture uses the published server contract: an explicitly selected OpenCode
-harness and xai/grok-4.6 model receive an Active mission with remote_job and
+fixtures use the published server contract: explicitly selected Claude Code
+(claude-sonnet-4-6) and OpenCode (xai/grok-4.6) receive Active missions with remote_job and
 waiting_remote_job execution metadata. The accepted view opens without waiting
 for the slow mission-list refresh, and durable user history replaces the
 optimistic prompt without duplication. Grok/Codex rejection tests retain their
-exact selection and assert one POST with no command or credential requests.
+exact selection and assert zero POSTs. Both supported-harness requests stay pending
+for at least one second with optimistic prompt/status visible and duplicate
+submission blocked. Neither request contains commands or credentials.
 The old-server test asserts an explicit rejection and no retry/fallback.
 
-51 unit/component tests, 16 targeted launch browser tests, and the production
+55 unit/component tests, 17 targeted launch browser tests, and the production
 frontend build pass. These are mocked client contract tests, not proof of DGX
 execution. Backend fixture admission tests are present in the referenced server
 checkpoint. Actual node startup needs the approved backend rollout and canary.
-Screenshot: `test-results/orb-remote-accepted.png`.
+Screenshots: `test-results/orb-remote-claudecode-accepted.png` and
+`test-results/orb-remote-opencode-accepted.png`.
