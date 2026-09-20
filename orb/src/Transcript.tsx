@@ -195,9 +195,6 @@ export function Transcript(p: { items: StreamItem[] }) {
               return (
                 <div class={`st-text ${item.live ? "live" : ""}`}>
                   <MdView text={item.text} compact />
-                  <Show when={item.live}>
-                    <span class="st-caret" />
-                  </Show>
                 </div>
               );
             case "tool":
