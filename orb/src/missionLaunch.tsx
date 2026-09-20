@@ -16,6 +16,22 @@ export function recalledLaunch(id: string): LaunchReceipt | undefined {
   try { return JSON.parse(sessionStorage.getItem(receiptKey(id)) ?? "null") ?? undefined; } catch { return undefined; }
 }
 export const nodeLabel = (id: string) => id === "core" ? "Core" : id === "dgx-spark" ? "DGX Spark" : id;
+
+/** Statuses where PATCH /settings can change the next-turn model. A live turn returns 409. */
+const SETTINGS_IDLE = new Set([
+  "awaiting_user", "acknowledged", "interrupted", "failed", "paused", "blocked",
+]);
+export function missionSettingsIdle(status?: string | null): boolean {
+  return SETTINGS_IDLE.has((status ?? "").toLowerCase());
+}
+
+/** "Grok 4.6" next to harness "Grok" → "4.6". */
+export function dockModelLabel(harnessName: string, modelLabel: string): string {
+  const h = harnessName.trim();
+  if (!h) return modelLabel;
+  const rest = modelLabel.replace(new RegExp(`^${h.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+`, "i"), "").trim();
+  return rest || modelLabel;
+}
 export function missionDestination(mission: Mission | null, receipt?: LaunchReceipt) {
   // Server-owned remote placement or the accepted selection takes precedence
   // over workspace_name, which can still name the host's bookkeeping workspace.

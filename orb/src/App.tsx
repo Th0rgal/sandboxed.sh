@@ -1,4 +1,4 @@
-import { LaunchStatus, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, type LaunchReceipt, type RemoteSupport } from "./missionLaunch";
+import { LaunchStatus, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, missionSettingsIdle, dockModelLabel, type LaunchReceipt, type RemoteSupport } from "./missionLaunch";
 import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, GoalTag, EMPTY_GOAL_ERROR, absorbGoalPrefix, composerModes, filterSlash, slashQuery, modePrompt, ModeChip, type ComposerMode } from "./goal";
 import { ProjectPicker, ProjectCreation } from "./ProjectPicker";
 import { hasFocusScope } from "./focusScope";
@@ -39,6 +39,7 @@ import {
   type HarnessChoice,
   cancelMission,
   sendMissionMessage,
+  updateMissionSettings,
   type Mission,
   type ProjectSummary,
   type RemoteNodeView,
@@ -1499,15 +1500,47 @@ export default function App() {
   );
 }
 
-function MissionDock(p: { mission: Mission | null; items: StreamItem[]; destination: string }) {
+function MissionDock(p: {
+  mission: Mission | null;
+  items: StreamItem[];
+  destination: string;
+  onMission?: (mission: Mission) => void;
+  onError?: (message: string) => void;
+}) {
   const used = () => estimateTokens(p.items);
   const windowSize = () => contextWindow(p.mission?.backend);
   const pct = () => contextPct(used(), windowSize());
   const [open, setOpen] = createSignal(false);
+  const [modelOpen, setModelOpen] = createSignal(false);
+  const [saving, setSaving] = createSignal(false);
+  const choice = () => harnessChoices().find((c) => c.backend.id === p.mission?.backend);
+  const harnessName = () => choice()?.backend.name ?? p.mission?.backend ?? "";
+  const modelId = () => p.mission?.model_override || "";
+  const modelLabel = () => {
+    const id = modelId();
+    const m = choice()?.models.find((x) => x.value === id);
+    if (m) return dockModelLabel(harnessName(), shortModelLabel(m.label));
+    return id ? dockModelLabel(harnessName(), shortModelLabel(id)) : "Default";
+  };
+  const idle = () => missionSettingsIdle(p.mission?.status);
+  const models = () => choice()?.models ?? [];
+  const canChangeModel = () => idle() && models().length > 1 && !saving();
   const close = (e: PointerEvent) => {
     if (!(e.target instanceof Node)) return;
-    if ((e.target as HTMLElement).closest?.(".ctx-wrap")) return;
-    setOpen(false);
+    const el = e.target as HTMLElement;
+    if (!el.closest?.(".ctx-wrap")) setOpen(false);
+    if (!el.closest?.(".under-model-wrap")) setModelOpen(false);
+  };
+  const pickModel = async (value: string) => {
+    const m = p.mission;
+    if (!m || value === modelId() || saving()) { setModelOpen(false); return; }
+    setSaving(true);
+    setModelOpen(false);
+    try {
+      p.onMission?.(await updateMissionSettings(m.id, { model_override: value }));
+    } catch (e) {
+      p.onError?.(e instanceof Error && e.message.includes("409") ? "Stop the current turn before switching models." : launchError(e));
+    } finally { setSaving(false); }
   };
   onMount(() => window.addEventListener("pointerdown", close));
   onCleanup(() => window.removeEventListener("pointerdown", close));
@@ -1519,6 +1552,44 @@ function MissionDock(p: { mission: Mission | null; items: StreamItem[]; destinat
         </Show>
         {p.destination}
       </span>
+      <Show when={harnessName()}>
+        <span class="under-sep" aria-hidden="true">·</span>
+        <span class="under-harness" title="Harness is fixed for this mission">{harnessName()}</span>
+        <span class="under-sep" aria-hidden="true">·</span>
+        <div class="under-model-wrap">
+          <Show
+            when={canChangeModel()}
+            fallback={
+              <span class="under-model" title={idle() ? modelLabel() : "Stop the current turn to switch models"}>
+                {modelLabel()}
+              </span>
+            }
+          >
+            <button
+              class={`under-model ${modelOpen() ? "on" : ""}`}
+              title="Model for the next turn"
+              onClick={() => setModelOpen(!modelOpen())}
+            >
+              {modelLabel()} <Ic.ChevronDown size={10} />
+            </button>
+            <Show when={modelOpen()}>
+              <div class="menu under-model-menu">
+                <For each={models()}>
+                  {(m) => (
+                    <button
+                      class={`menu-item ${m.value === modelId() ? "on" : ""}`}
+                      onClick={() => pickModel(m.value)}
+                    >
+                      <span class="pick-name">{shortModelLabel(m.label)}</span>
+                      <span class="pick-check">{m.value === modelId() ? "✓" : ""}</span>
+                    </button>
+                  )}
+                </For>
+              </div>
+            </Show>
+          </Show>
+        </div>
+      </Show>
       <div class="ctx-wrap">
         <button class="ctx" title="Context used" onClick={() => setOpen(!open())}>
           <Ic.ContextRing pct={pct()} /> {pct()}%
@@ -1684,7 +1755,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
       <div class="dock">
         <div class="col">
           <Composer placeholder="Send follow-up" picker={false} busy={busy()} onSend={sendMsg} onStop={stopM} scope={`m:${p.id}`} backend={mission()?.backend} />
-          <MissionDock mission={mission()} items={viewItems()} destination={missionDestination(mission(), receipt)} />
+          <MissionDock mission={mission()} items={viewItems()} destination={missionDestination(mission(), receipt)} onMission={setMission} onError={setError} />
         </div>
       </div>
     </>

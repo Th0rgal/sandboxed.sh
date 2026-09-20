@@ -605,10 +605,17 @@ textarea::placeholder { color: var(--placeholder); }
 .menu-ico svg { width: 14px; height: 14px; display: block; }
 .menu-sep { height: 1px; background: var(--stroke-soft); margin: 3px 6px; }
 .popup-menu { position: fixed; bottom: auto; right: auto; z-index: 60; min-width: 168px; padding: 3px; }
-.under { display: flex; align-items: center; gap: 14px; padding: 8px 12px 4px; color: var(--fg-3); font-size: 12px; }
-.under-loc, .ctx { display: inline-flex; align-items: center; gap: 5px; }
+.under { display: flex; align-items: center; gap: 8px; padding: 8px 12px 4px; color: var(--fg-3); font-size: 12px; }
+.under-loc, .ctx, .under-harness, .under-model { display: inline-flex; align-items: center; gap: 5px; }
 .under svg { width: 13px; height: 13px; }
-.under-loc:hover, .ctx:hover { color: var(--fg); }
+.under-loc:hover, .ctx:hover, button.under-model:hover, button.under-model.on { color: var(--fg); }
+.under-sep { color: var(--fg-4); flex: none; }
+.under-harness { cursor: default; }
+.under-model-wrap { position: relative; min-width: 0; }
+.under-model { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+button.under-model { color: inherit; }
+.under-model svg { width: 10px; height: 10px; }
+.under-model-menu { left: 0; right: auto; bottom: 22px; min-width: 180px; }
 .ctx-wrap, .ctx { margin-left: auto; }
 .ctx-wrap { position: relative; }
 .ctx { color: inherit; }

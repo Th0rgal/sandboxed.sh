@@ -165,6 +165,7 @@ export interface Mission {
   workspace_name?: string | null;
   agent?: string | null;
   backend?: string;
+  model_override?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -608,4 +609,16 @@ export async function sendMissionMessage(id: string, text: string): Promise<{ id
 
 export async function cancelMission(id: string): Promise<void> {
   await api<void>(`/api/control/missions/${id}/cancel`, { method: "POST" });
+}
+
+/** Next-turn settings. The mission must be idle; a running turn returns 409. */
+export async function updateMissionSettings(
+  id: string,
+  body: { model_override?: string; backend?: string },
+): Promise<Mission> {
+  return api(`/api/control/missions/${id}/settings`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }

@@ -2,7 +2,7 @@ import { test,expect,type Page } from "@playwright/test";
 import { writeFileSync } from "node:fs";
 const objective="Check remote startup without losing this draft";
 const prompt=`/goal ${objective}`;
-const base={id:"accepted",title:"Remote task",status:"pending",history:[],workspace_name:"host",created_at:"",updated_at:""};
+const base={id:"accepted",title:"Remote task",status:"pending",history:[],workspace_name:"host",backend:"grok",model_override:"grok-4.6",created_at:"",updated_at:""};
 const node={id:"dgx-spark",status:"online",cordoned:false};
 // What production (release 21e29373) advertises today. Grok appears only when a
 // backend that supports native Grok remote launches says so.
@@ -108,6 +108,8 @@ test("/goal draft shows a Goal indicator, needs an objective, and is sent as the
  await page.screenshot({path:"test-results/orb-goal-composer.png"});
  await input.focus();await input.press("Enter");
  await expect(page.getByPlaceholder("Send follow-up")).toBeVisible();
+ await expect(page.locator(".under-harness")).toHaveText("Grok");
+ await expect(page.locator(".under-model")).toHaveText("4.6");
  expect(state.posts).toHaveLength(1);
  expect(state.posts[0]).toMatchObject({prompt,title:"Check remote startup without losing this…",backend:"grok",model_override:"grok-4.6"});
  expect(state.posts[0]).not.toHaveProperty("goal_mode");expect(state.posts[0]).not.toHaveProperty("goal_objective");
@@ -183,6 +185,9 @@ test("Grok remote launch is sent unchanged once the server advertises grok",asyn
  expect(state.posts[0]).toMatchObject({backend:"grok",model_override:"grok-4.6",remote_node_id:"dgx-spark",prompt,title:"Check remote startup without losing this…"});
  expect(state.posts[0]).not.toHaveProperty("remote_command");
  state.releasePost();await expect(page.getByPlaceholder("Send follow-up")).toBeVisible({timeout:1500});
+ await expect(page.locator(".under-loc")).toContainText("DGX Spark");
+ await expect(page.locator(".under-harness")).toHaveText("Grok");
+ await expect(page.locator(".under-model")).toHaveText("4.6");
  await expect(page.locator(".launch-status")).toContainText("Remote job accepted on DGX Spark");await expect(page.locator(".launch-status .goal-tag")).toHaveText("Goal");
  await expectGoalTurn(page,".user");state.releaseHistory();await expectGoalTurn(page,".user");
  await page.screenshot({path:"test-results/orb-remote-grok-accepted.png"});

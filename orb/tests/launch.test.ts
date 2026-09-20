@@ -1,5 +1,5 @@
 import { describe,it,expect } from "vitest";
-import { initialPrompt,withInitialPrompt,missionDestination,missionPhase,launchError } from "../src/missionLaunch";
+import { initialPrompt,withInitialPrompt,missionDestination,missionPhase,launchError,missionSettingsIdle,dockModelLabel } from "../src/missionLaunch";
 import { ApiError,type Mission } from "../src/api";
 import { buildTranscript } from "../src/Transcript";
 const mission=(extra:Partial<Mission>={}):Mission=>({id:"m",title:null,status:"interrupted",history:[],created_at:"",updated_at:"",...extra});
@@ -21,6 +21,16 @@ describe("mission launch projection",()=>{
  });
  it("explains an older server that requires a remote command",()=>{
   expect(launchError(new ApiError(400,"remote_command is required when remote_node_id is set"))).toContain("does not support structured remote launches");
+ });
+ it("treats parked statuses as settings-idle and live turns as not",()=>{
+  expect(missionSettingsIdle("awaiting_user")).toBe(true);
+  expect(missionSettingsIdle("interrupted")).toBe(true);
+  expect(missionSettingsIdle("active")).toBe(false);
+  expect(missionSettingsIdle("pending")).toBe(false);
+ });
+ it("drops a repeated harness prefix from the dock model label",()=>{
+  expect(dockModelLabel("Grok","Grok 4.6")).toBe("4.6");
+  expect(dockModelLabel("Claude Code","Fable 5.1")).toBe("Fable 5.1");
  });
 });
 
