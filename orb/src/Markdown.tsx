@@ -35,23 +35,53 @@ function inline(text: string): JSX.Element[] {
   return out;
 }
 
+type Align = "left" | "center" | "right";
 type Block =
   | { t: "h"; n: number; text: string }
   | { t: "p"; text: string }
   | { t: "ul"; items: string[] }
   | { t: "pre"; lang: string; text: string }
   | { t: "quote"; text: string }
-  | { t: "table"; heads: string[]; rows: string[][] };
+  | { t: "table"; heads: string[]; rows: string[][]; aligns: Align[] };
 
-function isTableSep(line: string): boolean {
-  const t = line.trim();
-  return /^\|?[\s:|-]+\|[\s:|-]*\|?$/.test(t) && t.includes("-");
-}
 function tableCells(line: string): string[] {
   let t = line.trim();
   if (t.startsWith("|")) t = t.slice(1);
   if (t.endsWith("|")) t = t.slice(0, -1);
   return t.split("|").map((c) => c.trim());
+}
+function sepAlign(cell: string): Align | null {
+  const n = cell.replace(/\s/g, "").replace(/[−–—]/g, "-");
+  if (!/^:?-+:?$/.test(n)) return null;
+  const left = n.startsWith(":");
+  const right = n.endsWith(":");
+  if (left && right) return "center";
+  if (right) return "right";
+  return "left";
+}
+function isTableSep(line: string): boolean {
+  const cells = tableCells(line);
+  return cells.length > 0 && cells.every((c) => sepAlign(c) != null);
+}
+function isPipeRow(line: string): boolean {
+  const t = line.trim();
+  return t.startsWith("|") && tableCells(t).length >= 2;
+}
+function readTable(lines: string[], start: number): { block: Extract<Block, { t: "table" }>; next: number } | null {
+  const header = lines[start];
+  if (!isPipeRow(header) || start + 1 >= lines.length) return null;
+  const sep = lines[start + 1];
+  const hasSep = isTableSep(sep);
+  if (!hasSep && !isPipeRow(sep)) return null;
+  const heads = tableCells(header);
+  const aligns = hasSep ? tableCells(sep).map((c) => sepAlign(c) ?? "left") : heads.map(() => "left" as Align);
+  let i = start + (hasSep ? 2 : 1);
+  const rows: string[][] = [];
+  while (i < lines.length && isPipeRow(lines[i]) && !isTableSep(lines[i])) {
+    rows.push(tableCells(lines[i++]));
+  }
+  if (!hasSep && rows.length === 0) return null;
+  return { block: { t: "table", heads, rows, aligns }, next: i };
 }
 
 export function parseMarkdown(src: string): Block[] {
@@ -93,19 +123,23 @@ export function parseMarkdown(src: string): Block[] {
       i++;
       continue;
     }
-    if (line.includes("|") && i + 1 < lines.length && isTableSep(lines[i + 1])) {
-      const heads = tableCells(line);
-      i += 2;
-      const rows: string[][] = [];
-      while (i < lines.length && lines[i].includes("|") && !isTableSep(lines[i])) {
-        rows.push(tableCells(lines[i++]));
-      }
-      out.push({ t: "table", heads, rows });
+    const table = readTable(lines, i);
+    if (table) {
+      out.push(table.block);
+      i = table.next;
       continue;
     }
     const buf = [line];
     i++;
-    while (i < lines.length && lines[i].trim() && !/^#{1,6}\s/.test(lines[i]) && !/^[-*]\s+/.test(lines[i]) && !lines[i].startsWith("```") && !lines[i].startsWith("> ") && !(lines[i].includes("|") && i + 1 < lines.length && isTableSep(lines[i + 1]))) {
+    while (
+      i < lines.length &&
+      lines[i].trim() &&
+      !/^#{1,6}\s/.test(lines[i]) &&
+      !/^[-*]\s+/.test(lines[i]) &&
+      !lines[i].startsWith("```") &&
+      !lines[i].startsWith("> ") &&
+      !readTable(lines, i)
+    ) {
       buf.push(lines[i++]);
     }
     out.push({ t: "p", text: buf.join(" ") });
@@ -138,24 +172,26 @@ export function MdView(p: { text: string; compact?: boolean }) {
           ) : b.t === "quote" ? (
             <blockquote>{inline(b.text)}</blockquote>
           ) : b.t === "table" ? (
-            <table>
-              <thead>
-                <tr>
-                  {b.heads.map((h) => (
-                    <th>{inline(h)}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {b.rows.map((row) => (
+            <div class="md-table-wrap">
+              <table>
+                <thead>
                   <tr>
-                    {row.map((c) => (
-                      <td>{inline(c)}</td>
+                    {b.heads.map((h, i) => (
+                      <th style={{ "text-align": b.aligns[i] ?? "left" }}>{inline(h)}</th>
                     ))}
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {b.rows.map((row) => (
+                    <tr>
+                      {row.map((c, i) => (
+                        <td style={{ "text-align": b.aligns[i] ?? "left" }}>{inline(c)}</td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           ) : (
             <p>{inline(b.text)}</p>
           )

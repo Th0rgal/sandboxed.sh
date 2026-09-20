@@ -413,7 +413,7 @@ code {
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ---------- mission stream transcript ---------- */
-.st-text { padding: 0 10px; overflow-wrap: anywhere; }
+.st-text { padding: 0 10px; overflow-wrap: anywhere; overflow-x: auto; }
 .st-text:empty { display: none; }
 .st-error { padding: 0 10px; color: var(--red); }
 .st-think { margin: 4px 10px; }
@@ -442,10 +442,13 @@ code {
 .st-work-body .st-tool, .st-work-body .st-think { margin: 0; }
 .st-work-body .st-tool-head { height: 22px; }
 /* Transcript prose: the document viewer's page metrics do not apply. */
-.md table { width: 100%; border-collapse: collapse; margin: 8px 0 12px; font-size: 13px; }
-.md th, .md td { text-align: left; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--stroke-soft); vertical-align: top; }
-.md th { color: var(--fg-2); font-weight: 500; }
-.md.md-compact table { font-size: 12.5px; margin: 6px 0 10px; }
+.md-table-wrap { overflow-x: auto; max-width: 100%; margin: 8px 0 12px; }
+.md table { width: max-content; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; overflow-wrap: normal; }
+.md th, .md td { padding: 5px 16px 5px 0; border-bottom: 1px solid var(--stroke-soft); vertical-align: top; }
+.md th { color: var(--fg-2); font-weight: 500; white-space: nowrap; }
+.md td:last-child, .md th:last-child { padding-right: 0; }
+.md.md-compact .md-table-wrap { margin: 6px 0 10px; }
+.md.md-compact table { font-size: 12.5px; }
 .md.md-compact { padding: 6px 0 10px; font-size: 13px; line-height: 21px; max-width: none; margin: 0; overflow: visible; flex: none; }
 .md.md-compact p { margin: 0 0 8px; }
 .md.md-compact p:last-child { margin-bottom: 0; }
