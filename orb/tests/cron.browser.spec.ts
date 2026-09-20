@@ -164,8 +164,8 @@ test("cron outage retains cached rows; Retry restores availability without loggi
   await expect(page.locator(".row.cron")).toHaveCount(1);
   fail = true;
   await folder.click(); await folder.click();
-  await expect(page.getByRole("status")).toContainText("Crons unavailable");
-  await expect(page.getByRole("status")).toContainText("Showing last loaded jobs");
+  await expect(page.getByRole("status")).toContainText("Crons temporarily unavailable");
+  await expect(page.getByRole("status")).toHaveAttribute("title", /Cached jobs are retained/);
   await expect(page.locator(".row.cron")).toHaveCount(1);
   expect(await page.evaluate(() => localStorage.getItem("orb.jwt"))).toBe("local-browser-test");
   fail = false; await page.getByRole("button", { name: "Retry crons" }).click();
@@ -184,4 +184,31 @@ test("creation defaults to the project conversation; missing route requires expl
   await page.getByLabel("Delivery", { exact: true }).fill("local");
   await expect(page.getByText(/no conversation message will be sent/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Create", exact: true })).toBeEnabled();
+});
+
+for (const status of [404, 500]) test(`cron ${status}: compact status preserves content and capability polling is bounded`, async ({page}) => {
+ let fail=false, requests=0;
+ await page.clock.install();
+ await page.route("**/api/**",route=>{
+  const path=new URL(route.request().url()).pathname;
+  if(path.endsWith("/crons")){requests++;if(fail)return route.fulfill({status,body:"upstream detail"});return route.fulfill({json:{jobs:[fixtures.hourly]}});}
+  const json=path==="/api/projects"?{projects:[{slug:"notes",title:"Project notes"}]}:path.endsWith("/crons/defaults")?{deliver:"project:notes",route_ready:true}:path.endsWith("/missions")?[]:path.endsWith("/files")?{entries:[]}: {slug:"notes",job:fixtures.weekdays,runs:[]};
+  return route.fulfill({json});
+ });
+ await page.goto("/tests/browser.html?theme=dark");
+ const project=page.getByRole("button",{name:"Project notes",exact:true});await project.click();await expect(page.locator(".row.cron")).toHaveCount(2);
+ fail=true;await project.click();await project.click();
+ const row=page.getByRole("status");await expect(row).toContainText(status===404?"Crons need backend update":"Crons temporarily unavailable");
+ await expect(row).not.toContainText(String(status));expect((await row.boundingBox())!.height).toBeLessThanOrEqual(32);
+ await expect(page.locator(".row.cron")).toHaveCount(2);
+ const failedCount=requests;await page.clock.fastForward(31000);
+ if(status===404){
+  expect(requests).toBe(failedCount);await expect(page.getByRole("button",{name:"Retry crons"})).toHaveCount(0);
+  await page.getByRole("button",{name:"Project actions for Project notes"}).click();await page.getByRole("menuitem",{name:"New cron",exact:true}).click();
+  await expect(page.getByRole("dialog",{name:"Project crons"})).toBeVisible();await expect(page.getByRole("dialog",{name:"New cron"})).toHaveCount(0);
+  await expect(page.getByText(/Update the connected backend/)).toBeVisible();
+  await page.getByRole("button",{name:"Close",exact:true}).click();
+  await page.screenshot({path:"test-results/orb-cron-unsupported.png"});
+  fail=false;await page.getByRole("button",{name:"Reconnect backend"}).click();await expect(row).toHaveCount(0);expect(requests).toBeGreaterThan(failedCount);
+ } else {expect(requests).toBeGreaterThan(failedCount);fail=false;await page.getByRole("button",{name:"Retry crons"}).click();await expect(row).toHaveCount(0);}
 });

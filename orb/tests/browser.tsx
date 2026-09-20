@@ -15,7 +15,7 @@ function Harness() {
   return <div style={{ display: "flex", height: "100vh", background: "var(--bg)" }}>
     <aside style={{ width: "260px", padding: "20px 10px", "flex-shrink": 0 }}>
       <LiveProjectsSection selected={selected} open={setSelected} missionGlyph={() => "idle"} StatusGlyph={() => null} onNewAgent={() => {}} onNewProject={() => {}} />
-      <div class="harness-controls"><button class="s-btn" onClick={() => setVisible(!visible())}>Toggle view</button>
+      <div class="harness-controls"><button onClick={() => setConnection(window.location.origin, "local-browser-test")}>Reconnect backend</button><button class="s-btn" onClick={() => setVisible(!visible())}>Toggle view</button>
       <a href="#notes">Project link</a><input disabled aria-label="Disabled field" /></div>
     </aside>
     <main style={{ flex: 1, "min-width": 0, overflow: "auto" }}>

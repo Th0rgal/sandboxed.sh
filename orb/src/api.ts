@@ -19,16 +19,19 @@ export function getJwt(): string | null {
 
 const [connected, setConnected] = createSignal(!!getJwt());
 export const isConnected = connected;
+export const [connectionVersion, bumpConnectionVersion] = createSignal(0);
 
 export function setConnection(url: string, token: string) {
   setApiUrl(url);
   localStorage.setItem(JWT_KEY, token);
   setConnected(true);
+  bumpConnectionVersion(v => v + 1);
 }
 
 export function clearConnection() {
   localStorage.removeItem(JWT_KEY);
   setConnected(false);
+  bumpConnectionVersion(v => v + 1);
 }
 
 export async function login(password: string): Promise<void> {
@@ -45,6 +48,11 @@ export async function login(password: string): Promise<void> {
   if (!data.token) throw new Error("Login response did not include a token");
   localStorage.setItem(JWT_KEY, data.token);
   setConnected(true);
+  bumpConnectionVersion(v => v + 1);
+}
+
+export class ApiError extends Error {
+  constructor(public status: number, public detail: string) { super(`${status} ${detail}`.trim()); }
 }
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -60,7 +68,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     const text = (await res.text().catch(() => "")).trim();
-    throw new Error(`${res.status} ${text.slice(0, 200)}`.trim());
+    throw new ApiError(res.status, text.slice(0, 200));
   }
   return res.json().catch(() => undefined as unknown as T);
 }
