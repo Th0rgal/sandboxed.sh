@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod voice;
+
 use tauri::{Manager, Theme, WebviewWindow};
 
 /// Follow the frontend's persisted preference. `None` delegates to the OS,
@@ -50,7 +52,11 @@ fn open_url(url: String) -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
+        .manage(voice::VoiceState::new())
         .setup(|app| {
+            // Local voice input: the Python worker starts on first use and
+            // is released again after a stretch of inactivity.
+            app.state::<voice::VoiceState>().start_idle_reaper();
             // macOS vibrancy: the window is transparent and the sidebar
             // shows the desktop through a sidebar-material blur, like
             // Cursor/Xcode. The main pane paints an opaque background in
@@ -75,7 +81,12 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             paloma_ssh_pubkey,
             open_url,
-            set_window_theme
+            set_window_theme,
+            voice::voice_capability,
+            voice::voice_prewarm,
+            voice::voice_transcribe,
+            voice::voice_cancel,
+            voice::voice_release
         ])
         .run(tauri::generate_context!())
         .expect("error while running orb");
