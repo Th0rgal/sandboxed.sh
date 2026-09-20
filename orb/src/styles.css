@@ -539,10 +539,10 @@ code {
   grid-column: 1 / -1; grid-row: 1;
   min-height: 56px; padding-left: 2px; align-self: stretch;
 }
-.composer.tall .plus-wrap { grid-column: 1; grid-row: 2; }
-.composer.tall .picks { grid-column: 2; grid-row: 2; justify-self: start; }
-.composer.tall .voice-slot { grid-column: 3; grid-row: 2; }
-.composer.tall .send { grid-column: 4; grid-row: 2; }
+.composer.tall .plus-wrap { grid-column: 1; grid-row: 2; align-self: center; }
+.composer.tall .picks { grid-column: 2; grid-row: 2; justify-self: start; align-self: center; }
+.composer.tall .voice-slot { grid-column: 3; grid-row: 2; align-self: center; }
+.composer.tall .send { grid-column: 4; grid-row: 2; align-self: center; }
 .composer.voice-on {
   grid-template-columns: auto 1fr;
   grid-template-rows: auto;
@@ -568,7 +568,7 @@ textarea {
   color: var(--fg); font: 13px/20px var(--sans); padding: 2px 0; max-height: 220px;
 }
 textarea::placeholder { color: var(--placeholder); }
-.picks { display: inline-flex; align-items: center; gap: 2px; min-width: 0; }
+.picks { display: flex; align-items: center; gap: 2px; min-width: 0; height: 24px; }
 .picks-sep { color: var(--fg-4); font-size: 12px; padding: 0 2px; }
 .model-wrap { position: relative; }
 .model { color: var(--fg-3); display: inline-flex; align-items: center; gap: 5px; height: 24px; }
@@ -1007,7 +1007,7 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 .dlg:has(.project-create) { background: var(--bg); border-radius: 12px; }
 /* ---------- local voice input (composer) ---------- */
 /* Mic stays mounted while a turn streams; Stop is a sibling send cell. */
-.voice-slot { display: inline-flex; align-items: center; }
+.voice-slot { display: flex; align-items: center; height: 24px; }
 .voice { position: relative; display: inline-flex; align-items: center; gap: 6px; }
 .voice.starting, .voice.recording, .voice.transcribing { flex: 1; width: 100%; min-width: 0; gap: 8px; }
 .voice-btn.idle { background: var(--plus-bg); color: var(--fg-2); }
@@ -1070,19 +1070,21 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 /* One compact tag everywhere a `/goal` shows up: the composer (while typing),
    the launch preview, transcript user turns, status and the title bar. */
 .goal-tag {
-  display: inline-flex; align-items: center; gap: 5px; flex: none;
-  height: 22px; padding: 0 8px 0 7px; border-radius: 11px;
-  font-size: 11.5px; line-height: 1; font-weight: 500; letter-spacing: .01em;
+  display: flex; align-items: center; justify-content: center; gap: 5px; flex: none;
+  height: 22px; padding: 0 8px 0 7px; border-radius: 999px;
+  font-size: 12px; line-height: 1; font-weight: 500; letter-spacing: .01em;
   color: var(--blue); background: color-mix(in srgb, var(--blue) 14%, transparent);
   border: 1px solid color-mix(in srgb, var(--blue) 32%, transparent);
-  white-space: nowrap; vertical-align: middle;
+  white-space: nowrap;
 }
-.goal-tag svg { flex: none; width: 12px; height: 12px; }
-.goal-tag.small { height: 18px; padding: 0 7px 0 6px; font-size: 11px; gap: 4px; border-radius: 9px; }
+.goal-tag svg { display: block; flex: none; width: 12px; height: 12px; }
+.goal-tag-label { display: block; line-height: 1; transform: translateY(0.5px); }
+.goal-tag.small { height: 18px; padding: 0 7px 0 6px; font-size: 11px; gap: 4px; }
 .goal-tag.small svg { width: 10px; height: 10px; }
-.goal-tag-detail { color: var(--fg-3); font-weight: 400; }
+.goal-tag-detail { color: var(--fg-3); font-weight: 400; line-height: 1; transform: translateY(0.5px); }
 .goal-tag-detail::before { content: "·"; margin: 0 4px 0 1px; color: var(--fg-4); }
-.goal-mode { display: inline-flex; align-items: center; margin-right: 4px; }
+.goal-mode { display: flex; align-items: center; height: 24px; margin-right: 6px; }
+.composer .goal-tag { height: 24px; padding: 0 9px 0 8px; }
 .picks .goal-mode + .model-wrap { margin-left: 2px; }
 .user.goal { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
 .user.goal > span:last-child { white-space: pre-wrap; }

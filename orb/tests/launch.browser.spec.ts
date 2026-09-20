@@ -58,7 +58,7 @@ const composerInput=(page:Page)=>page.getByPlaceholder("Plan, Build, / for comma
 /** A `/goal` turn renders as a Goal tag plus the exact objective, never the raw slash command. */
 async function expectGoalTurn(page:Page,selector:string,text=objective){
  const turn=page.locator(selector);await expect(turn).toHaveCount(1);
- await expect(turn).toHaveClass(/goal/);await expect(turn.locator(".goal-tag")).toHaveText("Goal");await expect(turn.locator("span:last-child")).toHaveText(text);
+ await expect(turn).toHaveClass(/goal/);await expect(turn.locator(".goal-tag")).toHaveText("Goal");await expect(turn.locator(":scope > span:last-child")).toHaveText(text);
 }
 
 test("slow local POST shows prompt immediately; accepted mission opens before slow list refresh and reconciles history",async({page})=>{
@@ -84,6 +84,19 @@ test("/goal draft shows a Goal indicator, needs an objective, and is sent as the
  await input.fill(`  /goal   ${objective}`);await expect(chip).toHaveText("Goal");
  await expect(page.getByRole("alert")).toHaveCount(0);
  await expect(chip).toHaveAttribute("aria-label",/keeps iterating/);
+ const align=await page.evaluate(()=>{
+  const tag=document.querySelector(".composer .goal-tag");
+  const model=document.querySelector(".composer .model");
+  const send=document.querySelector(".composer .send");
+  if(!tag||!model||!send)return null;
+  const t=tag.getBoundingClientRect(),m=model.getBoundingClientRect(),s=send.getBoundingClientRect();
+  const mid=(r:DOMRect)=>r.top+r.height/2;
+  return {tagMid:mid(t),modelMid:mid(m),sendMid:mid(s),tagH:t.height,modelH:m.height,sendH:s.height};
+ });
+ expect(align).not.toBeNull();
+ expect(align!.tagH).toBe(24);
+ expect(Math.abs(align!.tagMid-align!.modelMid)).toBeLessThan(1);
+ expect(Math.abs(align!.tagMid-align!.sendMid)).toBeLessThan(1);
  await input.press("Tab");expect(await page.evaluate(()=>!!document.activeElement?.closest(".goal-mode"))).toBe(false);
  await page.screenshot({path:"test-results/orb-goal-composer.png"});
  await input.focus();await input.press("Enter");
