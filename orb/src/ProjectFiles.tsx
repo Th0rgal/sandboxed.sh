@@ -8,6 +8,7 @@ import {
   listProjectFiles,
   listProjectMissions,
   listProjects,
+  mkdirProjectFile,
   readProjectFile,
   writeProjectFile,
   type Mission,
@@ -18,6 +19,8 @@ import {
   type ControllerView as ControllerData,
 } from "./api";
 import { CronGlyph, untilLabel } from "./Controller";
+import { Dialog, Field } from "./Dialog";
+import { PopupMenu, type MenuEntry } from "./Menu";
 
 /** Sidebar section listing the core backend's projects with their missions
  * and hosted files. Replaces the demo projects when connected. */
@@ -57,6 +60,11 @@ export function LiveProjectsSection(p: {
   const [dirs, setDirs] = createStore<Record<string, ProjectFileEntry[]>>({});
   // The project's controller (Hermes cron), shown as the folder's first row.
   const [controllers, setControllers] = createStore<Record<string, ControllerData>>({});
+  const [actionMenu, setActionMenu] = createSignal<{ x: number; y: number; slug: string; path: string } | null>(null);
+  const [newFolder, setNewFolder] = createSignal<{ slug: string; path: string } | null>(null);
+  const [folderName, setFolderName] = createSignal("");
+  const [folderError, setFolderError] = createSignal<string | null>(null);
+  const [makingFolder, setMakingFolder] = createSignal(false);
   const loadController = (slug: string) => {
     getProjectController(slug, 3)
       .then((view) => setControllers(slug, view))
@@ -106,13 +114,45 @@ export function LiveProjectsSection(p: {
       });
   };
 
-  const loadDir = (slug: string, path: string) => {
+  const loadDir = (slug: string, path: string, force = false) => {
     const key = `${slug}:${path}`;
-    if (dirs[key]) return;
+    if (dirs[key] && !force) return;
     listProjectFiles(slug, path)
       .then((entries) => setDirs(key, entries))
       .catch(() => setDirs(key, []));
   };
+
+  const beginFolder = (slug: string, path: string) => {
+    setActionMenu(null);
+    setFolderName("");
+    setFolderError(null);
+    setNewFolder({ slug, path });
+  };
+  const createFolder = async () => {
+    const target = newFolder();
+    const name = folderName().trim();
+    if (!target || makingFolder()) return;
+    if (!name || name === "." || name === ".." || /[\\/]/.test(name)) {
+      setFolderError("Use a folder name without slashes.");
+      return;
+    }
+    setMakingFolder(true);
+    setFolderError(null);
+    try {
+      await mkdirProjectFile(target.slug, target.path ? `${target.path}/${name}` : name);
+      loadDir(target.slug, target.path, true);
+      setExpanded(`${target.slug}:${target.path}`, true);
+      setNewFolder(null);
+    } catch (e) {
+      setFolderError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMakingFolder(false);
+    }
+  };
+  const menuItems = (slug: string, path: string): MenuEntry[] => [
+    { kind: "item", label: "New folder", icon: Ic.FolderIcon, onClick: () => beginFolder(slug, path) },
+    { kind: "item", label: "New agent", icon: Ic.NewAgentIcon, onClick: () => p.onNewAgent(slug) },
+  ];
 
   const toggleProject = (slug: string) => {
     const next = !expanded[slug];
@@ -145,6 +185,10 @@ export function LiveProjectsSection(p: {
                   class="row folder depth"
                   style={{ "--depth": dp.depth + 1 }}
                   onClick={() => toggleDir(dp.slug, childPath())}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setActionMenu({ x: e.clientX, y: e.clientY, slug: dp.slug, path: childPath() });
+                  }}
                 >
                   <Show when={expanded[key()]} fallback={<Ic.FolderIcon />}>
                     <Ic.FolderOpenIcon />
@@ -189,23 +233,29 @@ export function LiveProjectsSection(p: {
           const isOpen = () => !!expanded[project.slug];
           return (
             <div class={`group ${isOpen() ? "has" : ""}`}>
-              <button class="row project" onClick={() => toggleProject(project.slug)}>
-                <Show when={isOpen()} fallback={<Ic.FolderIcon />}>
-                  <Ic.FolderOpenIcon />
-                </Show>
-                <span class="row-label">{project.title || project.slug}</span>
-                <span
+              <div class="row project" onContextMenu={(e) => {
+                e.preventDefault();
+                setActionMenu({ x: e.clientX, y: e.clientY, slug: project.slug, path: "" });
+              }}>
+                <button class="row-main" aria-expanded={isOpen()} onClick={() => toggleProject(project.slug)}>
+                  <Show when={isOpen()} fallback={<Ic.FolderIcon />}>
+                    <Ic.FolderOpenIcon />
+                  </Show>
+                  <span class="row-label">{project.title || project.slug}</span>
+                </button>
+                <button
                   class="row-action"
-                  role="button"
-                  title="New agent in this project"
+                  aria-label={`Project actions for ${project.title || project.slug}`}
+                  title="Project actions"
                   onClick={(e) => {
                     e.stopPropagation();
-                    p.onNewAgent(project.slug);
+                    const box = e.currentTarget.getBoundingClientRect();
+                    setActionMenu({ x: box.right - 150, y: box.bottom + 4, slug: project.slug, path: "" });
                   }}
                 >
                   <Ic.PlusIcon size={13} />
-                </span>
-              </button>
+                </button>
+              </div>
               <Show when={isOpen()}>
                 <Show when={controllers[project.slug]?.job}>
                   {(job) => {
@@ -284,6 +334,19 @@ export function LiveProjectsSection(p: {
       </For>
       <Show when={projects().length === 0 && !error()}>
         <div class="row note">No projects on the core backend.</div>
+      </Show>
+      <Show when={actionMenu()}>
+        {(menu) => <PopupMenu {...menu()} items={menuItems(menu().slug, menu().path)} onClose={() => setActionMenu(null)} />}
+      </Show>
+      <Show when={newFolder()}>
+        {(target) => (
+          <Dialog title="New folder" onClose={() => !makingFolder() && setNewFolder(null)} footer={<><button class="s-btn" disabled={makingFolder()} onClick={() => setNewFolder(null)}>Cancel</button><button class="s-btn primary" disabled={makingFolder()} onClick={createFolder}>{makingFolder() ? "Creating…" : "Create"}</button></>}>
+            <Field label={`In ${target().path ? `${target().slug}/${target().path}` : target().slug}`}>
+              <input autofocus class="s-input" placeholder="Folder name" value={folderName()} onInput={(e) => setFolderName(e.currentTarget.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void createFolder(); } }} />
+            </Field>
+            <Show when={folderError()}><p class="st-error">{folderError()}</p></Show>
+          </Dialog>
+        )}
       </Show>
     </>
   );

@@ -1,7 +1,7 @@
 :root {
   color-scheme: dark;
-  --bg: #191919;
-  --bg-sidebar: #1d1d1d;
+  --bg: #141414;
+  --bg-sidebar: #181818;
   --bg-elev: #212121;
   --bg-hover: #252525;
   --bg-active: #292929;
@@ -112,7 +112,9 @@ body {
   cursor: default;
 }
 body.resizing, body.resizing * { cursor: col-resize !important; }
-button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: default; }
+button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+button:disabled { cursor: default; }
+input, textarea, [contenteditable="true"] { cursor: text; }
 button:focus-visible { outline: 1px solid var(--blue); outline-offset: -1px; }
 
 .app {
@@ -148,9 +150,9 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 .sb-scroll::-webkit-scrollbar { display: none; }
 .row {
   display: flex; align-items: center; gap: 9px;
-  width: 100%; height: 28px; padding: 0 8px;
+  width: 100%; height: 40px; padding: 0 10px;
   margin-bottom: 2px;
-  border-radius: 6px;
+  border-radius: 10px;
   text-align: left;
   color: var(--fg);
 }
@@ -161,12 +163,13 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 .row kbd { font: inherit; font-size: 12px; color: var(--fg-4); }
 .row.project { color: var(--fg-2); }
 .row.project:hover { color: var(--fg); }
+.row-main { display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0; height: 100%; text-align: left; }
 .row-action { display: none; color: var(--fg-3); height: 20px; width: 20px; border-radius: 4px; align-items: center; justify-content: center; }
 .row.project:hover .row-action { display: flex; }
 .row-action:hover { background: var(--bg-active); color: var(--fg); }
 .glyph { width: 16px; height: 16px; display: flex; align-items: center; justify-content: center; }
 .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--fg-4); opacity: .45; }
-.section { color: var(--fg-4); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; padding: 0 8px; margin: 16px 0 6px; }
+.section { color: var(--fg-4); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; padding: 0 10px; margin: 16px 0 6px; }
 .section-row { display: flex; align-items: center; justify-content: space-between; }
 .section-add {
   width: 18px; height: 18px; border-radius: 4px; display: grid; place-items: center;
@@ -207,6 +210,8 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 .cs-sec h3 { margin-bottom: 4px; }
 .cs-hint { font-size: 12.5px; color: var(--fg-3); margin: 0 0 8px; line-height: 17px; max-width: 620px; }
 .cs-input { width: 240px; max-width: 46vw; height: 26px; }
+.cs .s-row-ctrl { width: 240px; max-width: 46vw; }
+.cs .s-row-ctrl .sp { width: 100%; }
 .cs-input.cs-narrow { width: 84px; text-align: center; }
 /* ---------- schedule picker: one right-aligned line ---------- */
 .sp { display: inline-flex; align-items: center; gap: 6px; }
