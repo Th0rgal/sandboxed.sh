@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { api, clearConnection, connectionVersion, getJwt, isConnected, setConnection } from "../src/api";
+import { createMission, api, clearConnection, connectionVersion, getJwt, isConnected, setConnection } from "../src/api";
 
 afterEach(() => { clearConnection(); vi.unstubAllGlobals(); });
 
@@ -26,4 +26,19 @@ it("a previous connection's delayed 401 cannot log out the new connection", asyn
   expect(isConnected()).toBe(true);
   expect(getJwt()).toBe("new-token");
   expect(connectionVersion()).toBe(version);
+});
+
+
+it.each(["grok", "claudecode", "opencode", "codex", "gemini"])("rejects unprovisioned remote %s before any POST or credential request", async backend => {
+  const fetcher = vi.fn(); vi.stubGlobal("fetch", fetcher);
+  await expect(createMission({remote_node_id:"dgx-spark",backend,model_override:"chosen-model",prompt:"Keep my draft"})).rejects.toThrow(`${backend} (chosen-model)`);
+  expect(fetcher).not.toHaveBeenCalled();
+});
+
+it("preserves the selected local harness and model in the supported create contract", async () => {
+  const fetcher = vi.fn(async () => new Response(JSON.stringify({id:"accepted"})));
+  vi.stubGlobal("fetch", fetcher);
+  const body = {backend:"grok",model_override:"grok-4.6",prompt:"Keep my draft"};
+  await createMission(body);
+  expect(JSON.parse((fetcher.mock.calls[0] as unknown as [string, RequestInit])[1].body as string)).toEqual(body);
 });

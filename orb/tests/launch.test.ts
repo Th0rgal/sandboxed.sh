@@ -19,7 +19,24 @@ describe("mission launch projection",()=>{
  it.each(["pending","resuming","interrupted","failed","completed"])("renders honest %s status without text",status=>{
   const phase=missionPhase(mission({status}),false);expect(phase.label).toBeTruthy();expect(phase.detail).toBeTruthy();expect(phase.moving).toBe(["pending","resuming"].includes(status));
  });
- it("explains unsupported legacy remote API without falling back",()=>{
-  expect(launchError(new ApiError(400,"remote_command is required when remote_node_id is set"))).toContain("backend needs an update");
+ it("explains a missing remote command without promising a backend upgrade",()=>{
+  expect(launchError(new ApiError(400,"remote_command is required when remote_node_id is set"))).toContain("requires a supported harness command");
  });
+});
+
+
+it.each(["observed", "unobserved", "lease_only", "submit_ambiguous"])("remote %s never infers running from Active or old transcript output", phase => {
+ const m=mission({status:"active",remote_job:{job_id:"job",node_id:"dgx-spark",phase},execution:{state:"waiting_remote_job"}});
+ expect(missionPhase(m,true).label).not.toBe("Running");
+ expect(missionDestination(m)).toBe("DGX Spark");
+});
+it("uses node evidence for queued/running and preserves terminal failures",()=>{
+ const m=mission({status:"active",remote_job:{job_id:"job",node_id:"dgx-spark",phase:"observed",node_state:"queued"}});
+ expect(missionPhase(m,true).label).toBe("Queued");
+ m.remote_job!.node_state="running";
+ expect(missionPhase(m,false).label).toBe("Running");
+ m.remote_job!.exit_code=1;
+ expect(missionPhase(m,true)).toMatchObject({label:"Remote job stopped",failed:true,moving:false});
+ m.status="failed";m.remote_job!.terminal_reason="orphan_no_runner";
+ expect(missionPhase(m,true)).toMatchObject({label:"Failed",detail:"The backend could not find an active runner."});
 });

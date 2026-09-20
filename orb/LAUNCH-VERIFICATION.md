@@ -19,18 +19,22 @@ precedence over a bookkeeping workspace named `host`.
 
 ## Remote contract and integration
 
-Orb sends the selected `backend`, `model_override`, `prompt`, `remote_node_id`,
-project and `idempotency_key` to POST `/api/control/missions`. It no longer builds
-shell commands or mints/embeds proxy keys. A missing/cordoned/offline selected
-node is an explicit error; the selection never falls back to Core. Unsupported
-remote harness errors preserve the draft and selection.
+The supported local create path sends the exact `backend`, `model_override`,
+`prompt`, project and `idempotency_key`. Remote selection is validated against
+the fleet, but Orb rejects remote agent creation before POST: the actual node
+contract requires a `remote_command`, and backend/model fields only hold local
+resume metadata. There is no verified remote harness/credential provisioning
+adapter in this client. Installed Claude/OpenCode executables are not a
+substitute for Grok Build. The draft, harness/model and node selection remain
+intact; no fallback machine, command or credential request is issued.
 
-The previously deployed raw-command API rejects an omitted remote_command.
-Orb translates that response into a clear backend-upgrade message and does not
-retry on Core or through Claude. Structured remote harness execution is owned by
-backend mission `1e991f8e-d0e5-468e-a51a-5eafaac0b560`; contract confirmation and
-backend rollout are separate from browser-mocked acceptance. No live mission or
-user goal was retried for this verification.
+Contract checked against `fix/orb-remote-mission-launch` at `1b292c9c`:
+`src/api/control/mod.rs` CreateMissionRequest and remote_job_projection. Existing
+remote missions use `remote_job.node_id` for placement and the durable job phase
+and node state for status. Active/observed alone means accepted, not running;
+only node_state=running confirms running. Ambiguous or unobserved jobs explicitly
+show that the backend is checking their state. Terminal mission status remains
+authoritative. No live mission or user goal was retried.
 
 Voice integration: Composer's existing `onSend` now accepts an async boolean
 result. Preserve its `sending` guard and only-clear-on-success behavior when
@@ -51,7 +55,8 @@ Run `pnpm test`, `pnpm build` and `pnpm test:browser` in orb. The launch browser
 suite mounts the actual App with intercepted APIs; it tests a POST held for over
 one second, a three-second mission-list refresh, request rejection, empty failed
 and interrupted history, pending/resuming status, late user-event reconciliation,
-missing nodes, unsupported harnesses, and legacy API rejection. All outbound
+missing nodes, pre-POST unsupported remote harness rejection, and durable remote
+job status. All outbound local
 launches are mocked; a proxy-key request fails the test.
 
 `benchmarks/launch-benchmark.json` records 12 explicit launches. Timing measures
@@ -78,3 +83,19 @@ pass. New cases cover concurrent 401s, logout without subsequent polling until
 reconnect, and held old-connection 200/401/404/500 cron responses. The 500 polling
 case explicitly checks page visibility and waits for the request count with
 `expect.poll`. No native or voice code changed.
+
+
+## Verified remote contract correction
+
+The launch timing and slow-POST success fixtures now use the supported local
+create path. Previous remote success mocks assumed command synthesis that the
+backend does not implement; they are not evidence of working remote harness
+launches. Remote Grok and Codex browser tests instead assert zero POSTs, retained
+draft and selection, and an explicit error. API tests also cover Claude,
+OpenCode and Gemini rejection without network requests. Read-only mission views
+cover observed, queued, running, unobserved and ambiguous remote job states.
+
+This correction passes 50 unit/component tests, 14 targeted launch browser tests,
+and the production frontend build. Local launch benchmark: optimistic feedback
+0.7 ms median / 1.3 ms p95; accepted-view transition 2.8 / 4.0 ms. Screenshot:
+`test-results/orb-remote-unsupported.png`.

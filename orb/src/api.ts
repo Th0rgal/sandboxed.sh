@@ -116,6 +116,23 @@ export interface MissionHistoryEntry {
   content: string;
 }
 
+/** Read-only remote execution evidence from the durable job ledger. */
+export interface RemoteJob {
+  job_id: string;
+  node_id: string;
+  phase: string;
+  node_state?: string | null;
+  exit_code?: number | null;
+  error?: string | null;
+  accepted_at?: string | null;
+  heartbeat_at?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  observed_age_secs?: number | null;
+  lease_state?: string | null;
+  terminal_reason?: string | null;
+}
+
 export interface Mission {
   id: string;
   status: string;
@@ -127,6 +144,7 @@ export interface Mission {
   terminal_reason?: string | null;
   status_message?: string | null;
   execution?: { state?: string; terminal_reason?: string | null };
+  remote_job?: RemoteJob | null;
   workspace_name?: string | null;
   agent?: string | null;
   backend?: string;
@@ -545,6 +563,13 @@ export async function getMission(id: string): Promise<Mission> {
 }
 
 export async function createMission(body: CreateMissionBody): Promise<Mission> {
+  // The node API executes remote_command verbatim. backend/model_override are
+  // local resume metadata, not remote argv or credential provisioning. No
+  // verified remote harness adapter exists yet; never substitute an installed
+  // CLI or submit a mission we cannot launch with the user's exact selection.
+  if (body.remote_node_id) {
+    throw new Error(`Remote launch for ${body.backend ?? "the selected harness"}${body.model_override ? ` (${body.model_override})` : ""} is not supported on ${body.remote_node_id} from Orb yet. Your draft and selection are kept. No mission was submitted.`);
+  }
   return api("/api/control/missions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
