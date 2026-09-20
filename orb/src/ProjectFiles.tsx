@@ -67,6 +67,7 @@ export function LiveProjectsSection(p: {
   // The project's controller (Hermes cron), shown as the folder's first row.
   const [controllers, setControllers] = createStore<Record<string, ControllerData>>({});
   const [cronErrors, setCronErrors] = createStore<Record<string, string | null>>({});
+  const [cronRetryable, setCronRetryable] = createStore<Record<string, boolean>>({});
   const [cronUnsupported, setCronUnsupported] = createSignal(false);
   const [cronInfo, setCronInfo] = createSignal<string | null>(null);
   const [cronChecking, setCronChecking] = createSignal(false);
@@ -89,7 +90,7 @@ export function LiveProjectsSection(p: {
   const missingCronApi = (error: unknown) => error instanceof ApiError && [404, 405].includes(error.status) && !/project not found/i.test(error.detail);
   const cronFailure = (slug: string, error: unknown) => {
     if (missingCronApi(error)) setCronUnsupported(true);
-    else setCronErrors(slug, error instanceof Error ? error.message : String(error));
+    else { setCronRetryable(slug, !(error instanceof ApiError) || error.status >= 500 || [408, 429].includes(error.status)); setCronErrors(slug, error instanceof Error ? error.message : String(error)); }
   };
   const loadCrons = async (slug: string, force = false) => {
     if (cronUnsupported() && !force) return;
@@ -326,8 +327,8 @@ export function LiveProjectsSection(p: {
                 <Show when={cronUnsupported() || cronErrors[project.slug]}>
                   <div class="cron-unavailable row d1" role="status" title={cronUnsupported() ? "This backend does not support project crons yet. Update the backend, then check again. Existing project content is unchanged." : `Crons could not refresh. Cached jobs are retained. ${cronErrors[project.slug]}`}>
                     <Ic.BellIcon size={12} />
-                    <button class="cron-status-label" onClick={() => setCronInfo(project.slug)}>{cronUnsupported() ? "Crons need backend update" : "Crons temporarily unavailable"}</button>
-                    <Show when={!cronUnsupported()}><button class="cron-retry" aria-label="Retry crons" title="Retry crons" onClick={() => void loadCrons(project.slug, true)}>↻</button></Show>
+                    <button class="cron-status-label" onClick={() => setCronInfo(project.slug)}>{cronUnsupported() ? "Crons need backend update" : cronRetryable[project.slug] ? "Crons temporarily unavailable" : "Crons unavailable"}</button>
+                    <Show when={!cronUnsupported() && cronRetryable[project.slug]}><button class="cron-retry" aria-label="Retry crons" title="Retry crons" onClick={() => void loadCrons(project.slug, true)}>↻</button></Show>
                   </div>
                 </Show>
                 <For each={crons[project.slug] ?? []}>
@@ -412,7 +413,7 @@ export function LiveProjectsSection(p: {
         )}
       </Show>
       <Show when={cronInfo()}>{(slug) => <Dialog title="Project crons" onClose={() => setCronInfo(null)} footer={<><button class="s-btn sm" onClick={() => setCronInfo(null)}>Close</button><button class="s-btn sm" disabled={cronChecking()} onClick={async () => { setCronChecking(true); await loadCrons(slug(), true); setCronChecking(false); if (!cronUnsupported() && !cronErrors[slug()]) setCronInfo(null); }}>Check again</button></>}>
-        <p>{cronUnsupported() ? "This backend does not support project crons yet. Update the connected backend, then choose Check again. Your canonical controller and existing project content remain available." : "Project crons could not refresh. Previously loaded jobs are retained. Try again when the scheduler is available."}</p>
+        <p>{cronUnsupported() ? "This backend does not support project crons yet. Update the connected backend, then choose Check again. Your canonical controller and existing project content remain available." : cronRetryable[slug()] ? "Project crons could not refresh. Previously loaded jobs are retained. Try again when the scheduler is available." : "The backend rejected this cron request. Check backend access and configuration, then check again. Previously loaded jobs are retained."}</p>
       </Dialog>}</Show>
       <Show when={newCron()}>
         {(slug) => <Dialog wide title="New cron" onClose={() => !makingCron() && setNewCron(null)} footer={<span>Unfinished drafts are kept until saved or discarded.</span>}>

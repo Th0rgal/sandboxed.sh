@@ -121,3 +121,9 @@ history replacement preserves expanded work and tool details even when the
 stored snapshot moves relative to tools. The actual DOM regression passes.
 Final production frontend build, all 29 unit/component tests and all 11 browser
 tests passed. Screenshots were refreshed from this final build's components.
+
+Launch and capability follow-up: see [LAUNCH-VERIFICATION.md](LAUNCH-VERIFICATION.md).
+Passed 37 unit/component tests, 22 browser tests and the frontend build. Compact
+unsupported-cron state, preserved launch drafts, visible initial prompts/status,
+remote selection guards and startup timing artifacts are committed. Backend
+structured-harness support is an explicitly separate integration dependency.
