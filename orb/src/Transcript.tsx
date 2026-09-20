@@ -119,7 +119,8 @@ function ThinkBlock(p: { item: Extract<StreamItem, { kind: "think" }> }) {
 
 /** Everything an agent does between two pieces of visible text (thoughts
  * and tool calls, interleaved) folds into one "Worked" line, Cursor-style:
- * open with the current activity while running, collapsed once done. */
+ * the header shows the current tool while running; the body stays closed
+ * until the user opens it, so a 150-tool run does not dump the full list. */
 type WorkItem = Extract<StreamItem, { kind: "tool" | "think" }>;
 type Grouped = StreamItem | { kind: "work"; key: string; items: WorkItem[] };
 
@@ -144,8 +145,7 @@ function groupWork(items: StreamItem[], previous: Grouped[] = []): Grouped[] {
 
 function WorkFold(p: { items: WorkItem[] }) {
   const running = () => p.items.some((t) => (t.kind === "tool" ? !t.done : !t.done));
-  const [forced, setForced] = createSignal<boolean | null>(null);
-  const open = () => forced() ?? running();
+  const [open, setOpen] = createSignal(false);
   const tools = () => p.items.filter((t) => t.kind === "tool").length;
   const current = () => {
     const cur = [...p.items].reverse().find((t) => (t.kind === "tool" ? !t.done : !t.done));
@@ -159,7 +159,7 @@ function WorkFold(p: { items: WorkItem[] }) {
   };
   return (
     <div class={`st-work ${open() ? "open" : ""}`}>
-      <button class="st-work-head" onClick={() => setForced(!open())}>
+      <button class="st-work-head" onClick={() => setOpen(!open())}>
         <Ic.ChevronRight size={12} class={`chev ${open() ? "open" : ""}`} />
         <Show when={running()} fallback={<span class="st-work-label">{summary()}</span>}>
           <span class="st-work-label shimmer">{current()}</span>

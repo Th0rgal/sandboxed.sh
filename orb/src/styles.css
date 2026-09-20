@@ -441,6 +441,10 @@ code {
 .st-work-body .st-tool, .st-work-body .st-think { margin: 0; }
 .st-work-body .st-tool-head { height: 22px; }
 /* Transcript prose: the document viewer's page metrics do not apply. */
+.md table { width: 100%; border-collapse: collapse; margin: 8px 0 12px; font-size: 13px; }
+.md th, .md td { text-align: left; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--stroke-soft); vertical-align: top; }
+.md th { color: var(--fg-2); font-weight: 500; }
+.md.md-compact table { font-size: 12.5px; margin: 6px 0 10px; }
 .md.md-compact { padding: 6px 0 10px; font-size: 13px; line-height: 21px; max-width: none; margin: 0; overflow: visible; flex: none; }
 .md.md-compact p { margin: 0 0 8px; }
 .md.md-compact p:last-child { margin-bottom: 0; }
@@ -491,7 +495,7 @@ code {
 .pill.round { width: 28px; padding: 0; justify-content: center; }
 .composer {
   display: grid;
-  grid-template-columns: auto 1fr auto auto;
+  grid-template-columns: auto 1fr auto auto auto;
   align-items: end;
   gap: 8px;
   min-height: 42px; padding: 8px 9px 8px 11px;
@@ -502,9 +506,10 @@ code {
 .composer textarea { grid-column: 2; }
 .composer .plus-wrap { grid-column: 1; }
 .composer .picks { grid-column: 3; }
-.composer .send { grid-column: 4; }
+.composer .voice-slot { grid-column: 4; }
+.composer .send { grid-column: 5; }
 .composer.tall {
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto 1fr auto auto;
   grid-template-rows: 1fr auto;
   align-items: center;
   border-radius: 16px; min-height: 112px;
@@ -516,7 +521,8 @@ code {
 }
 .composer.tall .plus-wrap { grid-column: 1; grid-row: 2; }
 .composer.tall .picks { grid-column: 2; grid-row: 2; justify-self: start; }
-.composer.tall .send { grid-column: 3; grid-row: 2; }
+.composer.tall .voice-slot { grid-column: 3; grid-row: 2; }
+.composer.tall .send { grid-column: 4; grid-row: 2; }
 .plus { width: 24px; height: 24px; border-radius: 50%; background: var(--plus-bg); color: var(--fg-3); display: grid; place-items: center; flex: none; }
 .plus:hover { background: var(--hover-2); color: var(--fg); }
 textarea {
@@ -533,6 +539,7 @@ textarea::placeholder { color: var(--placeholder); }
 .model > :first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model:hover, .model.on { background: var(--bg-active); }
 .send { width: 24px; height: 24px; border-radius: 50%; background: var(--send-bg); color: var(--send-fg); display: grid; place-items: center; }
+.send.stop { border-radius: 7px; }
 .send:hover { background: var(--send-bg-hover); }
 .menu {
   position: absolute; right: 0; bottom: 30px; min-width: 176px; padding: 4px;
@@ -554,11 +561,24 @@ textarea::placeholder { color: var(--placeholder); }
 .menu-ico svg { width: 14px; height: 14px; display: block; }
 .menu-sep { height: 1px; background: var(--stroke-soft); margin: 3px 6px; }
 .popup-menu { position: fixed; bottom: auto; right: auto; z-index: 60; min-width: 168px; padding: 3px; }
-.under { display: flex; gap: 14px; padding: 9px 14px 11px; color: var(--fg-3); }
-.under span { display: inline-flex; align-items: center; gap: 3px; }
+.under { display: flex; align-items: center; gap: 14px; padding: 8px 12px 4px; color: var(--fg-3); font-size: 12px; }
+.under-loc, .ctx { display: inline-flex; align-items: center; gap: 5px; }
 .under svg { width: 13px; height: 13px; }
-.under span:hover { color: var(--fg); }
-.ctx { margin-left: auto; }
+.under-loc:hover, .ctx:hover { color: var(--fg); }
+.ctx-wrap, .ctx { margin-left: auto; }
+.ctx-wrap { position: relative; }
+.ctx { color: inherit; }
+.ctx-panel {
+  position: absolute; right: 0; bottom: calc(100% + 8px); z-index: 12;
+  width: min(360px, 70vw); padding: 12px 14px 10px;
+  background: var(--menu-bg); border: 1px solid var(--stroke-strong); border-radius: 10px;
+  box-shadow: var(--shadow-lg); color: var(--fg); text-align: left;
+}
+.ctx-panel-h { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; font-size: 13px; }
+.ctx-panel-meta { color: var(--fg-3); font-size: 12px; }
+.ctx-bar { height: 6px; border-radius: 3px; background: var(--bg-active); overflow: hidden; margin-bottom: 10px; }
+.ctx-bar i { display: block; height: 100%; background: color-mix(in srgb, var(--blue) 70%, #fff 10%); }
+.ctx-row { display: flex; justify-content: space-between; font-size: 12px; color: var(--fg-2); padding: 2px 0; }
 
 /* ---------- new agent ---------- */
 .new-agent { flex: 1; display: grid; place-items: center; padding: 0 34px 16vh; }
@@ -948,12 +968,11 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 
 .dlg:has(.project-create) { background: var(--bg); border-radius: 12px; }
 /* ---------- local voice input (composer) ---------- */
-/* The dictation control lives in the composer's send cell: an unobtrusive
-   language chip, then the round button that is a mic when idle, a pulsing
-   dot while recording and a spinner while the local model transcribes. */
-.composer .voice { grid-column: 4; }
-.composer.tall .voice { grid-column: 3; grid-row: 2; }
+/* Mic stays mounted while a turn streams; Stop is a sibling send cell. */
+.voice-slot { display: inline-flex; align-items: center; }
 .voice { position: relative; display: inline-flex; align-items: center; gap: 6px; }
+.voice-btn:not(.recording) { background: var(--plus-bg); color: var(--fg-2); }
+.voice-btn:not(.recording):hover { background: var(--hover-2); color: var(--fg); }
 .voice-lang-wrap { position: relative; display: inline-flex; }
 .voice-lang {
   height: 20px; padding: 0 5px; border-radius: 5px;

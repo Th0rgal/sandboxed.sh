@@ -19,6 +19,7 @@ import { mergeById, pollWhileVisible } from "./poll";
 import { LiveProjectsSection, ProjectFileView } from "./ProjectFiles";
 import { VoiceButton, ensureVoiceProbe, voiceAvailable } from "./VoiceButton";
 import { insertAtCaret } from "./voice";
+import { contextPct, contextWindow, estimateTokens, formatTokens } from "./missionContext";
 import { ControllerView } from "./Controller";
 import {
   createMission,
@@ -418,28 +419,29 @@ function Composer(p: {
       </div>
     </Show>
   );
-  // Empty composer: the microphone where local voice exists, otherwise a
-  // plain (inert) send arrow. A recording in progress keeps the mic mounted
-  // even once text is typed so the draft and the dictation both survive.
+  // Cursor keeps the microphone mounted while a turn is streaming; Stop sits
+  // beside it. A recording also keeps the mic even once text is typed.
   const sendBtn = (
     <Show
       when={p.busy}
       fallback={
-        <Show
-          when={voiceAvailable() && (!text().trim() || voiceActive())}
-          fallback={
-            <button class="send" onClick={send} title="Send">
-              <Ic.ArrowUpIcon size={14} />
-            </button>
-          }
-        >
-          <VoiceButton scope={p.scope} onText={insertDictation} onActive={setVoiceActive} />
+        <Show when={text().trim() && !voiceActive()}>
+          <button class="send" onClick={send} title="Send">
+            <Ic.ArrowUpIcon size={14} />
+          </button>
         </Show>
       }
     >
-      <button class="send" onClick={p.onStop} title="Stop">
+      <button class="send stop" onClick={p.onStop} title="Stop">
         <Ic.StopIcon size={14} />
       </button>
+    </Show>
+  );
+  const voice = (
+    <Show when={voiceAvailable()}>
+      <div class="voice-slot" onPointerDown={(e) => e.stopPropagation()}>
+        <VoiceButton scope={p.scope} onText={insertDictation} onActive={setVoiceActive} />
+      </div>
     </Show>
   );
   return (
@@ -463,6 +465,7 @@ function Composer(p: {
         }}
       />
       {modelBtn}
+      {voice}
       {sendBtn}
     </div>
   );
@@ -1401,6 +1404,50 @@ export default function App() {
   );
 }
 
+function MissionDock(p: { mission: Mission | null; items: StreamItem[]; destination: string }) {
+  const used = () => estimateTokens(p.items);
+  const windowSize = () => contextWindow(p.mission?.backend);
+  const pct = () => contextPct(used(), windowSize());
+  const [open, setOpen] = createSignal(false);
+  const close = (e: PointerEvent) => {
+    if (!(e.target instanceof Node)) return;
+    if ((e.target as HTMLElement).closest?.(".ctx-wrap")) return;
+    setOpen(false);
+  };
+  onMount(() => window.addEventListener("pointerdown", close));
+  onCleanup(() => window.removeEventListener("pointerdown", close));
+  return (
+    <div class="under">
+      <span class="under-loc" title={p.destination}>
+        <Show when={p.destination !== "Core"} fallback={<Ic.LaptopIcon size={13} />}>
+          <Ic.CloudIcon />
+        </Show>
+        {p.destination}
+      </span>
+      <div class="ctx-wrap">
+        <button class="ctx" title="Context used" onClick={() => setOpen(!open())}>
+          <Ic.ContextRing pct={pct()} /> {pct()}%
+        </button>
+        <Show when={open()}>
+          <div class="ctx-panel" role="dialog" aria-label="Context">
+            <div class="ctx-panel-h">
+              <span>Context</span>
+              <span class="ctx-panel-meta">{pct()}% · ~{formatTokens(used())} / {formatTokens(windowSize())}</span>
+            </div>
+            <div class="ctx-bar" aria-hidden="true">
+              <i style={{ width: `${pct()}%` }} />
+            </div>
+            <div class="ctx-row">
+              <span>Conversation</span>
+              <span>{formatTokens(used())}</span>
+            </div>
+          </div>
+        </Show>
+      </div>
+    </div>
+  );
+}
+
 function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: Mission | null) => void }) {
   const receipt = recalledLaunch(p.id);
   const [mission, setMission] = createSignal<Mission | null>(p.initial ?? null);
@@ -1535,6 +1582,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
       <div class="dock">
         <div class="col">
           <Composer placeholder="Send follow-up" picker={false} busy={busy()} onSend={sendMsg} onStop={stopM} scope={`m:${p.id}`} />
+          <MissionDock mission={mission()} items={viewItems()} destination={missionDestination(mission(), receipt)} />
         </div>
       </div>
     </>

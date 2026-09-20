@@ -40,9 +40,21 @@ type Block =
   | { t: "p"; text: string }
   | { t: "ul"; items: string[] }
   | { t: "pre"; lang: string; text: string }
-  | { t: "quote"; text: string };
+  | { t: "quote"; text: string }
+  | { t: "table"; heads: string[]; rows: string[][] };
 
-function parse(src: string): Block[] {
+function isTableSep(line: string): boolean {
+  const t = line.trim();
+  return /^\|?[\s:|-]+\|[\s:|-]*\|?$/.test(t) && t.includes("-");
+}
+function tableCells(line: string): string[] {
+  let t = line.trim();
+  if (t.startsWith("|")) t = t.slice(1);
+  if (t.endsWith("|")) t = t.slice(0, -1);
+  return t.split("|").map((c) => c.trim());
+}
+
+export function parseMarkdown(src: string): Block[] {
   const lines = src.replace(/\r\n/g, "\n").split("\n");
   const out: Block[] = [];
   let i = 0;
@@ -81,9 +93,19 @@ function parse(src: string): Block[] {
       i++;
       continue;
     }
+    if (line.includes("|") && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+      const heads = tableCells(line);
+      i += 2;
+      const rows: string[][] = [];
+      while (i < lines.length && lines[i].includes("|") && !isTableSep(lines[i])) {
+        rows.push(tableCells(lines[i++]));
+      }
+      out.push({ t: "table", heads, rows });
+      continue;
+    }
     const buf = [line];
     i++;
-    while (i < lines.length && lines[i].trim() && !/^#{1,6}\s/.test(lines[i]) && !/^[-*]\s+/.test(lines[i]) && !lines[i].startsWith("```") && !lines[i].startsWith("> ")) {
+    while (i < lines.length && lines[i].trim() && !/^#{1,6}\s/.test(lines[i]) && !/^[-*]\s+/.test(lines[i]) && !lines[i].startsWith("```") && !lines[i].startsWith("> ") && !(lines[i].includes("|") && i + 1 < lines.length && isTableSep(lines[i + 1]))) {
       buf.push(lines[i++]);
     }
     out.push({ t: "p", text: buf.join(" ") });
@@ -92,7 +114,7 @@ function parse(src: string): Block[] {
 }
 
 export function MdView(p: { text: string; compact?: boolean }) {
-  const blocks = createMemo(() => parse(p.text));
+  const blocks = createMemo(() => parseMarkdown(p.text));
   return (
     <div class={`md ${p.compact ? "md-compact" : ""}`}>
       <For each={blocks()}>
@@ -115,6 +137,25 @@ export function MdView(p: { text: string; compact?: boolean }) {
             </pre>
           ) : b.t === "quote" ? (
             <blockquote>{inline(b.text)}</blockquote>
+          ) : b.t === "table" ? (
+            <table>
+              <thead>
+                <tr>
+                  {b.heads.map((h) => (
+                    <th>{inline(h)}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {b.rows.map((row) => (
+                  <tr>
+                    {row.map((c) => (
+                      <td>{inline(c)}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           ) : (
             <p>{inline(b.text)}</p>
           )
