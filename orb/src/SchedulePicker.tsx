@@ -1,4 +1,4 @@
-import { For, Match, Show, Switch, createMemo, createSignal } from "solid-js";
+import { For, Match, Show, Switch, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 
 /** What Hermes' schedule grammar can express, as structured state. */
 type Parsed =
@@ -104,16 +104,51 @@ const MODES: { id: Parsed["mode"]; label: string }[] = [
 /** Small pop-up menu in the macOS style: a quiet button, a checkmarked list. */
 function PopUp<T extends string>(p: { value: T; options: { id: T; label: string }[]; onPick: (v: T) => void }) {
   const [open, setOpen] = createSignal(false);
-  const close = () => setOpen(false);
+  let root!: HTMLDivElement;
+  let trigger!: HTMLButtonElement;
+  let menu!: HTMLDivElement;
+  const close = (restore = false) => {
+    if (!open()) return;
+    setOpen(false);
+    if (restore) requestAnimationFrame(() => trigger?.focus());
+  };
+  const clamp = () => {
+    if (!menu) return;
+    const r = menu.getBoundingClientRect();
+    if (r.bottom > window.innerHeight - 8) {
+      menu.style.top = "auto";
+      menu.style.bottom = "30px";
+    }
+    if (r.left < 8) menu.style.transform = `translateX(${8 - r.left}px)`;
+  };
+  onMount(() => {
+    const outside = (e: PointerEvent) => {
+      if (open() && !root.contains(e.target as Node)) close();
+    };
+    const keys = (e: KeyboardEvent) => {
+      if (!open()) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        close(true);
+      }
+    };
+    window.addEventListener("pointerdown", outside, true);
+    window.addEventListener("keydown", keys);
+    onCleanup(() => {
+      window.removeEventListener("pointerdown", outside, true);
+      window.removeEventListener("keydown", keys);
+    });
+  });
   const label = () => p.options.find((o) => o.id === p.value)?.label ?? p.value;
   return (
-    <div class="sp-pop" onPointerDown={(e) => e.stopPropagation()}>
+    <div ref={root} class="sp-pop">
       <button
+        ref={trigger}
         class={`sp-pop-btn ${open() ? "on" : ""}`}
         onClick={() => {
           const next = !open();
           setOpen(next);
-          if (next) window.addEventListener("pointerdown", close, { once: true });
+          if (next) requestAnimationFrame(clamp);
         }}
       >
         {label()}
@@ -122,11 +157,13 @@ function PopUp<T extends string>(p: { value: T; options: { id: T; label: string 
         </svg>
       </button>
       <Show when={open()}>
-        <div class="menu sp-pop-menu">
+        <div ref={menu} class="menu sp-pop-menu" role="menu">
           <For each={p.options}>
             {(o) => (
               <button
                 class={`menu-item ${o.id === p.value ? "on" : ""}`}
+                role="menuitemradio"
+                aria-checked={o.id === p.value}
                 onClick={() => {
                   p.onPick(o.id);
                   setOpen(false);
