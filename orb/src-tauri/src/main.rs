@@ -1,5 +1,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use tauri::{Manager, Theme, WebviewWindow};
+
+/// Follow the frontend's persisted preference. `None` delegates to the OS,
+/// which makes titlebar material and the frontend change together for Auto.
+#[tauri::command]
+fn set_window_theme(window: WebviewWindow, theme: String) -> Result<(), String> {
+    let theme = match theme.as_str() {
+        "auto" => None,
+        "light" => Some(Theme::Light),
+        "dark" => Some(Theme::Dark),
+        _ => return Err("theme must be auto, light, or dark".to_string()),
+    };
+    window.set_theme(theme).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn paloma_ssh_pubkey() -> Result<String, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME is unset".to_string())?;
@@ -55,7 +70,7 @@ fn main() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![paloma_ssh_pubkey, open_url])
+        .invoke_handler(tauri::generate_handler![paloma_ssh_pubkey, open_url, set_window_theme])
         .run(tauri::generate_context!())
         .expect("error while running orb");
 }
