@@ -9,6 +9,7 @@ import {
   listProjectMissions,
   listProjects,
   createProjectCron,
+  listProjectCrons,
   mkdirProjectFile,
   readProjectFile,
   writeProjectFile,
@@ -62,6 +63,7 @@ export function LiveProjectsSection(p: {
   const [dirs, setDirs] = createStore<Record<string, ProjectFileEntry[]>>({});
   // The project's controller (Hermes cron), shown as the folder's first row.
   const [controllers, setControllers] = createStore<Record<string, ControllerData>>({});
+  const [crons, setCrons] = createStore<Record<string, import("./api").ControllerJob[]>>({});
   const [actionMenu, setActionMenu] = createSignal<{ x: number; y: number; slug: string; path: string } | null>(null);
   const [newFolder, setNewFolder] = createSignal<{ slug: string; path: string } | null>(null);
   const [folderName, setFolderName] = createSignal("");
@@ -77,6 +79,9 @@ export function LiveProjectsSection(p: {
     getProjectController(slug, 3)
       .then((view) => setControllers(slug, view))
       .catch(() => {});
+  };
+  const loadCrons = (slug: string) => {
+    listProjectCrons(slug).then((jobs) => setCrons(slug, jobs)).catch(() => setCrons(slug, []));
   };
 
   const refresh = () => {
@@ -106,6 +111,7 @@ export function LiveProjectsSection(p: {
         if (!expanded[project.slug]) continue;
         loadMissions(project.slug);
         loadController(project.slug);
+        loadCrons(project.slug);
       }
     }, 10000);
     onCleanup(stop);
@@ -176,6 +182,7 @@ export function LiveProjectsSection(p: {
     try {
       await createProjectCron(slug, { name: cronName().trim(), prompt: cronPrompt().trim(), schedule: cronSchedule().trim() });
       loadController(slug);
+      loadCrons(slug);
       setNewCron(null);
     } catch (e) {
       setCronError(e instanceof Error ? e.message : String(e));
@@ -189,6 +196,7 @@ export function LiveProjectsSection(p: {
       loadMissions(slug);
       loadDir(slug, "");
       loadController(slug);
+      loadCrons(slug);
     }
   };
 
@@ -308,6 +316,19 @@ export function LiveProjectsSection(p: {
                     );
                   }}
                 </Show>
+                <For each={crons[project.slug] ?? []}>
+                  {(job) => (
+                    <button
+                      class={`row agent d1 cron ${p.selected() === `pc:${project.slug}:${job.id}` ? "active" : ""}`}
+                      title="Project cron"
+                      onClick={() => p.open(`pc:${project.slug}:${job.id}`)}
+                    >
+                      <span class="glyph"><CronGlyph job={job} /></span>
+                      <span class="row-label">{job.name}</span>
+                      <span class="row-machine"><span class="row-machine-name cron-next">{!job.enabled || job.state === "paused" ? "paused" : untilLabel(job.next_run_at, Date.now())}</span></span>
+                    </button>
+                  )}
+                </For>
                 <For each={liveOf(project.slug)}>
                   {(m) => (
                     <button

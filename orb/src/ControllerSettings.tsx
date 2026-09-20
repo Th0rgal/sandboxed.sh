@@ -66,7 +66,7 @@ function Row(p: { title: string; desc?: string; stack?: boolean; children: JSX.E
 }
 
 /** Settings for a project's controller: every field Hermes lets you edit. */
-export function ControllerSettingsPanel(p: { slug: string; view: ControllerView; onSaved: (v: ControllerView) => void }) {
+export function ControllerSettingsPanel(p: { slug: string; view: ControllerView; onSaved: (v: ControllerView) => void; save?: (patch: ControllerPatch) => Promise<ControllerView> }) {
   const [draft, setDraft] = createStore<Draft>(draftOf(p.view));
   const [base, setBase] = createSignal<Draft>(draftOf(p.view));
   const [saving, setSaving] = createSignal(false);
@@ -111,7 +111,7 @@ export function ControllerSettingsPanel(p: { slug: string; view: ControllerView;
     setSaving(true);
     setError(null);
     try {
-      const view = await updateController(p.slug, patch());
+      const view = await (p.save ? p.save(patch()) : updateController(p.slug, patch()));
       const next = draftOf(view);
       setBase(next);
       setDraft(next);

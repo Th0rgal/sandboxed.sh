@@ -436,6 +436,26 @@ export async function createProjectCron(slug: string, draft: ProjectCronDraft): 
   return data.job;
 }
 
+export async function getProjectCron(slug: string, id: string): Promise<ControllerView> {
+  const data = await api<{ job: ControllerJob & Partial<ControllerSettings> }>(`/api/projects/${encodeURIComponent(slug)}/crons/${encodeURIComponent(id)}`);
+  const job = data.job;
+  return { slug, job, settings: { prompt: job.prompt ?? "", prompt_chars: (job.prompt ?? "").length, skills: job.skills ?? [], repeat_completed: 0, no_agent: false, continuity: false, enabled_toolsets: [], deliver: job.deliver ?? null, repeat_times: (job as { repeat?: number }).repeat ?? null }, runs: [] };
+}
+
+export async function updateProjectCron(slug: string, id: string, patch: ControllerPatch): Promise<ControllerView> {
+  const data = await api<{ job: ControllerJob & Partial<ControllerSettings> }>(`/api/projects/${encodeURIComponent(slug)}/crons/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch) });
+  return getProjectCronFromJob(slug, data.job);
+}
+
+function getProjectCronFromJob(slug: string, job: ControllerJob & Partial<ControllerSettings>): ControllerView {
+  return { slug, job, settings: { prompt: job.prompt ?? "", prompt_chars: (job.prompt ?? "").length, skills: job.skills ?? [], repeat_completed: 0, no_agent: false, continuity: false, enabled_toolsets: [], deliver: job.deliver ?? null, repeat_times: (job as { repeat?: number }).repeat ?? null }, runs: [] };
+}
+
+export async function projectCronAction(slug: string, id: string, action: "pause" | "resume" | "run"): Promise<ControllerView> {
+  const data = await api<{ job: ControllerJob & Partial<ControllerSettings> }>(`/api/projects/${encodeURIComponent(slug)}/crons/${encodeURIComponent(id)}/action`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action }) });
+  return getProjectCronFromJob(slug, data.job);
+}
+
 /** Bumped after a project is created so every list re-fetches. */
 const [projectsVersion, setProjectsVersion] = createSignal(0);
 export { projectsVersion };

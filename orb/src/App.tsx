@@ -503,7 +503,12 @@ export default function App() {
   // Project controller (Hermes cron): `c:<slug>`.
   const currentController = createMemo(() => {
     const id = selected();
-    return id && id.startsWith("c:") ? id.slice(2) : null;
+    if (id?.startsWith("c:")) return { slug: id.slice(2) };
+    if (id?.startsWith("pc:")) {
+      const [, slug, cronId] = id.split(":");
+      return slug && cronId ? { slug, id: cronId } : null;
+    }
+    return null;
   });
   // Hosted project file: `pf:<slug>:<path>` (path may itself contain slashes).
   const currentProjectFile = createMemo(() => {
@@ -1006,7 +1011,7 @@ export default function App() {
           <Match when={currentController()}>
             {(slug) => (
               <Show when={slug()} keyed>
-                {(s) => <ControllerView slug={s} />}
+                {(s) => <ControllerView slug={s.slug} id={s.id} />}
               </Show>
             )}
           </Match>

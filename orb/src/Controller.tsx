@@ -2,7 +2,7 @@ import { For, Show, createMemo, createSignal, onCleanup } from "solid-js";
 import { MdView } from "./Markdown";
 import { pollWhileVisible } from "./poll";
 import { ControllerSettingsPanel } from "./ControllerSettings";
-import { controllerAction, getProjectController, isConnected, type ControllerJob, type ControllerRun, type ControllerView as View } from "./api";
+import { controllerAction, getProjectController, getProjectCron, isConnected, projectCronAction, updateProjectCron, type ControllerJob, type ControllerRun, type ControllerView as View } from "./api";
 
 /** How a controller is doing, derived from its Hermes job record. */
 export type CronState = "running" | "paused" | "attention" | "scheduled";
@@ -205,7 +205,7 @@ function FailedFold(p: { runs: ControllerRun[]; error: string }) {
 }
 
 /** Page for a project's controller: a timeline of ticks, newest first. */
-export function ControllerView(p: { slug: string }) {
+export function ControllerView(p: { slug: string; id?: string }) {
   const [view, setView] = createSignal<View | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   const [busy, setBusy] = createSignal<string | null>(null);
@@ -215,7 +215,7 @@ export function ControllerView(p: { slug: string }) {
   const load = async () => {
     if (!isConnected()) return;
     try {
-      setView(await getProjectController(p.slug));
+      setView(p.id ? await getProjectCron(p.slug, p.id) : await getProjectController(p.slug));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -235,7 +235,7 @@ export function ControllerView(p: { slug: string }) {
     if (busy()) return;
     setBusy(action);
     try {
-      setView(await controllerAction(p.slug, action));
+      setView(p.id ? await projectCronAction(p.slug, p.id, action) : await controllerAction(p.slug, action));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -308,7 +308,7 @@ export function ControllerView(p: { slug: string }) {
                 </div>
 
                 <Show when={tab() === "settings"}>
-                  <ControllerSettingsPanel slug={p.slug} view={view()!} onSaved={setView} />
+                  <ControllerSettingsPanel slug={p.slug} view={view()!} onSaved={setView} save={p.id ? (patch) => updateProjectCron(p.slug, p.id!, patch) : undefined} />
                 </Show>
                 <div class="cr-timeline" style={{ display: tab() === "runs" ? "block" : "none" }}>
                   <For each={entries()}>
