@@ -25,10 +25,11 @@ no client-generated shell, proxy-key provisioning, or fallback machine/harness.
 Preflight no longer carries a client-side harness list. Every remote launch
 re-reads `GET /api/remote-nodes` and follows its `remote_launch` capability
 (`{typed, harnesses, raw_command, proxy_url_configured, optional
-requires_proxy_harnesses}`; production release `21e29373` advertises
-`claudecode` and `opencode`). A harness the server has not advertised, a missing
-or untyped capability (older backend), an unset proxy URL for Claude Code/OpenCode
-(or advertised `requires_proxy_harnesses`), a failed capability read, and a
+requires_proxy_harnesses}`; backend `07b57559` on `fix/orb-native-grok-goal`
+advertises `claudecode`, `opencode`, and `grok` once that SHA is deployed).
+A harness the server has not advertised, a missing or untyped capability
+(older backend), an unset proxy URL for Claude Code/OpenCode (or advertised
+`requires_proxy_harnesses`), a failed capability read, and a
 missing/cordoned/offline node are all refused before POST while retaining the
 draft and selection. Native Grok uses managed OAuth, so `proxy_url_configured=false`
 does not block it. Grok is sent unchanged as soon as a backend advertises `grok`,
@@ -37,14 +38,14 @@ validation errors keep the draft and selection. A typed-capable backend that sti
 answers `remote_command is required` is explained the same way, without a raw
 command or local-machine retry.
 
-Contract verified against `fix/orb-remote-mission-launch` at `8271a0e8` (unchanged
-at `488d0a4e`), `docs/REMOTE_NODES.md` and the typed remote admission test in
+Contract verified against `fix/orb-native-grok-goal` at `07b57559`,
+`docs/REMOTE_NODES.md` and the typed remote admission test in
 `src/api/control/dispatch_admission_tests.rs`. There is no capability endpoint
 in this checkpoint: the typed POST remains the authority for model/provisioning validation after
 the client checks the confirmed harness list.
-The server currently supports Claude Code and OpenCode. Native Grok Build is
-explicitly rejected; its node provisioning remains a separate backend task.
-OpenCode with a Grok model is never substituted for a Grok Build selection.
+The server supports Claude Code, OpenCode, and native Grok Build when
+`remote_launch.harnesses` includes `grok`. OpenCode with a Grok model is never
+substituted for a Grok Build selection.
 
 Existing and newly accepted remote missions use `remote_job.node_id` for
 placement and job phase/node state for status. Active/observed means accepted,
