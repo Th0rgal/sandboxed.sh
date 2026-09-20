@@ -324,7 +324,6 @@ export const startRecording: RecorderFactory = async (opts) => {
   let sink!: GainNode;
   const chunks: Float32Array[] = [];
   let frames = 0;
-  let lastLevel = 0;
   let finished = false;
   try {
     try {
@@ -344,13 +343,17 @@ export const startRecording: RecorderFactory = async (opts) => {
       chunks.push(new Float32Array(data));
       frames += data.length;
       if (opts.onLevel) {
-        let sum = 0;
-        for (let i = 0; i < data.length; i += 4) sum += data[i] * data[i];
-        const rms = Math.sqrt(sum / Math.max(1, data.length / 4));
-        const level = Math.min(1, rms * 4);
-        if (Math.abs(level - lastLevel) > 0.02) {
-          lastLevel = level;
-          opts.onLevel(level);
+        const hop = 512;
+        for (let off = 0; off < data.length; off += hop) {
+          let sum = 0;
+          let n = 0;
+          const end = Math.min(off + hop, data.length);
+          for (let i = off; i < end; i += 4) {
+            sum += data[i] * data[i];
+            n++;
+          }
+          const rms = Math.sqrt(sum / Math.max(1, n));
+          opts.onLevel(Math.min(1, rms * 4));
         }
       }
       if (frames >= maxFrames) {

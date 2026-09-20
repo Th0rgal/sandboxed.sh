@@ -103,6 +103,9 @@ describe("VoiceButton flow", () => {
     expect(rec.state.opts?.maxSeconds).toBe(120);
     expect(onActive).toHaveBeenLastCalledWith(true);
     expect(screen.queryByRole("button", { name: "Dictation language" })).toBeNull(); // chip hidden while recording
+    expect(document.querySelector(".voice-wave")).toBeTruthy();
+    rec.state.opts?.onLevel?.(0.9);
+    rec.state.opts?.onLevel?.(0.2);
     fireEvent.click(button()); // stop
     await waitFor(() => expect(onText).toHaveBeenCalledWith("hello world"));
     expect(bridge.transcribe).toHaveBeenCalledTimes(1);

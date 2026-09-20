@@ -79,6 +79,9 @@ const fmt = (ms: number) => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 };
 
+const WAVE_BARS = 120;
+const silentWave = () => Array.from({ length: WAVE_BARS }, () => 0);
+
 export function VoiceButton(p: {
   /** Receives the dictated text; the composer inserts it and does not send. */
   onText: (text: string) => void;
@@ -95,7 +98,7 @@ export function VoiceButton(p: {
   const record = () => p.recorder ?? startRecording;
   const [status, setStatus] = createSignal<VoiceStatus>("idle");
   const [elapsed, setElapsed] = createSignal(0);
-  const [level, setLevel] = createSignal(0);
+  const [bars, setBars] = createSignal<number[]>(silentWave());
   const [error, setError] = createSignal<string | null>(null);
   const [langOpen, setLangOpen] = createSignal(false);
   let rec: Recorder | null = null;
@@ -126,6 +129,7 @@ export function VoiceButton(p: {
     if (!b) return;
     setError(null);
     setLangOpen(false);
+    setBars(silentWave());
     const my = ++token;
     const scope = p.scope;
     activeScope = scope;
@@ -145,7 +149,12 @@ export function VoiceButton(p: {
     try {
       candidate = await record()({
         onLevel: (l) => {
-          if (live()) setLevel(l);
+          if (!live()) return;
+          setBars((prev) => {
+            const next = prev.slice(1);
+            next.push(Math.max(0, Math.min(1, l)));
+            return next;
+          });
         },
         maxSeconds: VOICE_MAX_SECONDS,
         onAutoStop: () => {
@@ -165,6 +174,7 @@ export function VoiceButton(p: {
       return;
     }
     rec = candidate;
+    setBars(silentWave());
     setState("recording");
     setElapsed(0);
     const t0 = rec.startedAt;
@@ -333,31 +343,48 @@ export function VoiceButton(p: {
             </div>
           </Show>
         </span>
+        <button
+          type="button"
+          class="send voice-btn idle"
+          title={title()}
+          aria-label={title()}
+          disabled={p.disabled}
+          onClick={toggle}
+        >
+          <Ic.MicIcon size={15} />
+        </button>
       </Show>
-      <Show when={status() === "recording" || status() === "starting"}>
+      <Show when={status() !== "idle"}>
+        <div class="voice-wave" aria-hidden="true">
+          <For each={bars()}>{(v) => <span style={{ "--v": String(v) }} />}</For>
+        </div>
         <span class="voice-time" aria-live="off">
           {status() === "starting" ? "…" : fmt(elapsed())}
         </span>
-      </Show>
-      <button
-        type="button"
-        class={`send voice-btn ${status()}`}
-        title={title()}
-        aria-label={title()}
-        aria-pressed={status() === "recording"}
-        disabled={p.disabled}
-        onClick={toggle}
-      >
-        <Show when={status() === "idle"}>
-          <Ic.MicIcon size={15} />
-        </Show>
-        <Show when={status() === "starting" || status() === "transcribing"}>
-          <Ic.Spinner size={14} />
-        </Show>
+        <button
+          type="button"
+          class="voice-x"
+          title={status() === "recording" ? "Cancel recording" : title()}
+          aria-label={status() === "recording" ? "Cancel recording" : title()}
+          onClick={cancel}
+        >
+          <Show when={status() === "transcribing"} fallback={<Ic.CloseIcon size={13} />}>
+            <Ic.Spinner size={13} />
+          </Show>
+        </button>
         <Show when={status() === "recording"}>
-          <span class="voice-dot" style={{ transform: `scale(${1 + level() * 0.9})` }} />
+          <button
+            type="button"
+            class="voice-ok"
+            title="Stop recording"
+            aria-label="Stop recording"
+            aria-pressed="true"
+            onClick={() => void finish()}
+          >
+            <Ic.CheckIcon size={13} />
+          </button>
         </Show>
-      </button>
+      </Show>
       <Show when={error()}>
         <div class="voice-err" role="alert">
           {error()}

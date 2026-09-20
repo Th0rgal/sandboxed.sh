@@ -445,7 +445,7 @@ function Composer(p: {
     </Show>
   );
   return (
-    <div class={`composer ${p.tall ? "tall" : ""}`} onClick={() => ta.focus()}>
+    <div class={`composer ${p.tall ? "tall" : ""} ${voiceActive() ? "voice-on" : ""}`} onClick={() => !voiceActive() && ta.focus()}>
       {plus}
       <textarea
         ref={ta}

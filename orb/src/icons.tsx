@@ -196,6 +196,11 @@ export const ArrowUpIcon = (p: P) => (
     <path d="M8 13V3M3.500 7.500 8 3l4.500 4.500" />
   </I>
 );
+export const CheckIcon = (p: P) => (
+  <I {...p} sw={1.7}>
+    <path d="M3.2 8.4 6.5 11.6 12.8 4.6" />
+  </I>
+);
 export const TargetIcon = (p: P) => (
   <I {...p} sw={1.3}>
     <circle cx="8" cy="8" r="5.5" />
