@@ -108,6 +108,18 @@ test("sidebar rows stay compact with distinct hover/selected and delayed real me
   await page.waitForTimeout(560);
   await expect(tip).toBeHidden();
   await expect(live).not.toHaveAttribute("aria-describedby");
+  await page.locator(".titlebar").click();
+  for (const dismiss of ["escape", "scroll", "pointer", "resize"] as const) {
+    await live.hover();
+    await expect(tip).toBeHidden();
+    if (dismiss === "escape") await page.keyboard.press("Escape");
+    else if (dismiss === "scroll") await page.locator(".sb-scroll").evaluate((el) => { el.scrollTop += 20; });
+    else if (dismiss === "pointer") await live.click();
+    else await page.evaluate(() => window.dispatchEvent(new Event("resize")));
+    await page.waitForTimeout(560);
+    await expect(tip).toBeHidden();
+    await page.locator(".titlebar").click();
+  }
   await live.focus();
   await page.keyboard.press("Tab");
   await expect(otherLive).toBeFocused();

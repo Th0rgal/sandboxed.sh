@@ -79,10 +79,11 @@ function MachineBadge(p: { name?: string | null }) {
 function useRowTip() {
   const [tip, setTip] = createSignal<{ title: string; meta: string[]; x: number; y: number } | null>(null);
   let timer = 0;
+  let gen = 0;
   let owner: HTMLElement | null = null;
   let card: HTMLDivElement | undefined;
   const unlink = () => { owner?.removeAttribute("aria-describedby"); owner = null; };
-  const hide = () => { window.clearTimeout(timer); timer = 0; unlink(); setTip(null); };
+  const hide = () => { window.clearTimeout(timer); timer = 0; gen++; unlink(); setTip(null); };
   const place = (el: HTMLElement, content: RowTipContent, size = { width: 240, height: 44 }) => {
     const pos = placeRowTip(el.getBoundingClientRect(), size, { width: window.innerWidth, height: window.innerHeight });
     setTip({ ...content, ...pos });
@@ -94,8 +95,10 @@ function useRowTip() {
   };
   const show = (content: RowTipContent, el: HTMLElement) => {
     window.clearTimeout(timer);
+    const id = ++gen;
     timer = window.setTimeout(() => {
-      if (!el.isConnected) return;
+      if (id !== gen || !el.isConnected) return;
+      timer = 0;
       unlink();
       owner = el;
       el.setAttribute("aria-describedby", ROW_TIP_ID);
@@ -114,7 +117,7 @@ function useRowTip() {
   });
   onMount(() => {
     const dismiss = (e: Event) => {
-      if (!tip() && !timer) return;
+      if (!timer && !tip()) return;
       if (e.type === "keydown") {
         if ((e as KeyboardEvent).key !== "Escape") return;
         e.preventDefault();
@@ -125,10 +128,12 @@ function useRowTip() {
     window.addEventListener("scroll", dismiss, true);
     window.addEventListener("keydown", dismiss, true);
     window.addEventListener("pointerdown", dismiss, true);
+    window.addEventListener("resize", dismiss);
     onCleanup(() => {
       window.removeEventListener("scroll", dismiss, true);
       window.removeEventListener("keydown", dismiss, true);
       window.removeEventListener("pointerdown", dismiss, true);
+      window.removeEventListener("resize", dismiss);
     });
   });
   onCleanup(hide);
