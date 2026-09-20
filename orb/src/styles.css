@@ -936,3 +936,36 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 .project-location small { color: var(--fg-3); line-height: 1.5; }
 
 .dlg:has(.project-create) { background: var(--bg); border-radius: 12px; }
+/* ---------- local voice input (composer) ---------- */
+/* The dictation control lives in the composer's send cell: an unobtrusive
+   language chip, then the round button that is a mic when idle, a pulsing
+   dot while recording and a spinner while the local model transcribes. */
+.composer .voice { grid-column: 4; }
+.composer.tall .voice { grid-column: 3; grid-row: 2; }
+.voice { position: relative; display: inline-flex; align-items: center; gap: 6px; }
+.voice-lang-wrap { position: relative; display: inline-flex; }
+.voice-lang {
+  height: 20px; padding: 0 5px; border-radius: 5px;
+  font: 500 10.5px/20px var(--sans); letter-spacing: .04em; color: var(--fg-4);
+}
+.voice-lang:hover, .voice-lang.on { color: var(--fg-2); background: var(--bg-active); }
+.voice-menu { min-width: 180px; max-height: 300px; overflow-y: auto; }
+.voice-menu .pick-meta { color: var(--fg-4); font-size: 11px; margin-left: auto; }
+.voice-time { font: 12px/20px var(--mono, monospace); color: var(--fg-3); min-width: 32px; text-align: right; font-variant-numeric: tabular-nums; }
+.voice-btn.recording { background: var(--red); color: #fff; }
+.voice-btn.recording:hover { background: var(--red); filter: brightness(1.1); }
+.voice-btn.starting, .voice-btn.transcribing { background: var(--plus-bg); color: var(--fg-2); }
+.voice-btn:disabled { opacity: .5; cursor: default; }
+.voice-dot {
+  width: 8px; height: 8px; border-radius: 50%; background: #fff;
+  animation: voice-pulse 1.4s ease-in-out infinite; transition: transform .12s ease-out;
+}
+@keyframes voice-pulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
+.voice-err {
+  position: absolute; right: 0; bottom: 32px; z-index: 10;
+  max-width: 320px; padding: 7px 10px; border-radius: 8px;
+  background: var(--menu-bg); border: 1px solid var(--stroke-strong); box-shadow: var(--shadow-lg);
+  color: var(--fg); font-size: 12px; line-height: 16px; white-space: normal; text-align: left;
+  animation: pop .1s ease-out;
+}
+@media (prefers-reduced-motion: reduce) { .voice-dot { animation: none; opacity: 1; } }

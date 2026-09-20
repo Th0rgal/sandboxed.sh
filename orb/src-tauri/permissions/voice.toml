@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-voice"
+description = "Local voice input: capability probe, warm-up, transcription, cancel and release of the on-device worker"
+commands.allow = ["voice_capability", "voice_prewarm", "voice_transcribe", "voice_cancel", "voice_release"]
