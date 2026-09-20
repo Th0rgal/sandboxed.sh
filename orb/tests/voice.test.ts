@@ -189,6 +189,46 @@ describe("recorder", () => {
       Object.defineProperty(navigator, "mediaDevices", { value: undefined, configurable: true });
     }
   });
+  it("releases the microphone and the context when the audio graph cannot be built", async () => {
+    const track = { stop: vi.fn() };
+    const getUserMedia = vi.fn(async () => ({ getTracks: () => [track] }));
+    Object.defineProperty(navigator, "mediaDevices", { value: { getUserMedia }, configurable: true });
+    const closed = vi.fn(async () => {});
+    class FakeContext {
+      sampleRate = 16000;
+      state = "running";
+      destination = {};
+      resume = async () => {};
+      close = closed;
+      createMediaStreamSource = () => ({ connect: vi.fn(), disconnect: vi.fn() });
+      createGain = () => ({ gain: { value: 1 }, connect: vi.fn(), disconnect: vi.fn() });
+      createScriptProcessor = () => {
+        throw new Error("ScriptProcessorNode is not supported");
+      };
+    }
+    (window as unknown as { AudioContext: unknown }).AudioContext = FakeContext;
+    try {
+      await expect(startRecording({})).rejects.toMatchObject({ code: "audio_setup", message: /ScriptProcessorNode/ });
+      expect(track.stop).toHaveBeenCalledTimes(1);
+      expect(closed).toHaveBeenCalledTimes(1);
+    } finally {
+      delete (window as unknown as { AudioContext?: unknown }).AudioContext;
+      Object.defineProperty(navigator, "mediaDevices", { value: undefined, configurable: true });
+    }
+  });
+  it("stops the tracks when no AudioContext constructor exists at all", async () => {
+    const track = { stop: vi.fn() };
+    Object.defineProperty(navigator, "mediaDevices", { value: { getUserMedia: async () => ({ getTracks: () => [track] }) }, configurable: true });
+    const saved = (window as unknown as { AudioContext?: unknown }).AudioContext;
+    delete (window as unknown as { AudioContext?: unknown }).AudioContext;
+    try {
+      await expect(startRecording({})).rejects.toMatchObject({ code: "unsupported" });
+      expect(track.stop).toHaveBeenCalledTimes(1);
+    } finally {
+      if (saved) (window as unknown as { AudioContext?: unknown }).AudioContext = saved;
+      Object.defineProperty(navigator, "mediaDevices", { value: undefined, configurable: true });
+    }
+  });
   it("auto-stops at the duration cap", async () => {
     const getUserMedia = vi.fn(async () => ({ getTracks: () => [] }));
     Object.defineProperty(navigator, "mediaDevices", { value: { getUserMedia }, configurable: true });

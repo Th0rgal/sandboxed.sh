@@ -4,7 +4,7 @@
  * is available; everywhere else `voiceAvailable()` stays false and the
  * composer shows no microphone.
  */
-import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, createEffect, createSignal, on, onCleanup, onMount } from "solid-js";
 import * as Ic from "./icons";
 import { hasFocusScope } from "./focusScope";
 import {
@@ -103,6 +103,8 @@ export function VoiceButton(p: {
   let errTimer: number | undefined;
   let token = 0; // bumps on every start/cancel; late results with an old token are dropped
   let disposed = false;
+  /** Conversation the current recording was started for; fixed at start, checked at every hand-off. */
+  let activeScope: string | undefined;
 
   const setState = (s: VoiceStatus) => {
     setStatus(s);
@@ -125,6 +127,8 @@ export function VoiceButton(p: {
     setError(null);
     setLangOpen(false);
     const my = ++token;
+    const scope = p.scope;
+    activeScope = scope;
     setState("starting");
     // Warm the model while the user is still talking so the cold start is
     // hidden behind the utterance. Failures surface when they stop.
@@ -132,24 +136,35 @@ export function VoiceButton(p: {
     const warm = b.prewarm().catch((e) => {
       warmFailure = toVoiceError(e);
     });
+    // Still the recording the UI is showing, in the conversation it was started for.
+    const live = () => my === token && !disposed && p.scope === scope;
+    // The recorder stays local until it has been validated: the permission
+    // prompt can outlive a cancel + restart, and a late result must never
+    // replace or tear down the recording that now owns the button.
+    let candidate: Recorder | null = null;
     try {
-      rec = await record()({
-        onLevel: setLevel,
+      candidate = await record()({
+        onLevel: (l) => {
+          if (live()) setLevel(l);
+        },
         maxSeconds: VOICE_MAX_SECONDS,
-        onAutoStop: () => void finish(),
+        onAutoStop: () => {
+          if (candidate && rec === candidate) void finish();
+        },
       });
     } catch (e) {
-      if (my !== token || disposed) return;
-      rec = null;
+      if (my !== token || disposed) return; // superseded: a newer start owns the UI
       setState("idle");
       showError(e);
       return;
     }
-    if (my !== token || disposed) {
-      rec.cancel();
-      rec = null;
+    if (!live()) {
+      // Cancelled, unmounted or navigated elsewhere while the prompt was up.
+      candidate.cancel();
+      if (my === token && !disposed) setState("idle");
       return;
     }
+    rec = candidate;
     setState("recording");
     setElapsed(0);
     const t0 = rec.startedAt;
@@ -167,7 +182,7 @@ export function VoiceButton(p: {
     const b = bridge();
     if (!r || !b || status() !== "recording") return;
     const my = token;
-    const scope = p.scope;
+    const scope = activeScope;
     rec = null;
     stopTimer();
     setState("transcribing");
@@ -210,6 +225,17 @@ export function VoiceButton(p: {
     if (status() === "recording" || status() === "starting") cancelRecording();
     else if (status() === "transcribing") cancelTranscribing();
   };
+  // The composer moved to another conversation: whatever is in flight was
+  // for the old one, so drop it rather than dictate into the wrong chat.
+  createEffect(
+    on(
+      () => p.scope,
+      (scope) => {
+        if (status() !== "idle" && scope !== activeScope) cancel();
+      },
+      { defer: true },
+    ),
+  );
 
   const toggle = () => {
     if (p.disabled) return;

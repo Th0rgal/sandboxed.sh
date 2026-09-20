@@ -86,3 +86,7 @@ android_dashboard/test-artifacts/
 # Orb browser test output
 orb/test-results/
 orb/playwright-report/
+
+# Python bytecode
+__pycache__/
+*.pyc

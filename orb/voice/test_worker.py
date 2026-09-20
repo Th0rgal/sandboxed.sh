@@ -86,6 +86,58 @@ class DecodeWav(unittest.TestCase):
         self.assertEqual(cm.exception.code, "audio_too_long")
         self.assertAlmostEqual(worker.check_duration(samples, rate), 2.0)
 
+    def test_max_seconds_is_clamped_finite_positive(self):
+        for raw, want in [("30", 30.0), ("120", 120.0), ("121", 120.0), ("1e9", 120.0), ("inf", 120.0), ("nan", 120.0), ("0", 120.0), ("-5", 120.0), ("lots", 120.0)]:
+            with mock.patch.dict(os.environ, {"ORB_VOICE_MAX_SECS": raw}):
+                self.assertEqual(worker.max_seconds(), want, raw)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ORB_VOICE_MAX_SECS", None)
+            self.assertEqual(worker.max_seconds(), 120.0)
+        with mock.patch.dict(os.environ, {"ORB_VOICE_MAX_SECS": "inf"}):
+            self.assertLess(worker.payload_hard_cap(), 2**31)
+
+
+class SilenceGate(unittest.TestCase):
+    def level(self, **kw):
+        samples, _ = worker.decode_wav(make_wav(0.5, **kw))
+        return samples
+
+    def test_digital_silence_is_gated(self):
+        self.assertTrue(worker.is_silent(self.level(amplitude=0)))
+        self.assertEqual(worker.signal_level(worker.array.array("h")), (0, 0.0))
+
+    def test_near_silence_is_gated(self):
+        self.assertTrue(worker.is_silent(self.level(amplitude=worker.SILENCE_PEAK // 4)))
+
+    def test_quiet_speech_passes(self):
+        # A constant tone at -40 dBFS is far quieter than any real utterance.
+        self.assertFalse(worker.is_silent(self.level(amplitude=330)))
+        self.assertFalse(worker.is_silent(self.level(amplitude=-330)))
+        # A lone click above the peak floor in an otherwise silent buffer also passes.
+        samples = self.level(amplitude=0)
+        samples[100] = worker.SILENCE_PEAK * 4
+        self.assertFalse(worker.is_silent(samples))
+
+    def test_gate_runs_before_the_backend(self):
+        backend = worker.FakeBackend()
+        backend.transcribe = mock.Mock(return_value="Thank you.")
+        w = worker.Worker(backend)
+        res = w.handle({"op": "transcribe", "language": "en"}, make_wav(2.0, amplitude=0))
+        self.assertEqual(res["text"], "")
+        self.assertEqual(res["duration_secs"], 2.0)
+        backend.transcribe.assert_not_called()
+        res = w.handle({"op": "transcribe", "language": "en"}, make_wav(2.0, amplitude=400))
+        self.assertEqual(res["text"], "Thank you.")
+        backend.transcribe.assert_called_once()
+
+    def test_log_carries_timings_not_text(self):
+        backend = worker.FakeBackend()
+        backend.transcribe = mock.Mock(return_value="the secret transcript")
+        with mock.patch.object(worker.sys, "stderr", new=io.StringIO()) as err:
+            worker.Worker(backend).handle({"op": "transcribe", "language": "en"}, make_wav(0.5))
+        self.assertIn("transcribe 0.50s", err.getvalue())
+        self.assertNotIn("secret", err.getvalue())
+
 
 class Protocol(unittest.TestCase):
     def test_hello_reports_pins_and_languages(self):
@@ -154,9 +206,33 @@ class Protocol(unittest.TestCase):
         self.assertEqual(lines[0]["error"]["code"], "bad_request")
         self.assertEqual(code, 0)  # EOF after the broken frame ends the loop cleanly
 
-    def test_payload_over_hard_cap_is_rejected(self):
-        code, lines = run_frames(frame({"id": 1, "op": "transcribe", "language": "en", "audio_bytes": 10**9}))
+    def test_payload_over_hard_cap_is_rejected_without_reading_it(self):
+        class NoBodyRead(io.BytesIO):
+            def read(self, n=-1):
+                raise AssertionError(f"tried to read {n} bytes of an oversized body")
+
+        header = frame({"id": 1, "op": "transcribe", "language": "en", "audio_bytes": 10**12})
+        out = io.BytesIO()
+        code = worker.serve(NoBodyRead(header + frame({"id": 2, "op": "hello"})), out, worker.Worker(worker.FakeBackend()))
+        lines = [json.loads(l) for l in out.getvalue().decode().splitlines()]
+        self.assertEqual(len(lines), 1)  # protocol violation ends the session
+        self.assertEqual(lines[0]["id"], 1)
         self.assertEqual(lines[0]["error"]["code"], "audio_too_long")
+        self.assertNotEqual(code, 0)
+
+    def test_overlong_header_terminates_the_session(self):
+        junk = b'{"id": 9, "op": "hello", "pad": "' + b"x" * (worker.MAX_HEADER_BYTES + 10) + b'"}\n'
+        code, lines = run_frames(junk, frame({"id": 2, "op": "hello"}))
+        self.assertEqual(len(lines), 1)
+        self.assertFalse(lines[0]["ok"])
+        self.assertEqual(lines[0]["error"]["code"], "bad_request")
+        self.assertNotEqual(code, 0)
+
+    def test_header_at_the_limit_still_parses(self):
+        pad = "x" * (worker.MAX_HEADER_BYTES - 60)
+        code, lines = run_frames(frame({"id": 1, "op": "hello", "pad": pad}))
+        self.assertTrue(lines[0]["ok"])
+        self.assertEqual(code, 0)
 
     def test_unload_then_reload(self):
         wav = make_wav(0.2)
@@ -191,6 +267,13 @@ class Subprocess(unittest.TestCase):
         self.assertIn(b"stdin closed", p.stderr.read())
         p.stdout.close()
         p.stderr.close()
+
+    def test_worker_forces_offline_env(self):
+        env = dict(os.environ, ORB_VOICE_FAKE="1", HF_HUB_OFFLINE="0")
+        env.pop("TRANSFORMERS_OFFLINE", None)
+        code = "import worker, os; print(os.environ['HF_HUB_OFFLINE'], os.environ['TRANSFORMERS_OFFLINE'])"
+        out = subprocess.run([sys.executable, "-c", code], cwd=HERE, capture_output=True, env=env, timeout=20, text=True)
+        self.assertEqual(out.stdout.split(), ["1", "1"])
 
     def test_model_dir_env_is_honoured(self):
         env = dict(os.environ, ORB_VOICE_FAKE="1", ORB_VOICE_MODEL_DIR="/nonexistent/snapshot")

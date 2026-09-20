@@ -314,45 +314,61 @@ export const startRecording: RecorderFactory = async (opts) => {
     stream.getTracks().forEach((t) => t.stop());
     throw new VoiceError("unsupported", "Web Audio is not available in this window.");
   }
-  let ctx: AudioContext;
-  try {
-    ctx = new Ctor({ sampleRate: VOICE_SAMPLE_RATE });
-  } catch {
-    ctx = new Ctor();
-  }
-  if (ctx.state === "suspended") await ctx.resume().catch(() => {});
-  const source = ctx.createMediaStreamSource(stream);
-  const processor = ctx.createScriptProcessor(4096, 1, 1);
-  const sink = ctx.createGain();
-  sink.gain.value = 0; // Safari only pumps the processor when it reaches the destination.
+  // Everything from the context up to the graph wiring can throw (Safari's
+  // sample-rate quirks, a suspended context that will not resume, a webview
+  // without ScriptProcessorNode). Whatever already exists must be released,
+  // or the microphone indicator stays on with no way to turn it off.
+  let ctx: AudioContext | null = null;
+  let source!: MediaStreamAudioSourceNode;
+  let processor!: ScriptProcessorNode;
+  let sink!: GainNode;
   const chunks: Float32Array[] = [];
   let frames = 0;
   let lastLevel = 0;
-  const maxFrames = (opts.maxSeconds ?? VOICE_MAX_SECONDS) * ctx.sampleRate;
   let finished = false;
-  processor.onaudioprocess = (ev) => {
-    if (finished) return;
-    const data = ev.inputBuffer.getChannelData(0);
-    chunks.push(new Float32Array(data));
-    frames += data.length;
-    if (opts.onLevel) {
-      let sum = 0;
-      for (let i = 0; i < data.length; i += 4) sum += data[i] * data[i];
-      const rms = Math.sqrt(sum / Math.max(1, data.length / 4));
-      const level = Math.min(1, rms * 4);
-      if (Math.abs(level - lastLevel) > 0.02) {
-        lastLevel = level;
-        opts.onLevel(level);
+  try {
+    try {
+      ctx = new Ctor({ sampleRate: VOICE_SAMPLE_RATE });
+    } catch {
+      ctx = new Ctor();
+    }
+    if (ctx.state === "suspended") await ctx.resume().catch(() => {});
+    source = ctx.createMediaStreamSource(stream);
+    processor = ctx.createScriptProcessor(4096, 1, 1);
+    sink = ctx.createGain();
+    sink.gain.value = 0; // Safari only pumps the processor when it reaches the destination.
+    const maxFrames = (opts.maxSeconds ?? VOICE_MAX_SECONDS) * ctx.sampleRate;
+    processor.onaudioprocess = (ev) => {
+      if (finished) return;
+      const data = ev.inputBuffer.getChannelData(0);
+      chunks.push(new Float32Array(data));
+      frames += data.length;
+      if (opts.onLevel) {
+        let sum = 0;
+        for (let i = 0; i < data.length; i += 4) sum += data[i] * data[i];
+        const rms = Math.sqrt(sum / Math.max(1, data.length / 4));
+        const level = Math.min(1, rms * 4);
+        if (Math.abs(level - lastLevel) > 0.02) {
+          lastLevel = level;
+          opts.onLevel(level);
+        }
       }
-    }
-    if (frames >= maxFrames) {
-      finished = true;
-      opts.onAutoStop?.();
-    }
-  };
-  source.connect(processor);
-  processor.connect(sink);
-  sink.connect(ctx.destination);
+      if (frames >= maxFrames) {
+        finished = true;
+        opts.onAutoStop?.();
+      }
+    };
+    source.connect(processor);
+    processor.connect(sink);
+    sink.connect(ctx.destination);
+  } catch (e) {
+    stream.getTracks().forEach((t) => t.stop());
+    if (ctx) void ctx.close().catch(() => {});
+    if (e instanceof VoiceError) throw e;
+    const reason = e instanceof Error ? e.message : String(e);
+    throw new VoiceError("audio_setup", `Microphone setup failed${reason ? `: ${reason}` : "."}`);
+  }
+  const audio = ctx;
 
   const teardown = () => {
     finished = true;
@@ -365,7 +381,7 @@ export const startRecording: RecorderFactory = async (opts) => {
       /* already gone */
     }
     stream.getTracks().forEach((t) => t.stop());
-    void ctx.close().catch(() => {});
+    void audio.close().catch(() => {});
   };
   return {
     startedAt: Date.now(),
@@ -374,7 +390,7 @@ export const startRecording: RecorderFactory = async (opts) => {
       const all = concatFloat32(chunks);
       chunks.length = 0;
       if (all.length === 0) return new Uint8Array(0);
-      return encodeWav(resampleLinear(all, ctx.sampleRate, VOICE_SAMPLE_RATE), VOICE_SAMPLE_RATE);
+      return encodeWav(resampleLinear(all, audio.sampleRate, VOICE_SAMPLE_RATE), VOICE_SAMPLE_RATE);
     },
     cancel() {
       teardown();
