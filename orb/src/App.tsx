@@ -15,7 +15,7 @@ import { getMissionEvents, storedToStream, streamMission, heldAfterHistory, type
 import { Transcript, applyStreamEvent, buildTranscript, type StreamItem } from "./Transcript";
 import { mergeById, pollWhileVisible } from "./poll";
 import { LiveProjectsSection, ProjectFileView } from "./ProjectFiles";
-import { VoiceButton, ensureVoiceProbe, voiceAvailable } from "./Voice";
+import { VoiceButton, ensureVoiceProbe, voiceAvailable } from "./VoiceButton";
 import { insertAtCaret } from "./voice";
 import { ControllerView } from "./Controller";
 import {

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createSignal } from "solid-js";
 import { fireEvent, render, screen, waitFor } from "@solidjs/testing-library";
-import { VoiceButton, describeVoiceError, ensureVoiceProbe, resetVoiceAvailability, voiceAvailable } from "../src/Voice";
+import { VoiceButton, describeVoiceError, ensureVoiceProbe, resetVoiceAvailability, voiceAvailable } from "../src/VoiceButton";
 import { VoiceError, encodeWav, reloadVoiceLanguage, resetVoiceProbe, setVoiceLanguage, type Recorder, type RecorderOptions, type VoiceBridge, type VoiceCapability } from "../src/voice";
 
 const cap = (over: Partial<VoiceCapability> = {}): VoiceCapability => ({
