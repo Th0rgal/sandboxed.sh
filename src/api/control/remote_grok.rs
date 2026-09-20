@@ -996,6 +996,7 @@ pub(crate) fn local_resume_refusal(mission: &Mission, placement: &RemotePlacemen
 ///   [`REMOTE_RESUME_REQUIRES_REPLACEMENT`] conflict.
 /// - A live node job ([`REMOTE_JOB_STILL_RUNNING`]) and an unconfigured
 ///   node are conflicts too; nothing is started locally in any case.
+///
 /// Explicit content is passed verbatim; a goal resumes with `/goal resume`.
 pub(crate) async fn continue_on_node(
     state: &Arc<AppState>,

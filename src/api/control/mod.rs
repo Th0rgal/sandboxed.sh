@@ -12430,6 +12430,7 @@ pub(crate) async fn deliver_pending_remote_build_wakes(state: &AppState) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finalize_remote_mission(
     owner: &RemoteMissionOwner,
     mission_id: Uuid,
