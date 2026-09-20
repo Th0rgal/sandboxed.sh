@@ -6,7 +6,7 @@ const base={id:"accepted",title:"Remote task",status:"pending",history:[],worksp
 const node={id:"dgx-spark",status:"online",cordoned:false};
 // What production (release 21e29373) advertises today. Grok appears only when a
 // backend that supports native Grok remote launches says so.
-type Capability={typed?:boolean;harnesses?:string[];raw_command?:boolean;proxy_url_configured?:boolean};
+type Capability={typed?:boolean;harnesses?:string[];raw_command?:boolean;proxy_url_configured?:boolean;requires_proxy_harnesses?:string[]};
 const typedCapability:Capability={typed:true,harnesses:["claudecode","opencode"],raw_command:true,proxy_url_configured:true};
 async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteSuccess?:boolean;missing?:boolean;failed?:boolean;remoteJob?:{phase:string;node_state?:string};emptyStatus?:string;capability?:Capability|null;fleetFailAfterFirst?:boolean}={}){
  let posts:any[]=[], releasePost!:()=>void,releaseHistory!:()=>void;
@@ -82,6 +82,7 @@ test("/goal draft shows a Goal indicator, needs an objective, and is sent as the
  await input.press("Enter");await expect(page.getByRole("alert")).toContainText("Add an objective after /goal");expect(state.posts).toHaveLength(0);await expect(input).toHaveValue("/goal");await expect(input).toBeFocused();
  await input.fill("/goals are nice");await expect(chip).toHaveCount(0);
  await input.fill(`  /goal   ${objective}`);await expect(chip).toHaveText("Goal");
+ await expect(page.getByRole("alert")).toHaveCount(0);
  await expect(chip).toHaveAttribute("aria-label",/keeps iterating/);
  await input.press("Tab");expect(await page.evaluate(()=>!!document.activeElement?.closest(".goal-mode"))).toBe(false);
  await page.screenshot({path:"test-results/orb-goal-composer.png"});
@@ -118,11 +119,12 @@ test("goal indicator overhead per keystroke stays negligible",async({page})=>{
  expect(result.goal.p95).toBeLessThan(50);expect(result.goalEdit.p95).toBeLessThan(50);
 });
 
-test("rejection preserves draft; explicit retry uses the same idempotency key",async({page})=>{
- const state=await setup(page,{reject:true});state.releasePost();const input=composerInput(page);await input.fill(prompt);await input.press("Enter");
- await expect(page.getByRole("alert")).toContainText("Runner admission unavailable");await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(1);
- state.setSuccess();await input.press("Enter");await expect(page.getByPlaceholder("Send follow-up")).toBeVisible();expect(state.posts).toHaveLength(2);expect(state.posts[1].idempotency_key).toBe(state.posts[0].idempotency_key);
-});
+ test("rejection preserves draft; explicit retry uses the same idempotency key",async({page})=>{
+  const state=await setup(page,{reject:true});state.releasePost();const input=composerInput(page);await input.fill(prompt);await input.press("Enter");
+  await expect(page.getByRole("alert")).toContainText("Runner admission unavailable");await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(1);
+  await input.fill(`${prompt} still`);await expect(page.getByRole("alert")).toContainText("Runner admission unavailable");
+  await input.fill(prompt);state.setSuccess();await input.press("Enter");await expect(page.getByPlaceholder("Send follow-up")).toBeVisible();expect(state.posts).toHaveLength(2);expect(state.posts[1].idempotency_key).toBe(state.posts[0].idempotency_key);
+ });
 
 test("missing selected node never silently launches on Core",async({page})=>{
  const state=await setup(page,{missing:true});await chooseRemote(page);const input=composerInput(page);await input.fill(prompt);await input.press("Enter");await expect(page.getByRole("alert")).toContainText("DGX Spark is unavailable");await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(0);
@@ -188,13 +190,25 @@ test("capability read failure refuses before POST and reports support as last kn
  await expect(page.getByRole("button",{name:/dgx-spark online/})).toContainText("Claude Code, OpenCode (last known)");
 });
 
-test("proxy URL not configured on the server is refused before a doomed mission is created",async({page})=>{
- const state=await setup(page,{capability:{...typedCapability,proxy_url_configured:false}});state.releasePost();await chooseRemote(page);
- await page.getByRole("button",{name:"Grok",exact:true}).click();await page.getByRole("button",{name:"Claude Code 1",exact:true}).click();
- const input=composerInput(page);await input.fill(prompt);await input.press("Enter");
- await expect(page.getByRole("alert")).toContainText("SANDBOXED_PUBLIC_URL");
- await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(0);
-});
+ test("proxy URL not configured still launches native Grok OAuth",async({page})=>{
+  const noProxy={...typedCapability,harnesses:["claudecode","opencode","grok"],proxy_url_configured:false};
+  const state=await setup(page,{remoteSuccess:true,capability:noProxy});state.releasePost();await chooseRemote(page);
+  const input=composerInput(page);await input.fill(prompt);await input.press("Enter");
+  await expect.poll(()=>state.posts.length).toBe(1);
+  expect(state.posts[0]).toMatchObject({backend:"grok",model_override:"grok-4.6",remote_node_id:"dgx-spark"});
+  await expect(page.getByRole("alert")).toHaveCount(0);
+ });
+
+ test("proxy URL not configured blocks Claude Code before POST without env jargon",async({page})=>{
+  const noProxy={...typedCapability,harnesses:["claudecode","opencode","grok"],proxy_url_configured:false};
+  const state=await setup(page,{capability:noProxy});state.releasePost();await chooseRemote(page);
+  await page.getByRole("button",{name:"Grok",exact:true}).click();await page.getByRole("button",{name:"Claude Code 1",exact:true}).click();
+  const input=composerInput(page);await input.fill(prompt);await input.press("Enter");
+  await expect(page.getByRole("alert")).toContainText("cannot reach this backend's model proxy");
+  await expect(page.getByRole("alert")).not.toContainText("SANDBOXED_PUBLIC_URL");
+  await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(0);
+  await page.screenshot({path:"test-results/orb-remote-proxy-missing.png"});
+ });
 
 test("empty failed mission shows recovered saved goal and honest terminal status",async({page})=>{
  await setup(page,{failed:true});await page.getByRole("button",{name:"Test",exact:true}).click();await page.getByRole("button",{name:/1 finished/}).click();await page.getByRole("button",{name:/Remote task/}).click();

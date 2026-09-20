@@ -24,12 +24,15 @@ project and `idempotency_key` to the server-owned typed create path. It contains
 no client-generated shell, proxy-key provisioning, or fallback machine/harness.
 Preflight no longer carries a client-side harness list. Every remote launch
 re-reads `GET /api/remote-nodes` and follows its `remote_launch` capability
-(`{typed, harnesses, raw_command, proxy_url_configured}`; production release
-`21e29373` advertises `claudecode` and `opencode`). A harness the server has not
-advertised, a missing or untyped capability (older backend), an unset proxy URL,
-a failed capability read, and a missing/cordoned/offline node are all refused
-before POST while retaining the draft and selection. Grok is therefore sent
-unchanged as soon as a backend advertises `grok`, and never before. Server
+(`{typed, harnesses, raw_command, proxy_url_configured, optional
+requires_proxy_harnesses}`; production release `21e29373` advertises
+`claudecode` and `opencode`). A harness the server has not advertised, a missing
+or untyped capability (older backend), an unset proxy URL for Claude Code/OpenCode
+(or advertised `requires_proxy_harnesses`), a failed capability read, and a
+missing/cordoned/offline node are all refused before POST while retaining the
+draft and selection. Native Grok uses managed OAuth, so `proxy_url_configured=false`
+does not block it. Grok is sent unchanged as soon as a backend advertises `grok`,
+and never before. Server
 validation errors keep the draft and selection. A typed-capable backend that still
 answers `remote_command is required` is explained the same way, without a raw
 command or local-machine retry.

@@ -58,8 +58,16 @@ export function remoteLaunchPreflight(fleet: RemoteNodesResponse, nodeId: string
     const supported = harnesses.length ? `This backend currently runs ${harnesses.map(harnessName).join(", ")} on remote nodes.` : "This backend has not enabled any harness on remote nodes yet.";
     return `Remote launch for ${pick.backend} (${pick.model}) is not supported on ${nodeId}. ${supported} Your draft and selection are kept; no mission was submitted.`;
   }
-  if (capability.proxy_url_configured === false) return `${destination} cannot reach this backend's model proxy: SANDBOXED_PUBLIC_URL is not configured on the server. Your draft and selection are kept; no mission was submitted.`;
+  if (capability.proxy_url_configured === false && remoteHarnessNeedsProxy(capability, pick.backend)) {
+    return `${destination} cannot reach this backend's model proxy. Your draft and selection are kept; no mission was submitted.`;
+  }
   return null;
+}
+/** Native Grok uses managed OAuth and does not need the model proxy. Claude Code and OpenCode do, unless the server lists `requires_proxy_harnesses`. */
+export function remoteHarnessNeedsProxy(capability: RemoteLaunchCapability, backend: string): boolean {
+  const listed = capability.requires_proxy_harnesses;
+  if (Array.isArray(listed)) return listed.includes(backend);
+  return backend === "claudecode" || backend === "opencode";
 }
 /** The capability could not be read at all (network/server error): refuse rather than guess. */
 export function remoteLaunchUnconfirmed(nodeId: string, error: unknown): string {

@@ -103,6 +103,8 @@ export interface RemoteLaunchCapability {
   harnesses?: string[];
   raw_command?: boolean;
   proxy_url_configured?: boolean;
+  /** Harness ids that need the backend model proxy. Absent: claudecode and opencode only. */
+  requires_proxy_harnesses?: string[];
   error_prefixes?: string[];
 }
 
