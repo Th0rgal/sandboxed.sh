@@ -362,8 +362,7 @@ impl JobRunner {
                 let mission_dir = self.work_root.join(job.mission_id.to_string());
                 tokio::fs::create_dir_all(&mission_dir).await?;
 
-                let mut cmd =
-                    crate::remote_node::raw_command(command, &mission_dir, env.as_ref());
+                let mut cmd = crate::remote_node::raw_command(command, &mission_dir, env.as_ref());
                 // Applied last: the payload env cannot redirect a managed
                 // profile to a mission-controlled path.
                 cmd.envs(managed_env);
@@ -915,7 +914,12 @@ pub const LOG_CHUNK_MAX_BYTES: u64 = 256 * 1024;
 /// line by line; a chunk with no newline at all is returned as-is (a caller
 /// must then buffer it until more arrives). `offset` past the end yields an
 /// empty chunk positioned at the end.
-pub async fn read_log_chunk(path: &Path, offset: u64, max_bytes: u64, terminal: bool) -> Option<(String, u64, u64)> {
+pub async fn read_log_chunk(
+    path: &Path,
+    offset: u64,
+    max_bytes: u64,
+    terminal: bool,
+) -> Option<(String, u64, u64)> {
     let path = path.to_path_buf();
     let max_bytes = max_bytes.clamp(4, LOG_CHUNK_MAX_BYTES);
     tokio::task::spawn_blocking(move || {
@@ -952,7 +956,12 @@ pub async fn read_log_chunk(path: &Path, offset: u64, max_bytes: u64, terminal: 
                     valid += error.valid_up_to();
                     match error.error_len() {
                         Some(invalid) => valid += invalid,
-                        None => { if !terminal || !reached_end { buf.truncate(valid); } break; }
+                        None => {
+                            if !terminal || !reached_end {
+                                buf.truncate(valid);
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -1027,11 +1036,53 @@ mod tests {
         assert_eq!(data, "abc");
         assert_eq!(next, 3);
         tokio::fs::write(&path, "abc🦀").await.unwrap();
-        assert_eq!(read_log_chunk(&path, next, 20, false).await.unwrap().0, "🦀");
+        assert_eq!(
+            read_log_chunk(&path, next, 20, false).await.unwrap().0,
+            "🦀"
+        );
         tokio::fs::write(&path, b"abc\xf0\x9f").await.unwrap();
         let (data, next, _) = read_log_chunk(&path, 3, 20, true).await.unwrap();
         assert_eq!(data, "�");
         assert_eq!(next, 5);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_grok_job_keeps_isolated_home_and_overrides_payload_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let auth_home = dir.path().join("trusted-grok");
+        std::fs::create_dir(&auth_home).unwrap();
+        std::fs::write(
+            auth_home.join("auth.json"),
+            "fixture credential never printed",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            auth_home.join("auth.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let store = JobStore::open(dir.path()).await.unwrap();
+        let runner = JobRunner::spawn_with_options(
+            store.clone(),
+            dir.path().into(),
+            1,
+            30,
+            Arc::new(Semaphore::new(1)),
+            super::super::managed_auth::ManagedAuth::with_grok_home(&auth_home),
+        );
+        let job_id = Uuid::new_v4();
+        runner.submit(job_id, Uuid::new_v4(), JobPayload::RawCommand {
+            command: format!("test \"$HOME\" = \"$PWD\" && test \"$GROK_HOME\" = '{}' && test -r \"$GROK_HOME/auth.json\" && printf managed-ok", auth_home.display()),
+            timeout_secs: Some(30),
+            env: Some(std::collections::HashMap::from([("GROK_HOME".into(), "/untrusted-payload-path".into())])),
+            managed_auth: vec!["grok".into()],
+        }).await.unwrap();
+        let record = wait_for_terminal(&store, job_id).await;
+        let tail = read_log_tail(&runner.log_path(job_id)).await.unwrap();
+        assert_eq!(record.state, JobState::Succeeded, "{tail}");
+        assert_eq!(tail, "managed-ok");
     }
 
     #[tokio::test]

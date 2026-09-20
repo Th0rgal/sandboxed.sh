@@ -116,7 +116,9 @@ async fn main() -> anyhow::Result<()> {
     // heartbeat only while the credential file is actually readable.
     let managed_auth = sandboxed_sh::node::ManagedAuth::from_env();
     match managed_auth.advertised().as_slice() {
-        [] => info!("managed auth: no profiles ready (SANDBOXED_NODE_GROK_HOME unset or not logged in)"),
+        [] => info!(
+            "managed auth: no profiles ready (SANDBOXED_NODE_GROK_HOME unset or not logged in)"
+        ),
         ready => info!(profiles = ?ready, "managed auth profiles ready"),
     }
     let runner = JobRunner::spawn_with_options(
@@ -500,9 +502,14 @@ async fn get_job_log(
         .max_bytes
         .unwrap_or(sandboxed_sh::node::LOG_CHUNK_MAX_BYTES);
     let (data, next_offset, log_len) = match record.log_path.as_deref() {
-        Some(path) => sandboxed_sh::node::read_log_chunk(Path::new(path), query.offset, max_bytes, sandboxed_sh::remote_node::job_state_confirms_termination(record.state.as_str()))
-            .await
-            .unwrap_or((String::new(), query.offset, query.offset)),
+        Some(path) => sandboxed_sh::node::read_log_chunk(
+            Path::new(path),
+            query.offset,
+            max_bytes,
+            sandboxed_sh::remote_node::job_state_confirms_termination(record.state.as_str()),
+        )
+        .await
+        .unwrap_or((String::new(), query.offset, query.offset)),
         None => (String::new(), query.offset, query.offset),
     };
     Ok(Json(sandboxed_sh::remote_node::JobLogChunk {

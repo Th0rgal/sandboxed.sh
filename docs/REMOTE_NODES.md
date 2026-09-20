@@ -889,7 +889,8 @@ Orb streams thought/text/tool events, suppresses the CLI's repeated final
 text snapshot, and saves emitted native session IDs under the current job
 lease. `POST /api/control/missions/:id/resume` continues on the recorded node
 using `--resume <session> -p '/goal resume'` for a goal, or passes explicit
-request `content` verbatim. It uses the same lease-before-submit fence as
+request `content` verbatim. PR/track writers and requests changing workspace or
+writer identity require a linked replacement through normal create admission. It uses the same lease-before-submit fence as
 initial dispatch. If the node or native session is missing, the API returns
 `REMOTE_RESUME_REQUIRES_REPLACEMENT`: create a remote mission with
 `supersedes_mission_id` pointing to the original. Do not silently resume

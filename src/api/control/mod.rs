@@ -11289,6 +11289,7 @@ pub(crate) fn remote_launch_capabilities() -> crate::remote_node::RemoteLaunchCa
             REMOTE_HARNESS_UNSUPPORTED.to_string(),
             REMOTE_PROMPT_REQUIRED.to_string(),
             REMOTE_MODEL_REQUIRED.to_string(),
+            remote_grok::REMOTE_AUTH_REQUIRED.to_string(),
         ],
     }
 }
@@ -15936,6 +15937,10 @@ pub async fn resume_mission(
     if let Some(placement) = remote_grok::placement(
         &state.config.working_dir, &control.mission_store, mission_id,
     ).await.map_err(internal_error)? {
+        if request.clean_workspace || request.skip_message || request.github_pr.is_some()
+            || request.track.is_some() || request.title.is_some() || request.continue_identity.is_some() {
+            return Err((StatusCode::CONFLICT, format!("{}: remote continuation supports content only; use a linked replacement for workspace or writer identity changes", remote_grok::REMOTE_RESUME_REQUIRES_REPLACEMENT)));
+        }
         return remote_grok::continue_on_node(
             &state, &control, &actor, mission_id, placement, request.content,
         ).await.map(Json);

@@ -134,8 +134,7 @@ pub(crate) fn execution(
 /// Planning-time check that the selected node advertises the `grok`
 /// managed-auth profile. A node whose last heartbeat lacks it is refused with
 /// [`REMOTE_AUTH_REQUIRED`] before any mission exists; a node without any
-/// cached heartbeat is probed once. An unreachable node is left to the
-/// dispatch path (which reports the transport failure).
+/// cached heartbeat is probed once. Missing capability evidence fails closed.
 pub(crate) async fn require_node_managed_auth(
     state: &AppState,
     node_id: &str,
@@ -161,7 +160,7 @@ pub(crate) async fn require_node_managed_auth(
         .get(node_id)
         .and_then(|cached| cached.last_heartbeat)
     else {
-        return Ok(());
+        return Err(format!("{REMOTE_AUTH_REQUIRED}: remote node '{node_id}' has no verified managed-auth heartbeat; check node connectivity and upgrade/configure sandboxed-node"));
     };
     heartbeat_supports_grok(&heartbeat.managed_auth, node_id)
 }
@@ -532,7 +531,10 @@ impl NativeGrokObserver {
         if chunk.next_offset < self.log_offset {
             // The node restarted its log (or the job was re-run); start over
             // rather than parse from a stale offset.
+            self.close_thinking();
             self.log_offset = 0;
+            self.log_len = chunk.log_len;
+            self.stream = GrokStream::default();
             return;
         }
         self.log_len = chunk.log_len;
@@ -651,7 +653,7 @@ impl NativeGrokObserver {
         let run = match self
             .owner
             .mission_store
-            .get_active_mission_run(self.mission_id)
+            .get_latest_mission_run(self.mission_id)
             .await
         {
             Ok(Some(run)) if run.owner_actor_id == super::remote_job_lease_owner(self.job_id) => {
@@ -777,11 +779,17 @@ impl NativeGrokObserver {
         }
 
         if let Some(objective) = goal_objective(&self.mission) {
-            self.owner.send(AgentEvent::GoalStatus {
+            let event = AgentEvent::GoalStatus {
                 status: if success { "complete" } else { "paused" }.to_string(),
                 objective,
                 mission_id: Some(self.mission_id),
-            });
+            };
+            let _ = self
+                .owner
+                .mission_store
+                .log_event(self.mission_id, &event)
+                .await;
+            self.owner.send(event);
         }
 
         TerminalVerdict {
@@ -928,6 +936,10 @@ pub(crate) async fn continue_on_node(
     placement: RemotePlacement,
     content: Option<String>,
 ) -> Result<Mission, (StatusCode, String)> {
+    let _admission = super::DISPATCH_ADMISSION.lock().await;
+    let _file_guard = super::dispatch_admission::durable_lock(&state.config)
+        .await
+        .map_err(internal)?;
     let store = control.mission_store.clone();
     let mission = store
         .get_mission(mission_id)
@@ -939,6 +951,12 @@ pub(crate) async fn continue_on_node(
                 format!("Mission {mission_id} not found"),
             )
         })?;
+    // PR/track writer re-admission is intentionally outside this bounded
+    // native continuation path. Preserve its existing identity checks by
+    // requiring a linked replacement through normal create admission.
+    if mission.project.github_pr.is_some() || mission.project.track.is_some() {
+        return Err((StatusCode::CONFLICT, format!("{REMOTE_RESUME_REQUIRES_REPLACEMENT}: tracked/PR writer missions need create admission; create a remote replacement with supersedes_mission_id={mission_id}")));
+    }
     if mission.backend != GROK_BACKEND {
         return Err((
             StatusCode::CONFLICT,
@@ -1000,7 +1018,12 @@ pub(crate) async fn continue_on_node(
         }
     });
     if let Some(objective) = super::parse_goal_objective(&prompt) {
-        if objective != "resume" {
+        if objective == "clear" {
+            store
+                .update_mission_goal(mission.id, false, None)
+                .await
+                .map_err(internal)?;
+        } else if !matches!(objective.as_str(), "resume" | "pause" | "status") {
             store
                 .update_mission_goal(mission.id, true, Some(&objective))
                 .await
@@ -1020,10 +1043,30 @@ pub(crate) async fn continue_on_node(
     require_node_managed_auth(state, &placement.node_id, &plan)
         .await
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    // Use the same lease-before-submit fence as initial dispatch.
-    let resumed = super::dispatch_remote_job(state, control, &mission, &placement.node_id, &plan)
+    // Acquiring a run requires Pending/Active. Under admission locks, mark
+    // the mission remote before moving it to Pending so no local scheduler
+    // can claim the activation window. Dispatch then fences before submit.
+    let previous = crate::api::mission_store::MissionStatusSnapshot::capture(&mission);
+    store
+        .set_mission_requires_local_disk(mission.id, false)
         .await
-        .map_err(|message| (StatusCode::CONFLICT, message))?;
+        .map_err(internal)?;
+    store
+        .update_mission_status(mission.id, MissionStatus::Pending)
+        .await
+        .map_err(internal)?;
+    let resumed =
+        match super::dispatch_remote_job(state, control, &mission, &placement.node_id, &plan).await
+        {
+            Ok(resumed) => resumed,
+            Err(message) => {
+                store
+                    .restore_mission_status(mission.id, &previous)
+                    .await
+                    .map_err(internal)?;
+                return Err((StatusCode::CONFLICT, message));
+            }
+        };
     persist_turn_prompt(&owner, mission.id, &prompt, &source).await;
     Ok(resumed)
 }

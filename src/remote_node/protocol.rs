@@ -637,7 +637,8 @@ mod tests {
     #[test]
     fn job_payload_round_trips_with_kind_tag() {
         let payload = JobPayload::RawCommand {
-            managed_auth: Vec::new(),            command: "cargo test".to_string(),
+            managed_auth: Vec::new(),
+            command: "cargo test".to_string(),
             timeout_secs: Some(600),
             env: Some(
                 [("RUST_LOG".to_string(), "info".to_string())]
