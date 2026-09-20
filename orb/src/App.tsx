@@ -14,6 +14,8 @@ import { getMissionEvents, storedToStream, streamMission, type StreamEvent } fro
 import { Transcript, applyStreamEvent, buildTranscript, type StreamItem } from "./Transcript";
 import { mergeById, pollWhileVisible } from "./poll";
 import { LiveProjectsSection, ProjectFileView } from "./ProjectFiles";
+import { VoiceButton, ensureVoiceProbe, voiceAvailable } from "./Voice";
+import { insertAtCaret } from "./voice";
 import { ControllerView } from "./Controller";
 import {
   buildRemoteAgentCommand,
@@ -217,8 +219,13 @@ function Composer(p: {
   onToggleFile?: (id: string) => void;
   /** Show the harness + model picker (new agents only). */
   picker?: boolean;
+  /** Conversation identity; dictation results for another scope are dropped. */
+  scope?: string;
 }) {
   const [text, setText] = createSignal("");
+  // Local voice input (macOS): dictated text lands at the caret, never sends.
+  const [voiceActive, setVoiceActive] = createSignal(false);
+  ensureVoiceProbe();
   const [model, setModel] = createSignal(MODELS[0]);
   const live = () => isConnected() && harnessChoices().length > 0;
   const [menu, setMenu] = createSignal(false);
@@ -236,6 +243,15 @@ function Composer(p: {
     setText("");
     ta.value = "";
     resize();
+  };
+  const insertDictation = (t: string) => {
+    const cur = ta.value;
+    const { value, caret } = insertAtCaret(cur, ta.selectionStart ?? cur.length, ta.selectionEnd ?? cur.length, t);
+    ta.value = value;
+    setText(value);
+    resize();
+    ta.setSelectionRange(caret, caret);
+    ta.focus();
   };
   onMount(() => p.autofocus && ta.focus());
   const close = () => {
@@ -381,15 +397,23 @@ function Composer(p: {
       </div>
     </Show>
   );
+  // Empty composer: the microphone where local voice exists, otherwise a
+  // plain (inert) send arrow. A recording in progress keeps the mic mounted
+  // even once text is typed so the draft and the dictation both survive.
   const sendBtn = (
     <Show
       when={p.busy}
       fallback={
-        <button class="send" onClick={send} title={text().trim() ? "Send" : "Dictate"}>
-          <Show when={text().trim()} fallback={<Ic.MicIcon size={15} />}>
-            <Ic.ArrowUpIcon size={14} />
-          </Show>
-        </button>
+        <Show
+          when={voiceAvailable() && (!text().trim() || voiceActive())}
+          fallback={
+            <button class="send" onClick={send} title="Send">
+              <Ic.ArrowUpIcon size={14} />
+            </button>
+          }
+        >
+          <VoiceButton scope={p.scope} onText={insertDictation} onActive={setVoiceActive} />
+        </Show>
       }
     >
       <button class="send" onClick={p.onStop} title="Stop">
@@ -1233,6 +1257,7 @@ export default function App() {
                   onStop={stop}
                   autofocus
                   tall
+                  scope="new-agent"
                   files={projectFiles()}
                   attached={attached()}
                   onToggleFile={(id) =>
@@ -1298,6 +1323,7 @@ export default function App() {
                     busy={streamingId() === c.id}
                     onSend={send}
                     onStop={stop}
+                    scope={c.id}
                     files={projectFiles()}
                     attached={attached()}
                     onToggleFile={(id) =>
@@ -1474,7 +1500,7 @@ function MissionView(p: { id: string }) {
       </div>
       <div class="dock">
         <div class="col">
-          <Composer placeholder="Send follow-up" picker={false} busy={busy()} onSend={sendMsg} onStop={stopM} />
+          <Composer placeholder="Send follow-up" picker={false} busy={busy()} onSend={sendMsg} onStop={stopM} scope={`m:${p.id}`} />
         </div>
       </div>
     </>

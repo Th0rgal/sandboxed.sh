@@ -48,3 +48,9 @@ API calls. They cover creation, cached root-folder refresh, revealing the create
 cron, keyboard menus, tab/unmount draft retention, cursors, compact schedule layout,
 and light/dark screenshots. The Hermes job records are captured from real storage
 functions; see `tests/fixtures/README.md` for provenance and regeneration.
+
+Local voice input (macOS on Apple Silicon): the composer's microphone records in
+the webview and transcribes on-device with a pinned MLX build of Cohere
+Transcribe, inserting editable text without sending. Install the isolated
+runtime with `voice/install.sh --download-model --check`; architecture, paths,
+verification commands and the remaining Mac checklist are in `voice/README.md`.
