@@ -298,17 +298,60 @@ raw command:
   `grok`, `codex`, `gemini` or `chatgpt_ui` is a `400` naming the supported
   harnesses **before** any mission exists. Nothing is silently swapped.
 - The harness talks back to this core's model proxy with a key minted for the
-  mission (`remote-launch:<node>:<mission>`), delivered in the job env
-  (`ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` for Claude Code,
-  `OPENAI_BASE_URL`/`OPENAI_API_KEY` for OpenCode with `--model openai/<id>`)
-  and never on the command line. `SANDBOXED_PUBLIC_URL` must be reachable
-  from the node. The key is retired when the observer finishes.
+  mission (`remote-launch:<node>:<mission>`), delivered in the job env and
+  never on the command line. Claude Code: `ANTHROPIC_BASE_URL` +
+  `ANTHROPIC_AUTH_TOKEN`, `--model <bare id>`. OpenCode: the job env carries
+  an inline config in `OPENCODE_CONFIG_CONTENT` (nothing is written into the
+  cwd) declaring a `builtin` provider (`@ai-sdk/openai-compatible`,
+  `baseURL <core>/v1`, `apiKey {env:SANDBOXED_PROXY_API_KEY}`) whose model
+  map carries the exact requested id, and runs `--model builtin/<id>` — the
+  same shape local OpenCode missions use, so the proxy receives e.g.
+  `xai/grok-4.6` unchanged and applies its own chain/passthrough routing.
+  The stock `openai` provider only lists OpenAI's catalog and would refuse
+  such ids before any request. `model_override` is therefore required for
+  OpenCode launches (`REMOTE_MODEL_REQUIRED` otherwise): nodes have no
+  authenticated default model. A client-sent `builtin/` prefix is stripped
+  so the map key and `--model` always agree. Prompts starting with `-` get a
+  leading space so they stay positional (`--` is not safe on `opencode run`).
+  The job's cwd is the node's per-mission directory (also its `HOME`), so
+  nothing depends on the service user's home. `SANDBOXED_PUBLIC_URL` must be
+  reachable from the node. Verified against the installed OpenCode 1.18 with
+  a local mock `/v1/chat/completions`: the CLI resolves `builtin/xai/grok-4.6`
+  and sends `model: "xai/grok-4.6"` with the env key as bearer (test
+  `remote_opencode_execution_resolves_model_against_mock_proxy`).
+- **Proxy key lifecycle.** The key is named `remote-launch:<mission id>`. It
+  is deleted on every dispatch failure after minting, when the observer
+  finishes (also after a restart re-attach), and at the reconciler's first
+  pass for any key whose mission holds no ledger handle (a job on a node
+  always has one: submission follows the tentative record). Nothing relies
+  on the periodic `cleanup_keys`.
 - `remote_command` still works verbatim (raw compatibility, own auth).
 - A retry with the same `idempotency_key` (and project) coalesces onto the
   mission holding the dispatch key (`x-coalesced-with`) and never submits a
   second node job; a dispatch that already failed closed is not reused.
 - The create response carries `execution` and `remote_job`; clients treat
   `remote_job.node_id`/`phase` as the authoritative placement.
+- **Capability detection.** `GET /api/remote-nodes` carries
+  `remote_launch: {typed: true, harnesses: ["claudecode","opencode"],
+  raw_command: true, proxy_url_configured: bool, error_prefixes: [...]}`.
+  The field is absent on older backends, which still require a raw
+  `remote_command`; clients must keep their guard there.
+- **Rejections before a mission exists** are plain-text `400` bodies with a
+  stable prefix: `REMOTE_HARNESS_UNSUPPORTED: backend '<id>' cannot run on
+  remote nodes: only claudecode or opencode are installed there …` and
+  `REMOTE_PROMPT_REQUIRED: …`, `REMOTE_MODEL_REQUIRED: …` (OpenCode without
+  `model_override`). Unknown node / disabled fleet keep their
+  existing 400 text. Dispatch failures after creation (node rejected, token
+  missing, `SANDBOXED_PUBLIC_URL` unset) are `502` with the mission marked
+  `failed`/`remote_dispatch_failed` and its prompt persisted.
+- **Success response** (`200`) is the mission JSON plus `execution`
+  (`{state: "waiting_remote_job", run_id, generation, heartbeat_at, scope_unit:
+  "remote-node:<id>", …}`) and `remote_job`
+  (`{job_id, node_id, phase: "observed", node_state: "queued"|"running"|…,
+  accepted_at, heartbeat_at, observed_age_secs, …}`). `remote_job.node_state`
+  is the node's last reported job state (queued until the node starts it);
+  `phase` is core's observation health. A coalesced retry answers `200` with
+  header `x-coalesced-with: <mission id>` and the same shape.
 - `scripts/remote-launch-canary.sh` exercises this shape against a real node.
 
 ### Raw remote mission lifecycle (durable ownership)

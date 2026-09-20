@@ -1562,6 +1562,7 @@ async fn list_remote_nodes(
             configured: spark_configured,
             enabled_workspaces: spark_workspaces,
         },
+        remote_launch: control::remote_launch_capabilities(),
     })
 }
 

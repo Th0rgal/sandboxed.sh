@@ -5706,12 +5706,22 @@ async fn typed_remote_launch_is_server_planned_idempotent_and_explicit_about_sup
     let command = payload["command"].as_str().unwrap();
     assert!(
         command.contains(
-            "opencode run --format json --model 'openai/grok-4.6' 'find the fastest kernel'"
+            "opencode run --format json --model 'builtin/xai/grok-4.6' 'find the fastest kernel'"
         ),
         "{command}"
     );
-    assert_eq!(payload["env"]["OPENAI_BASE_URL"], "http://127.0.0.1:9/v1");
-    let key = payload["env"]["OPENAI_API_KEY"]
+    let config: Value =
+        serde_json::from_str(payload["env"]["OPENCODE_CONFIG_CONTENT"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        config["provider"]["builtin"]["options"]["baseURL"],
+        "http://127.0.0.1:9/v1"
+    );
+    assert_eq!(
+        config["provider"]["builtin"]["options"]["apiKey"],
+        "{env:SANDBOXED_PROXY_API_KEY}"
+    );
+    assert!(config["provider"]["builtin"]["models"]["xai/grok-4.6"].is_object());
+    let key = payload["env"]["SANDBOXED_PROXY_API_KEY"]
         .as_str()
         .unwrap()
         .to_string();
@@ -5720,6 +5730,10 @@ async fn typed_remote_launch_is_server_planned_idempotent_and_explicit_about_sup
         !command.contains(&key),
         "proxy key must not be in the command line"
     );
+    assert!(!payload["env"]["OPENCODE_CONFIG_CONTENT"]
+        .as_str()
+        .unwrap()
+        .contains(&key));
     assert!(h.state.proxy_api_keys.verify(&key).await);
     let dispatched = store
         .get_events(mission_id, Some(&["mission_status_changed"]), None, None)
@@ -5778,7 +5792,14 @@ async fn typed_remote_launch_is_server_planned_idempotent_and_explicit_about_sup
         .unwrap();
     assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     let detail = refused.text().await.unwrap();
+    assert!(
+        detail.starts_with("REMOTE_HARNESS_UNSUPPORTED: "),
+        "{detail}"
+    );
     assert!(detail.contains("claudecode or opencode"), "{detail}");
+    let caps = remote_launch_capabilities();
+    assert!(caps.typed && caps.raw_command && caps.proxy_url_configured);
+    assert_eq!(caps.harnesses, vec!["claudecode", "opencode"]);
     assert_eq!(
         store
             .list_missions_filtered(&crate::api::mission_store::MissionFilter::default(), 50, 0)
@@ -5788,6 +5809,40 @@ async fn typed_remote_launch_is_server_planned_idempotent_and_explicit_about_sup
         before
     );
     assert_eq!(fixture.submissions.lock().unwrap().len(), 1);
+
+    // A dispatch that fails before submission retires its key immediately.
+    std::env::remove_var("REMOTE_TYPED_FIXTURE_TOKEN");
+    let failed = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&json!({
+            "prompt": "find the fastest kernel",
+            "project": "lido",
+            "backend": "opencode",
+            "model_override": "xai/grok-4.6",
+            "remote_node_id": "typed-fixture",
+            "idempotency_key": "orb-launch-attempt-3",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
+    std::env::set_var("REMOTE_TYPED_FIXTURE_TOKEN", "fixture-token");
+    let names: Vec<String> = h
+        .state
+        .proxy_api_keys
+        .list()
+        .await
+        .into_iter()
+        .map(|k| k.name)
+        .filter(|n| n.starts_with("remote-launch:"))
+        .collect();
+    assert_eq!(
+        names,
+        vec![remote_launch_key_name(mission_id)],
+        "only the live launch keeps a key"
+    );
 
     // Terminal: the launch key is retired with the observer.
     fixture.set_state("succeeded");

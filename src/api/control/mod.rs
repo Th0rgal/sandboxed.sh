@@ -11249,6 +11249,33 @@ impl RemoteMissionOwner {
 /// before the mission exists instead of being silently swapped.
 pub(crate) const REMOTE_NODE_HARNESSES: &[&str] = &["claudecode", "opencode"];
 
+/// Stable prefixes of the plain-text `400` bodies a typed remote launch can
+/// return before any mission exists. Clients match on the prefix, not the
+/// prose.
+pub(crate) const REMOTE_HARNESS_UNSUPPORTED: &str = "REMOTE_HARNESS_UNSUPPORTED";
+pub(crate) const REMOTE_PROMPT_REQUIRED: &str = "REMOTE_PROMPT_REQUIRED";
+pub(crate) const REMOTE_MODEL_REQUIRED: &str = "REMOTE_MODEL_REQUIRED";
+
+/// Capability block advertised on `GET /api/remote-nodes` so clients can tell
+/// a backend that plans typed launches server-side from one that still
+/// requires a raw `remote_command` (the field is absent there).
+pub(crate) fn remote_launch_capabilities() -> crate::remote_node::RemoteLaunchCapabilities {
+    crate::remote_node::RemoteLaunchCapabilities {
+        typed: true,
+        harnesses: REMOTE_NODE_HARNESSES
+            .iter()
+            .map(|h| h.to_string())
+            .collect(),
+        raw_command: true,
+        proxy_url_configured: super::mission_runner::public_api_base_url_from_env().is_some(),
+        error_prefixes: vec![
+            REMOTE_HARNESS_UNSUPPORTED.to_string(),
+            REMOTE_PROMPT_REQUIRED.to_string(),
+            REMOTE_MODEL_REQUIRED.to_string(),
+        ],
+    }
+}
+
 /// What a remote mission will execute on its node, decided by the server
 /// from the client's selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11308,7 +11335,7 @@ pub(crate) fn plan_remote_harness(
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .ok_or_else(|| {
-            "a remote launch needs a prompt (or an explicit remote_command)".to_string()
+            format!("{REMOTE_PROMPT_REQUIRED}: a remote launch needs a prompt (or an explicit remote_command)")
         })?
         .to_string();
     let model = model_override
@@ -11325,9 +11352,27 @@ pub(crate) fn plan_remote_harness(
             }),
             prompt,
         }),
-        "opencode" => Ok(RemoteHarnessPlan::OpenCode { model, prompt }),
+        "opencode" => {
+            // A node has no authenticated default provider: the only model
+            // that can run there is the one this core registers and routes.
+            // The exact id is the provider map key; a client-supplied
+            // `builtin/` prefix is the local runner's argument shape, not
+            // part of the id.
+            let model = model
+                .map(|m| m.trim_start_matches("builtin/").to_string())
+                .filter(|m| !m.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "{REMOTE_MODEL_REQUIRED}: an OpenCode remote launch needs model_override (provider/model, e.g. xai/grok-4.6); nodes have no authenticated default model"
+                    )
+                })?;
+            Ok(RemoteHarnessPlan::OpenCode {
+                model: Some(model),
+                prompt,
+            })
+        }
         other => Err(format!(
-            "backend '{other}' cannot run on remote nodes: only {} are installed there. \
+            "{REMOTE_HARNESS_UNSUPPORTED}: backend '{other}' cannot run on remote nodes: only {} are installed there. \
              Pick one of those (for Grok models, OpenCode with an xai/ model routes through this core), \
              or pass an explicit remote_command.",
             REMOTE_NODE_HARNESSES.join(" or ")
@@ -11348,12 +11393,58 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// OpenCode reaches this core through its `openai` provider
-/// (`OPENAI_BASE_URL`), so the proxy sees the bare model id and resolves it
-/// exactly as it does for local OpenCode missions.
-fn opencode_proxy_model(model: &str) -> String {
-    let bare = model.split_once('/').map(|(_, id)| id).unwrap_or(model);
-    format!("openai/{bare}")
+/// Env var the node job receives the per-mission proxy key in. The OpenCode
+/// config references it (`{env:…}`) so neither the config nor the command
+/// line ever contains the secret.
+pub(crate) const REMOTE_PROXY_KEY_ENV: &str = "SANDBOXED_PROXY_API_KEY";
+/// OpenCode reads an inline JSON config from this env var (verified with the
+/// installed 1.18 CLI), so the job never writes into or overwrites a cwd
+/// `opencode.json`.
+pub(crate) const REMOTE_OPENCODE_CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
+
+/// Prompts are positional CLI arguments; one starting with `-` would be
+/// parsed as an option (and yargs' `--` terminator swallows the message on
+/// `opencode run`, verified). A leading space is inert for the model and
+/// keeps the argument positional on every CLI version.
+fn positional_prompt(prompt: &str) -> String {
+    if prompt.starts_with('-') {
+        format!(" {prompt}")
+    } else {
+        prompt.to_string()
+    }
+}
+
+/// OpenCode on a node reaches this core exactly like a local OpenCode
+/// mission does: a `builtin` provider (`@ai-sdk/openai-compatible`, base URL
+/// `<core>/v1`) whose model map carries the exact requested id, so the proxy
+/// receives `xai/grok-4.6` (or any `provider/model`) unchanged and applies
+/// its own chain/passthrough resolution. The stock `openai` provider only
+/// advertises OpenAI's catalog and would reject non-GPT ids before any
+/// request.
+pub(crate) fn remote_opencode_config(model: &str, api_base_url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "provider": {
+            "builtin": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Builtin",
+                "models": { model: { "name": model } },
+                "options": {
+                    "baseURL": format!("{}/v1", api_base_url.trim_end_matches('/')),
+                    "apiKey": format!("{{env:{REMOTE_PROXY_KEY_ENV}}}")
+                }
+            }
+        }
+    })
+}
+
+/// `--model` argument for the node: `builtin/<exact id>` (the local runner's
+/// `opencode_model_argument` shape for proxy-routed models).
+fn remote_opencode_model_argument(model: &str) -> String {
+    match model.strip_prefix("builtin/") {
+        Some(_) => model.to_string(),
+        None => format!("builtin/{model}"),
+    }
 }
 
 pub(crate) fn remote_execution_for_plan(
@@ -11378,7 +11469,7 @@ pub(crate) fn remote_execution_for_plan(
                 command.push_str(&shell_single_quote(model));
             }
             command.push(' ');
-            command.push_str(&shell_single_quote(prompt));
+            command.push_str(&shell_single_quote(&positional_prompt(prompt)));
             let env = HashMap::from([
                 ("ANTHROPIC_BASE_URL".to_string(), api_base_url.to_string()),
                 ("ANTHROPIC_AUTH_TOKEN".to_string(), proxy_key.to_string()),
@@ -11393,29 +11484,82 @@ pub(crate) fn remote_execution_for_plan(
             }
         }
         RemoteHarnessPlan::OpenCode { model, prompt } => {
+            // Inline config through OPENCODE_CONFIG_CONTENT: nothing is
+            // written into the job cwd (the node's per-mission directory,
+            // also its HOME), and nothing depends on the service user's home.
             let mut command = String::from(
                 "command -v opencode >/dev/null 2>&1 || { echo 'opencode is not installed on this node' >&2; exit 127; }; \
                  opencode run --format json",
             );
-            if let Some(model) = model {
-                command.push_str(" --model ");
-                command.push_str(&shell_single_quote(&opencode_proxy_model(model)));
-            }
-            command.push(' ');
-            command.push_str(&shell_single_quote(prompt));
-            let env = HashMap::from([
-                (
-                    "OPENAI_BASE_URL".to_string(),
-                    format!("{}/v1", api_base_url.trim_end_matches('/')),
-                ),
-                ("OPENAI_API_KEY".to_string(), proxy_key.to_string()),
+            let mut env = HashMap::from([
+                (REMOTE_PROXY_KEY_ENV.to_string(), proxy_key.to_string()),
                 ("NO_COLOR".to_string(), "1".to_string()),
             ]);
+            // `plan_remote_harness` guarantees a model for OpenCode; the
+            // config registers exactly that id under `builtin`.
+            let model = model.as_deref().unwrap_or_default();
+            command.push_str(" --model ");
+            command.push_str(&shell_single_quote(&remote_opencode_model_argument(model)));
+            env.insert(
+                REMOTE_OPENCODE_CONFIG_ENV.to_string(),
+                remote_opencode_config(model, api_base_url).to_string(),
+            );
+            command.push(' ');
+            command.push_str(&shell_single_quote(&positional_prompt(prompt)));
             RemoteExecution {
                 command,
                 env: Some(env),
                 label,
             }
+        }
+    }
+}
+
+/// Name of the per-mission proxy key a typed remote launch mints. Keyed by
+/// mission so a re-attached observer or a boot sweep can retire it by name.
+pub(crate) fn remote_launch_key_name(mission_id: Uuid) -> String {
+    format!("remote-launch:{mission_id}")
+}
+
+/// Delete every proxy key minted for `mission_id`'s remote launches.
+pub(crate) async fn retire_remote_launch_keys(
+    proxy_keys: &super::proxy_keys::ProxyApiKeyStore,
+    mission_id: Uuid,
+) {
+    if let Err(error) = proxy_keys
+        .delete_named_except(&remote_launch_key_name(mission_id), None)
+        .await
+    {
+        tracing::warn!(%mission_id, %error, "remote launch proxy key retirement failed");
+    }
+}
+
+/// Boot sweep: a `remote-launch:*` key minted before `boot_cutoff` whose
+/// mission holds no ledger handle belongs to a launch of a previous process
+/// that never reached submission or whose observer already finished. No node
+/// job can still be using it (submission always follows the tentative ledger
+/// record). Keys minted after the cutoff belong to this process's launches
+/// and are left alone even when the ledger snapshot predates their handle.
+pub(crate) async fn retire_orphaned_remote_launch_keys(
+    proxy_keys: &super::proxy_keys::ProxyApiKeyStore,
+    handles: &[crate::remote_node::job_ledger::JobHandle],
+    boot_cutoff: chrono::DateTime<chrono::Utc>,
+) {
+    let live: HashSet<Uuid> = handles.iter().map(|handle| handle.mission_id).collect();
+    for key in proxy_keys.list().await {
+        let Some(mission_id) = key
+            .name
+            .strip_prefix("remote-launch:")
+            .and_then(|id| Uuid::parse_str(id).ok())
+        else {
+            continue;
+        };
+        if key.created_at >= boot_cutoff {
+            continue;
+        }
+        if !live.contains(&mission_id) {
+            tracing::info!(%mission_id, key_id = %key.id, "retiring orphaned remote launch proxy key");
+            let _ = proxy_keys.delete(key.id).await;
         }
     }
 }
@@ -12281,26 +12425,6 @@ async fn dispatch_remote_job(
             )
         })?;
     let job_id = Uuid::new_v4();
-    // A harness launch talks back to this core through the model proxy with
-    // a key minted for this mission only; the key travels in the job env,
-    // never in the logged command line. Raw commands carry their own auth.
-    let (execution, proxy_key_id) = if plan.uses_core_proxy() {
-        let api_base_url = super::mission_runner::public_api_base_url_from_env()
-            .ok_or_else(|| {
-                "SANDBOXED_PUBLIC_URL is not configured; a remote harness launch needs a core URL the node can reach".to_string()
-            })?;
-        let key = state
-            .proxy_api_keys
-            .create(format!("remote-launch:{}:{}", node.id, mission.id))
-            .await
-            .map_err(|error| format!("remote launch proxy key could not be minted: {error}"))?;
-        (
-            remote_execution_for_plan(plan, &api_base_url, &key.key),
-            Some(key.id),
-        )
-    } else {
-        (remote_execution_for_plan(plan, "", ""), None)
-    };
     let claims = crate::remote_node::LeaseClaims {
         mission_id: mission.id,
         node_id: node.id.clone(),
@@ -12310,6 +12434,28 @@ async fn dispatch_remote_job(
     };
     let lease_token = crate::remote_node::create_lease_token(&claims, &shared_token)
         .map_err(|e| e.to_string())?;
+    // A harness launch talks back to this core through the model proxy with
+    // a key minted for this mission only; the key travels in the job env,
+    // never in the logged command line. Raw commands carry their own auth.
+    // Minted last, after every other fallible pre-submit step, so each path
+    // below that can fail after this point retires it explicitly.
+    let (execution, proxy_key_id) = if plan.uses_core_proxy() {
+        let api_base_url = super::mission_runner::public_api_base_url_from_env()
+            .ok_or_else(|| {
+                "SANDBOXED_PUBLIC_URL is not configured; a remote harness launch needs a core URL the node can reach".to_string()
+            })?;
+        let key = state
+            .proxy_api_keys
+            .create(remote_launch_key_name(mission.id))
+            .await
+            .map_err(|error| format!("remote launch proxy key could not be minted: {error}"))?;
+        (
+            remote_execution_for_plan(plan, &api_base_url, &key.key),
+            Some(key.id),
+        )
+    } else {
+        (remote_execution_for_plan(plan, "", ""), None)
+    };
     let request = crate::remote_node::SubmitJobRequest {
         job_id,
         mission_id: mission.id,
@@ -12321,11 +12467,18 @@ async fn dispatch_remote_job(
         },
     };
     let proxy_keys = Arc::clone(&state.proxy_api_keys);
-    // Best-effort key retirement once this process's observer is done; a
-    // re-attached observer after restart leaves the key to `cleanup_keys`.
-    let retire_proxy_key = move || async move {
-        if let Some(id) = proxy_key_id {
-            let _ = proxy_keys.delete(id).await;
+    // Key retirement: on every early failure below and when this process's
+    // observer finishes. A re-attached observer after restart retires by
+    // name (`retire_remote_launch_keys`), and the reconciler's first pass
+    // sweeps keys whose mission holds no ledger handle, so nothing relies on
+    // the periodic `cleanup_keys`.
+    let retire_proxy_key = {
+        let proxy_keys = Arc::clone(&proxy_keys);
+        let mission_id = mission.id;
+        move || async move {
+            if proxy_key_id.is_some() {
+                retire_remote_launch_keys(&proxy_keys, mission_id).await;
+            }
         }
     };
 
@@ -12335,7 +12488,7 @@ async fn dispatch_remote_job(
     // Record the generated id before the POST. If the process dies after the
     // node accepts but before the HTTP result is observed, restart recovery
     // still has enough information to cancel the maybe-accepted job.
-    crate::remote_node::job_ledger::record(
+    let tentative_recorded = crate::remote_node::job_ledger::record(
         &ledger_dir,
         crate::remote_node::job_ledger::JobHandle {
             mission_id: mission.id,
@@ -12352,8 +12505,13 @@ async fn dispatch_remote_job(
             wake_on_terminal: false,
         },
     )
-    .await
-    .map_err(|error| format!("remote job recovery handle could not be prepared: {error}"))?;
+    .await;
+    if let Err(error) = tentative_recorded {
+        retire_proxy_key().await;
+        return Err(format!(
+            "remote job recovery handle could not be prepared: {error}"
+        ));
+    }
     let accepted = match client.submit_job(&node, &shared_token, &request).await {
         Ok(accepted) => accepted,
         Err(crate::remote_node::RemoteNodeError::Request(message)) => {
@@ -12370,6 +12528,7 @@ async fn dispatch_remote_job(
                 submit_started_at,
                 ledger_dir,
             );
+            retire_proxy_key().await;
             return Err(format!(
                 "remote job submit outcome is ambiguous; cancellation is being reconciled: {message}"
             ));
@@ -12378,6 +12537,7 @@ async fn dispatch_remote_job(
             // A node HTTP rejection is definitive: the handler did not queue
             // the job, so this pre-submit handle can be discarded.
             crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
+            retire_proxy_key().await;
             return Err(error.to_string());
         }
     };
@@ -12416,6 +12576,7 @@ async fn dispatch_remote_job(
             submit_started_at,
             state.config.working_dir.clone(),
         );
+        retire_proxy_key().await;
         return Err(format!(
             "remote job accepted but recovery handle could not be persisted: {err}"
         ));
@@ -12639,10 +12800,18 @@ async fn observe_untracked_remote_job_cancellation(
 /// Missing owners, configuration, credentials and stale observations are not
 /// terminal evidence: retain the durable ownership fence and retry recovery.
 pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
+    // Captured synchronously, before any request can be served: only proxy
+    // keys minted before this instant are boot leftovers. A launch minting
+    // its key between the ledger snapshot and the key listing below is a
+    // live launch of THIS process and must keep its key.
+    let boot_cutoff = chrono::Utc::now();
     tokio::spawn(async move {
         // Let control sessions boot before touching their stores.
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         let working_dir = state.config.working_dir.clone();
+        // The leaked-key sweep runs once, after the first SUCCESSFUL ledger
+        // read (an unreadable first pass must not skip it forever).
+        let mut sweep_done = false;
         // Job ids a poll loop was already re-attached for (or that were
         // finalized), so retry passes never double-attach.
         let mut settled: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
@@ -12662,6 +12831,14 @@ pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
                     continue;
                 }
             };
+            if !sweep_done {
+                // Sweep leaked launch keys once per boot, against the FULL
+                // ledger (every mission with any handle keeps its key), and
+                // before the empty-ledger early return below.
+                retire_orphaned_remote_launch_keys(&state.proxy_api_keys, &handles, boot_cutoff)
+                    .await;
+                sweep_done = true;
+            }
             let pending: Vec<_> = handles
                 .into_iter()
                 .filter(|h| !settled.contains(&h.job_id))
@@ -12857,6 +13034,7 @@ async fn reconcile_pending_handles(
                     settled.insert(handle.job_id);
                     let fleet = Arc::clone(&state.fleet);
                     let ledger_dir = working_dir.to_path_buf();
+                    let proxy_keys = Arc::clone(&state.proxy_api_keys);
                     tokio::spawn(async move {
                         poll_remote_job(
                             &ledger_dir,
@@ -12870,6 +13048,7 @@ async fn reconcile_pending_handles(
                             handle.started_at,
                         )
                         .await;
+                        retire_remote_launch_keys(&proxy_keys, handle.mission_id).await;
                     });
                 }
                 _ => {
@@ -35038,13 +35217,39 @@ Investigate <service/> failures.
                 prompt: "do it".into()
             }
         );
+        assert_eq!(
+            plan_remote_harness(
+                None,
+                "opencode",
+                Some("builtin/xai/grok-4.6"),
+                Some("do it")
+            )
+            .unwrap(),
+            RemoteHarnessPlan::OpenCode {
+                model: Some("xai/grok-4.6".into()),
+                prompt: "do it".into()
+            }
+        );
+        let no_model = plan_remote_harness(None, "opencode", None, Some("do it"))
+            .expect_err("opencode needs a routed model");
+        assert!(
+            no_model.starts_with("REMOTE_MODEL_REQUIRED: "),
+            "{no_model}"
+        );
         let rejected = plan_remote_harness(None, "grok", Some("grok-4.6"), Some("do it"))
             .expect_err("grok has no node runtime");
+        assert!(
+            rejected.starts_with("REMOTE_HARNESS_UNSUPPORTED: "),
+            "{rejected}"
+        );
         assert!(rejected.contains("'grok'"), "{rejected}");
         assert!(rejected.contains("claudecode or opencode"), "{rejected}");
         let no_prompt =
             plan_remote_harness(None, "claudecode", None, Some("   ")).expect_err("prompt");
-        assert!(no_prompt.contains("prompt"), "{no_prompt}");
+        assert!(
+            no_prompt.starts_with("REMOTE_PROMPT_REQUIRED: "),
+            "{no_prompt}"
+        );
     }
 
     #[test]
@@ -35080,13 +35285,50 @@ Investigate <service/> failures.
         let exec = remote_execution_for_plan(&plan, "https://core.example/", "sk-proxy-abc");
         assert!(
             exec.command
-                .contains("opencode run --format json --model 'openai/grok-4.6' 'build'"),
+                .contains("opencode run --format json --model 'builtin/xai/grok-4.6' 'build'"),
             "{}",
             exec.command
         );
+        assert!(!exec.command.contains("opencode.json"), "{}", exec.command);
+        assert!(!exec.command.contains("sk-proxy-abc"));
         let env = exec.env.unwrap();
-        assert_eq!(env["OPENAI_BASE_URL"], "https://core.example/v1");
-        assert_eq!(env["OPENAI_API_KEY"], "sk-proxy-abc");
+        assert_eq!(env[REMOTE_PROXY_KEY_ENV], "sk-proxy-abc");
+        let config: serde_json::Value =
+            serde_json::from_str(&env[REMOTE_OPENCODE_CONFIG_ENV]).unwrap();
+        assert_eq!(
+            config["provider"]["builtin"]["options"]["baseURL"],
+            "https://core.example/v1"
+        );
+        assert_eq!(
+            config["provider"]["builtin"]["options"]["apiKey"],
+            "{env:SANDBOXED_PROXY_API_KEY}"
+        );
+        assert_eq!(
+            config["provider"]["builtin"]["models"]["xai/grok-4.6"]["name"],
+            "xai/grok-4.6"
+        );
+        assert!(!env[REMOTE_OPENCODE_CONFIG_ENV].contains("sk-proxy-abc"));
+        // Map key and --model agree even when the client sent `builtin/`,
+        // and a leading-dash prompt stays positional.
+        let plan = plan_remote_harness(None, "opencode", Some("builtin/xai/grok-4.6"), Some("-x"))
+            .unwrap();
+        let exec = remote_execution_for_plan(&plan, "https://core.example", "k");
+        assert!(
+            exec.command
+                .contains("--model 'builtin/xai/grok-4.6' ' -x'"),
+            "{}",
+            exec.command
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(&exec.env.unwrap()[REMOTE_OPENCODE_CONFIG_ENV]).unwrap();
+        assert!(config["provider"]["builtin"]["models"]["xai/grok-4.6"].is_object());
+        let plan = RemoteHarnessPlan::ClaudeCode {
+            model: None,
+            prompt: "--help".into(),
+        };
+        assert!(remote_execution_for_plan(&plan, "u", "k")
+            .command
+            .ends_with("' --help'"));
 
         let raw = remote_execution_for_plan(
             &RemoteHarnessPlan::Raw {
@@ -35097,6 +35339,209 @@ Investigate <service/> failures.
         );
         assert_eq!(raw.env, None);
         assert_eq!(raw.command, "hostname");
+    }
+
+    #[tokio::test]
+    async fn boot_key_sweep_removes_old_orphans_and_keeps_new_process_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            super::super::proxy_keys::ProxyApiKeyStore::new(dir.path().join("keys.json")).await;
+        let old_orphan = Uuid::new_v4();
+        let old_live = Uuid::new_v4();
+        let unrelated = store.create("dashboard-key".into()).await.unwrap();
+        store
+            .create(remote_launch_key_name(old_orphan))
+            .await
+            .unwrap();
+        store
+            .create(remote_launch_key_name(old_live))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let boot_cutoff = chrono::Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // A launch of this process, minted after the cutoff, absent from
+        // the (empty) ledger snapshot because its handle is not written yet.
+        let fresh = Uuid::new_v4();
+        store.create(remote_launch_key_name(fresh)).await.unwrap();
+        let live_handle = crate::remote_node::job_ledger::JobHandle {
+            mission_id: old_live,
+            node_id: "dgx-spark".into(),
+            job_id: Uuid::new_v4(),
+            started_at: boot_cutoff,
+            submission_sequence: 0,
+            accepted_at: Some(boot_cutoff),
+            heartbeat_at: None,
+            disk_reservation_bytes: 0,
+            kind: crate::remote_node::job_ledger::JobHandleKind::Mission,
+            identity: None,
+            wait_for_completion: None,
+            wake_on_terminal: false,
+        };
+        retire_orphaned_remote_launch_keys(&store, std::slice::from_ref(&live_handle), boot_cutoff)
+            .await;
+        let mut names: Vec<String> = store.list().await.into_iter().map(|k| k.name).collect();
+        names.sort();
+        let mut expected = vec![
+            unrelated.name.clone(),
+            remote_launch_key_name(old_live),
+            remote_launch_key_name(fresh),
+        ];
+        expected.sort();
+        assert_eq!(names, expected);
+        // Empty ledger: only the pre-cutoff orphan goes; the fresh key stays.
+        retire_orphaned_remote_launch_keys(&store, &[], boot_cutoff).await;
+        let mut names: Vec<String> = store.list().await.into_iter().map(|k| k.name).collect();
+        names.sort();
+        let mut expected = vec![unrelated.name, remote_launch_key_name(fresh)];
+        expected.sort();
+        assert_eq!(names, expected);
+    }
+
+    /// Bounded real-CLI resolution proof (no paid inference): the installed
+    /// OpenCode, configured exactly as a node job is (inline
+    /// `OPENCODE_CONFIG_CONTENT`, cwd = HOME = scratch dir, key only in env),
+    /// must send the exact requested model id and the env key to the
+    /// proxy-shaped endpoint. A local mock answers one canned streamed
+    /// completion. Skipped when the CLI is not installed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_opencode_execution_resolves_model_against_mock_proxy() {
+        if !std::process::Command::new("bash")
+            .args(["-lc", "command -v opencode"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("opencode CLI not installed; skipping mock-proxy fixture");
+            return;
+        }
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post({
+                let seen = seen.clone();
+                move |headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        let model = body["model"].as_str().unwrap_or_default().to_string();
+                        let auth = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        seen.lock().unwrap().push((model.clone(), auth));
+                        let chunk = |delta: serde_json::Value, finish: Option<&str>| {
+                            format!(
+                                "data: {}\n\n",
+                                serde_json::json!({
+                                    "id": "c1", "object": "chat.completion.chunk", "created": 1,
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                                })
+                            )
+                        };
+                        let body = format!(
+                            "{}{}data: [DONE]\n\n",
+                            chunk(
+                                serde_json::json!({"role": "assistant", "content": "ok"}),
+                                None
+                            ),
+                            chunk(serde_json::json!({}), Some("stop"))
+                        );
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            body,
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let plan =
+            plan_remote_harness(None, "opencode", Some("xai/grok-4.6"), Some("say ok")).unwrap();
+        let exec = remote_execution_for_plan(&plan, &base, "sk-proxy-fixture-key");
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = tokio::process::Command::new("bash");
+        // The node runs the command verbatim under `bash -lc`; a `timeout`
+        // prefix would turn the leading `command -v` builtin into a program
+        // lookup. The tokio timeout below bounds the run instead.
+        command
+            .arg("-lc")
+            .arg(&exec.command)
+            .kill_on_drop(true)
+            .current_dir(dir.path())
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", dir.path())
+            .env("LANG", "C.UTF-8")
+            .envs(exec.env.clone().unwrap());
+        let output = tokio::time::timeout(std::time::Duration::from_secs(170), command.output())
+            .await
+            .expect("opencode run must finish")
+            .unwrap();
+        server.abort();
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!seen.is_empty(), "the CLI never called the proxy endpoint");
+        for (model, auth) in &seen {
+            assert_eq!(model, "xai/grok-4.6");
+            assert_eq!(auth, "Bearer sk-proxy-fixture-key");
+        }
+        assert!(String::from_utf8_lossy(&output.stdout).contains("\"ok\""));
+    }
+
+    /// Bounded real-CLI fixture (no inference, no cost): the installed
+    /// OpenCode must accept the per-job config and list the exact proxy
+    /// model id under the `builtin` provider from a cwd that is also HOME,
+    /// the way node jobs run. Skipped when the CLI is not installed.
+    #[test]
+    fn remote_opencode_config_is_accepted_by_installed_cli_catalog() {
+        let Ok(output) = std::process::Command::new("bash")
+            .args(["-lc", "command -v opencode"])
+            .output()
+        else {
+            return;
+        };
+        if !output.status.success() {
+            eprintln!("opencode CLI not installed; skipping catalog fixture");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let listed = std::process::Command::new("bash")
+            .args(["-lc", "timeout 120 opencode models builtin"])
+            .current_dir(dir.path())
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", dir.path())
+            .env("LANG", "C.UTF-8")
+            .env(
+                REMOTE_OPENCODE_CONFIG_ENV,
+                remote_opencode_config("xai/grok-4.6", "http://127.0.0.1:9").to_string(),
+            )
+            .env(REMOTE_PROXY_KEY_ENV, "phony-fixture-key")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            listed.status.success()
+                && stdout
+                    .lines()
+                    .any(|line| line.trim() == "builtin/xai/grok-4.6"),
+            "status={:?} stdout={stdout} stderr={}",
+            listed.status,
+            String::from_utf8_lossy(&listed.stderr)
+        );
     }
 
     #[test]
