@@ -39,12 +39,11 @@ export function missionMachine(m: { remote_job?: { node_id?: string } | null; re
   return id ? nodeLabel(id) : undefined;
 }
 
-/** Delayed native title for truncated labels plus known repo/branch/machine. */
-export function rowDetail(title: string, extra: Array<string | undefined | null> = []): string | undefined {
-  const known = extra.map((part) => part?.trim()).filter((part): part is string => !!part);
-  const overflow = title.length > 28;
-  if (!overflow && !known.length) return undefined;
-  return [overflow ? title : undefined, ...known].filter(Boolean).join(" · ");
+export type RowTipContent = { title: string; meta: string[] };
+
+/** Full title plus known repo/branch/machine lines. Never invented. */
+export function rowDetail(title: string, extra: Array<string | undefined | null> = []): RowTipContent {
+  return { title, meta: extra.map((part) => part?.trim()).filter((part): part is string => !!part) };
 }
 
 /** Where an agent runs: the workspace/machine name behind a cloud glyph.
@@ -60,19 +59,29 @@ function MachineBadge(p: { name?: string | null }) {
 }
 
 function useRowTip() {
-  const [tip, setTip] = createSignal<{ text: string; x: number; y: number } | null>(null);
+  const [tip, setTip] = createSignal<{ title: string; meta: string[]; x: number; y: number } | null>(null);
   let timer = 0;
-  const hide = () => { window.clearTimeout(timer); setTip(null); };
-  const show = (text: string | undefined, el: HTMLElement) => {
+  const hide = () => { window.clearTimeout(timer); timer = 0; setTip(null); };
+  const show = (content: RowTipContent, el: HTMLElement) => {
     window.clearTimeout(timer);
-    if (!text) { setTip(null); return; }
     timer = window.setTimeout(() => {
+      if (!el.isConnected) return;
       const box = el.getBoundingClientRect();
-      setTip({ text, x: Math.max(8, Math.min(box.left, window.innerWidth - 260)), y: box.bottom + 6 });
+      setTip({
+        ...content,
+        x: Math.max(8, Math.min(box.left, window.innerWidth - 280)),
+        y: box.bottom + 6,
+      });
     }, 480);
   };
+  const bind = (content: RowTipContent) => ({
+    onPointerEnter: (e: { currentTarget: HTMLElement }) => show(content, e.currentTarget),
+    onPointerLeave: hide,
+    onFocus: (e: { currentTarget: HTMLElement }) => show(content, e.currentTarget),
+    onBlur: hide,
+  });
   onCleanup(hide);
-  return { tip, show, hide };
+  return { tip, bind, hide };
 }
 
 export function LiveProjectsSection(p: {
@@ -282,10 +291,7 @@ export function LiveProjectsSection(p: {
                 <button
                   class="row folder depth"
                   style={{ "--depth": dp.depth + 1 }}
-                  onPointerEnter={(e) => rowTip.show(rowDetail(entry.name), e.currentTarget)}
-                  onPointerLeave={rowTip.hide}
-                  onFocus={(e) => rowTip.show(rowDetail(entry.name), e.currentTarget)}
-                  onBlur={rowTip.hide}
+                  {...rowTip.bind(rowDetail(entry.name))}
                   onClick={() => toggleDir(dp.slug, childPath())}
                   onContextMenu={(e) => {
                     e.preventDefault();
@@ -309,10 +315,7 @@ export function LiveProjectsSection(p: {
             <button
               class={`row file depth ${p.selected() === id() ? "active" : ""}`}
               style={{ "--depth": dp.depth + 1 }}
-              onPointerEnter={(e) => rowTip.show(rowDetail(entry.name), e.currentTarget)}
-              onPointerLeave={rowTip.hide}
-              onFocus={(e) => rowTip.show(rowDetail(entry.name), e.currentTarget)}
-              onBlur={rowTip.hide}
+              {...rowTip.bind(rowDetail(entry.name))}
               onClick={() => p.open(id())}
             >
               <span class="row-ico"><Ic.FileIcon /></span>
@@ -375,10 +378,7 @@ export function LiveProjectsSection(p: {
                     return (
                       <button
                         class={`row agent d1 cron ${p.selected() === `c:${project.slug}` ? "active" : ""}`}
-                        onPointerEnter={(e) => rowTip.show(rowDetail(job().name, ["Controller"]), e.currentTarget)}
-                        onPointerLeave={rowTip.hide}
-                        onFocus={(e) => rowTip.show(rowDetail(job().name, ["Controller"]), e.currentTarget)}
-                        onBlur={rowTip.hide}
+                        {...rowTip.bind(rowDetail(job().name, ["Controller"]))}
                         onClick={() => p.open(`c:${project.slug}`)}
                       >
                         <span class="row-ico glyph">
@@ -405,10 +405,7 @@ export function LiveProjectsSection(p: {
                   {(job) => (
                     <button
                       class={`row agent d1 cron ${p.selected() === `pc:${project.slug}:${job.id}` ? "active" : ""}`}
-                      onPointerEnter={(e) => rowTip.show(rowDetail(job.name, ["Cron"]), e.currentTarget)}
-                      onPointerLeave={rowTip.hide}
-                      onFocus={(e) => rowTip.show(rowDetail(job.name, ["Cron"]), e.currentTarget)}
-                      onBlur={rowTip.hide}
+                      {...rowTip.bind(rowDetail(job.name, ["Cron"]))}
                       onClick={() => p.open(`pc:${project.slug}:${job.id}`)}
                     >
                       <span class="row-ico glyph"><CronGlyph job={job} /></span>
@@ -421,10 +418,7 @@ export function LiveProjectsSection(p: {
                   {(m) => (
                     <button
                       class={`row agent d1 ${p.selected() === `m:${m.id}` ? "active" : ""}`}
-                      onPointerEnter={(e) => rowTip.show(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]), e.currentTarget)}
-                      onPointerLeave={rowTip.hide}
-                      onFocus={(e) => rowTip.show(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]), e.currentTarget)}
-                      onBlur={rowTip.hide}
+                      {...rowTip.bind(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]))}
                       onClick={() => p.open(`m:${m.id}`)}
                     >
                       <span class="row-ico glyph">
@@ -450,10 +444,7 @@ export function LiveProjectsSection(p: {
                       {(m) => (
                         <button
                           class={`row agent done d1 ${p.selected() === `m:${m.id}` ? "active" : ""}`}
-                          onPointerEnter={(e) => rowTip.show(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]), e.currentTarget)}
-                          onPointerLeave={rowTip.hide}
-                          onFocus={(e) => rowTip.show(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]), e.currentTarget)}
-                          onBlur={rowTip.hide}
+                          {...rowTip.bind(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]))}
                           onClick={() => p.open(`m:${m.id}`)}
                         >
                           <span class="row-ico glyph">
@@ -483,7 +474,14 @@ export function LiveProjectsSection(p: {
       <Show when={actionMenu()}>
         {(menu) => <PopupMenu {...menu()} focus={actionFocus()} items={menuItems(menu().slug, menu().path)} onClose={() => setActionMenu(null)} />}
       </Show>
-      <Show when={rowTip.tip()}>{(tip) => <div class="row-tip" role="tooltip" style={{ left: `${tip().x}px`, top: `${tip().y}px` }}>{tip().text}</div>}</Show>
+      <div class="row-tip" role="tooltip" hidden={!rowTip.tip()} style={rowTip.tip() ? { left: `${rowTip.tip()!.x}px`, top: `${rowTip.tip()!.y}px` } : undefined}>
+        <Show when={rowTip.tip()}>{(tip) => (
+          <>
+            <div class="row-tip-title">{tip().title}</div>
+            <For each={tip().meta}>{(line) => <div class="row-tip-meta">{line}</div>}</For>
+          </>
+        )}</Show>
+      </div>
       <Show when={newFolder()}>
         {(target) => (
           <Dialog title="New folder" onClose={() => !makingFolder() && setNewFolder(null)} footer={<><button class="s-btn" disabled={makingFolder()} onClick={() => setNewFolder(null)}>Cancel</button><button class="s-btn primary" disabled={makingFolder()} onClick={createFolder}>{makingFolder() ? "Creating…" : "Create"}</button></>}>

@@ -79,11 +79,25 @@ test("sidebar rows stay compact with distinct hover/selected and delayed real me
   expect(doneColor).toBe(liveColor);
   const dim = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--fg-3").trim());
   expect(doneColor).not.toBe(dim);
+  expect(await live.getAttribute("title")).toBeNull();
   await live.hover();
+  const tip = page.locator(".row-tip");
+  await expect(tip).toBeHidden();
   await page.waitForTimeout(560);
-  await expect(page.locator(".row-tip")).toContainText("Orb DGX launch without losing this draft");
-  await expect(page.locator(".row-tip")).toContainText("DGX Spark");
-  await expect(page.locator(".row-tip")).not.toContainText("host");
+  await expect(tip).toBeVisible();
+  await expect(tip.locator(".row-tip-title")).toHaveText("Orb DGX launch without losing this draft");
+  await expect(tip.locator(".row-tip-meta")).toHaveText("DGX Spark");
+  await expect(tip).not.toContainText("host");
+  await expect(live).toHaveAccessibleName(/Orb DGX launch without losing this draft/);
+  await page.screenshot({ path: "test-results/orb-sidebar-tooltip.png" });
+  await page.mouse.move(0, 0);
+  await expect(tip).toBeHidden();
+  await otherLive.focus();
+  await expect(tip).toBeHidden();
+  await page.waitForTimeout(560);
+  await expect(tip).toBeVisible();
+  await expect(tip.locator(".row-tip-title")).toHaveText("Live mission 1");
+  await expect(tip.locator(".row-tip-meta")).toHaveCount(0);
   await page.locator("#orb-sidebar").screenshot({ path: "test-results/orb-sidebar-finished.png" });
   const measure = await page.evaluate(() => {
     const rows = [...document.querySelectorAll("#orb-sidebar .row")];
