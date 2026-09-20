@@ -419,14 +419,15 @@ code {
 .st-think { margin: 4px 10px; }
 .st-think-head {
   display: inline-flex; align-items: center; gap: 4px;
-  color: var(--fg-4); font-size: 12.5px; line-height: 21px;
+  color: var(--fg-3); font-size: 13px; line-height: 21px;
 }
 .st-think-head:hover { color: var(--fg-2); }
-.st-think-head .chev { opacity: 1; }
+.st-think-head .chev { opacity: .85; transition: transform .12s; }
+.st-think-head .chev.open { transform: rotate(90deg); }
 .st-think-body {
-  margin: 2px 0 6px 16px; padding-left: 8px;
-  border-left: 2px solid var(--stroke-soft);
-  color: var(--fg-3); font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere;
+  margin: 2px 0 8px;
+  color: var(--fg-3); font-size: 13px; line-height: 20px;
+  white-space: pre-wrap; overflow-wrap: anywhere;
 }
 .st-work { margin: 4px 10px; }
 .st-work-head {

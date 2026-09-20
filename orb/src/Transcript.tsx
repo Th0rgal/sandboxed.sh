@@ -101,16 +101,16 @@ function ToolRow(p: { item: Extract<StreamItem, { kind: "tool" }> }) {
 }
 
 function ThinkBlock(p: { item: Extract<StreamItem, { kind: "think" }> }) {
-  const [open, setOpen] = createSignal(false);
+  const [open, setOpen] = createSignal(true);
   return (
-    <div class="st-think">
+    <div class={`st-think ${open() ? "open" : ""}`}>
       <button class="st-think-head" onClick={() => setOpen(!open())}>
-        <Ic.ChevronRight size={12} class={`chev ${open() ? "open" : ""}`} />
-        <Show when={p.item.done} fallback={<span class="shimmer">Thinking…</span>}>
-          <span>Thought</span>
+        <Show when={p.item.done} fallback={<span class="shimmer">Thinking</span>}>
+          <span>Thinking</span>
         </Show>
+        <Ic.ChevronRight size={12} class={`chev ${open() ? "open" : ""}`} />
       </button>
-      <Show when={open()}>
+      <Show when={open() && p.item.text}>
         <div class="st-think-body">{p.item.text}</div>
       </Show>
     </div>
@@ -150,7 +150,7 @@ function WorkFold(p: { items: WorkItem[] }) {
   const current = () => {
     const cur = [...p.items].reverse().find((t) => (t.kind === "tool" ? !t.done : !t.done));
     if (!cur) return "Working…";
-    if (cur.kind === "think") return "Thinking…";
+    if (cur.kind === "think") return "Thinking";
     return `${cur.name} ${toolTarget(cur.name, cur.args) ?? ""}`.trim();
   };
   const summary = () => {
@@ -167,7 +167,11 @@ function WorkFold(p: { items: WorkItem[] }) {
       </button>
       <Show when={open()}>
         <div class="st-work-body">
-          <For each={p.items}>{(t) => (t.kind === "tool" ? <ToolRow item={t} /> : <ThinkBlock item={t} />)}</For>
+          <For each={p.items}>
+            {(t) => (t.kind === "tool" ? <ToolRow item={t} /> : (
+              <Show when={t.text}><div class="st-think-body">{t.text}</div></Show>
+            ))}
+          </For>
         </div>
       </Show>
     </div>
@@ -186,6 +190,13 @@ export function Transcript(p: { items: StreamItem[] }) {
         {(item) => {
           switch (item.kind) {
             case "work":
+              if (!item.items.some((t) => t.kind === "tool")) {
+                return (
+                  <For each={item.items}>
+                    {(t) => (t.kind === "think" ? <ThinkBlock item={t} /> : null)}
+                  </For>
+                );
+              }
               return <WorkFold items={item.items} />;
             case "user":
               return <UserTurn text={item.text} />;
