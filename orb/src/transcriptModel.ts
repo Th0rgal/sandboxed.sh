@@ -59,11 +59,22 @@ export class TranscriptReducer {
       case "text_delta":
       case "text_op": {
         let index = this.bubbles.get(bubble);
+        if (index == null && bubble === "text_delta_latest" && this.lastFinal != null && this.items[this.lastFinal]?.kind === "text") {
+          index = this.lastFinal;
+          this.bubbles.set(bubble, index);
+        }
         const previous = index == null ? undefined : this.items[index];
         let text = previous?.kind === "text" ? previous.text : "";
-        let live = true;
+        let live = previous?.kind === "text" ? previous.live : true;
         if (ev.type === "text_delta") {
-          text = d.mode === "delta" ? text + str(d.content) : str(d.content);
+          const next = str(d.content);
+          if (d.mode === "delta") {
+            text += next;
+            live = true;
+          } else {
+            text = next;
+            if (!(previous?.kind === "text" && !previous.live && previous.text === next)) live = true;
+          }
         } else {
           for (const op of (Array.isArray(d.ops) ? d.ops : []) as Record<string, unknown>[]) {
             const chars = Array.from(text);

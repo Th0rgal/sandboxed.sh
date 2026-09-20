@@ -1,0 +1,163 @@
+[
+  {
+    "id": 3794544,
+    "mission_id": "44584615-b118-45c4-a4e7-299c2ab1a153",
+    "sequence": 1,
+    "event_type": "user_message",
+    "timestamp": "2026-09-20T13:47:27.710033576+00:00",
+    "tool_call_id": null,
+    "tool_name": null,
+    "content": "Run hostname exactly once and report ORB_PROD_NATIVE_GROK_OK with its output. Do not edit files, install packages, or run builds.",
+    "metadata": {
+      "queued": false,
+      "source": "api:prod"
+    }
+  },
+  {
+    "id": 3794545,
+    "mission_id": "44584615-b118-45c4-a4e7-299c2ab1a153",
+    "sequence": 2,
+    "event_type": "mission_status_changed",
+    "timestamp": "2026-09-20T13:47:28.031719188+00:00",
+    "tool_call_id": null,
+    "tool_name": null,
+    "content": "Dispatched job e14b14a3-bce7-4d80-8d81-ad7ad239fd82 to remote node 'dgx-spark' (grok/grok-4.6; node state: queued)",
+    "metadata": {
+      "completion": null,
+      "execution": {
+        "ended_at": null,
+        "execution_state": "waiting_remote_job",
+        "generation": 1,
+        "heartbeat_at": "2026-09-20T13:47:28.018575911+00:00",
+        "mission_id": "44584615-b118-45c4-a4e7-299c2ab1a153",
+        "owner_actor_id": "remote-job:e14b14a3-bce7-4d80-8d81-ad7ad239fd82",
+        "run_id": "504f6281-3e2c-47d4-894f-dbdc7d3a90c4",
+        "scope_unit": "remote-node:dgx-spark",
+        "started_at": "2026-09-20T13:47:27.717079132+00:00",
+        "stopping_at": null,
+        "terminal_reason": null
+      },
+      "status": "active"
+    }
+  },
+  {
+    "id": 3794546,
+    "mission_id": "44584615-b118-45c4-a4e7-299c2ab1a153",
+    "sequence": 3,
+    "event_type": "assistant_message",
+    "timestamp": "2026-09-20T13:47:31.215204913+00:00",
+    "tool_call_id": null,
+    "tool_name": null,
+    "content": "Remote job e14b14a3-bce7-4d80-8d81-ad7ad239fd82 on node 'dgx-spark' is now running",
+    "metadata": {
+      "cost": {
+        "amount_cents": 0,
+        "currency": "USD",
+        "source": "unknown"
+      },
+      "cost_cents": 0,
+      "success": true
+    }
+  },
+  {
+    "id": 3794547,
+    "mission_id": "44584615-b118-45c4-a4e7-299c2ab1a153",
+    "sequence": 4,
+    "event_type": "tool_call",
+    "timestamp": "2026-09-20T13:47:37.755246444+00:00",
+    "tool_call_id": "call-ce8c29b5-6223-4b6b-b3e6-aadd3df179db-0",
+    "tool_name": "run_terminal_command",
+    "content": "{\"command\":\"hostname\",\"description\":\"Run hostname exactly once\"}",
+    "metadata": {}
+  },
+  {
+    "id": 3794549,
+    "mission_id": "44584615-b118-45c4-a4e7-299c2ab1a153",
+    "sequence": 6,
+    "event_type": "tool_result",
+    "timestamp": "2026-09-20T13:47:37.779135156+00:00",
+    "tool_call_id": "call-ce8c29b5-6223-4b6b-b3e6-aadd3df179db-0",
+    "tool_name": "tool",
+    "content": "{\"output\":\"spark-de79\",\"exit_code\":0}",
+    "metadata": {}
+  },
+  {
+    "id": 3794551,
+    "mission_id": "44584615-b118-45c4-a4e7-299c2ab1a153",
+    "sequence": 8,
+    "event_type": "tool_call",
+    "timestamp": "2026-09-20T13:47:37.798688235+00:00",
+    "tool_call_id": "call-ce8c29b5-6223-4b6b-b3e6-aadd3df179db-0",
+    "tool_name": "run_terminal_command",
+    "content": "{\"command\":\"hostname\",\"description\":\"Run hostname exactly once\"}",
+    "metadata": {}
+  },
+  {
+    "id": 3794552,
+    "mission_id": "44584615-b118-45c4-a4e7-299c2ab1a153",
+    "sequence": 9,
+    "event_type": "tool_result",
+    "timestamp": "2026-09-20T13:47:37.805416289+00:00",
+    "tool_call_id": "call-ce8c29b5-6223-4b6b-b3e6-aadd3df179db-0",
+    "tool_name": "tool",
+    "content": "{\"output\":\"spark-de79\",\"exit_code\":0}",
+    "metadata": {}
+  },
+  {
+    "id": 3794554,
+    "mission_id": "44584615-b118-45c4-a4e7-299c2ab1a153",
+    "sequence": 11,
+    "event_type": "assistant_message",
+    "timestamp": "2026-09-20T13:47:47.621404697+00:00",
+    "tool_call_id": null,
+    "tool_name": null,
+    "content": "I'll run `hostname` once and report the result with `ORB_PROD_NATIVE_GROK_OK`.ORB_PROD_NATIVE_GROK_OK\n\n`spark-de79`",
+    "metadata": {
+      "cost": {
+        "amount_cents": 0,
+        "currency": "USD",
+        "source": "unknown"
+      },
+      "cost_cents": 0,
+      "success": true
+    }
+  },
+  {
+    "id": 3794550,
+    "mission_id": "44584615-b118-45c4-a4e7-299c2ab1a153",
+    "sequence": 12,
+    "event_type": "text_delta",
+    "timestamp": "2026-09-20T13:47:47.608212482+00:00",
+    "tool_call_id": null,
+    "tool_name": null,
+    "content": "I'll run `hostname` once and report the result with `ORB_PROD_NATIVE_GROK_OK`.ORB_PROD_NATIVE_GROK_OK\n\n`spark-de79`",
+    "metadata": {}
+  },
+  {
+    "id": 3794555,
+    "mission_id": "44584615-b118-45c4-a4e7-299c2ab1a153",
+    "sequence": 13,
+    "event_type": "mission_status_changed",
+    "timestamp": "2026-09-20T13:47:47.641769636+00:00",
+    "tool_call_id": null,
+    "tool_name": null,
+    "content": "Remote node 'dgx-spark' finished",
+    "metadata": {
+      "completion": null,
+      "execution": {
+        "ended_at": "2026-09-20T13:47:47.634957093+00:00",
+        "execution_state": "terminal",
+        "generation": 1,
+        "heartbeat_at": "2026-09-20T13:47:47.634957093+00:00",
+        "mission_id": "44584615-b118-45c4-a4e7-299c2ab1a153",
+        "owner_actor_id": "remote-job:e14b14a3-bce7-4d80-8d81-ad7ad239fd82",
+        "run_id": "504f6281-3e2c-47d4-894f-dbdc7d3a90c4",
+        "scope_unit": "remote-node:dgx-spark",
+        "started_at": "2026-09-20T13:47:27.717079132+00:00",
+        "stopping_at": null,
+        "terminal_reason": "remote_node_job"
+      },
+      "status": "completed"
+    }
+  }
+]

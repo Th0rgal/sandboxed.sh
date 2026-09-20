@@ -32,5 +32,35 @@ test("cumulative live text across tools renders once and preserves open tool det
  ]));
  await expect(page.locator(".st-text")).toHaveCount(1);
  await expect(page.locator(".st-work-body")).toBeVisible();await expect(page.locator(".st-tool-detail")).toBeVisible();
- await page.screenshot({path:"test-results/orb-stream-reconciled.png"});
+  await page.screenshot({path:"test-results/orb-stream-reconciled.png"});
+});
+
+test("native Grok canary final assistant_message then text_delta renders once",async({page})=>{
+  const events=(await import("./fixtures/native-canary-events.json",{with:{type:"json"}})).default;
+  await page.addInitScript(()=>{localStorage.setItem("orb.apiUrl",location.origin);localStorage.setItem("orb.jwt","test");localStorage.setItem("orb-theme","dark");});
+  const mission={id:"44584615-b118-45c4-a4e7-299c2ab1a153",title:"Orb native Grok launch verification",status:"completed",history:[],workspace_name:"host",remote_node_id:"dgx-spark",created_at:"",updated_at:""};
+  await page.route("**/api/**",async route=>{
+    const path=new URL(route.request().url()).pathname;
+    const json=path==="/api/projects"?{projects:[{slug:"test",title:"test"}]}
+      :path==="/api/control/missions"&&new URL(route.request().url()).searchParams.get("project")==="test"?[mission]
+      :path==="/api/control/missions/44584615-b118-45c4-a4e7-299c2ab1a153"?mission
+      :path.endsWith("/events")?events
+      :path==="/api/control/stream"?undefined
+      :path.endsWith("/files")?{entries:[]}
+      :path.endsWith("/crons")?{jobs:[]}
+      :path.endsWith("/controller")?{job:null,runs:[]}
+      :[];
+    if(path==="/api/control/stream")return route.fulfill({contentType:"text/event-stream",body:""});
+    return route.fulfill({json});
+  });
+  await page.goto("/");
+  await page.getByRole("button",{name:"test",exact:true}).click();
+  await page.getByRole("button",{name:"1 finished"}).click();
+  await page.getByRole("button",{name:/Orb native Grok launch verification/}).click();
+  await expect(page.locator(".tb-title")).toContainText("Orb native Grok launch verification");
+  await expect(page.locator(".tb-title")).not.toHaveText(/^Mission$/);
+  await expect(page.locator(".st-text")).toHaveCount(1);
+  await expect(page.locator(".st-text")).toContainText("ORB_PROD_NATIVE_GROK_OK");
+  await expect(page.locator(".st-text")).toContainText("spark-de79");
+  await page.screenshot({path:"test-results/orb-native-canary-once.png"});
 });

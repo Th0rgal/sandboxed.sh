@@ -516,6 +516,7 @@ export default function App() {
   });
 
   const [missions, setMissions] = createSignal<Mission[]>([]);
+  const [openMission, setOpenMission] = createSignal<Mission | null>(null);
   /** Only missions still doing something: the sidebar is a place to act,
    * not a history. Everything else lives under its project. */
   const [fleetNodes, setFleetNodes] = createSignal<RemoteNodeView[]>([]);
@@ -1040,8 +1041,8 @@ export default function App() {
             <Match when={currentMissionId()}>
               {(id) => (
                 <>
-                  <Show when={missionGoal(missions().find((m) => m.id === id()))}><GoalTag class="small" /></Show>
-                  <span>{displayTitle(missions().find((m) => m.id === id())?.title) || "Mission"}</span>
+                  <Show when={missionGoal(missions().find((m) => m.id === id()) ?? openMission())}><GoalTag class="small" /></Show>
+                  <span>{displayTitle((openMission()?.id === id() ? openMission()?.title : undefined) ?? missions().find((m) => m.id === id())?.title) || "Mission"}</span>
                   <Ic.CloudIcon class="dim" />
                 </>
               )}
@@ -1093,7 +1094,7 @@ export default function App() {
           <Match when={currentMissionId()}>
             {(id) => (
               <Show when={id()} keyed>
-                {(mid) => <MissionView id={mid} initial={missions().find(m => m.id === mid)} />}
+                {(mid) => <MissionView id={mid} initial={missions().find(m => m.id === mid)} onMission={setOpenMission} />}
               </Show>
             )}
           </Match>
@@ -1400,9 +1401,11 @@ export default function App() {
   );
 }
 
-function MissionView(p: { id: string; initial?: Mission }) {
+function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: Mission | null) => void }) {
   const receipt = recalledLaunch(p.id);
   const [mission, setMission] = createSignal<Mission | null>(p.initial ?? null);
+  createEffect(() => p.onMission?.(mission()));
+  onCleanup(() => p.onMission?.(null));
   const [items, setItems] = createSignal<StreamItem[]>([]);
   const [error, setError] = createSignal<string | null>(null);
   let scroller: HTMLDivElement | undefined;

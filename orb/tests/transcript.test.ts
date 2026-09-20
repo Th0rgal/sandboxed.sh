@@ -59,8 +59,25 @@ it("replays the supplied 328-event redacted production fixture and updates its l
 });
 
 it("keeps distinct canonical bubble IDs and bridges canonical-before-final ordering",()=>{
- const canonical=(bubble_id:string,content:string)=>ev("assistant_message",{canonical:true,bubble_id,content});
- const items=buildTranscript([canonical("one","First"),canonical("two","Second")]);
- expect(texts(items)).toMatchObject([{text:"First"},{text:"Second"}]);
- expect(texts(buildTranscript([canonical("text_delta_latest","Draft"),final("Final")]))).toMatchObject([{text:"Final"}]);
+  const canonical=(bubble_id:string,content:string)=>ev("assistant_message",{canonical:true,bubble_id,content});
+  const items=buildTranscript([canonical("one","First"),canonical("two","Second")]);
+  expect(texts(items)).toMatchObject([{text:"First"},{text:"Second"}]);
+  expect(texts(buildTranscript([canonical("text_delta_latest","Draft"),final("Final")]))).toMatchObject([{text:"Final"}]);
+});
+
+import canary from "./fixtures/native-canary-events.json";
+it("replays native Grok canary without duplicating final assistant_message + text_delta",()=>{
+  const stream=canary.map(row=>storedToStream(row as Parameters<typeof storedToStream>[0])).filter((x):x is StreamEvent=>!!x);
+  const replay=buildTranscript(stream);
+  let live=buildTranscript([]);for(const e of stream)live=applyStreamEvent(live,e);
+  const converse=[...stream].sort((a,b)=>(a.sequence??0)-(b.sequence??0));
+  const ordered=buildTranscript(converse);
+  const finalText="I'll run `hostname` once and report the result with `ORB_PROD_NATIVE_GROK_OK`.ORB_PROD_NATIVE_GROK_OK\n\n`spark-de79`";
+  for(const items of [replay,live,ordered]){
+    expect(items.filter(x=>x.kind==="user")).toHaveLength(1);
+    expect(items.filter(x=>x.kind==="tool")).toHaveLength(1);
+    expect(texts(items).filter(x=>x.text===finalText)).toHaveLength(1);
+    expect(texts(items).at(-1)).toMatchObject({text:finalText,live:false});
+  }
+  expect(texts(buildTranscript([final("Same","a"),ev("user_message",{content:"Again"}),final("Same","b")]))).toHaveLength(2);
 });
