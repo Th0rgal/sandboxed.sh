@@ -12,7 +12,7 @@
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,6 +31,10 @@ pub const SUPPORTED_LANGUAGES: [&str; 14] = [
 pub const MAX_SECONDS: f64 = 120.0;
 /// Absolute cap on the request body regardless of what the header claims.
 const HARD_CAP_BYTES: usize = 24 * 1024 * 1024;
+/// Longest response line accepted from the worker. A transcript of a
+/// two-minute utterance is a few kilobytes; anything near this is a broken
+/// or hostile worker, not a result.
+const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 const PROTOCOL_VERSION: u64 = 1;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(240);
@@ -295,7 +299,7 @@ impl Worker {
             std::fs::create_dir_all(dir)?;
         }
         let log = std::fs::File::create(&paths.log)?;
-        let mut child = Command::new(&paths.python)
+        let child = Command::new(&paths.python)
             .arg(paths.runtime.join("worker.py"))
             .env("ORB_VOICE_MODEL_DIR", &paths.model_dir)
             .env("ORB_VOICE_MAX_SECS", format!("{MAX_SECONDS}"))
@@ -313,21 +317,7 @@ impl Worker {
                     format!("cannot start {}: {e}", paths.python.display()),
                 )
             })?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| VoiceError::new("io", "no stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| VoiceError::new("io", "no stdout"))?;
-        let mut w = Worker {
-            child: Arc::new(Mutex::new(child)),
-            stdin,
-            stdout: BufReader::new(stdout),
-            next_id: 0,
-            loaded: false,
-        };
+        let mut w = Worker::attach(child)?;
         let hello = w.request(json!({"op": "hello"}), None, HELLO_TIMEOUT)?;
         if hello.get("protocol").and_then(Value::as_u64) != Some(PROTOCOL_VERSION) {
             w.kill();
@@ -339,8 +329,33 @@ impl Worker {
         Ok(w)
     }
 
-    /// Send one frame and wait for its reply. A watchdog kills the child at
-    /// the deadline, which unblocks the read with EOF.
+    /// Wrap an already-spawned child whose stdin/stdout are piped.
+    fn attach(mut child: Child) -> Result<Worker, VoiceError> {
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| VoiceError::new("io", "no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| VoiceError::new("io", "no stdout"))?;
+        Ok(Worker {
+            child: Arc::new(Mutex::new(child)),
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: 0,
+            loaded: false,
+        })
+    }
+
+    /// Send one frame and wait for its reply, all under one deadline.
+    ///
+    /// The watchdog is armed before the first byte is written: a worker that
+    /// stops draining its stdin would otherwise block `write_all` on a full
+    /// pipe forever, with no timer running. At the deadline it kills the
+    /// child, which fails the pending write (EPIPE) or read (EOF). The
+    /// response line is bounded too, so a runaway worker cannot make this
+    /// side allocate without limit.
     fn request(
         &mut self,
         mut req: Value,
@@ -356,16 +371,75 @@ impl Worker {
         let mut line =
             serde_json::to_string(&req).map_err(|e| VoiceError::new("internal", e.to_string()))?;
         line.push('\n');
-        self.stdin.write_all(line.as_bytes())?;
-        if let Some(p) = payload {
-            self.stdin.write_all(p)?;
-        }
-        self.stdin.flush()?;
 
+        let watchdog = Watchdog::arm(self.child.clone(), timeout);
+        let stdin = &mut self.stdin;
+        let stdout = &mut self.stdout;
+        let io = (move || -> std::io::Result<Option<String>> {
+            stdin.write_all(line.as_bytes())?;
+            if let Some(p) = payload {
+                stdin.write_all(p)?;
+            }
+            stdin.flush()?;
+            let mut buf = String::new();
+            let n = stdout.take(MAX_RESPONSE_BYTES).read_line(&mut buf)?;
+            Ok((n > 0).then_some(buf))
+        })();
+        let fired = watchdog.disarm();
+
+        match io {
+            Ok(Some(buf)) if buf.ends_with('\n') => parse_response(buf.trim_end(), id),
+            Ok(Some(_)) => {
+                // Hit MAX_RESPONSE_BYTES without a newline: not a frame.
+                self.kill();
+                Err(VoiceError::new(
+                    "protocol",
+                    "voice worker response exceeded the size limit",
+                ))
+            }
+            Ok(None) | Err(_) => {
+                if fired {
+                    Err(VoiceError::new(
+                        "timeout",
+                        format!("voice worker took longer than {}s", timeout.as_secs()),
+                    ))
+                } else {
+                    Err(VoiceError::new(
+                        "worker_exited",
+                        "voice worker exited unexpectedly (see logs/worker.log)",
+                    ))
+                }
+            }
+        }
+    }
+
+    fn kill(&mut self) {
+        if let Ok(mut c) = self.child.lock() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Deadline for one request. Kills the child when it expires unless
+/// disarmed first; dropping it (including on an early `?` return or a
+/// panic) always stops the timer thread.
+struct Watchdog {
+    done: Arc<AtomicBool>,
+    fired: Arc<AtomicBool>,
+}
+
+impl Watchdog {
+    fn arm(child: Arc<Mutex<Child>>, timeout: Duration) -> Watchdog {
         let done = Arc::new(AtomicBool::new(false));
         let fired = Arc::new(AtomicBool::new(false));
         {
-            let child = self.child.clone();
             let done = done.clone();
             let fired = fired.clone();
             thread::spawn(move || {
@@ -382,38 +456,19 @@ impl Worker {
                 }
             });
         }
-        let mut buf = String::new();
-        let read = self.stdout.read_line(&mut buf);
-        done.store(true, Ordering::Release);
-        match read {
-            Ok(0) | Err(_) => {
-                if fired.load(Ordering::Acquire) {
-                    Err(VoiceError::new(
-                        "timeout",
-                        format!("voice worker took longer than {}s", timeout.as_secs()),
-                    ))
-                } else {
-                    Err(VoiceError::new(
-                        "worker_exited",
-                        "voice worker exited unexpectedly (see logs/worker.log)",
-                    ))
-                }
-            }
-            Ok(_) => parse_response(buf.trim_end(), id),
-        }
+        Watchdog { done, fired }
     }
 
-    fn kill(&mut self) {
-        if let Ok(mut c) = self.child.lock() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+    /// Stop the timer and report whether the deadline had already passed.
+    fn disarm(self) -> bool {
+        self.done.store(true, Ordering::Release);
+        self.fired.load(Ordering::Acquire)
     }
 }
 
-impl Drop for Worker {
+impl Drop for Watchdog {
     fn drop(&mut self) {
-        self.kill();
+        self.done.store(true, Ordering::Release);
     }
 }
 
@@ -902,18 +957,106 @@ mod tests {
         assert!(!state.0.release());
     }
 
-    /// Drive the real worker.py through the Rust side with the stub backend.
-    #[test]
-    fn worker_round_trip_with_fake_backend() {
-        let python = ["python3", "python"].iter().find_map(|p| {
+    fn find_python() -> Option<PathBuf> {
+        ["python3", "python"].iter().find_map(|p| {
             Command::new(p)
                 .arg("--version")
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
                 .map(|_| PathBuf::from(p))
-        });
-        let Some(python) = python else {
+        })
+    }
+
+    /// A stand-in child running the given Python snippet with piped stdio.
+    fn fake_child(python: &PathBuf, code: &str) -> Worker {
+        let child = Command::new(python)
+            .arg("-c")
+            .arg(code)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fake child");
+        Worker::attach(child).expect("attach")
+    }
+
+    /// A worker that never reads its stdin must not hang the request: the
+    /// payload is far larger than any pipe buffer, so without the watchdog
+    /// armed before the writes `write_all` would block forever.
+    #[test]
+    fn request_times_out_when_worker_never_drains_stdin() {
+        let Some(python) = find_python() else {
+            eprintln!("skipping: no python on PATH");
+            return;
+        };
+        let mut w = fake_child(&python, "import time; time.sleep(60)");
+        let payload = vec![0u8; 8 * 1024 * 1024];
+        let t0 = Instant::now();
+        let e = w
+            .request(
+                json!({"op": "transcribe", "language": "en"}),
+                Some(&payload),
+                Duration::from_millis(500),
+            )
+            .unwrap_err();
+        assert_eq!(e.code, "timeout", "{e}");
+        assert!(t0.elapsed() < Duration::from_secs(20), "{:?}", t0.elapsed());
+        // The deadline killed the child; a later call sees it gone.
+        let e = w
+            .request(json!({"op": "status"}), None, Duration::from_secs(5))
+            .unwrap_err();
+        assert!(
+            ["worker_exited", "io", "timeout"].contains(&e.code.as_str()),
+            "{e}"
+        );
+    }
+
+    /// A worker that answers with an endless line is cut off at
+    /// MAX_RESPONSE_BYTES instead of growing the buffer without bound.
+    #[test]
+    fn request_rejects_oversized_response_line() {
+        let Some(python) = find_python() else {
+            eprintln!("skipping: no python on PATH");
+            return;
+        };
+        let mut w = fake_child(
+            &python,
+            "import sys; sys.stdin.readline(); sys.stdout.write('x' * (3 * 1024 * 1024)); sys.stdout.flush(); sys.stdin.read()",
+        );
+        let e = w
+            .request(json!({"op": "status"}), None, Duration::from_secs(20))
+            .unwrap_err();
+        assert_eq!(e.code, "protocol", "{e}");
+    }
+
+    /// A well-behaved child that replies before the deadline is unaffected
+    /// by the watchdog, and the watchdog is disarmed afterwards.
+    #[test]
+    fn request_disarms_watchdog_after_a_prompt_reply() {
+        let Some(python) = find_python() else {
+            eprintln!("skipping: no python on PATH");
+            return;
+        };
+        let mut w = fake_child(
+            &python,
+            "import sys, json\nfor line in sys.stdin:\n    req = json.loads(line)\n    sys.stdout.write(json.dumps({'id': req['id'], 'ok': True, 'result': {'echo': req['op']}}) + '\\n'); sys.stdout.flush()",
+        );
+        let r = w
+            .request(json!({"op": "ping"}), None, Duration::from_millis(300))
+            .unwrap();
+        assert_eq!(r["echo"], "ping");
+        thread::sleep(Duration::from_millis(500)); // past the old deadline: child must still be alive
+        let r = w
+            .request(json!({"op": "again"}), None, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(r["echo"], "again");
+    }
+
+    /// Drive the real worker.py through the Rust side with the stub backend.
+    #[test]
+    fn worker_round_trip_with_fake_backend() {
+        let Some(python) = find_python() else {
             eprintln!("skipping: no python on PATH");
             return;
         };

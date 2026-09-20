@@ -22,19 +22,36 @@ Protocol v1 (one JSON object per line, UTF-8):
 stdout carries protocol frames only; diagnostics go to stderr. Requests are
 handled strictly in order, so inference is serialized by construction.
 
+Framing is bounded: a header line longer than MAX_HEADER_BYTES or an
+audio_bytes claim over the hard cap is a protocol violation. The worker
+answers with an error and exits (the stream cannot be re-framed safely, and
+the Rust side restarts it), rather than trying to read the oversized body.
+
+stderr becomes a persistent log file (<voice home>/logs/worker.log). Never
+write transcripts or audio there: durations and timings only.
+
 Environment:
     ORB_VOICE_MODEL_DIR   local snapshot directory of the pinned model.
-    ORB_VOICE_MAX_SECS    longest utterance accepted (default 120).
+    ORB_VOICE_MAX_SECS    longest utterance accepted (default and ceiling 120).
     ORB_VOICE_WARMUP      "0" skips the post-load warm-up inference.
     ORB_VOICE_FAKE        "1" uses a stub backend (tests / Linux CI); no MLX.
 """
 
 from __future__ import annotations
 
+import os
+
+# The worker never reaches the network: the installer downloads the snapshot
+# and everything else is local. Force this before any Hugging Face / MLX
+# import so a stray default cannot turn a transcription into a download.
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
 import array
 import io
 import json
-import os
+import math
 import platform
 import signal
 import sys
@@ -56,13 +73,28 @@ SUPPORTED_LANGUAGES = (
 DEFAULT_MAX_SECS = 120.0
 MIN_SECS = 0.15
 TARGET_SAMPLE_RATE = 16000
+# Longest JSON header line the framing accepts (a real header is < 200 bytes).
+MAX_HEADER_BYTES = 64 * 1024
+
+# Silence gate, applied before the model sees anything. The checkpoint
+# hallucinates on digital silence (two seconds of zeros reliably yields
+# "Thank you."), so utterances with no signal are answered with "" locally.
+# Thresholds are deliberately far below anything a live microphone captures
+# (room noise through AGC peaks in the hundreds); quiet speech passes.
+SILENCE_PEAK = 64  # int16 units, about -54 dBFS
+SILENCE_RMS = 16.0  # int16 units, about -66 dBFS
 
 
 class WorkerError(Exception):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, req_id: Any = None):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.req_id = req_id  # set when the failing frame's id is known before dispatch
+
+
+class ProtocolError(WorkerError):
+    """The stream can no longer be trusted to be framed; answer, then exit."""
 
 
 def log(msg: str) -> None:
@@ -90,10 +122,22 @@ def model_present(model_dir: str) -> bool:
 
 
 def max_seconds() -> float:
+    """Utterance limit from the environment, clamped to (0, DEFAULT_MAX_SECS].
+
+    The value also sizes the framing hard cap, so it must be finite and
+    positive; anything else ("inf", "nan", "-5", "1e9", garbage) falls back
+    to the default rather than lifting the bound.
+    """
+    raw = os.environ.get("ORB_VOICE_MAX_SECS")
+    if raw is None:
+        return DEFAULT_MAX_SECS
     try:
-        return float(os.environ.get("ORB_VOICE_MAX_SECS", DEFAULT_MAX_SECS))
+        secs = float(raw)
     except ValueError:
         return DEFAULT_MAX_SECS
+    if not math.isfinite(secs) or secs <= 0:
+        return DEFAULT_MAX_SECS
+    return min(secs, DEFAULT_MAX_SECS)
 
 
 # --------------------------------------------------------------------------
@@ -136,6 +180,24 @@ def check_duration(samples: array.array, rate: int) -> float:
     if secs > max_seconds():
         raise WorkerError("audio_too_long", f"{secs:.1f}s exceeds the {max_seconds():.0f}s limit")
     return secs
+
+
+def signal_level(samples: array.array) -> Tuple[int, float]:
+    """(peak, rms) of int16 samples, in int16 units."""
+    if not samples:
+        return 0, 0.0
+    peak = max(abs(max(samples)), abs(min(samples)))
+    if hasattr(math, "sumprod"):  # 3.12+: C speed over the whole utterance
+        energy = math.sumprod(samples, samples)
+    else:
+        energy = sum(s * s for s in samples)
+    return peak, math.sqrt(energy / len(samples))
+
+
+def is_silent(samples: array.array) -> bool:
+    """True only when there is essentially no signal at all; see SILENCE_*."""
+    peak, rms = signal_level(samples)
+    return peak <= SILENCE_PEAK and rms <= SILENCE_RMS
 
 
 # --------------------------------------------------------------------------
@@ -210,9 +272,6 @@ class MlxBackend:
                 f"model snapshot not found at {self.model_dir}. Run orb/voice/install.sh --download-model.",
             )
         load = self._import()
-        # Never reach the network from the worker; the installer downloads.
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         t0 = time.perf_counter()
         self.model = load(self.model_dir)
         load_secs = time.perf_counter() - t0
@@ -326,15 +385,18 @@ class Worker:
         load_info = {}
         if not self.backend.loaded:
             load_info = self.backend.load()
-        if secs < MIN_SECS:
+        infer = 0.0
+        if secs < MIN_SECS or is_silent(samples):
+            # Too short or no signal: the model would only hallucinate.
             text = ""
-            infer = 0.0
         else:
             t0 = time.perf_counter()
             text = self.backend.transcribe(samples, rate, language, punctuation)
             infer = time.perf_counter() - t0
         self.transcriptions += 1
         self.last_infer_secs = round(infer, 3)
+        # Timings only; the transcript itself must never reach the log file.
+        log(f"transcribe {secs:.2f}s audio lang={language} infer={infer:.3f}s chars={len(text)}")
         return {
             "text": text,
             "language": language,
@@ -358,11 +420,23 @@ def read_exact(stream: BinaryIO, n: int) -> bytes:
     return bytes(buf)
 
 
+def payload_hard_cap() -> int:
+    """Largest audio_bytes claim honoured: 4 bytes/sample at 48 kHz, plus headers."""
+    return int(max_seconds() * 4 * 48000) + 1_000_000
+
+
 def read_request(stream: BinaryIO) -> Optional[Tuple[Dict[str, Any], bytes]]:
-    """Read one frame. Returns None at EOF. Raises WorkerError on malformed input."""
-    line = stream.readline()
+    """Read one frame. Returns None at EOF.
+
+    Raises WorkerError on a malformed but well-framed request (the loop keeps
+    serving) and ProtocolError when the framing itself is violated (an
+    overlong header or an oversized payload claim), after which serve() exits.
+    """
+    line = stream.readline(MAX_HEADER_BYTES + 1)
     if not line:
         return None
+    if len(line) > MAX_HEADER_BYTES or (len(line) == MAX_HEADER_BYTES and not line.endswith(b"\n")):
+        raise ProtocolError("bad_request", f"header line exceeds {MAX_HEADER_BYTES} bytes")
     line = line.strip()
     if not line:
         return {}, b""
@@ -375,11 +449,10 @@ def read_request(stream: BinaryIO) -> Optional[Tuple[Dict[str, Any], bytes]]:
     n = req.get("audio_bytes", 0)
     if not isinstance(n, int) or n < 0:
         raise WorkerError("bad_request", "audio_bytes must be a non-negative integer")
-    hard_cap = int(max_seconds() * 4 * 48000) + 1_000_000  # generous: 4 bytes/sample at 48 kHz
-    if n > hard_cap:
-        # Drain what we can so the stream stays framed, then reject.
-        stream.read(n)
-        raise WorkerError("audio_too_long", f"payload of {n} bytes exceeds the hard cap")
+    if n > payload_hard_cap():
+        # Do not read (or allocate) the claimed body: report and let serve()
+        # exit, the parent restarts the worker with a clean stream.
+        raise ProtocolError("audio_too_long", f"payload of {n} bytes exceeds the hard cap", req.get("id"))
     payload = read_exact(stream, n) if n else b""
     return req, payload
 
@@ -407,8 +480,14 @@ def serve(stdin: BinaryIO, stdout: BinaryIO, worker: Optional[Worker] = None) ->
             write_response(stdout, {"id": req_id, "ok": True, "result": result})
             if req.get("op") == "shutdown":
                 return 0
+        except ProtocolError as e:
+            rid = e.req_id if e.req_id is not None else req_id
+            write_response(stdout, {"id": rid, "ok": False, "error": {"code": e.code, "message": e.message}})
+            log(f"protocol violation, exiting: {e.message}")
+            return 2
         except WorkerError as e:
-            write_response(stdout, {"id": req_id, "ok": False, "error": {"code": e.code, "message": e.message}})
+            rid = e.req_id if e.req_id is not None else req_id
+            write_response(stdout, {"id": rid, "ok": False, "error": {"code": e.code, "message": e.message}})
         except MemoryError:
             write_response(stdout, {"id": req_id, "ok": False, "error": {"code": "internal", "message": "out of memory"}})
             return 3

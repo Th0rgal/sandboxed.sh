@@ -70,9 +70,35 @@ else
   echo "Using existing venv at $VENV ($("$VENV/bin/python" --version 2>&1))"
 fi
 
-echo "Installing pinned dependencies (this pulls mlx-audio from git; needs git + Xcode CLT)"
-"$VENV/bin/python" -m pip install --quiet --upgrade pip
-"$VENV/bin/python" -m pip install --quiet --no-cache-dir -r "$HERE/requirements.txt"
+# A venv is not guaranteed to carry pip: `uv venv` (and `python -m venv
+# --without-pip`) leave it out, and then `python -m pip` fails with
+# "No module named pip". Bootstrap it with ensurepip, or fall back to uv
+# driving this interpreter; only give up when neither works.
+INSTALLER=""
+if "$VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+  INSTALLER=pip
+elif "$VENV/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 && "$VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+  echo "Bootstrapped pip into the venv with ensurepip"
+  INSTALLER=pip
+elif command -v uv >/dev/null 2>&1; then
+  echo "The venv has no pip and ensurepip is unavailable; installing with uv"
+  INSTALLER=uv
+else
+  echo "The venv at $VENV has no pip and it cannot be bootstrapped (no ensurepip, no uv). Rerun with --recreate or install uv." >&2
+  exit 1
+fi
+
+install_requirements() {
+  if [ "$INSTALLER" = uv ]; then
+    uv pip install --quiet --python "$VENV/bin/python" -r "$HERE/requirements.txt"
+  else
+    "$VENV/bin/python" -m pip install --quiet --upgrade pip
+    "$VENV/bin/python" -m pip install --quiet --no-cache-dir -r "$HERE/requirements.txt"
+  fi
+}
+
+echo "Installing pinned dependencies with $INSTALLER (this pulls mlx-audio from git; needs git + Xcode CLT)"
+install_requirements
 "$VENV/bin/python" - <<'PY'
 import importlib.metadata as m
 import mlx.core as mx

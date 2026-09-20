@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createSignal } from "solid-js";
 import { fireEvent, render, screen, waitFor } from "@solidjs/testing-library";
-import { VoiceButton, describeVoiceError, ensureVoiceProbe, resetVoiceAvailability, voiceAvailable } from "../src/Voice";
+import { VoiceButton, describeVoiceError, ensureVoiceProbe, resetVoiceAvailability, voiceAvailable } from "../src/VoiceButton";
 import { VoiceError, encodeWav, reloadVoiceLanguage, resetVoiceProbe, setVoiceLanguage, type Recorder, type RecorderOptions, type VoiceBridge, type VoiceCapability } from "../src/voice";
 
 const cap = (over: Partial<VoiceCapability> = {}): VoiceCapability => ({
@@ -178,6 +178,101 @@ describe("VoiceButton flow", () => {
     await flush();
     expect(onText).not.toHaveBeenCalled();
     await waitFor(() => expect(button().getAttribute("title")).toBe("Dictate (EN)"));
+  });
+
+  it("navigating to another conversation while recording cancels it; nothing is transcribed", async () => {
+    const bridge = fakeBridge();
+    const rec = fakeRecorder();
+    const onText = vi.fn();
+    const onActive = vi.fn();
+    const [scope, setScope] = createSignal("m:1");
+    render(() => <VoiceButton bridge={bridge} recorder={rec.factory} onText={onText} onActive={onActive} scope={scope()} />);
+    fireEvent.click(button());
+    await waitFor(() => expect(button().getAttribute("aria-pressed")).toBe("true"));
+    setScope("m:2");
+    expect(rec.state.cancelled).toBe(1);
+    expect(button().getAttribute("title")).toBe("Dictate (EN)");
+    expect(onActive).toHaveBeenLastCalledWith(false);
+    await flush();
+    expect(bridge.transcribe).not.toHaveBeenCalled();
+    expect(onText).not.toHaveBeenCalled();
+    // The button still works for the new conversation.
+    fireEvent.click(button());
+    await waitFor(() => expect(button().getAttribute("aria-pressed")).toBe("true"));
+    fireEvent.click(button());
+    await waitFor(() => expect(onText).toHaveBeenCalledWith("hello world"));
+  });
+
+  it("drops a recorder whose permission prompt resolves after the conversation changed", async () => {
+    let grant!: (r: Recorder) => void;
+    const cancelled = vi.fn();
+    const factory = vi.fn((): Promise<Recorder> => new Promise((r) => (grant = r)));
+    const bridge = fakeBridge();
+    const [scope, setScope] = createSignal("m:1");
+    render(() => <VoiceButton bridge={bridge} recorder={factory} onText={() => {}} scope={scope()} />);
+    fireEvent.click(button());
+    await waitFor(() => expect(button().getAttribute("title")).toBe("Starting microphone…"));
+    setScope("m:2");
+    expect(button().getAttribute("title")).toBe("Dictate (EN)");
+    grant({ startedAt: Date.now(), stop: async () => new Uint8Array(0), cancel: cancelled });
+    await flush();
+    expect(cancelled).toHaveBeenCalledTimes(1);
+    expect(button().getAttribute("title")).toBe("Dictate (EN)");
+  });
+
+  it("a slow permission prompt from a cancelled start cannot replace or stop the restarted recording", async () => {
+    const wav = encodeWav(new Float32Array(1600).fill(0.2), 16000);
+    const pending: Array<{ resolve: (r: Recorder) => void; reject: (e: unknown) => void }> = [];
+    const stale = { startedAt: Date.now(), stop: vi.fn(async () => wav), cancel: vi.fn() };
+    const fresh = { startedAt: Date.now(), stop: vi.fn(async () => wav), cancel: vi.fn() };
+    const factory = vi.fn(
+      (): Promise<Recorder> =>
+        factory.mock.calls.length === 1
+          ? new Promise((resolve, reject) => pending.push({ resolve, reject })) // first prompt: hangs
+          : Promise.resolve(fresh),
+    );
+    const bridge = fakeBridge();
+    const onText = vi.fn();
+    render(() => <VoiceButton bridge={bridge} recorder={factory} onText={onText} scope="a" />);
+    fireEvent.click(button()); // start #1: waits on the prompt
+    await waitFor(() => expect(button().getAttribute("title")).toBe("Starting microphone…"));
+    fireEvent.click(button()); // cancel while starting
+    expect(button().getAttribute("title")).toBe("Dictate (EN)");
+    fireEvent.click(button()); // start #2: granted immediately
+    await waitFor(() => expect(button().getAttribute("aria-pressed")).toBe("true"));
+    expect(factory).toHaveBeenCalledTimes(2);
+    // The old prompt finally resolves: its recorder is released, ours is untouched.
+    pending[0].resolve(stale);
+    await flush();
+    expect(stale.cancel).toHaveBeenCalledTimes(1);
+    expect(fresh.cancel).not.toHaveBeenCalled();
+    expect(button().getAttribute("aria-pressed")).toBe("true");
+    expect(screen.queryByRole("alert")).toBeNull();
+    fireEvent.click(button()); // stop: transcribes the fresh recording only
+    await waitFor(() => expect(onText).toHaveBeenCalledWith("hello world"));
+    expect(fresh.stop).toHaveBeenCalledTimes(1);
+    expect(stale.stop).not.toHaveBeenCalled();
+    expect(bridge.transcribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("a denied permission from a cancelled start does not surface on the restarted recording", async () => {
+    let reject!: (e: unknown) => void;
+    const rec = fakeRecorder();
+    const factory = vi.fn((opts: RecorderOptions): Promise<Recorder> =>
+      factory.mock.calls.length === 1 ? new Promise((_, rej) => (reject = rej)) : rec.factory(opts),
+    );
+    const bridge = fakeBridge();
+    render(() => <VoiceButton bridge={bridge} recorder={factory} onText={() => {}} />);
+    fireEvent.click(button());
+    await waitFor(() => expect(button().getAttribute("title")).toBe("Starting microphone…"));
+    fireEvent.keyDown(window, { key: "Escape" });
+    fireEvent.click(button());
+    await waitFor(() => expect(button().getAttribute("aria-pressed")).toBe("true"));
+    reject(new VoiceError("permission", "Microphone access was denied."));
+    await flush();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(button().getAttribute("aria-pressed")).toBe("true");
+    expect(rec.state.cancelled).toBe(0);
   });
 
   it("unmounting mid-recording releases the microphone and mid-transcription cancels", async () => {
