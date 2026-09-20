@@ -201,6 +201,8 @@ for (const status of [404, 500]) test(`cron ${status}: compact status preserves 
  const row=page.getByRole("status");await expect(row).toContainText(status===404?"Crons need backend update":"Crons temporarily unavailable");
  await expect(row).not.toContainText(String(status));expect((await row.boundingBox())!.height).toBeLessThanOrEqual(32);
  await expect(page.locator(".row.cron")).toHaveCount(2);
+ await page.bringToFront();
+ expect(await page.evaluate(() => document.visibilityState)).toBe("visible");
  const failedCount=requests;await page.clock.fastForward(31000);
  if(status===404){
   expect(requests).toBe(failedCount);await expect(page.getByRole("button",{name:"Retry crons"})).toHaveCount(0);
@@ -211,4 +213,64 @@ for (const status of [404, 500]) test(`cron ${status}: compact status preserves 
   await page.screenshot({path:"test-results/orb-cron-unsupported.png"});
   fail=false;await page.getByRole("button",{name:"Reconnect backend"}).click();await expect(row).toHaveCount(0);expect(requests).toBeGreaterThan(failedCount);
  } else {await expect.poll(()=>requests).toBeGreaterThan(failedCount);fail=false;await page.getByRole("button",{name:"Retry crons"}).click();await expect(row).toHaveCount(0);}
+});
+
+for (const disconnect of ["401", "logout"]) test(`cron ${disconnect} stops fetching until reconnect`, async ({ page }) => {
+  let unauthorized = false, requests = 0;
+  await page.clock.install();
+  await page.route("**/api/**", route => {
+    requests++;
+    const path = new URL(route.request().url()).pathname;
+    if (unauthorized) return route.fulfill({ status: 401 });
+    return route.fulfill({ json: path === "/api/projects" ? { projects: [{ slug: "notes", title: "Project notes" }] } : path.endsWith("/crons") ? { jobs: [fixtures.hourly] } : path.endsWith("/missions") ? [] : path.endsWith("/files") ? { entries: [] } : { slug: "notes", job: fixtures.weekdays, runs: [] } });
+  });
+  await page.goto("/tests/browser.html");
+  await page.getByRole("button", { name: "Project notes", exact: true }).click();
+  await expect(page.locator(".row.cron")).toHaveCount(2);
+  if (disconnect === "logout") await page.getByRole("button", { name: "Disconnect backend" }).click();
+  else {
+    unauthorized = true;
+    await page.clock.fastForward(11000);
+    await expect.poll(() => page.evaluate(() => localStorage.getItem("orb.jwt"))).toBeNull();
+  }
+  // Let all requests from the same polling tick settle before checking silence.
+  await page.waitForLoadState("networkidle");
+  const stopped = requests;
+  await page.bringToFront();
+  expect(await page.evaluate(() => document.visibilityState)).toBe("visible");
+  await page.clock.fastForward(61000);
+  await page.waitForLoadState("networkidle");
+  expect(requests).toBe(stopped);
+  unauthorized = false;
+  await page.getByRole("button", { name: "Reconnect backend" }).click();
+  await expect.poll(() => requests).toBeGreaterThan(stopped);
+  await expect(page.locator(".row.cron")).toHaveCount(2);
+});
+
+for (const staleStatus of [200, 401, 404, 500]) test(`old connection cron ${staleStatus} response cannot change reconnected cache`, async ({ page }) => {
+  let cronRequests = 0;
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  await page.route("**/api/**", async route => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/crons")) {
+      cronRequests++;
+      if (cronRequests === 1) {
+        await held;
+        return route.fulfill({ status: staleStatus, json: staleStatus === 200 ? { jobs: [] } : { error: "Old backend response" } });
+      }
+      return route.fulfill({ json: { jobs: [fixtures.hourly] } });
+    }
+    return route.fulfill({ json: path === "/api/projects" ? { projects: [{ slug: "notes", title: "Project notes" }] } : path.endsWith("/missions") ? [] : path.endsWith("/files") ? { entries: [] } : { slug: "notes", job: fixtures.weekdays, runs: [] } });
+  });
+  await page.goto("/tests/browser.html");
+  await page.getByRole("button", { name: "Project notes", exact: true }).click();
+  await expect.poll(() => cronRequests).toBe(1);
+  await page.getByRole("button", { name: "Reconnect backend" }).click();
+  await expect(page.locator(".row.cron")).toHaveCount(2);
+  release();
+  await page.waitForLoadState("networkidle");
+  await expect(page.locator(".row.cron")).toHaveCount(2);
+  await expect(page.getByRole("status")).toHaveCount(0);
+  expect(await page.evaluate(() => localStorage.getItem("orb.jwt"))).toBe("local-browser-test");
 });
