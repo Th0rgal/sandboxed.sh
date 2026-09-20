@@ -145,6 +145,8 @@ function PopUp<T extends string>(p: { value: T; options: { id: T; label: string 
       <button
         ref={trigger}
         class={`sp-pop-btn ${open() ? "on" : ""}`}
+        aria-haspopup="menu"
+        aria-expanded={open()}
         onClick={() => {
           const next = !open();
           setOpen(next);
