@@ -167,6 +167,7 @@ impl Harness {
             .nest("/workspaces", crate::api::workspaces::routes())
             .route("/message", axum::routing::post(post_message))
             .route("/missions", axum::routing::post(create_mission))
+            .route("/missions/:id", axum::routing::get(get_mission))
             .route("/missions/:id/resume", axum::routing::post(resume_mission))
             .route(
                 "/missions/:id/title",
@@ -4877,4 +4878,980 @@ async fn http_idle_message_continuation_captures_predecessor_before_delivery() {
             assert!(body.get("previous_execution").is_none());
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Raw remote mission launch lifecycle (incident ab1792b4, 2026-09-20): a
+// mission dispatched to dgx-spark from the Orb was marked `orphan_no_runner`
+// by the stuck-mission watchdog seven seconds after the node accepted the
+// job, the poll loop then cancelled the job as if an operator had asked, and
+// the mission carried no prompt, no run and no record of the outcome.
+// ---------------------------------------------------------------------------
+
+/// Minimal node job API: accepts any submission, reports a controllable
+/// state, and confirms cancellation by moving to `cancelled`.
+struct FixtureNode {
+    node: crate::remote_node::RemoteNodeConfig,
+    state: Arc<std::sync::Mutex<String>>,
+    cancels: Arc<std::sync::atomic::AtomicUsize>,
+    submissions: Arc<std::sync::Mutex<Vec<Value>>>,
+    _server: tokio::task::JoinHandle<()>,
+}
+
+impl FixtureNode {
+    fn set_state(&self, state: &str) {
+        *self.state.lock().unwrap() = state.to_string();
+    }
+    fn cancels(&self) -> usize {
+        self.cancels.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+async fn spawn_fixture_node(id: &str, token_env: &str, initial_state: &str) -> FixtureNode {
+    use std::sync::atomic::Ordering;
+    let state = Arc::new(std::sync::Mutex::new(initial_state.to_string()));
+    let cancels = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let submissions: Arc<std::sync::Mutex<Vec<Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let app = axum::Router::new()
+        .route(
+            "/jobs",
+            axum::routing::post({
+                let state = state.clone();
+                let submissions = submissions.clone();
+                move |Json(body): Json<Value>| {
+                    let state = state.clone();
+                    let submissions = submissions.clone();
+                    async move {
+                        let job_id = body["job_id"].clone();
+                        submissions.lock().unwrap().push(body);
+                        (
+                            StatusCode::ACCEPTED,
+                            Json(json!({"job_id": job_id, "state": state.lock().unwrap().clone()})),
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/jobs/:id",
+            axum::routing::get({
+                let state = state.clone();
+                let submissions = submissions.clone();
+                move |axum::extract::Path(job_id): axum::extract::Path<Uuid>| {
+                    let state = state.clone();
+                    let submissions = submissions.clone();
+                    async move {
+                        let state = state.lock().unwrap().clone();
+                        let mission_id = submissions
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .find(|body| body["job_id"].as_str() == Some(&job_id.to_string()))
+                            .and_then(|body| body["mission_id"].as_str().map(str::to_string))
+                            .unwrap_or_else(|| Uuid::nil().to_string());
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "job_id": job_id,
+                                "mission_id": mission_id,
+                                "state": state,
+                                "exit_code": if state == "succeeded" { Some(0) } else if state == "failed" { Some(1) } else { None },
+                                "created_at": chrono::Utc::now().to_rfc3339(),
+                                "log_tail": format!("fixture log for {state}"),
+                            })),
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/jobs/:id/cancel",
+            axum::routing::post({
+                let state = state.clone();
+                let cancels = cancels.clone();
+                move |axum::extract::Path(job_id): axum::extract::Path<Uuid>| {
+                    let state = state.clone();
+                    let cancels = cancels.clone();
+                    async move {
+                        cancels.fetch_add(1, Ordering::SeqCst);
+                        let mut state = state.lock().unwrap();
+                        if !crate::remote_node::job_state_confirms_termination(&state) {
+                            *state = "cancelled".to_string();
+                        }
+                        (
+                            StatusCode::OK,
+                            Json(json!({"job_id": job_id, "state": state.clone(), "cancel_requested": true})),
+                        )
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node = crate::remote_node::RemoteNodeConfig {
+        id: id.to_string(),
+        base_url: format!("http://{}", listener.local_addr().unwrap()),
+        token_env: token_env.to_string(),
+        labels: None,
+    };
+    std::env::set_var(token_env, "fixture-token");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    FixtureNode {
+        node,
+        state,
+        cancels,
+        submissions,
+        _server: server,
+    }
+}
+
+async fn wait_until<F, Fut>(what: &str, secs: u64, mut probe: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    tokio::time::timeout(std::time::Duration::from_secs(secs), async {
+        while !probe().await {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+fn accepted_mission_handle(
+    mission_id: Uuid,
+    node_id: &str,
+    job_id: Uuid,
+    proof_at: chrono::DateTime<chrono::Utc>,
+) -> crate::remote_node::job_ledger::JobHandle {
+    crate::remote_node::job_ledger::JobHandle {
+        mission_id,
+        node_id: node_id.to_string(),
+        job_id,
+        started_at: proof_at,
+        submission_sequence: 0,
+        accepted_at: Some(proof_at),
+        heartbeat_at: Some(proof_at),
+        disk_reservation_bytes: 0,
+        kind: crate::remote_node::job_ledger::JobHandleKind::Mission,
+        identity: None,
+        wait_for_completion: None,
+        wake_on_terminal: false,
+    }
+}
+
+async fn active_mission(h: &Harness, title: &str) -> Mission {
+    let mission = h
+        .control
+        .mission_store
+        .create_mission(
+            Some(title),
+            None,
+            None,
+            None,
+            None,
+            Some("test-no-execution"),
+            None,
+        )
+        .await
+        .unwrap();
+    h.control
+        .mission_store
+        .update_mission_status(mission.id, MissionStatus::Active)
+        .await
+        .unwrap();
+    mission
+}
+
+async fn watchdog_pass(h: &Harness) {
+    let store = h.control.mission_store.clone();
+    let active = store.get_all_active_missions().await.unwrap();
+    let mut resumed = HashSet::new();
+    crate::api::supervision::repair_orphaned_active_missions(
+        &store,
+        &h.state.config.working_dir,
+        &h.control.cmd_tx,
+        &h.control.events_tx,
+        &active,
+        &HashSet::new(),
+        &mut resumed,
+        chrono::Utc::now(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn remote_launch_persists_prompt_and_lease_then_survives_watchdog_until_terminal() {
+    let fixture =
+        spawn_fixture_node("launch-fixture", "REMOTE_LAUNCH_FIXTURE_TOKEN", "queued").await;
+    let h = Harness::with_nodes(vec![fixture.node.clone()]).await;
+    h.state.backend_registry.write().await.register(Arc::new(
+        crate::backend::opencode::OpenCodeBackend::new("http://127.0.0.1:9".into(), None, false),
+    ));
+    let store = h.control.mission_store.clone();
+    let prompt = "/goal find the most optimized kernel for this workload";
+
+    // The native UI shape: prompt + remote_node_id + raw remote_command.
+    let response = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&json!({
+            "title": "orb remote launch",
+            "prompt": prompt,
+            "remote_node_id": "launch-fixture",
+            "remote_command": "claude -p 'hello from the node'",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        response.text().await.unwrap()
+    );
+    let created: Value = response.json().await.unwrap();
+    assert_eq!(created["status"], "active");
+    let mission_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    assert_eq!(fixture.submissions.lock().unwrap().len(), 1);
+
+    // Durable prompt before the response: events, initial message, history.
+    let prompts = store
+        .get_events(mission_id, Some(&["user_message"]), None, None)
+        .await
+        .unwrap();
+    assert_eq!(prompts.len(), 1, "exactly one persisted prompt");
+    assert_eq!(prompts[0].content, prompt);
+    assert_eq!(
+        store
+            .get_initial_user_message(mission_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(prompt)
+    );
+    let mission = store.get_mission(mission_id).await.unwrap().unwrap();
+    assert_eq!(
+        mission.history.first().map(|entry| entry.role.as_str()),
+        Some("user")
+    );
+    assert_eq!(
+        mission.history.first().map(|entry| entry.content.as_str()),
+        Some(prompt)
+    );
+
+    // Durable execution truth: a run lease owned by the job, waiting on it.
+    let run = store
+        .get_active_mission_run(mission_id)
+        .await
+        .unwrap()
+        .expect("remote job run lease");
+    assert_eq!(run.execution_state, MissionExecutionState::WaitingRemoteJob);
+    assert!(
+        is_remote_mission_job_owner(&run.owner_actor_id),
+        "{}",
+        run.owner_actor_id
+    );
+    assert_eq!(
+        run.scope_unit.as_deref(),
+        Some("remote-node:launch-fixture")
+    );
+    let handles = crate::remote_node::job_ledger::load(&h.state.config.working_dir)
+        .await
+        .unwrap();
+    let handle = handles
+        .iter()
+        .find(|handle| handle.mission_id == mission_id)
+        .expect("accepted ledger handle");
+    assert_eq!(
+        handle.kind,
+        crate::remote_node::job_ledger::JobHandleKind::Mission
+    );
+    assert!(handle.accepted_at.is_some());
+    assert_eq!(run.owner_actor_id, remote_job_lease_owner(handle.job_id));
+
+    // The read model shows placement and honest execution state.
+    let read: Value = h
+        .state
+        .http_client
+        .get(format!("{}/missions/{mission_id}", h.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(read["execution"]["state"], "waiting_remote_job");
+    assert_eq!(read["remote_job"]["node_id"], "launch-fixture");
+    assert_eq!(read["remote_job"]["job_id"], json!(handle.job_id));
+    assert_eq!(read["remote_job"]["phase"], "observed");
+
+    // The watchdog sees an Active mission with no runner — and leaves it.
+    watchdog_pass(&h).await;
+    let mission = store.get_mission(mission_id).await.unwrap().unwrap();
+    assert_eq!(
+        mission.status,
+        MissionStatus::Active,
+        "{:?}",
+        mission.terminal_reason
+    );
+    assert_eq!(
+        fixture.cancels(),
+        0,
+        "a live queued job must never be cancelled"
+    );
+
+    // The poll loop keeps both proofs fresh while the job is queued.
+    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+    let queued_events = store
+        .get_events(mission_id, Some(&["assistant_message"]), None, None)
+        .await
+        .unwrap();
+    assert!(
+        queued_events.is_empty(),
+        "no spurious progress notes: {queued_events:?}"
+    );
+    watchdog_pass(&h).await;
+    assert_eq!(
+        store.get_mission(mission_id).await.unwrap().unwrap().status,
+        MissionStatus::Active
+    );
+
+    // Normal terminal update: mission, lease, ledger and history all settle.
+    fixture.set_state("succeeded");
+    wait_until("mission completion", 20, || async {
+        store.get_mission(mission_id).await.unwrap().unwrap().status == MissionStatus::Completed
+    })
+    .await;
+    let done = store.get_mission(mission_id).await.unwrap().unwrap();
+    assert_eq!(done.terminal_reason.as_deref(), Some("remote_node_job"));
+    let latest = store
+        .get_latest_mission_run(mission_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.run_id, run.run_id);
+    assert!(latest.execution_state.is_terminal());
+    assert_eq!(latest.terminal_reason.as_deref(), Some("remote_node_job"));
+    wait_until("ledger handle retirement", 10, || async {
+        crate::remote_node::job_ledger::load(&h.state.config.working_dir)
+            .await
+            .unwrap()
+            .iter()
+            .all(|handle| handle.mission_id != mission_id)
+    })
+    .await;
+    let notes = store
+        .get_events(mission_id, Some(&["assistant_message"]), None, None)
+        .await
+        .unwrap();
+    assert!(
+        notes
+            .iter()
+            .any(|event| event.content.contains("finished with state 'succeeded'")),
+        "{notes:?}"
+    );
+    let read: Value = h
+        .state
+        .http_client
+        .get(format!("{}/missions/{mission_id}", h.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(read["remote_job"]["node_id"], "launch-fixture");
+    assert_eq!(read["remote_job"]["phase"], "finished");
+    assert_eq!(read["remote_job"]["node_state"], "succeeded");
+    assert_eq!(fixture.cancels(), 0);
+}
+
+#[tokio::test]
+async fn remote_launch_dispatch_failure_keeps_the_prompt_and_fails_closed() {
+    let fixture =
+        spawn_fixture_node("reject-fixture", "REMOTE_REJECT_FIXTURE_TOKEN", "queued").await;
+    let h = Harness::with_nodes(vec![fixture.node.clone()]).await;
+    h.state.backend_registry.write().await.register(Arc::new(
+        crate::backend::opencode::OpenCodeBackend::new("http://127.0.0.1:9".into(), None, false),
+    ));
+    // Unset token: dispatch cannot mint a lease. The prompt must still be
+    // durable and the mission must fail closed instead of lingering.
+    std::env::remove_var("REMOTE_REJECT_FIXTURE_TOKEN");
+    let response = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&json!({
+            "prompt": "run the suite",
+            "remote_node_id": "reject-fixture",
+            "remote_command": "make test",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let store = h.control.mission_store.clone();
+    let failed = store
+        .list_missions_filtered(&crate::api::mission_store::MissionFilter::default(), 10, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|mission| mission.status == MissionStatus::Failed)
+        .expect("failed mission");
+    assert_eq!(
+        failed.terminal_reason.as_deref(),
+        Some("remote_dispatch_failed")
+    );
+    assert_eq!(
+        store
+            .get_initial_user_message(failed.id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("run the suite")
+    );
+    assert!(store
+        .get_active_mission_run(failed.id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn watchdog_distinguishes_live_remote_jobs_from_orphans_and_unobserved_handles() {
+    use crate::remote_node::job_ledger;
+    let h = Harness::new().await;
+    let store = h.control.mission_store.clone();
+    let working_dir = h.state.config.working_dir.clone();
+    let now = chrono::Utc::now();
+    let stale =
+        now - chrono::Duration::seconds(crate::api::supervision::REMOTE_JOB_UNOBSERVED_SECS + 60);
+
+    // Live: accepted handle observed just now, no lease yet.
+    let live = active_mission(&h, "live remote job").await;
+    let live_job = Uuid::new_v4();
+    job_ledger::record(
+        &working_dir,
+        accepted_mission_handle(live.id, "node-a", live_job, now),
+    )
+    .await
+    .unwrap();
+
+    // Live through the lease: stale ledger heartbeat, fresh lease heartbeat.
+    let lease_live = active_mission(&h, "lease-fresh remote job").await;
+    let lease_job = Uuid::new_v4();
+    job_ledger::record(
+        &working_dir,
+        accepted_mission_handle(lease_live.id, "node-a", lease_job, stale),
+    )
+    .await
+    .unwrap();
+    ensure_remote_job_lease(store.as_ref(), lease_live.id, lease_job, "node-a")
+        .await
+        .unwrap()
+        .expect("lease");
+
+    // Unobserved: accepted handle nobody refreshed, plus a lease whose
+    // heartbeat is equally stale (aged directly in the store).
+    let unobserved = active_mission(&h, "unobserved remote job").await;
+    let unobserved_job = Uuid::new_v4();
+    job_ledger::record(
+        &working_dir,
+        accepted_mission_handle(unobserved.id, "node-b", unobserved_job, stale),
+    )
+    .await
+    .unwrap();
+    let unobserved_run =
+        ensure_remote_job_lease(store.as_ref(), unobserved.id, unobserved_job, "node-b")
+            .await
+            .unwrap()
+            .expect("lease");
+    {
+        let db =
+            rusqlite::Connection::open(h._dir.path().join("missions/missions-admission-test.db"))
+                .unwrap();
+        db.execute(
+            "UPDATE mission_runs SET heartbeat_at = ?1 WHERE run_id = ?2",
+            rusqlite::params![stale.to_rfc3339(), unobserved_run.run_id.to_string()],
+        )
+        .unwrap();
+    }
+
+    // Genuine orphan: no runner, no handle, no lease.
+    let orphan = active_mission(&h, "genuine orphan").await;
+
+    // A remote-job lease with no ledger handle is not liveness on its own.
+    let lease_only = active_mission(&h, "lease without handle").await;
+    ensure_remote_job_lease(store.as_ref(), lease_only.id, Uuid::new_v4(), "node-c")
+        .await
+        .unwrap()
+        .expect("lease");
+
+    // A remote *build* lease keeps its existing protection.
+    let build = active_mission(&h, "remote build wait").await;
+    let build_run = store
+        .begin_mission_run(build.id, "remote-build:fixture", None)
+        .await
+        .unwrap();
+    store
+        .heartbeat_mission_run(
+            build_run.run_id,
+            build_run.generation,
+            MissionExecutionState::WaitingRemoteJob,
+            None,
+        )
+        .await
+        .unwrap();
+
+    watchdog_pass(&h).await;
+
+    let status = |id: Uuid| {
+        let store = store.clone();
+        async move {
+            let mission = store.get_mission(id).await.unwrap().unwrap();
+            (mission.status, mission.terminal_reason)
+        }
+    };
+    assert_eq!(status(live.id).await, (MissionStatus::Active, None));
+    assert_eq!(status(lease_live.id).await, (MissionStatus::Active, None));
+    assert_eq!(status(build.id).await, (MissionStatus::Active, None));
+    assert_eq!(
+        status(unobserved.id).await,
+        (
+            MissionStatus::Interrupted,
+            Some("remote_job_unobserved".to_string())
+        )
+    );
+    assert_eq!(
+        status(orphan.id).await,
+        (
+            MissionStatus::Interrupted,
+            Some("orphan_no_runner".to_string())
+        )
+    );
+    assert_eq!(
+        status(lease_only.id).await,
+        (
+            MissionStatus::Interrupted,
+            Some("orphan_no_runner".to_string())
+        )
+    );
+    // The unobserved handle is retained as a cancellation fence; its lease
+    // is settled with the same reason.
+    let handles = job_ledger::load(&working_dir).await.unwrap();
+    assert!(handles.iter().any(|handle| handle.job_id == unobserved_job));
+    let settled = store
+        .get_latest_mission_run(unobserved.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(settled.execution_state.is_terminal());
+    assert_eq!(
+        settled.terminal_reason.as_deref(),
+        Some("remote_job_unobserved")
+    );
+    assert!(store
+        .get_active_mission_run(unobserved.id)
+        .await
+        .unwrap()
+        .is_none());
+    // Live leases are untouched.
+    assert!(store
+        .get_active_mission_run(lease_live.id)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn poll_loop_surfaces_terminal_outcome_after_operator_interruption() {
+    use crate::remote_node::job_ledger;
+    let fixture = spawn_fixture_node(
+        "interrupt-fixture",
+        "REMOTE_INTERRUPT_FIXTURE_TOKEN",
+        "running",
+    )
+    .await;
+    let h = Harness::new().await;
+    let store = h.control.mission_store.clone();
+    let working_dir = h.state.config.working_dir.clone();
+    let mission = active_mission(&h, "interrupted remote job").await;
+    let job_id = Uuid::new_v4();
+    job_ledger::record(
+        &working_dir,
+        accepted_mission_handle(mission.id, &fixture.node.id, job_id, chrono::Utc::now()),
+    )
+    .await
+    .unwrap();
+    ensure_remote_job_lease(store.as_ref(), mission.id, job_id, &fixture.node.id)
+        .await
+        .unwrap()
+        .expect("lease");
+    // Operator interruption (the same transition the watchdog writes).
+    store
+        .update_mission_status_with_reason(
+            mission.id,
+            MissionStatus::Interrupted,
+            Some("operator_stop"),
+        )
+        .await
+        .unwrap();
+    let poller = tokio::spawn({
+        let ledger_dir = working_dir.clone();
+        let owner = RemoteMissionOwner::live(&h.control);
+        let fleet = h.state.fleet.clone();
+        let node = fixture.node.clone();
+        async move {
+            poll_remote_job(
+                &ledger_dir,
+                owner,
+                fleet,
+                crate::remote_node::RemoteNodeClient::default(),
+                node,
+                "fixture-token".into(),
+                mission.id,
+                job_id,
+                chrono::Utc::now(),
+            )
+            .await;
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(20), poller)
+        .await
+        .expect("poll loop retires after confirmed cancellation")
+        .unwrap();
+    assert!(fixture.cancels() >= 1);
+    let after = store.get_mission(mission.id).await.unwrap().unwrap();
+    assert_eq!(after.status, MissionStatus::Interrupted);
+    assert_eq!(after.terminal_reason.as_deref(), Some("operator_stop"));
+    let notes = store
+        .get_events(mission.id, Some(&["assistant_message"]), None, None)
+        .await
+        .unwrap();
+    let surfaced: Vec<_> = notes
+        .iter()
+        .filter(|event| event.content.contains("after the mission left Active"))
+        .collect();
+    assert_eq!(surfaced.len(), 1, "{notes:?}");
+    assert!(surfaced[0].content.contains("'cancelled'"));
+    let settled = store
+        .get_latest_mission_run(mission.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(settled.execution_state.is_terminal());
+    assert_eq!(
+        settled.terminal_reason.as_deref(),
+        Some("remote_job_cancelled")
+    );
+    assert!(job_ledger::load(&working_dir)
+        .await
+        .unwrap()
+        .iter()
+        .all(|handle| handle.job_id != job_id));
+}
+
+#[tokio::test]
+async fn restart_keeps_accepted_remote_job_active_and_reattaches_its_observer() {
+    use crate::remote_node::job_ledger;
+    let fixture =
+        spawn_fixture_node("restart-fixture", "REMOTE_RESTART_FIXTURE_TOKEN", "running").await;
+    let stale = chrono::Utc::now()
+        - chrono::Duration::seconds(crate::api::supervision::REMOTE_JOB_UNOBSERVED_SECS * 4);
+
+    // Process one: an accepted job whose observer died with the process,
+    // with heartbeats stale by the downtime.
+    let mut first = Harness::with_nodes(vec![fixture.node.clone()]).await;
+    let mission = active_mission(&first, "survives restart").await;
+    let job_id = Uuid::new_v4();
+    job_ledger::record(
+        &first.state.config.working_dir,
+        accepted_mission_handle(mission.id, &fixture.node.id, job_id, stale),
+    )
+    .await
+    .unwrap();
+    let path = first._dir.path().to_path_buf();
+    let cleanup = first._dir._cleanup.take();
+    drop(first);
+
+    // Process two: startup recovery must not mark the mission server_shutdown.
+    let admission = DISPATCH_ADMISSION.lock().await;
+    let restarted = Harness::with_directory(
+        FixtureDir {
+            path,
+            _cleanup: cleanup,
+        },
+        vec![fixture.node.clone()],
+    )
+    .await;
+    let scanned = wait_for(mission.id, "startup_scanned");
+    drop(admission);
+    tokio::time::timeout(std::time::Duration::from_secs(60), scanned)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = restarted.control.mission_store.clone();
+    let after_boot = store.get_mission(mission.id).await.unwrap().unwrap();
+    assert_eq!(
+        after_boot.status,
+        MissionStatus::Active,
+        "{:?}",
+        after_boot.terminal_reason
+    );
+    assert_eq!(fixture.cancels(), 0);
+
+    // The remote job reconciler re-attaches the poll loop, which rebuilds
+    // the lease and refreshes the ledger heartbeat.
+    let working_dir = restarted.state.config.working_dir.clone();
+    let handles = job_ledger::load(&working_dir).await.unwrap();
+    let mut settled = HashSet::new();
+    reconcile_pending_handles(&restarted.state, &working_dir, handles, &mut settled).await;
+    assert!(settled.contains(&job_id));
+    wait_until("re-attached observer lease", 20, || async {
+        store
+            .get_active_mission_run(mission.id)
+            .await
+            .unwrap()
+            .is_some_and(|run| run.owner_actor_id == remote_job_lease_owner(job_id))
+    })
+    .await;
+    let refreshed = job_ledger::load(&working_dir)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|handle| handle.job_id == job_id)
+        .unwrap();
+    assert!(refreshed.heartbeat_at.unwrap() > stale);
+    watchdog_pass(&restarted).await;
+    assert_eq!(
+        store.get_mission(mission.id).await.unwrap().unwrap().status,
+        MissionStatus::Active
+    );
+
+    // And the normal terminal path still finishes it.
+    fixture.set_state("failed");
+    wait_until("failed finalization", 20, || async {
+        store.get_mission(mission.id).await.unwrap().unwrap().status == MissionStatus::Failed
+    })
+    .await;
+    let done = store.get_mission(mission.id).await.unwrap().unwrap();
+    assert_eq!(done.terminal_reason.as_deref(), Some("remote_node_job"));
+    let settled_run = store
+        .get_latest_mission_run(mission.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(settled_run.execution_state.is_terminal());
+    assert_eq!(fixture.cancels(), 0);
+}
+
+#[tokio::test]
+async fn typed_remote_launch_is_server_planned_idempotent_and_explicit_about_support() {
+    let fixture = spawn_fixture_node("typed-fixture", "REMOTE_TYPED_FIXTURE_TOKEN", "queued").await;
+    std::env::set_var("SANDBOXED_PUBLIC_URL", "http://127.0.0.1:9");
+    let h = Harness::with_nodes(vec![fixture.node.clone()]).await;
+    {
+        let mut registry = h.state.backend_registry.write().await;
+        registry.register(Arc::new(crate::backend::opencode::OpenCodeBackend::new(
+            "http://127.0.0.1:9".into(),
+            None,
+            false,
+        )));
+        registry.register(Arc::new(crate::backend::grok::GrokBackend::new()));
+    }
+    let store = h.control.mission_store.clone();
+
+    // The Orb shape after 9a39ef1d: no raw command, no client-minted key.
+    let body = json!({
+        "title": "typed launch",
+        "prompt": "find the fastest kernel",
+        "project": "lido",
+        "backend": "opencode",
+        "model_override": "grok-4.6",
+        "remote_node_id": "typed-fixture",
+        "idempotency_key": "orb-launch-attempt-1",
+    });
+    let response = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        response.text().await.unwrap()
+    );
+    let created: Value = response.json().await.unwrap();
+    let mission_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    assert_eq!(created["status"], "active");
+    assert_eq!(created["backend"], "opencode");
+    assert_eq!(created["model_override"], "xai/grok-4.6");
+    assert_eq!(created["remote_job"]["node_id"], "typed-fixture");
+    assert_eq!(created["remote_job"]["phase"], "observed");
+    assert_eq!(created["execution"]["state"], "waiting_remote_job");
+
+    // Server-owned execution: selected harness + model, proxy auth in env.
+    let submissions = fixture.submissions.lock().unwrap().clone();
+    assert_eq!(submissions.len(), 1);
+    let payload = &submissions[0]["payload"];
+    let command = payload["command"].as_str().unwrap();
+    assert!(
+        command.contains(
+            "opencode run --format json --model 'builtin/xai/grok-4.6' 'find the fastest kernel'"
+        ),
+        "{command}"
+    );
+    let config: Value =
+        serde_json::from_str(payload["env"]["OPENCODE_CONFIG_CONTENT"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        config["provider"]["builtin"]["options"]["baseURL"],
+        "http://127.0.0.1:9/v1"
+    );
+    assert_eq!(
+        config["provider"]["builtin"]["options"]["apiKey"],
+        "{env:SANDBOXED_PROXY_API_KEY}"
+    );
+    assert!(config["provider"]["builtin"]["models"]["xai/grok-4.6"].is_object());
+    let key = payload["env"]["SANDBOXED_PROXY_API_KEY"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(key.starts_with("sk-proxy-"));
+    assert!(
+        !command.contains(&key),
+        "proxy key must not be in the command line"
+    );
+    assert!(!payload["env"]["OPENCODE_CONFIG_CONTENT"]
+        .as_str()
+        .unwrap()
+        .contains(&key));
+    assert!(h.state.proxy_api_keys.verify(&key).await);
+    let dispatched = store
+        .get_events(mission_id, Some(&["mission_status_changed"]), None, None)
+        .await
+        .unwrap();
+    assert!(
+        dispatched
+            .iter()
+            .any(|e| e.content.contains("opencode/xai/grok-4.6")),
+        "{dispatched:?}"
+    );
+
+    // Retry with the same idempotency key coalesces onto the same mission
+    // and never submits a second node job.
+    let retry = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(
+        retry
+            .headers()
+            .get("x-coalesced-with")
+            .and_then(|v| v.to_str().ok()),
+        Some(mission_id.to_string().as_str())
+    );
+    let coalesced: Value = retry.json().await.unwrap();
+    assert_eq!(coalesced["id"], json!(mission_id));
+    assert_eq!(coalesced["remote_job"]["node_id"], "typed-fixture");
+    assert_eq!(fixture.submissions.lock().unwrap().len(), 1);
+
+    // A harness nodes cannot run is refused before any mission exists.
+    let before = store
+        .list_missions_filtered(&crate::api::mission_store::MissionFilter::default(), 50, 0)
+        .await
+        .unwrap()
+        .len();
+    let refused = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&json!({
+            "prompt": "find the fastest kernel",
+            "project": "lido",
+            "backend": "grok",
+            "model_override": "grok-4.6",
+            "remote_node_id": "typed-fixture",
+            "idempotency_key": "orb-launch-attempt-2",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let detail = refused.text().await.unwrap();
+    assert!(
+        detail.starts_with("REMOTE_HARNESS_UNSUPPORTED: "),
+        "{detail}"
+    );
+    assert!(detail.contains("claudecode or opencode"), "{detail}");
+    let caps = remote_launch_capabilities();
+    assert!(caps.typed && caps.raw_command && caps.proxy_url_configured);
+    assert_eq!(caps.harnesses, vec!["claudecode", "opencode"]);
+    assert_eq!(
+        store
+            .list_missions_filtered(&crate::api::mission_store::MissionFilter::default(), 50, 0)
+            .await
+            .unwrap()
+            .len(),
+        before
+    );
+    assert_eq!(fixture.submissions.lock().unwrap().len(), 1);
+
+    // A dispatch that fails before submission retires its key immediately.
+    std::env::remove_var("REMOTE_TYPED_FIXTURE_TOKEN");
+    let failed = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&json!({
+            "prompt": "find the fastest kernel",
+            "project": "lido",
+            "backend": "opencode",
+            "model_override": "xai/grok-4.6",
+            "remote_node_id": "typed-fixture",
+            "idempotency_key": "orb-launch-attempt-3",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
+    std::env::set_var("REMOTE_TYPED_FIXTURE_TOKEN", "fixture-token");
+    let names: Vec<String> = h
+        .state
+        .proxy_api_keys
+        .list()
+        .await
+        .into_iter()
+        .map(|k| k.name)
+        .filter(|n| n.starts_with("remote-launch:"))
+        .collect();
+    assert_eq!(
+        names,
+        vec![remote_launch_key_name(mission_id)],
+        "only the live launch keeps a key"
+    );
+
+    // Terminal: the launch key is retired with the observer.
+    fixture.set_state("succeeded");
+    wait_until("typed launch completion", 20, || async {
+        store.get_mission(mission_id).await.unwrap().unwrap().status == MissionStatus::Completed
+    })
+    .await;
+    wait_until("proxy key retirement", 10, || async {
+        !h.state.proxy_api_keys.verify(&key).await
+    })
+    .await;
 }
