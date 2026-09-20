@@ -59,21 +59,19 @@ export class TranscriptReducer {
       case "text_delta":
       case "text_op": {
         let index = this.bubbles.get(bubble);
-        if (index == null && bubble === "text_delta_latest" && this.lastFinal != null && this.items[this.lastFinal]?.kind === "text") {
-          index = this.lastFinal;
-          this.bubbles.set(bubble, index);
-        }
         const previous = index == null ? undefined : this.items[index];
         let text = previous?.kind === "text" ? previous.text : "";
         let live = previous?.kind === "text" ? previous.live : true;
+        let snapshot: string | undefined;
         if (ev.type === "text_delta") {
           const next = str(d.content);
           if (d.mode === "delta") {
             text += next;
             live = true;
           } else {
+            snapshot = next;
             text = next;
-            if (!(previous?.kind === "text" && !previous.live && previous.text === next)) live = true;
+            live = true;
           }
         } else {
           for (const op of (Array.isArray(d.ops) ? d.ops : []) as Record<string, unknown>[]) {
@@ -81,13 +79,21 @@ export class TranscriptReducer {
             if (op.type === "insert") {
               // This synthetic bubble carries a full snapshot even on reconnect,
               // when a fresh producer buffer emits insert(0, accumulated_text).
-              if (bubble === "text_delta_latest" && op.pos === 0) text = str(op.text);
+              if (bubble === "text_delta_latest" && op.pos === 0) { snapshot = str(op.text); text = snapshot; }
               else { const pos = typeof op.pos === "number" ? op.pos : chars.length; chars.splice(Math.max(0,pos),0,str(op.text)); text=chars.join(""); }
             } else if (op.type === "replace") {
               const range = Array.isArray(op.range) ? op.range as number[] : [0,chars.length];
-              if (bubble === "text_delta_latest" && range[0] === 0) text = str(op.text);
+              if (bubble === "text_delta_latest" && range[0] === 0) { snapshot = str(op.text); text = snapshot; }
               else { chars.splice(Math.max(0,range[0]),Math.max(0,range[1]-range[0]),str(op.text)); text=chars.join(""); }
             } else if (op.type === "finalize") live = false;
+          }
+        }
+        if (index == null && bubble === "text_delta_latest" && this.lastFinal != null) {
+          const finalized = this.items[this.lastFinal];
+          if (finalized?.kind === "text" && !finalized.live && snapshot != null && snapshot === finalized.text) {
+            index = this.lastFinal;
+            this.bubbles.set(bubble, index);
+            live = false;
           }
         }
         if (index == null) {

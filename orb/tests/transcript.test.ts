@@ -81,3 +81,10 @@ it("replays native Grok canary without duplicating final assistant_message + tex
   }
   expect(texts(buildTranscript([final("Same","a"),ev("user_message",{content:"Again"}),final("Same","b")]))).toHaveLength(2);
 });
+
+it("does not reattach a distinct later snapshot to lastFinal in the same user turn",()=>{
+  expect(texts(buildTranscript([final("First"),tool,result,snap("Second")]))).toMatchObject([{text:"First",live:false},{text:"Second"}]);
+  expect(texts(buildTranscript([final("First"),snap("Second")]))).toMatchObject([{text:"First",live:false},{text:"Second"}]);
+  expect(texts(buildTranscript([final("First"),ev("text_delta",{content:" more",mode:"delta"})]))).toMatchObject([{text:"First",live:false},{text:" more"}]);
+  expect(texts(buildTranscript([final("Same"),snap("Same")]))).toMatchObject([{text:"Same",live:false}]);
+});
