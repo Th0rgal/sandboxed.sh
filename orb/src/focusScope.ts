@@ -5,10 +5,11 @@ export const hasFocusScope = () => scopes.length > 0;
 
 function focusable(root: HTMLElement): HTMLElement[] {
   return Array.from(root.querySelectorAll<HTMLElement>(
-    'button, a[href], input, select, textarea, [tabindex]',
+    'button, a[href], input, select, textarea, summary, [tabindex]',
   )).filter((el) => {
     if (el.tabIndex < 0 || el.matches(':disabled') || el.closest('[hidden], [inert]')) return false;
     for (let node: HTMLElement | null = el; node; node = node.parentElement) {
+      if (node instanceof HTMLDetailsElement && !node.open && !node.querySelector(":scope > summary")?.contains(el)) return false;
       const style = getComputedStyle(node);
       if (style.display === 'none' || style.visibility === 'hidden') return false;
       if (node === root) break;

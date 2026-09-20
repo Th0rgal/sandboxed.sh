@@ -35,7 +35,6 @@ function MachineBadge(p: { name?: string | null }) {
   return (
     <Show when={p.name}>
       <span class="row-machine" title={`Runs on ${p.name}`}>
-        <span class="row-machine-name">{p.name}</span>
         <Ic.CloudIcon />
       </span>
     </Show>

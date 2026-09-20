@@ -91,3 +91,27 @@ Additional review fixes — 2026-09-20:
   screenshots reflect the visible delivery destination and explanation.
 
 No deployment or native Mac integration was performed.
+
+Consolidated sidebar, streaming and project chooser checkpoint:
+
+- Sidebar rows are 32px, with 5px selection radii, 4px group separation,
+  #141415 dark tint at 96% opacity, and quiet trailing cloud icons without
+  redundant workspace text. Actual App browser assertions verify row height.
+- The project chooser has search, Recents, current selection, bounded scrolling,
+  keyboard navigation, focus restoration and outside-click dismissal. Supported
+  actions open separate project creation or the existing machine picker.
+  Creation keeps the existing PUT endpoint and validates names/IDs, existing
+  IDs and backend failures. The form explains hosted project file location;
+  no filesystem path is fabricated.
+- The transcript follows the producer's cumulative response bubble across tool
+  boundaries, preserves event/sequence metadata, reconciles held overlap by
+  identity/tool boundaries, and handles Unicode scalar offsets and canonical
+  native bubbles. Genuine repeated messages remain distinct.
+- Stable keyed rendering and reused work groups preserve expanded work/tool
+  state. See benchmarks/README.md and raw before/after results for initial
+  render, replay, update timing and DOM mutation counts.
+- Passed 29 unit/component tests, all 11 browser scenarios, and the production
+  frontend build. Browser tests use port 1431. The earlier backend checks and
+  six Rust tests remain valid; this checkpoint changes no backend Rust.
+- Composer voice code is untouched. Native validation belongs to the local
+  coordinator; no production deployment or live mission mutation occurred.

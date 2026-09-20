@@ -1,10 +1,10 @@
 :root {
   color-scheme: dark;
   --bg: #141414;
-  --bg-sidebar: #181818;
+  --bg-sidebar: #141415;
   --bg-elev: #212121;
   --bg-hover: #252525;
-  --bg-active: #292929;
+  --bg-active: #262525;
   --bg-code: #282828;
   --bg-inset: #1c1c1c;
   --bg-field: #1e1e1e;
@@ -144,8 +144,8 @@ button:focus-visible { outline: 1px solid var(--blue); outline-offset: -1px; }
 /* ---------- sidebar ---------- */
 .sidebar {
   grid-row: 1 / 3;
-  /* Tinted glass: the desktop blurs through at ~30%. */
-  background: color-mix(in srgb, var(--bg-sidebar) 70%, transparent);
+  /* Near-opaque tint keeps native vibrancy close to the reference neutral. */
+  background: color-mix(in srgb, var(--bg-sidebar) 96%, transparent);
   border-right: 1px solid var(--stroke-soft);
   display: flex;
   flex-direction: column;
@@ -163,9 +163,9 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 .sb-scroll::-webkit-scrollbar { display: none; }
 .row {
   display: flex; align-items: center; gap: 9px;
-  width: 100%; height: 40px; padding: 0 10px;
-  margin-bottom: 2px;
-  border-radius: 10px;
+  width: 100%; height: 32px; padding: 0 8px;
+  margin-bottom: 0;
+  border-radius: 5px;
   text-align: left;
   color: var(--fg);
 }
@@ -300,20 +300,10 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 .row-machine { display: inline-flex; align-items: center; gap: 5px; flex: none; color: var(--fg-4); }
 .row-machine svg { width: 14px; height: 14px; }
 .row-machine-name { display: none; font-size: 11px; font-family: var(--mono); color: var(--fg-4); }
-.row.agent:hover .row-machine-name, .row.agent.active .row-machine-name { display: inline; }
-/* "New project…" inside the project picker: the menu turns into a field. */
-.menu-new {
-  display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 10px;
-}
-.menu-new input {
-  flex: 1; min-width: 0; height: 24px; padding: 0 6px; border-radius: 5px;
-  border: 1px solid var(--stroke-strong); background: var(--bg-field); color: var(--fg);
-  font: 13px var(--sans);
-}
-.menu-new input:focus { outline: 0; border-color: var(--focus-border); }
+
 .menu-item.quiet { color: var(--fg-3); }
 .menu-item.quiet:hover { color: var(--fg); }
-.group.has { margin-bottom: 10px; }
+.group.has { margin-bottom: 4px; }
 .sb-foot {
   flex: none;
   display: flex;
@@ -926,3 +916,23 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 
 .cs-advanced { margin-top: 20px; }
 .cs-advanced > summary { cursor: pointer; color: var(--fg-2); padding: 8px 0; font-size: 12px; }
+
+.project-picker { position: absolute; top: 28px; left: 0; z-index: 100; width: 300px; max-width: calc(100vw - 32px); padding: 6px; border: 1px solid var(--stroke); border-radius: 10px; background: var(--bg); box-shadow: 0 10px 30px #0004; color: var(--fg); }
+.project-search { width: 100%; height: 34px; padding: 0 8px; border: 0; background: none; color: var(--fg); font: inherit; }
+.project-search::placeholder { color: var(--fg-4); }
+.project-picker-label { padding: 9px 8px 5px; font-size: 12px; color: var(--fg-3); }
+.project-options { max-height: min(280px, 40vh); overflow-y: auto; overscroll-behavior: contain; }
+.project-option, .project-picker-actions button { display: flex; align-items: center; gap: 10px; text-align: left; width: 100%; height: 32px; padding: 0 8px; border-radius: 5px; color: var(--fg-2); }
+.project-option > span:first-of-type { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-option svg, .project-picker-actions svg { flex: none; color: var(--fg-3); }
+.project-option.highlighted, .project-option:hover, .project-picker-actions button:hover { background: var(--bg-active); color: var(--fg); }
+.project-check { color: var(--fg-3); margin-left: auto; }
+.project-picker-actions { border-top: 1px solid var(--stroke-soft); margin: 6px -6px -2px; padding: 5px 6px 0; }
+.project-empty { margin: 8px; font-size: 12px; color: var(--fg-3); }
+.project-create { display: flex; flex-direction: column; gap: 14px; }
+.project-create .s-input { width: 100%; }
+.project-location { font-size: 12px; color: var(--fg-2); }
+.project-location p { margin: 6px 0; }
+.project-location small { color: var(--fg-3); line-height: 1.5; }
+
+.dlg:has(.project-create) { background: var(--bg); border-radius: 12px; }

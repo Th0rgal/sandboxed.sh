@@ -1,3 +1,4 @@
+import { ProjectPicker, ProjectCreation } from "./ProjectPicker";
 import { hasFocusScope } from "./focusScope";
 import { For, Show, Switch, Match, createMemo, createSignal, createEffect, on, onCleanup, onMount, batch } from "solid-js";
 import { createStore, produce } from "solid-js/store";
@@ -10,7 +11,7 @@ import { Providers } from "./Providers";
 import { Dialog, Field } from "./Dialog";
 import { MenuList, PopupMenu, type MenuEntry } from "./Menu";
 import { MdSource, MdView, safeHref } from "./Markdown";
-import { getMissionEvents, storedToStream, streamMission, type StreamEvent } from "./stream";
+import { getMissionEvents, storedToStream, streamMission, heldAfterHistory, type StreamEvent } from "./stream";
 import { Transcript, applyStreamEvent, buildTranscript, type StreamItem } from "./Transcript";
 import { mergeById, pollWhileVisible } from "./poll";
 import { LiveProjectsSection, ProjectFileView } from "./ProjectFiles";
@@ -27,7 +28,6 @@ import {
   listHarnessChoices,
   shortModelLabel,
   createProject,
-  slugify,
   bumpProjects,
   projectsVersion,
   type HarnessChoice,
@@ -432,28 +432,15 @@ export default function App() {
   // "New project…" inside the project picker (Cursor puts creation at the
   // bottom of the picker it belongs to, never in the sidebar chrome).
   const [newProjectDraft, setNewProjectDraft] = createSignal(false);
-  const [newProjectName, setNewProjectName] = createSignal("");
-  const [newProjectBusy, setNewProjectBusy] = createSignal(false);
   createEffect(on(projectsVersion, () => {
     if (isConnected()) listProjects().then(setLiveProjects).catch(() => {});
   }, { defer: true }));
-  const submitNewProject = async () => {
-    const title = newProjectName().trim();
-    const slug = slugify(title);
-    if (!slug || newProjectBusy()) return;
-    setNewProjectBusy(true);
-    try {
-      await createProject({ slug, title });
-      bumpProjects();
-      setNewProject(slug);
-      setNewProjectDraft(false);
-      setNewProjectName("");
-      setEnvOpen(null);
-    } catch (e) {
-      setCreateError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setNewProjectBusy(false);
-    }
+  const submitNewProject = async (title: string, slug: string) => {
+    await createProject({ slug, title });
+    setLiveProjects((current) => [...current, { slug, title } as ProjectSummary]);
+    bumpProjects();
+    setNewProject(slug);
+    setNewProjectDraft(false);
   };
   const [liveProjects, setLiveProjects] = createSignal<ProjectSummary[]>([]);
   const [createError, setCreateError] = createSignal<string | null>(null);
@@ -894,9 +881,8 @@ export default function App() {
                     }}
                     onNewProject={() => {
                       open(null);
-                      setNewProjectName("");
                       setNewProjectDraft(true);
-                      setEnvOpen("project");
+                      setEnvOpen(null);
                     }}
                   />
                 </Show>
@@ -1060,63 +1046,19 @@ export default function App() {
               <div class="new-inner">
                 <div class="na-meta">
                   <div class="na-drop" onPointerDown={(e) => e.stopPropagation()}>
-                    <button class="na-drop-btn" onClick={() => setEnvOpen(envOpen() === "project" ? null : "project")}>
+                    <button class="na-drop-btn" aria-label="Choose project" aria-haspopup="dialog" aria-expanded={envOpen() === "project"} onClick={() => setEnvOpen(envOpen() === "project" ? null : "project")}>
                       {isConnected()
                         ? (liveProjects().find((p) => p.slug === newProject())?.title ?? liveProjects()[0]?.title ?? "No project")
                         : projects.find((p) => p.id === newProject())?.name}
                       <Ic.ChevronDown size={12} />
                     </button>
                     <Show when={envOpen() === "project"}>
-                      <div class="menu na-menu">
-                        <Show
-                          when={!newProjectDraft()}
-                          fallback={
-                            <div class="menu-new">
-                              <Ic.FolderIcon />
-                              <input
-                                placeholder="Project name"
-                                value={newProjectName()}
-                                autofocus
-                                disabled={newProjectBusy()}
-                                onInput={(e) => setNewProjectName(e.currentTarget.value)}
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter") void submitNewProject();
-                                  else if (e.key === "Escape") {
-                                    e.stopPropagation();
-                                    setNewProjectDraft(false);
-                                  }
-                                }}
-                              />
-                            </div>
-                          }
-                        >
-                          <For each={isConnected() ? liveProjects().map((p) => ({ id: p.slug, name: p.title ?? p.slug })) : projects.map((p) => ({ id: p.id, name: p.name }))}>
-                            {(p) => (
-                              <button
-                                class={`menu-item ${p.id === newProject() ? "on" : ""}`}
-                                onClick={() => {
-                                  setNewProject(p.id);
-                                  setEnvOpen(null);
-                                }}
-                              >
-                                <span class="menu-ico">
-                                  <Ic.FolderIcon />
-                                </span>
-                                {p.name}
-                              </button>
-                            )}
-                          </For>
-                          <Show when={isConnected()}>
-                            <div class="menu-sep" />
-                            <button class="menu-item quiet" onClick={() => setNewProjectDraft(true)}>
-                              <span class="menu-ico">
-                                <Ic.PlusIcon size={14} />
-                              </span>
-                              New project…
-                            </button>
-                          </Show>
-                        </Show>
-                      </div>
+                      <ProjectPicker projects={isConnected() ? [...liveProjects()].sort((a,b) => (b.updated_at ?? "").localeCompare(a.updated_at ?? "")).map((p) => ({ id: p.slug, name: p.title ?? p.slug })) : projects.map((p) => ({ id: p.id, name: p.name }))}
+                        selected={isConnected() ? (liveProjects().find(p => p.slug === newProject())?.slug ?? liveProjects()[0]?.slug ?? "") : newProject()} canCreate={isConnected()}
+                        onSelect={(id) => { setNewProject(id); setEnvOpen(null); }}
+                        onClose={() => setEnvOpen(null)}
+                        onCreate={() => { setEnvOpen(null); setNewProjectDraft(true); }}
+                        onMachine={() => setEnvOpen("machine")} />
                     </Show>
                   </div>
                   <div class="na-drop" onPointerDown={(e) => e.stopPropagation()}>
@@ -1325,6 +1267,7 @@ export default function App() {
       <Show when={ctx()}>
         {(c) => <PopupMenu x={c().x} y={c().y} items={c().items} onClose={() => setCtx(null)} />}
       </Show>
+      <Show when={newProjectDraft()}><ProjectCreation existingIds={liveProjects().map(p => p.slug)} onCreate={submitNewProject} onClose={() => setNewProjectDraft(false)} /></Show>
       <Show when={nameDlg()}>
         {(d) => (
           <Dialog
@@ -1389,8 +1332,10 @@ function MissionView(p: { id: string }) {
     });
   };
   const resync = async () => {
+    if (replaying) return;
     replaying = true;
     held = [];
+    let history: StreamEvent[] = [];
     try {
       const events = await getMissionEvents(p.id);
       const stream: StreamEvent[] = [];
@@ -1398,6 +1343,7 @@ function MissionView(p: { id: string }) {
         const ev = storedToStream(row);
         if (ev) stream.push(ev);
       }
+      history = stream;
       setItems(buildTranscript(stream));
       setError(null);
     } catch (e) {
@@ -1406,7 +1352,7 @@ function MissionView(p: { id: string }) {
       replaying = false;
       const queued = held;
       held = [];
-      for (const ev of queued) applyLive(ev);
+      for (const ev of heldAfterHistory(history, queued)) applyLive(ev);
     }
   };
 

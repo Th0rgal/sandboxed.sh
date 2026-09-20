@@ -2,6 +2,7 @@ import { clearConnection, getApiUrl, getJwt } from "./api";
 
 export interface StoredEvent {
   id: number;
+  event_id?: string | null;
   sequence: number;
   event_type: string;
   timestamp: string;
@@ -12,6 +13,9 @@ export interface StoredEvent {
 }
 
 export interface StreamEvent {
+  eventId?: string;
+  sequence?: number;
+  storedId?: number;
   type: string;
   data: Record<string, unknown>;
 }
@@ -37,7 +41,7 @@ export async function getMissionEvents(id: string): Promise<StoredEvent[]> {
 
 /** Map a stored (replayed) event row onto the live-stream event shape. */
 export function storedToStream(ev: StoredEvent): StreamEvent | null {
-  const d = (obj: Record<string, unknown>): StreamEvent => ({ type: ev.event_type, data: obj });
+  const d = (obj: Record<string, unknown>): StreamEvent => ({ type: ev.event_type, data: obj, eventId: ev.event_id ?? undefined, sequence: ev.sequence, storedId: ev.id });
   switch (ev.event_type) {
     case "text_delta":
       return d({ content: ev.content });
@@ -49,7 +53,7 @@ export function storedToStream(ev: StoredEvent): StreamEvent | null {
     case "assistant_message_canonical":
       // Canonical rows are the finalized text_op bubble; treat both as the
       // turn's final message (the reducer dedupes identical text).
-      return { type: "assistant_message", data: { content: ev.content, success: ev.metadata?.success !== false } };
+      return { ...d({ content: ev.content, success: ev.metadata?.success !== false, canonical: ev.event_type === "assistant_message_canonical", bubble_id: ev.metadata?.bubble_id }), type: "assistant_message" };
     case "text_op": {
       let ops: unknown = [];
       try {
@@ -149,7 +153,8 @@ export function streamMission(
             continue;
           }
           try {
-            onEvent({ type: eventType, data: JSON.parse(data) });
+            const parsed = JSON.parse(data);
+            onEvent({ type: eventType, data: parsed, eventId: parsed.event_id ?? parsed.id, sequence: parsed.sequence });
           } catch {
             /* malformed frame — skip */
           }
@@ -169,4 +174,23 @@ export function streamMission(
     if (timer) clearTimeout(timer);
     controller?.abort();
   };
+}
+
+/** Trim only overlap proven by event identity/sequence or a tool boundary.
+ * Text contents are deliberately never an identity: two real replies may match. */
+export function heldAfterHistory(history: StreamEvent[], held: StreamEvent[]): StreamEvent[] {
+  const identity = (event: StreamEvent): string | undefined => {
+    const id = event.eventId ?? event.data.id;
+    if (id != null) return `${event.type}:${id}`;
+    if (event.sequence != null) return `sequence:${event.sequence}:${event.type}`;
+    if ((event.type === "tool_call" || event.type === "tool_result") && event.data.tool_call_id)
+      return `${event.type}:${event.data.tool_call_id}`;
+    return undefined;
+  };
+  const known = new Set(history.map(identity).filter(Boolean));
+  // Stored rows also retain tool ids when they have sequence metadata.
+  for (const event of history) if (event.type === "tool_call" || event.type === "tool_result") known.add(`${event.type}:${event.data.tool_call_id}`);
+  let cut = 0;
+  held.forEach((event,index) => { const key=identity(event); if(key && known.has(key)) cut=index+1; });
+  return held.slice(cut);
 }

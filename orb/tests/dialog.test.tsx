@@ -70,4 +70,15 @@ describe("dialog focus ownership", () => {
     expect(document.activeElement).toBe(dialog);
     fireEvent.keyDown(dialog, { key: "Tab" }); expect(document.activeElement).toBe(dialog);
   });
+  it("excludes collapsed advanced fields from the focus loop", () => {
+    render(() => <Dialog title="Compact" onClose={() => {}} footer={<span>Footer</span>}>
+      <input aria-label="First" /><details><summary>Advanced</summary><input aria-label="Hidden override" /></details>
+    </Dialog>);
+    const first=screen.getByLabelText("First");
+    fireEvent.keyDown(first,{key:"Tab",shiftKey:true});
+    expect(document.activeElement).toBe(screen.getByText("Advanced"));
+    fireEvent.keyDown(document.activeElement!,{key:"Tab"});
+    expect(document.activeElement).toBe(first);
+  });
+
 });
