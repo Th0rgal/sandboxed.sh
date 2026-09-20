@@ -788,7 +788,7 @@ textarea::placeholder { color: var(--placeholder); }
 .row.d2 { padding-left: 22px; }
 .row.depth { padding-left: calc(8px + var(--depth, 0) * 14px); }
 .row-tip {
-  position: fixed; z-index: 80; max-width: 280px; padding: 7px 9px; border-radius: 8px;
+  position: fixed; z-index: 80; max-width: min(280px, calc(100vw - 16px)); padding: 7px 9px; border-radius: 8px;
   background: var(--bg-dlg); color: var(--fg); border: 1px solid var(--stroke);
   box-shadow: 0 8px 22px color-mix(in srgb, #000 24%, transparent);
   font-size: 12px; line-height: 16px; pointer-events: none; white-space: normal;

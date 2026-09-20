@@ -40,10 +40,28 @@ export function missionMachine(m: { remote_job?: { node_id?: string } | null; re
 }
 
 export type RowTipContent = { title: string; meta: string[] };
+const ROW_TIP_ID = "orb-row-tip";
 
 /** Full title plus known repo/branch/machine lines. Never invented. */
 export function rowDetail(title: string, extra: Array<string | undefined | null> = []): RowTipContent {
   return { title, meta: extra.map((part) => part?.trim()).filter((part): part is string => !!part) };
+}
+
+/** Prefer the right of the row; otherwise below. Clamp to the viewport. */
+export function placeRowTip(
+  row: { top: number; left: number; right: number; bottom: number },
+  size: { width: number; height: number },
+  view: { width: number; height: number },
+  gap = 8,
+) {
+  const pad = 8;
+  const beside = view.width - row.right - gap - pad >= Math.min(size.width, 120);
+  const x = beside ? row.right + gap : row.left;
+  const y = beside ? row.top : row.bottom + gap;
+  return {
+    x: Math.max(pad, Math.min(x, view.width - size.width - pad)),
+    y: Math.max(pad, Math.min(y, view.height - size.height - pad)),
+  };
 }
 
 /** Where an agent runs: the workspace/machine name behind a cloud glyph.
@@ -61,17 +79,27 @@ function MachineBadge(p: { name?: string | null }) {
 function useRowTip() {
   const [tip, setTip] = createSignal<{ title: string; meta: string[]; x: number; y: number } | null>(null);
   let timer = 0;
-  const hide = () => { window.clearTimeout(timer); timer = 0; setTip(null); };
+  let owner: HTMLElement | null = null;
+  let card: HTMLDivElement | undefined;
+  const unlink = () => { owner?.removeAttribute("aria-describedby"); owner = null; };
+  const hide = () => { window.clearTimeout(timer); timer = 0; unlink(); setTip(null); };
+  const place = (el: HTMLElement, content: RowTipContent, size = { width: 240, height: 44 }) => {
+    const pos = placeRowTip(el.getBoundingClientRect(), size, { width: window.innerWidth, height: window.innerHeight });
+    setTip({ ...content, ...pos });
+    requestAnimationFrame(() => {
+      if (owner !== el || !card || card.hidden) return;
+      const next = placeRowTip(el.getBoundingClientRect(), { width: card.offsetWidth, height: card.offsetHeight }, { width: window.innerWidth, height: window.innerHeight });
+      setTip((cur) => cur && owner === el && (cur.x !== next.x || cur.y !== next.y) ? { ...cur, ...next } : cur);
+    });
+  };
   const show = (content: RowTipContent, el: HTMLElement) => {
     window.clearTimeout(timer);
     timer = window.setTimeout(() => {
       if (!el.isConnected) return;
-      const box = el.getBoundingClientRect();
-      setTip({
-        ...content,
-        x: Math.max(8, Math.min(box.left, window.innerWidth - 280)),
-        y: box.bottom + 6,
-      });
+      unlink();
+      owner = el;
+      el.setAttribute("aria-describedby", ROW_TIP_ID);
+      place(el, content);
     }, 480);
   };
   const bind = (content: RowTipContent) => ({
@@ -80,8 +108,28 @@ function useRowTip() {
     onFocus: (e: { currentTarget: HTMLElement }) => show(content, e.currentTarget),
     onBlur: hide,
   });
+  onMount(() => {
+    const dismiss = (e: Event) => {
+      if (!tip()) return;
+      if (e.type === "keydown") {
+        if ((e as KeyboardEvent).key !== "Escape") return;
+        e.preventDefault();
+        e.stopPropagation();
+      }
+      if (e.type === "pointerdown" && owner && (e.target instanceof Node) && owner.contains(e.target)) return;
+      hide();
+    };
+    window.addEventListener("scroll", dismiss, true);
+    window.addEventListener("keydown", dismiss, true);
+    window.addEventListener("pointerdown", dismiss, true);
+    onCleanup(() => {
+      window.removeEventListener("scroll", dismiss, true);
+      window.removeEventListener("keydown", dismiss, true);
+      window.removeEventListener("pointerdown", dismiss, true);
+    });
+  });
   onCleanup(hide);
-  return { tip, bind, hide };
+  return { tip, bind, hide, id: ROW_TIP_ID, setCard: (el: HTMLDivElement) => { card = el; } };
 }
 
 export function LiveProjectsSection(p: {
@@ -474,7 +522,7 @@ export function LiveProjectsSection(p: {
       <Show when={actionMenu()}>
         {(menu) => <PopupMenu {...menu()} focus={actionFocus()} items={menuItems(menu().slug, menu().path)} onClose={() => setActionMenu(null)} />}
       </Show>
-      <div class="row-tip" role="tooltip" hidden={!rowTip.tip()} style={rowTip.tip() ? { left: `${rowTip.tip()!.x}px`, top: `${rowTip.tip()!.y}px` } : undefined}>
+      <div ref={rowTip.setCard} id={rowTip.id} class="row-tip" role="tooltip" hidden={!rowTip.tip()} style={rowTip.tip() ? { left: `${rowTip.tip()!.x}px`, top: `${rowTip.tip()!.y}px` } : undefined}>
         <Show when={rowTip.tip()}>{(tip) => (
           <>
             <div class="row-tip-title">{tip().title}</div>

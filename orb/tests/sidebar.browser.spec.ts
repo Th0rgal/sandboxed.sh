@@ -88,9 +88,23 @@ test("sidebar rows stay compact with distinct hover/selected and delayed real me
   await expect(tip.locator(".row-tip-title")).toHaveText("Orb DGX launch without losing this draft");
   await expect(tip.locator(".row-tip-meta")).toHaveText("DGX Spark");
   await expect(tip).not.toContainText("host");
+  await expect(live).toHaveAttribute("aria-describedby", "orb-row-tip");
   await expect(live).toHaveAccessibleName(/Orb DGX launch without losing this draft/);
+  const liveBox = (await live.boundingBox())!;
+  const tipBox = (await tip.boundingBox())!;
+  expect(tipBox.x).toBeGreaterThanOrEqual(liveBox.x + liveBox.width);
   await page.screenshot({ path: "test-results/orb-sidebar-tooltip.png" });
-  await page.mouse.move(0, 0);
+  await page.keyboard.press("Escape");
+  await expect(tip).toBeHidden();
+  await expect(live).not.toHaveAttribute("aria-describedby");
+  await page.locator(".titlebar").click();
+  await live.hover();
+  await expect(tip).toBeHidden();
+  await page.waitForTimeout(560);
+  await expect(tip).toBeVisible();
+  await page.mouse.move(900, 80);
+  await page.mouse.down();
+  await page.mouse.up();
   await expect(tip).toBeHidden();
   await otherLive.focus();
   await expect(tip).toBeHidden();
@@ -98,6 +112,8 @@ test("sidebar rows stay compact with distinct hover/selected and delayed real me
   await expect(tip).toBeVisible();
   await expect(tip.locator(".row-tip-title")).toHaveText("Live mission 1");
   await expect(tip.locator(".row-tip-meta")).toHaveCount(0);
+  await page.locator(".sb-scroll").evaluate((el) => { el.scrollTop += 40; });
+  await expect(tip).toBeHidden();
   await page.locator("#orb-sidebar").screenshot({ path: "test-results/orb-sidebar-finished.png" });
   const measure = await page.evaluate(() => {
     const rows = [...document.querySelectorAll("#orb-sidebar .row")];
@@ -134,6 +150,8 @@ test("project action menu is compact, pointer hover has no focus ring, keyboard 
   await action.click();
   const menu = page.getByRole("menu");
   await expect(menu).toBeVisible();
+  await expect.poll(() => menu.evaluate((el) => Number(getComputedStyle(el).opacity))).toBe(1);
+  await page.waitForTimeout(120);
   const box = await menu.boundingBox();
   expect(box!.width).toBeLessThanOrEqual(220);
   const first = page.getByRole("menuitem", { name: "New folder" });
@@ -149,5 +167,6 @@ test("project action menu is compact, pointer hover has no focus ring, keyboard 
   await page.keyboard.press("Enter");
   await expect(page.getByRole("menuitem", { name: "New folder" })).toBeFocused();
   await page.evaluate(() => { document.documentElement.dataset.theme = "light"; });
+  await expect.poll(() => menu.evaluate((el) => getComputedStyle(el).opacity)).toBe("1");
   await page.screenshot({ path: "test-results/orb-project-menu-light.png" });
 });
