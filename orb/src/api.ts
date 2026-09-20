@@ -419,6 +419,23 @@ export async function controllerAction(slug: string, action: "pause" | "resume" 
   });
 }
 
+/** Additional Hermes jobs explicitly bound to this project by the core. */
+export async function listProjectCrons(slug: string): Promise<ControllerJob[]> {
+  const data = await api<{ jobs?: ControllerJob[] }>(`/api/projects/${encodeURIComponent(slug)}/crons`);
+  return data.jobs ?? [];
+}
+
+export type ProjectCronDraft = Pick<ControllerPatch, "name" | "schedule" | "prompt" | "skills" | "deliver"> & { repeat?: number };
+
+export async function createProjectCron(slug: string, draft: ProjectCronDraft): Promise<ControllerJob> {
+  const data = await api<{ job: ControllerJob }>(`/api/projects/${encodeURIComponent(slug)}/crons`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(draft),
+  });
+  return data.job;
+}
+
 /** Bumped after a project is created so every list re-fetches. */
 const [projectsVersion, setProjectsVersion] = createSignal(0);
 export { projectsVersion };
