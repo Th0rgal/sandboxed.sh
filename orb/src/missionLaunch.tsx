@@ -1,5 +1,6 @@
 import { Show } from "solid-js";
-import { ApiError, getApiUrl, type Mission } from "./api";
+import { ApiError, getApiUrl, type Mission, type RemoteLaunchCapability, type RemoteNodesResponse } from "./api";
+import { goalObjective, GoalTag } from "./goal";
 import type { StreamItem } from "./Transcript";
 
 export type LaunchReceipt = { prompt: string; nodeId: string; destination: string };
@@ -33,8 +34,40 @@ export function withInitialPrompt(items: StreamItem[], mission: Mission | null, 
   const prompt = initialPrompt(mission, receipt);
   return prompt && !items.some(item => item.kind === "user") ? [{kind:"user",key:`initial:${mission?.id ?? "launch"}`,text:prompt}, ...items] : items;
 }
+export const TYPED_LAUNCH_UNSUPPORTED = "This backend does not support structured remote launches. Update the connected backend to enable them. Your draft and selection are kept; no mission was submitted.";
+export type RemoteSupport = "supported" | "unsupported" | "unknown";
+/** Whether the server has confirmed typed remote launches for a harness id. Nothing is assumed until it does. */
+export function remoteHarnessSupport(capability: RemoteLaunchCapability | null | undefined, backend: string): RemoteSupport {
+  if (!capability || capability.typed !== true || !Array.isArray(capability.harnesses)) return "unknown";
+  return capability.harnesses.includes(backend) ? "supported" : "unsupported";
+}
+/**
+ * Pre-POST check against the fresh `GET /api/remote-nodes` answer. Returns the
+ * user-facing refusal, or null when the server has confirmed the launch can be
+ * accepted. Only harness support and proxy reachability are checked here;
+ * model validation and provisioning stay on the typed server path.
+ */
+export function remoteLaunchPreflight(fleet: RemoteNodesResponse, nodeId: string, pick: { backend: string; model: string }, harnessName: (id: string) => string = id => id): string | null {
+  const destination = nodeLabel(nodeId);
+  const node = fleet.nodes?.find(n => n.id === nodeId);
+  if (!fleet.enabled || !node || node.cordoned || !["online","degraded"].includes(node.status)) return `${destination} is unavailable. Choose an available machine; your draft is kept.`;
+  const capability = fleet.remote_launch;
+  if (!capability || capability.typed !== true) return TYPED_LAUNCH_UNSUPPORTED;
+  const harnesses = Array.isArray(capability.harnesses) ? capability.harnesses : [];
+  if (!harnesses.includes(pick.backend)) {
+    const supported = harnesses.length ? `This backend currently runs ${harnesses.map(harnessName).join(", ")} on remote nodes.` : "This backend has not enabled any harness on remote nodes yet.";
+    return `Remote launch for ${pick.backend} (${pick.model}) is not supported on ${nodeId}. ${supported} Your draft and selection are kept; no mission was submitted.`;
+  }
+  if (capability.proxy_url_configured === false) return `${destination} cannot reach this backend's model proxy: SANDBOXED_PUBLIC_URL is not configured on the server. Your draft and selection are kept; no mission was submitted.`;
+  return null;
+}
+/** The capability could not be read at all (network/server error): refuse rather than guess. */
+export function remoteLaunchUnconfirmed(nodeId: string, error: unknown): string {
+  const detail = error instanceof Error ? error.message : String(error);
+  return `Could not confirm remote launch support on ${nodeLabel(nodeId)}: ${detail}. Your draft and selection are kept; no mission was submitted.`;
+}
 export function launchError(error: unknown): string {
-  if (error instanceof ApiError && /remote_command.*required/i.test(error.detail)) return "This backend does not support structured remote launches. Update the connected backend to enable them. Your draft and selection are kept.";
+  if (error instanceof ApiError && /remote_command.*required/i.test(error.detail)) return TYPED_LAUNCH_UNSUPPORTED;
   if (error instanceof ApiError) return error.detail || "The launch request was rejected. Your draft is kept.";
   return error instanceof Error ? error.message : String(error);
 }
@@ -64,10 +97,15 @@ export function missionPhase(mission: Mission | null, activity: boolean) {
   if (["active","running","starting"].includes(status)) return {label:activity?"Running":"Starting",moving:true,detail:activity?"":"Request accepted. Waiting for the first output."};
   return {label:status.replaceAll("_"," "),moving:false,detail:""};
 }
-export function LaunchStatus(p: { destination: string; mission?: Mission | null; activity?: boolean; submitting?: boolean }) {
+/** Goal mode from persisted state first, then from the accepted prompt (covers the optimistic window before the server answers). */
+export function missionGoal(mission: Mission | null | undefined, receipt?: LaunchReceipt): string | null {
+  if (mission?.goal_mode && mission.goal_objective) return mission.goal_objective;
+  return goalObjective(receipt?.prompt) ?? goalObjective(mission?.history?.find(entry => entry.role === "user")?.content);
+}
+export function LaunchStatus(p: { destination: string; mission?: Mission | null; activity?: boolean; submitting?: boolean; goal?: string | null }) {
   const phase = () => p.submitting ? {label:"Starting",moving:true,detail:"Submitting your request…",failed:false} : missionPhase(p.mission ?? null, !!p.activity);
   return <div class={`launch-status ${phase().failed ? "failed" : ""}`} role="status" aria-live="polite">
-    <div><Show when={phase().moving}><span class="launch-pulse" aria-hidden="true" /></Show><span>{phase().label} on {p.destination}</span></div>
+    <div><Show when={phase().moving}><span class="launch-pulse" aria-hidden="true" /></Show><Show when={p.goal}><GoalTag class="small" /></Show><span>{phase().label} on {p.destination}</span></div>
     <Show when={phase().detail}><p>{phase().detail}</p></Show>
   </div>;
 }

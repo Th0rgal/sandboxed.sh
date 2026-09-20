@@ -40,3 +40,44 @@ it("uses node evidence for queued/running and preserves terminal failures",()=>{
  m.status="failed";m.remote_job!.terminal_reason="orphan_no_runner";
  expect(missionPhase(m,true)).toMatchObject({label:"Failed",detail:"The backend could not find an active runner."});
 });
+
+import { remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, TYPED_LAUNCH_UNSUPPORTED } from "../src/missionLaunch";
+import type { RemoteNodesResponse, RemoteLaunchCapability } from "../src/api";
+const node={id:"dgx-spark",base_url:"",token_env:"",status:"online",labels:[],version:null,capacity_total:null,capacity_available:null,active_jobs:null,queued_jobs:null,last_seen:null,error:null,cordoned:false};
+const fleet=(remote_launch?:RemoteLaunchCapability|null,extra:Partial<RemoteNodesResponse>={}):RemoteNodesResponse=>({enabled:true,nodes:[node],...(remote_launch===undefined?{}:{remote_launch}),...extra});
+const typed:RemoteLaunchCapability={typed:true,harnesses:["claudecode","opencode"],raw_command:true,proxy_url_configured:true};
+const names=(id:string)=>({claudecode:"Claude Code",opencode:"OpenCode",grok:"Grok"} as Record<string,string>)[id]??id;
+describe("remote launch preflight follows the server-advertised capability",()=>{
+ it("refuses a harness the server has not confirmed and names what it does run",()=>{
+  const refusal=remoteLaunchPreflight(fleet(typed),"dgx-spark",{backend:"grok",model:"grok-4.6"},names);
+  expect(refusal).toContain("Remote launch for grok (grok-4.6) is not supported on dgx-spark");
+  expect(refusal).toContain("Claude Code, OpenCode");expect(refusal).toContain("no mission was submitted");
+  expect(remoteLaunchPreflight(fleet(typed),"dgx-spark",{backend:"claudecode",model:"claude-sonnet-4-6"},names)).toBeNull();
+ });
+ it("accepts grok only once the server advertises it, with nothing hardcoded",()=>{
+  const withGrok={...typed,harnesses:[...typed.harnesses!,"grok"]};
+  expect(remoteLaunchPreflight(fleet(withGrok),"dgx-spark",{backend:"grok",model:"grok-4.6"},names)).toBeNull();
+  expect(remoteHarnessSupport(withGrok,"grok")).toBe("supported");expect(remoteHarnessSupport(typed,"grok")).toBe("unsupported");
+  expect(remoteLaunchPreflight(fleet({...typed,harnesses:[]}),"dgx-spark",{backend:"claudecode",model:"m"},names)).toContain("has not enabled any harness");
+ });
+ it("treats a missing or untyped capability as an older backend and refuses before POST",()=>{
+  expect(remoteLaunchPreflight(fleet(),"dgx-spark",{backend:"claudecode",model:"m"})).toBe(TYPED_LAUNCH_UNSUPPORTED);
+  expect(remoteLaunchPreflight(fleet(null),"dgx-spark",{backend:"claudecode",model:"m"})).toBe(TYPED_LAUNCH_UNSUPPORTED);
+  expect(remoteLaunchPreflight(fleet({typed:false,harnesses:["claudecode"]}),"dgx-spark",{backend:"claudecode",model:"m"})).toBe(TYPED_LAUNCH_UNSUPPORTED);
+  expect(remoteHarnessSupport(undefined,"claudecode")).toBe("unknown");expect(remoteHarnessSupport({typed:true},"claudecode")).toBe("unknown");
+ });
+ it("refuses when the server cannot be reached from the node or the node is unavailable",()=>{
+  expect(remoteLaunchPreflight(fleet({...typed,proxy_url_configured:false}),"dgx-spark",{backend:"claudecode",model:"m"})).toContain("SANDBOXED_PUBLIC_URL");
+  expect(remoteLaunchPreflight(fleet(typed,{enabled:false}),"dgx-spark",{backend:"claudecode",model:"m"})).toContain("DGX Spark is unavailable");
+  expect(remoteLaunchPreflight(fleet(typed,{nodes:[{...node,status:"offline"}]}),"dgx-spark",{backend:"claudecode",model:"m"})).toContain("unavailable");
+  expect(remoteLaunchPreflight(fleet(typed,{nodes:[{...node,cordoned:true}]}),"dgx-spark",{backend:"claudecode",model:"m"})).toContain("unavailable");
+  expect(remoteLaunchPreflight(fleet(typed),"other",{backend:"claudecode",model:"m"})).toContain("other is unavailable");
+ });
+ it("explains a failed capability read instead of guessing",()=>{
+  expect(remoteLaunchUnconfirmed("dgx-spark",new Error("503 fleet unavailable"))).toBe("Could not confirm remote launch support on DGX Spark: 503 fleet unavailable. Your draft and selection are kept; no mission was submitted.");
+ });
+ it("keeps the persisted goal fallback for empty-history missions",()=>{
+  const m=mission({goal_mode:true,goal_objective:"Original saved objective",history:[]});
+  expect(initialPrompt(m)).toBe("/goal Original saved objective");
+ });
+});

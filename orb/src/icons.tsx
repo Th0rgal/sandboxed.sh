@@ -196,6 +196,13 @@ export const ArrowUpIcon = (p: P) => (
     <path d="M8 13V3M3.500 7.500 8 3l4.500 4.500" />
   </I>
 );
+export const TargetIcon = (p: P) => (
+  <I {...p} sw={1.3}>
+    <circle cx="8" cy="8" r="5.5" />
+    <circle cx="8" cy="8" r="2.2" />
+    <path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2" />
+  </I>
+);
 export const StopIcon = (p: P) => (
   <svg class={p.class} width={p.size ?? 16} height={p.size ?? 16} viewBox="0 0 16 16" fill="currentColor">
     <rect x="4.500" y="4.500" width="7" height="7" rx="1.500" />
