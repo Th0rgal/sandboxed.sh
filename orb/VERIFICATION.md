@@ -115,3 +115,9 @@ Consolidated sidebar, streaming and project chooser checkpoint:
   six Rust tests remain valid; this checkpoint changes no backend Rust.
 - Composer voice code is untouched. Native validation belongs to the local
   coordinator; no production deployment or live mission mutation occurred.
+
+Final reconnect verification: tool row keys use tool_call_id, so a coalesced
+history replacement preserves expanded work and tool details even when the
+stored snapshot moves relative to tools. The actual DOM regression passes.
+Final production frontend build, all 29 unit/component tests and all 11 browser
+tests passed. Screenshots were refreshed from this final build's components.

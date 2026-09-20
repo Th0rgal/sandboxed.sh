@@ -16,9 +16,9 @@ Measured in this Linux Chromium checkout on 2026-09-20:
 
 | Metric | Before | After |
 | --- | ---: | ---: |
-| Initial render median / p95 | 42.4 / 62.5 ms | 41.4 / 52.6 ms |
-| Live update median / p95 | 20.2 / 27.1 ms | 4.4 / 6.2 ms |
-| Replay median / p95 | 0.3 / 0.8 ms | 0.4 / 1.0 ms |
+| Initial render median / p95 | 42.4 / 62.5 ms | 45.5 / 56.2 ms |
+| Live update median / p95 | 20.2 / 27.1 ms | 4.6 / 6.9 ms |
+| Replay median / p95 | 0.3 / 0.8 ms | 0.5 / 1.2 ms |
 | Added / removed nodes | 18,120 / 18,119 | 60 / 59 |
 | Existing open work group retained | No | Yes |
 

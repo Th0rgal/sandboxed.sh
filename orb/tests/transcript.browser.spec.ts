@@ -25,5 +25,12 @@ test("cumulative live text across tools renders once and preserves open tool det
  await page.evaluate(()=> (window as any).transcriptHarness.apply({type:"assistant_message",data:{id:"final",content:"Fixed the guard."}}));
  await expect(page.locator(".st-text")).toHaveCount(1);await expect(page.locator(".st-caret")).toHaveCount(0);
  await expect(page.locator(".st-tool-detail")).toBeVisible();
+ await page.evaluate(()=> (window as any).transcriptHarness.reset([
+  {type:"tool_call",data:{tool_call_id:"a",name:"read",args:{path:"guard.ts"}}},
+  {type:"tool_result",data:{tool_call_id:"a",result:"Complete"}},
+  {type:"assistant_message",data:{id:"final",content:"Fixed the guard."}}
+ ]));
+ await expect(page.locator(".st-text")).toHaveCount(1);
+ await expect(page.locator(".st-work-body")).toBeVisible();await expect(page.locator(".st-tool-detail")).toBeVisible();
  await page.screenshot({path:"test-results/orb-stream-reconciled.png"});
 });

@@ -121,7 +121,7 @@ export class TranscriptReducer {
           return;
         }
         this.tools.set(callId,this.items.length);
-        this.items.push({kind:"tool",key:this.key("tool"),callId,name:str(d.name)||"tool",args:d.args??null,...(ev.type==="tool_result"?{result:d.result}:{}),done:ev.type==="tool_result"});return;
+        this.items.push({kind:"tool",key:`tool:${callId}`,callId,name:str(d.name)||"tool",args:d.args??null,...(ev.type==="tool_result"?{result:d.result}:{}),done:ev.type==="tool_result"});return;
       }
       case "error": this.close(); this.items.push({kind:"error",key:this.key("error"),text:str(d.message)});return;
     }
