@@ -87,6 +87,7 @@ test("sidebar rows stay compact with distinct hover/selected and delayed real me
   await expect(tip).toBeVisible();
   await expect(tip.locator(".row-tip-title")).toHaveText("Orb DGX launch without losing this draft");
   await expect(tip.locator(".row-tip-meta")).toHaveText("DGX Spark");
+  expect(await tip.evaluate((el) => getComputedStyle(el).backgroundColor)).toBe("rgb(25, 25, 25)");
   await expect(tip).not.toContainText("host");
   await expect(live).toHaveAttribute("aria-describedby", "orb-row-tip");
   await expect(live).toHaveAccessibleName(/Orb DGX launch without losing this draft/);
@@ -152,6 +153,8 @@ test("project action menu is compact, pointer hover has no focus ring, keyboard 
   await expect(menu).toBeVisible();
   await expect.poll(() => menu.evaluate((el) => Number(getComputedStyle(el).opacity))).toBe(1);
   await page.waitForTimeout(120);
+  expect(await menu.evaluate((el) => getComputedStyle(el).backgroundColor)).toBe("rgb(25, 25, 25)");
+  expect(await menu.evaluate((el) => getComputedStyle(el).backdropFilter === "none" || !getComputedStyle(el).backdropFilter)).toBeTruthy();
   const box = await menu.boundingBox();
   expect(box!.width).toBeLessThanOrEqual(220);
   const first = page.getByRole("menuitem", { name: "New folder" });
@@ -167,6 +170,7 @@ test("project action menu is compact, pointer hover has no focus ring, keyboard 
   await page.keyboard.press("Enter");
   await expect(page.getByRole("menuitem", { name: "New folder" })).toBeFocused();
   await page.evaluate(() => { document.documentElement.dataset.theme = "light"; });
-  await expect.poll(() => menu.evaluate((el) => getComputedStyle(el).opacity)).toBe("1");
+  await expect.poll(() => menu.evaluate((el) => Number(getComputedStyle(el).opacity))).toBe(1);
+  expect(await menu.evaluate((el) => getComputedStyle(el).backgroundColor)).toBe("rgb(255, 255, 255)");
   await page.screenshot({ path: "test-results/orb-project-menu-light.png" });
 });

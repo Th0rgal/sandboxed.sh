@@ -33,7 +33,7 @@
   --placeholder: #676767;
   --plus-bg: #2c2c2c;
   --scroll-thumb: #3a3a3a;
-  --menu-bg: rgba(44, 44, 44, 0.9);
+  --menu-bg: #191919;
   --overlay: rgba(0, 0, 0, 0.5);
   --shadow-lg: 0 10px 32px rgba(0, 0, 0, 0.5);
   --shadow-dlg: 0 18px 48px rgba(0, 0, 0, 0.5);
@@ -85,7 +85,7 @@
   --placeholder: #a3a29c;
   --plus-bg: #e8e7e3;
   --scroll-thumb: #cfcec8;
-  --menu-bg: rgba(255, 255, 255, 0.92);
+  --menu-bg: #ffffff;
   --overlay: rgba(30, 30, 28, 0.32);
   --shadow-lg: 0 10px 32px rgba(30, 30, 28, 0.18);
   --shadow-dlg: 0 18px 48px rgba(30, 30, 28, 0.22);
@@ -542,9 +542,8 @@ textarea::placeholder { color: var(--placeholder); }
 .send:hover { background: var(--send-bg-hover); }
 .menu {
   position: absolute; right: 0; bottom: 30px; min-width: 176px; padding: 4px;
-  background: var(--menu-bg); border: 1px solid var(--stroke); border-radius: 8px;
+  background: var(--menu-bg); border: 1px solid var(--stroke-strong); border-radius: 8px;
   box-shadow: 0 8px 24px color-mix(in srgb, #000 28%, transparent); z-index: 10;
-  backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
   animation: pop .1s ease-out;
 }
 @keyframes pop { from { opacity: 0; transform: translateY(4px); } }
@@ -789,7 +788,7 @@ textarea::placeholder { color: var(--placeholder); }
 .row.depth { padding-left: calc(8px + var(--depth, 0) * 14px); }
 .row-tip {
   position: fixed; z-index: 80; max-width: min(280px, calc(100vw - 16px)); padding: 7px 9px; border-radius: 8px;
-  background: var(--bg-dlg); color: var(--fg); border: 1px solid var(--stroke);
+  background: var(--menu-bg); color: var(--fg); border: 1px solid var(--stroke-strong);
   box-shadow: 0 8px 22px color-mix(in srgb, #000 24%, transparent);
   font-size: 12px; line-height: 16px; pointer-events: none; white-space: normal;
 }
