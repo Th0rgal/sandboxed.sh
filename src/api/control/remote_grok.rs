@@ -1031,26 +1031,24 @@ pub(crate) async fn continue_on_node(
                 format!("Mission {mission_id} not found"),
             )
         })?;
-    // Create absorbs even writer:false project missions under a generated
-    // track. Only that narrow read-only identity can skip writer re-admission.
-    // A generated-looking name alone is not a capability.
+    // Create absorbs project missions under a generated track, including Orb
+    // requests with no writer flag. Re-admit that same identity and capability;
+    // PR bindings and explicit tracks still require full create admission.
     let replacement = || {
-        (StatusCode::CONFLICT, format!("{REMOTE_RESUME_REQUIRES_REPLACEMENT}: tracked/PR writer missions need create admission; create a remote replacement with supersedes_mission_id={mission_id}"))
+        (StatusCode::CONFLICT, format!("{REMOTE_RESUME_REQUIRES_REPLACEMENT}: PR or explicit-track missions need create admission; create a remote replacement with supersedes_mission_id={mission_id}"))
     };
     if mission.project.github_pr.is_some()
         || mission.project.tags.iter().any(|tag| tag == "pr-writer")
     {
         return Err(replacement());
     }
-    let reader_claim = if let Some(track) = mission.project.track.as_deref() {
+    let track_claim = if let Some(track) = mission.project.track.as_deref() {
         let slug = mission
             .project
             .project
             .as_deref()
             .ok_or_else(&replacement)?;
-        if track != crate::api::track_leases::generated_track_key(&mission_id.to_string())
-            || !mission.project.tags.iter().any(|tag| tag == "pr-readonly")
-        {
+        if track != crate::api::track_leases::generated_track_key(&mission_id.to_string()) {
             return Err(replacement());
         }
         let canonical = state
@@ -1061,22 +1059,34 @@ pub(crate) async fn continue_on_node(
         if canonical.track != track {
             return Err(replacement());
         }
-        // Readers normally coexist with writers. This compatibility exception
-        // is stricter: a generated track claimed as a writer needs full admission.
+        // Preserve the generated-track restriction against another owner, but
+        // allow our own still-live writer lease to be renewed on continuation.
         if state
             .projects
             .live_leases(Some(slug))
             .map_err(internal)?
             .iter()
-            .any(|lease| lease.track_id == canonical.id && lease.mode == "writer")
+            .any(|lease| {
+                lease.track_id == canonical.id
+                    && lease.mode == "writer"
+                    && lease.attempt_id != mission_id.to_string()
+            })
         {
             return Err(replacement());
         }
+        let writer = super::mission_is_pr_writer_in_store(&store, &mission)
+            .await
+            .map_err(internal)?;
+        let mode = crate::api::track_leases::lease_mode(
+            writer.then_some(true),
+            &mission.project.tags,
+            mission.project.intent.as_deref(),
+        );
         Some(crate::api::track_leases::lease_request(
             slug,
             track,
             &mission_id.to_string(),
-            "reader",
+            mode,
             None,
         ))
     } else {
@@ -1169,12 +1179,16 @@ pub(crate) async fn continue_on_node(
     require_node_managed_auth(state, &placement.node_id, &plan)
         .await
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    // Terminal cleanup may have released the original reader claim. Reacquire
-    // it under the same admission locks before making the mission runnable.
-    if let Some(request) = reader_claim.as_ref() {
+    // Terminal cleanup may have released the original claim. Reacquire and
+    // revalidate it under admission locks before making the mission runnable.
+    if let Some(request) = track_claim.as_ref() {
         state
             .projects
             .acquire_track_lease(request)
+            .map_err(|_| replacement())?;
+        state
+            .projects
+            .revalidate_track_lease(request)
             .map_err(|_| replacement())?;
     }
     // Acquiring a run requires Pending/Active. Under admission locks, mark

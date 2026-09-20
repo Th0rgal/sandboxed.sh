@@ -6387,6 +6387,24 @@ async fn typed_remote_launch_is_server_planned_idempotent_and_explicit_about_sup
 
 #[tokio::test]
 async fn native_grok_remote_goal_streams_resumes_and_never_creates_host_loop() {
+    native_grok_auto_track_continuation(Some(false), None, "reader").await;
+}
+
+#[tokio::test]
+async fn native_grok_orb_omitted_writer_auto_track_continues() {
+    native_grok_auto_track_continuation(None, None, "writer").await;
+}
+
+#[tokio::test]
+async fn native_grok_omitted_writer_readonly_intent_auto_track_continues() {
+    native_grok_auto_track_continuation(None, Some("research"), "reader").await;
+}
+
+async fn native_grok_auto_track_continuation(
+    writer: Option<bool>,
+    intent: Option<&str>,
+    expected_mode: &str,
+) {
     let fixture =
         spawn_fixture_node("native-grok", "REMOTE_NATIVE_GROK_TEST_TOKEN", "running").await;
     let h = Harness::with_nodes(vec![fixture.node.clone()]).await;
@@ -6404,10 +6422,30 @@ async fn native_grok_remote_goal_streams_resumes_and_never_creates_host_loop() {
         .unwrap(),
     );
     let mut events = h.control.events_tx.subscribe();
-    let objective = "/goal Validate the GB10 implementation and reproducible benchmarks";
-    let response = h.state.http_client.post(format!("{}/missions", h.url)).json(&json!({
-        "project":"lido", "writer":false, "backend":"grok", "model_override":"grok-4.6", "remote_node_id":"native-grok", "prompt":objective
-    })).send().await.unwrap();
+    let objective = if intent.is_some() {
+        "/goal Report hostname and benchmark results"
+    } else {
+        "/goal Validate the GB10 implementation and reproducible benchmarks"
+    };
+    // Orb's normal create body omits writer, track, intent, and capability tags.
+    // Exercise the HTTP create path so admission and persisted identity are real.
+    let mut body = json!({
+        "project":"lido", "backend":"grok", "model_override":"grok-4.6", "remote_node_id":"native-grok", "prompt":objective
+    });
+    if let Some(writer) = writer {
+        body["writer"] = json!(writer);
+    }
+    if let Some(intent) = intent {
+        body["intent"] = json!(intent);
+    }
+    let response = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(
         response.status(),
         StatusCode::OK,
@@ -6420,8 +6458,19 @@ async fn native_grok_remote_goal_streams_resumes_and_never_creates_host_loop() {
     let auto_track = crate::api::track_leases::generated_track_key(&id.to_string());
     let mission = store.get_mission(id).await.unwrap().unwrap();
     assert_eq!(mission.project.track.as_deref(), Some(auto_track.as_str()));
-    assert_eq!(mission.project.tags, vec!["pr-readonly"]);
+    let original_tags = mission.project.tags.clone();
+    if writer == Some(false) {
+        assert_eq!(original_tags, vec!["pr-readonly"]);
+    } else {
+        assert!(original_tags.is_empty());
+    }
     assert!(mission.project.github_pr.is_none());
+    let original_claims = h.state.projects.live_leases(Some("lido")).unwrap();
+    assert!(original_claims
+        .iter()
+        .any(|lease| lease.attempt_id == id.to_string()
+            && lease.track == auto_track
+            && lease.mode == expected_mode));
     let payload = fixture.submissions.lock().unwrap()[0]["payload"].clone();
     assert_eq!(payload["managed_auth"], json!(["grok"]));
     assert_eq!(payload["env"], json!({"NO_COLOR":"1"}));
@@ -6597,10 +6646,6 @@ async fn native_grok_remote_goal_streams_resumes_and_never_creates_host_loop() {
     // real generated identity before accepting its ordinary composer follow-up.
     for patch in [
         crate::api::mission_store::MissionProjectPatch {
-            tags: Some(vec![]),
-            ..Default::default()
-        },
-        crate::api::mission_store::MissionProjectPatch {
             github_pr: Some(Some("owner/repo#42".into())),
             ..Default::default()
         },
@@ -6627,13 +6672,18 @@ async fn native_grok_remote_goal_streams_resumes_and_never_creates_host_loop() {
                 crate::api::mission_store::MissionProjectPatch {
                     github_pr: Some(None),
                     track: Some(Some(auto_track.clone())),
-                    tags: Some(vec!["pr-readonly".into()]),
+                    tags: Some(original_tags.clone()),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
     }
+    // Release our own writer before simulating a different owner.
+    h.state
+        .projects
+        .release_leases_for_attempt(&id.to_string())
+        .unwrap();
     let conflicting = h
         .state
         .projects
@@ -6654,7 +6704,7 @@ async fn native_grok_remote_goal_streams_resumes_and_never_creates_host_loop() {
         .contains(remote_grok::REMOTE_RESUME_REQUIRES_REPLACEMENT));
     h.state.projects.expire_lease(&conflicting.id).unwrap();
     assert_eq!(fixture.submissions.lock().unwrap().len(), 2);
-    // Simulate the terminal lease sweep; continuation must restore a reader.
+    // Simulate the terminal lease sweep; continuation must restore its capability.
     h.state
         .projects
         .release_leases_for_attempt(&id.to_string())
@@ -6720,7 +6770,15 @@ async fn native_grok_remote_goal_streams_resumes_and_never_creates_host_loop() {
     let claims = h.state.projects.live_leases(Some("lido")).unwrap();
     assert!(claims.iter().any(|lease| lease.attempt_id == id.to_string()
         && lease.track == auto_track
-        && lease.mode == "reader"));
+        && lease.mode == expected_mode));
+    let continued = store.get_mission(id).await.unwrap().unwrap();
+    assert_eq!(
+        continued.project.track.as_deref(),
+        Some(auto_track.as_str())
+    );
+    assert_eq!(continued.project.tags, original_tags);
+    assert!(continued.project.github_pr.is_none());
+    assert_eq!(continued.session_id.as_deref(), Some(session_id.as_str()));
     let run = store.get_active_mission_run(id).await.unwrap().unwrap();
     assert!(run.owner_actor_id.starts_with("remote-job:"));
     assert!(
