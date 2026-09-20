@@ -339,7 +339,7 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
   width: calc(var(--sb-w) - 90px); z-index: 6;
 }
 .app.sb-hidden .tb-left { margin-left: 70px; }
-.tb-left svg, .tb-title svg { width: 15px; height: 15px; }
+.tb-left svg, .tb-title > svg { width: 15px; height: 15px; }
 .tb-left { padding-bottom: 1px; display: flex; align-items: center; gap: 2px; }
 .tb-gap { flex: 1; min-width: 8px; max-width: 40px; }
 .app:not(.sb-hidden) .tb-gap { max-width: none; }
@@ -1019,15 +1019,16 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 /* One compact tag everywhere a `/goal` shows up: the composer (while typing),
    the launch preview, transcript user turns, status and the title bar. */
 .goal-tag {
-  display: inline-flex; align-items: center; gap: 4px; flex: none;
-  height: 20px; padding: 0 7px 0 6px; border-radius: 10px;
-  font-size: 11px; line-height: 20px; font-weight: 500; letter-spacing: .01em;
+  display: inline-flex; align-items: center; gap: 5px; flex: none;
+  height: 22px; padding: 0 8px 0 7px; border-radius: 11px;
+  font-size: 11.5px; line-height: 1; font-weight: 500; letter-spacing: .01em;
   color: var(--blue); background: color-mix(in srgb, var(--blue) 14%, transparent);
   border: 1px solid color-mix(in srgb, var(--blue) 32%, transparent);
   white-space: nowrap; vertical-align: middle;
 }
-.goal-tag svg { flex: none; }
-.goal-tag.small { height: 16px; line-height: 16px; padding: 0 5px 0 4px; font-size: 10px; }
+.goal-tag svg { flex: none; width: 12px; height: 12px; }
+.goal-tag.small { height: 18px; padding: 0 7px 0 6px; font-size: 11px; gap: 4px; border-radius: 9px; }
+.goal-tag.small svg { width: 10px; height: 10px; }
 .goal-tag-detail { color: var(--fg-3); font-weight: 400; }
 .goal-tag-detail::before { content: "·"; margin: 0 4px 0 1px; color: var(--fg-4); }
 .goal-mode { display: inline-flex; align-items: center; margin-right: 4px; }

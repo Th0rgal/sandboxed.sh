@@ -1044,7 +1044,7 @@ export default function App() {
             <Match when={currentMissionId()}>
               {(id) => (
                 <>
-                  <Show when={missionGoal(missions().find((m) => m.id === id()) ?? openMission())}><GoalTag class="small" /></Show>
+                  <Show when={missionGoal(missions().find((m) => m.id === id()) ?? openMission())}><GoalTag /></Show>
                   <span>{displayTitle((openMission()?.id === id() ? openMission()?.title : undefined) ?? missions().find((m) => m.id === id())?.title) || "Mission"}</span>
                   <Ic.CloudIcon class="dim" />
                 </>

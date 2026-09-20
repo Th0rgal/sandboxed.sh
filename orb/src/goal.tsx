@@ -52,7 +52,7 @@ export function displayTitle(title: string | null | undefined): string | null {
 export function GoalTag(p: { detail?: string; class?: string }) {
   return (
     <span class={`goal-tag ${p.class ?? ""}`} title="Goal mode: the agent keeps iterating until this objective is met.">
-      <Ic.TargetIcon size={11} />
+      <Ic.TargetIcon size={12} />
       Goal{p.detail ? <span class="goal-tag-detail">{p.detail}</span> : null}
     </span>
   );
