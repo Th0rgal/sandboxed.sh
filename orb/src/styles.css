@@ -911,8 +911,10 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
   .cs-savebar { flex-wrap: wrap; }
 }
 
-.cron-unavailable { padding: 6px 12px; font-size: 12px; color: var(--fg-3); overflow-wrap: anywhere; }
-.cron-unavailable button { margin-top: 5px; }
+.cron-unavailable { font-size: 11px; color: var(--fg-3); height: 28px; gap: 7px; }
+.cron-status-label { min-width: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left; }
+.cron-retry { flex: none; width: 18px; height: 18px; color: var(--fg-3); border-radius: 4px; }
+.cron-retry:hover { background: var(--bg-active); color: var(--fg); }
 
 .cs-advanced { margin-top: 20px; }
 .cs-advanced > summary { cursor: pointer; color: var(--fg-2); padding: 8px 0; font-size: 12px; }

@@ -5,6 +5,8 @@ import * as Ic from "./icons";
 import { MdSource, MdView } from "./Markdown";
 import {
   isConnected,
+  ApiError,
+  connectionVersion,
   listProjectFiles,
   listProjectMissions,
   listProjects,
@@ -65,6 +67,9 @@ export function LiveProjectsSection(p: {
   // The project's controller (Hermes cron), shown as the folder's first row.
   const [controllers, setControllers] = createStore<Record<string, ControllerData>>({});
   const [cronErrors, setCronErrors] = createStore<Record<string, string | null>>({});
+  const [cronUnsupported, setCronUnsupported] = createSignal(false);
+  const [cronInfo, setCronInfo] = createSignal<string | null>(null);
+  const [cronChecking, setCronChecking] = createSignal(false);
   const [cronDefaults, setCronDefaults] = createSignal<import("./api").ProjectCronDefaults | null>(null);
   const [defaultsError, setDefaultsError] = createSignal<string | null>(null);
   const [crons, setCrons] = createStore<Record<string, import("./api").ControllerJob[]>>({});
@@ -81,8 +86,29 @@ export function LiveProjectsSection(p: {
       .then((view) => setControllers(slug, view))
       .catch(() => {});
   };
-  const loadCrons = (slug: string) => {
-    listProjectCrons(slug).then((jobs) => { setCrons(slug, jobs); setCronErrors(slug, null); }).catch((error) => setCronErrors(slug, error instanceof Error ? error.message : String(error)));
+  const missingCronApi = (error: unknown) => error instanceof ApiError && [404, 405].includes(error.status) && !/project not found/i.test(error.detail);
+  const cronFailure = (slug: string, error: unknown) => {
+    if (missingCronApi(error)) setCronUnsupported(true);
+    else setCronErrors(slug, error instanceof Error ? error.message : String(error));
+  };
+  const loadCrons = async (slug: string, force = false) => {
+    if (cronUnsupported() && !force) return;
+    try { const jobs = await listProjectCrons(slug); setCrons(slug, jobs); setCronErrors(slug, null); setCronUnsupported(false); }
+    catch (error) { cronFailure(slug, error); }
+  };
+  createEffect(on(connectionVersion, () => {
+    setCronUnsupported(false);
+    for (const slug of Object.keys(expanded)) if (expanded[slug] && !slug.includes(":")) void loadCrons(slug);
+  }, { defer: true }));
+  const beginCron = async (slug: string) => {
+    setActionMenu(null);
+    if (cronUnsupported()) { setCronInfo(slug); return; }
+    setCronChecking(true);
+    try {
+      const defaults = await getProjectCronDefaults(slug);
+      setCronDefaults(defaults); setDefaultsError(null); setNewCron(slug);
+    } catch (error) { cronFailure(slug, error); setCronInfo(slug); }
+    finally { setCronChecking(false); }
   };
 
   const refresh = () => {
@@ -167,11 +193,7 @@ export function LiveProjectsSection(p: {
   const menuItems = (slug: string, path: string): MenuEntry[] => [
     { kind: "item", label: "New folder", icon: Ic.FolderIcon, onClick: () => beginFolder(slug, path) },
     { kind: "item", label: "New agent", icon: Ic.NewAgentIcon, onClick: () => p.onNewAgent(slug) },
-    { kind: "item", label: "New cron", icon: Ic.BellIcon, onClick: () => {
-      setActionMenu(null);
-      setCronDefaults(null); setDefaultsError(null); setNewCron(slug);
-      getProjectCronDefaults(slug).then((value) => { if (newCron() === slug) setCronDefaults(value); }).catch((error) => { if (newCron() === slug) setDefaultsError(error instanceof Error ? error.message : String(error)); });
-    } },
+    { kind: "item", label: cronChecking() ? "Checking crons…" : "New cron", icon: Ic.BellIcon, onClick: () => { if (!cronChecking()) void beginCron(slug); } },
   ];
   const toggleProject = (slug: string) => {
     const next = !expanded[slug];
@@ -301,9 +323,11 @@ export function LiveProjectsSection(p: {
                     );
                   }}
                 </Show>
-                <Show when={cronErrors[project.slug]}>
-                  <div class="cron-unavailable" role="status">Crons unavailable. {crons[project.slug]?.length ? "Showing last loaded jobs. " : ""}{cronErrors[project.slug]}
-                    <button class="s-btn sm" onClick={() => loadCrons(project.slug)}>Retry crons</button>
+                <Show when={cronUnsupported() || cronErrors[project.slug]}>
+                  <div class="cron-unavailable row d1" role="status" title={cronUnsupported() ? "This backend does not support project crons yet. Update the backend, then check again. Existing project content is unchanged." : `Crons could not refresh. Cached jobs are retained. ${cronErrors[project.slug]}`}>
+                    <Ic.BellIcon size={12} />
+                    <button class="cron-status-label" onClick={() => setCronInfo(project.slug)}>{cronUnsupported() ? "Crons need backend update" : "Crons temporarily unavailable"}</button>
+                    <Show when={!cronUnsupported()}><button class="cron-retry" aria-label="Retry crons" title="Retry crons" onClick={() => void loadCrons(project.slug, true)}>↻</button></Show>
                   </div>
                 </Show>
                 <For each={crons[project.slug] ?? []}>
@@ -387,6 +411,9 @@ export function LiveProjectsSection(p: {
           </Dialog>
         )}
       </Show>
+      <Show when={cronInfo()}>{(slug) => <Dialog title="Project crons" onClose={() => setCronInfo(null)} footer={<><button class="s-btn sm" onClick={() => setCronInfo(null)}>Close</button><button class="s-btn sm" disabled={cronChecking()} onClick={async () => { setCronChecking(true); await loadCrons(slug(), true); setCronChecking(false); if (!cronUnsupported() && !cronErrors[slug()]) setCronInfo(null); }}>Check again</button></>}>
+        <p>{cronUnsupported() ? "This backend does not support project crons yet. Update the connected backend, then choose Check again. Your canonical controller and existing project content remain available." : "Project crons could not refresh. Previously loaded jobs are retained. Try again when the scheduler is available."}</p>
+      </Dialog>}</Show>
       <Show when={newCron()}>
         {(slug) => <Dialog wide title="New cron" onClose={() => !makingCron() && setNewCron(null)} footer={<span>Unfinished drafts are kept until saved or discarded.</span>}>
           <CronForm creating deliveryRoute={{ ready: cronDefaults()?.route_ready ?? false, loading: !cronDefaults() && !defaultsError(), error: defaultsError() }} onBusyChange={setMakingCron} draftKey={`create:${slug()}`} view={{ slug: slug(), job: { id: "", name: "", schedule: "every 1h", enabled: true, failure_streak: 0 }, runs: [] }}
