@@ -1540,6 +1540,28 @@ fn hermes_api_server_port(config: &crate::config::Config) -> u16 {
     }
 }
 
+/// Internal callers proxy scheduler operations through the local Hermes API;
+/// the browser never receives this key.
+pub(crate) async fn hermes_api_server_key(
+    state: &crate::api::routes::AppState,
+) -> Result<String, String> {
+    let runtime_name = assistant_runtime_name(&state.config);
+    for path in hermes_env_paths(runtime_name) {
+        if let Ok(contents) = tokio::fs::read_to_string(path).await {
+            if let Some(key) =
+                parse_env_value(&contents, "API_SERVER_KEY").filter(|key| !key.trim().is_empty())
+            {
+                return Ok(key);
+            }
+        }
+    }
+    Err("Hermes API server key is not configured; enable Hermes remote access first".into())
+}
+
+pub(crate) fn hermes_api_server_url(config: &crate::config::Config) -> String {
+    format!("http://127.0.0.1:{}", hermes_api_server_port(config))
+}
+
 fn hermes_env_paths(runtime_name: &str) -> [String; 2] {
     [
         format!("/etc/sandboxed-sh/{runtime_name}.env"),

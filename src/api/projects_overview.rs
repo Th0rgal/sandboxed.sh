@@ -1959,6 +1959,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         // Lightweight roster + per-project file storage for Orb/desktop.
         .merge(super::project_files::routes())
         .merge(super::project_controller::routes())
+        .merge(super::project_crons::routes())
 }
 
 pub(crate) fn hermes_projects_dir() -> Option<PathBuf> {
