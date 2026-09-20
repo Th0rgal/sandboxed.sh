@@ -3,6 +3,10 @@
 //! Hermes remains the scheduler and source of job state. This module owns only
 //! the durable project <-> Hermes job-id binding and never writes a cron file.
 
+// Handlers return the mapped axum `Response` as the error branch on purpose:
+// the Hermes adapter decides the client-visible status once, at the boundary.
+#![allow(clippy::result_large_err)]
+
 use std::sync::Arc;
 
 use axum::{
