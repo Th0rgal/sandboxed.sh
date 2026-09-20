@@ -66,3 +66,28 @@ Follow-up after inspecting both uploaded Cursor references:
   in addition to the intercepted browser integration tests.
 
 Follow-up validation: `pnpm build`, all 17 component/unit tests, and all 5 browser tests passed. Native Mac integration has not been run in this Linux checkout.
+
+Additional review fixes — 2026-09-20:
+
+- Project cron listing propagates upstream outages, authentication failures and
+  malformed records. Only an explicit Hermes deleted-job response is skipped.
+  The UI retains cached jobs, displays the error and offers retry; upstream
+  authentication failures do not clear the Orb login.
+- Creation defaults to `project:<slug>` and explains the canonical conversation
+  destination. Missing bindings produce actionable validation; local output
+  requires an explicit choice. Additional cron ownership remains separate from
+  the canonical controller.
+- At widths up to 720px the sidebar toggle opens a drawer, dismissible with the
+  toggle, backdrop or Escape. Browser coverage uses the actual App at 375px.
+- Passed: 18 unit/component tests, 8 Chromium browser tests, production frontend
+  build, 6 targeted Rust tests (`cargo +stable test --locked --lib project_cron
+  -j 2`), backend check and build. Root rustfmt and the separate
+  `orb/src-tauri/Cargo.toml` rustfmt check both passed. The backend compile also
+  verifies the `ProjectsStore::project_cron_ids` lifetime fix.
+- Rust tests exercise the HTTP adapter against a local Axum server, real Hermes
+  record fixtures, exclusive project/job ownership, and delivery validation.
+  These supplement the browser's intercepted API tests.
+- [Narrow sidebar drawer](../screenshots/orb-narrow-drawer.png). Updated form
+  screenshots reflect the visible delivery destination and explanation.
+
+No deployment or native Mac integration was performed.

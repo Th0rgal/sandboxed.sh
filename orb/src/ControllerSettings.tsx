@@ -71,6 +71,7 @@ export function CronForm(p: {
   draftKey: string;
   view: ControllerView;
   creating?: boolean;
+  deliveryRoute?: { ready: boolean; loading: boolean; error: string | null };
   save: (patch: ControllerPatch) => Promise<ControllerView>;
   onSaved: (view: ControllerView, warning?: string) => void;
   onBusyChange?: (busy: boolean) => void;
@@ -80,8 +81,9 @@ export function CronForm(p: {
   const storageKey = `${draftPrefix}${p.draftKey}`;
   let restored: { draft: CronDraft; base: CronDraft; skillInput?: string } | null = null;
   try { restored = JSON.parse(sessionStorage.getItem(storageKey) ?? "null"); } catch { /* unavailable storage */ }
-  const [draft, setDraft] = createStore<CronDraft>(restored?.draft ?? draftOf(p.view));
-  const [base, setBase] = createSignal<CronDraft>(restored?.base ?? draftOf(p.view));
+  const initialDraft = () => ({ ...draftOf(p.view), ...(p.creating ? { deliver: p.view.settings?.deliver ?? `project:${p.view.slug}` } : {}) });
+  const [draft, setDraft] = createStore<CronDraft>(restored?.draft ?? initialDraft());
+  const [base, setBase] = createSignal<CronDraft>(restored?.base ?? initialDraft());
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [skillInput, setSkillInput] = createSignal(restored?.skillInput ?? "");
@@ -131,6 +133,15 @@ export function CronForm(p: {
   });
   const dirtyCount = () => Object.keys(patch()).length;
 
+  const usesProjectRoute = () => !draft.deliver.trim() || draft.deliver.split(",").some((target) => target.trim() === `project:${p.view.slug}`);
+  const deliveryHint = () => {
+    if (draft.deliver.trim() === "local") return "Save output in Hermes only; no conversation message will be sent.";
+    if (!usesProjectRoute()) return "Send run output to the destination specified here.";
+    if (p.deliveryRoute?.error) return `Project delivery unavailable: ${p.deliveryRoute.error}`;
+    if (p.deliveryRoute?.loading) return "Checking the project's canonical conversation route…";
+    if (p.deliveryRoute && !p.deliveryRoute.ready) return "No canonical conversation is bound. Bind one first, or explicitly choose local to save output only.";
+    return "Send each run's output to this project's canonical conversation. The canonical controller is unchanged.";
+  };
   const save = async () => {
     if (saving()) return;
     addSkill();
@@ -142,6 +153,9 @@ export function CronForm(p: {
       setError("Stops after must be a positive whole number, or empty for Never."); return;
     }
     if ((p.creating || patch().prompt !== undefined) && draft.prompt.length > (p.view.settings?.prompt_budget ?? 5000)) { setError("Instruction exceeds the allowed character budget."); return; }
+    if (p.creating && usesProjectRoute() && p.deliveryRoute && !p.deliveryRoute.ready) {
+      setError(p.deliveryRoute.error ?? (p.deliveryRoute.loading ? "Checking project delivery route…" : "No canonical conversation is bound. Bind one first, or explicitly choose local delivery to save output only.")); return;
+    }
     if (!p.creating && dirtyCount() === 0) return;
     setSaving(true);
     p.onBusyChange?.(true);
@@ -149,7 +163,7 @@ export function CronForm(p: {
     try {
       const changes: ControllerPatch = p.creating ? {
         name: draft.name.trim(), schedule: draft.schedule.trim(), prompt: draft.prompt,
-        skills: [...draft.skills], deliver: draft.deliver.trim() || "local",
+        skills: [...draft.skills], deliver: draft.deliver.trim() || `project:${p.view.slug}`,
         ...(draft.repeat ? { repeat: Number(draft.repeat) } : {}),
         ...Object.fromEntries((["failure_deliver", "workdir", "model", "provider", "reasoning_effort"] as const).filter((key) => draft[key].trim()).map((key) => [key, draft[key].trim()])),
         ...(draft.continuity ? { continuity: true } : {}),
@@ -212,6 +226,9 @@ export function CronForm(p: {
             onInput={(e) => setDraft("repeat", e.currentTarget.value)}
           />
         </Row>
+        <Row title="Deliver to" desc={deliveryHint()}>
+          <input class="s-input cs-input" placeholder={`project:${p.view.slug}`} aria-label="Delivery" value={draft.deliver} onInput={(e) => setDraft("deliver", e.currentTarget.value)} />
+        </Row>
       </Section>
 
       <Section title="Instruction">
@@ -264,9 +281,7 @@ export function CronForm(p: {
       </Section>
 
       <Section title="Advanced" hint="Optional Hermes execution and delivery overrides.">
-        <Row title="Deliver to">
-          <input class="s-input cs-input" placeholder="local" aria-label="Delivery" value={draft.deliver} onInput={(e) => setDraft("deliver", e.currentTarget.value)} />
-        </Row>
+
         <Row title="Model" desc={settings()?.model_snapshot ? `Saved default: ${settings()!.model_snapshot}` : undefined}>
           <input class="s-input cs-input" placeholder={settings()?.model_snapshot ? "No override" : "Hermes default"} aria-label="Model" value={draft.model} onInput={(e) => setDraft("model", e.currentTarget.value)} />
         </Row>
@@ -294,7 +309,7 @@ export function CronForm(p: {
           <button class="s-btn sm quiet" disabled={saving()} onClick={discard}>
             Discard
           </button>
-          <button class="s-btn sm primary" disabled={saving() || (!p.creating && dirtyCount() === 0 && !skillInput().trim())} onClick={save}>
+          <button class="s-btn sm primary" disabled={saving() || (p.creating && usesProjectRoute() && !!p.deliveryRoute && !p.deliveryRoute.ready) || (!p.creating && dirtyCount() === 0 && !skillInput().trim())} onClick={save}>
             {saving() ? (p.creating ? "Creating…" : "Saving…") : (p.creating ? "Create" : "Save")}
           </button>
         </div>

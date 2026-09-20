@@ -429,6 +429,11 @@ export async function listProjectCrons(slug: string): Promise<ControllerJob[]> {
   return (data.jobs ?? []).map((job) => getProjectCronFromJob(slug, job).job!);
 }
 
+export interface ProjectCronDefaults { deliver: string; route_ready: boolean }
+export async function getProjectCronDefaults(slug: string): Promise<ProjectCronDefaults> {
+  return api(`/api/projects/${encodeURIComponent(slug)}/crons/defaults`);
+}
+
 export type ProjectCronDraft = ControllerPatch;
 
 export async function createProjectCron(slug: string, draft: ProjectCronDraft): Promise<HermesJob> {

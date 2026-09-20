@@ -76,6 +76,17 @@ describe("shared cron form", () => {
     expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe(fixtures.hourly.name);
     expect(save).not.toHaveBeenCalled();
   });
+  it("defaults creation to the project route and requires an explicit local choice when missing", async () => {
+    const save = vi.fn(async () => view());
+    render(() => <CronForm creating draftKey="route" view={{ slug: "notes", job: view().job, runs: [] }} deliveryRoute={{ ready: false, loading: false, error: null }} save={save} onSaved={() => {}} />);
+    expect((screen.getByLabelText("Delivery") as HTMLInputElement).value).toBe("project:notes");
+    expect((screen.getByText("Create") as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/No canonical conversation is bound/)).toBeTruthy();
+    fireEvent.input(screen.getByLabelText("Delivery"), { target: { value: "local" } });
+    fireEvent.input(screen.getByLabelText("Instruction"), { target: { value: "Read local notes" } });
+    fireEvent.click(screen.getByText("Create"));
+    await waitFor(() => expect(save).toHaveBeenCalledWith(expect.objectContaining({ deliver: "local" })));
+  });
   it("validates name and repeat, then sends numeric repeat with skills on create", async () => {
     const save = vi.fn(async () => view());
     render(() => <CronForm creating draftKey="new" view={view()} save={save} onSaved={() => {}} />);

@@ -10,6 +10,7 @@ import {
   listProjects,
   createProjectCron,
   listProjectCrons,
+  getProjectCronDefaults,
   mkdirProjectFile,
   readProjectFile,
   writeProjectFile,
@@ -64,6 +65,9 @@ export function LiveProjectsSection(p: {
   const [dirs, setDirs] = createStore<Record<string, ProjectFileEntry[]>>({});
   // The project's controller (Hermes cron), shown as the folder's first row.
   const [controllers, setControllers] = createStore<Record<string, ControllerData>>({});
+  const [cronErrors, setCronErrors] = createStore<Record<string, string | null>>({});
+  const [cronDefaults, setCronDefaults] = createSignal<import("./api").ProjectCronDefaults | null>(null);
+  const [defaultsError, setDefaultsError] = createSignal<string | null>(null);
   const [crons, setCrons] = createStore<Record<string, import("./api").ControllerJob[]>>({});
   const [actionMenu, setActionMenu] = createSignal<{ x: number; y: number; slug: string; path: string } | null>(null);
   const [newFolder, setNewFolder] = createSignal<{ slug: string; path: string } | null>(null);
@@ -79,7 +83,7 @@ export function LiveProjectsSection(p: {
       .catch(() => {});
   };
   const loadCrons = (slug: string) => {
-    listProjectCrons(slug).then((jobs) => setCrons(slug, jobs)).catch(() => setCrons(slug, []));
+    listProjectCrons(slug).then((jobs) => { setCrons(slug, jobs); setCronErrors(slug, null); }).catch((error) => setCronErrors(slug, error instanceof Error ? error.message : String(error)));
   };
 
   const refresh = () => {
@@ -166,7 +170,8 @@ export function LiveProjectsSection(p: {
     { kind: "item", label: "New agent", icon: Ic.NewAgentIcon, onClick: () => p.onNewAgent(slug) },
     { kind: "item", label: "New cron", icon: Ic.BellIcon, onClick: () => {
       setActionMenu(null);
-      setNewCron(slug);
+      setCronDefaults(null); setDefaultsError(null); setNewCron(slug);
+      getProjectCronDefaults(slug).then((value) => { if (newCron() === slug) setCronDefaults(value); }).catch((error) => { if (newCron() === slug) setDefaultsError(error instanceof Error ? error.message : String(error)); });
     } },
   ];
   const toggleProject = (slug: string) => {
@@ -297,6 +302,11 @@ export function LiveProjectsSection(p: {
                     );
                   }}
                 </Show>
+                <Show when={cronErrors[project.slug]}>
+                  <div class="cron-unavailable" role="status">Crons unavailable. {crons[project.slug]?.length ? "Showing last loaded jobs. " : ""}{cronErrors[project.slug]}
+                    <button class="s-btn sm" onClick={() => loadCrons(project.slug)}>Retry crons</button>
+                  </div>
+                </Show>
                 <For each={crons[project.slug] ?? []}>
                   {(job) => (
                     <button
@@ -380,7 +390,7 @@ export function LiveProjectsSection(p: {
       </Show>
       <Show when={newCron()}>
         {(slug) => <Dialog wide title="New cron" onClose={() => !makingCron() && setNewCron(null)} footer={<span>Unfinished drafts are kept until saved or discarded.</span>}>
-          <CronForm creating onBusyChange={setMakingCron} draftKey={`create:${slug()}`} view={{ slug: slug(), job: { id: "", name: "", schedule: "every 1h", enabled: true, failure_streak: 0 }, runs: [] }}
+          <CronForm creating deliveryRoute={{ ready: cronDefaults()?.route_ready ?? false, loading: !cronDefaults() && !defaultsError(), error: defaultsError() }} onBusyChange={setMakingCron} draftKey={`create:${slug()}`} view={{ slug: slug(), job: { id: "", name: "", schedule: "every 1h", enabled: true, failure_streak: 0 }, runs: [] }}
             save={async (draft) => getProjectCronFromJob(slug(), await createProjectCron(slug(), draft))}
             onClose={() => setNewCron(null)} onSaved={(view, warning) => {
               setCronWarning(warning ? `Cron created. ${warning}` : null);

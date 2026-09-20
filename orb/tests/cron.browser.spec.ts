@@ -20,6 +20,7 @@ for (const theme of ["light", "dark"]) {
       else if (path.endsWith("/files")) result = { entries: folderCreated ? [{ name: "Notes", kind: "dir" }] : [] };
       else if (path.endsWith("/missions")) result = [];
       else if (path.endsWith("/controller")) result = { slug: "notes", job: null, runs: [] };
+      else if (path.endsWith("/crons/defaults")) result = { deliver: "project:notes", route_ready: true };
       else if (path.endsWith("/crons")) {
         if (method === "POST") { cronCreated = true; result = { job: fixtures.hourly }; }
         else result = { jobs: cronCreated ? [fixtures.hourly] : [] };
@@ -82,7 +83,7 @@ for (const theme of ["light", "dark"]) {
     await page.getByRole("button", { name: "Create", exact: true }).click();
     await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeVisible();
     await expect(project).toHaveAttribute("aria-expanded", "true");
-    expect(requests.some((r) => r.method === "POST" && r.path.endsWith("/crons"))).toBe(true);
+    expect(requests.find((r) => r.method === "POST" && r.path.endsWith("/crons"))?.body.deliver).toBe("project:notes");
     await page.getByRole("button", { name: "Settings", exact: true }).click();
     await page.getByLabel("Name", { exact: true }).fill("Draft retained");
     await page.getByRole("button", { name: "Runs", exact: true }).click();
@@ -143,3 +144,42 @@ for (const theme of ["light", "dark"]) {
     await page.screenshot({ path: `test-results/cron-snapshots-${theme}.png`, fullPage: true, style: ".harness-controls { visibility: hidden; }" });
   });
 }
+
+test("cron outage retains cached rows; Retry restores availability without logging out", async ({ page }) => {
+  let fail = false;
+  await page.route("**/api/**", (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/crons") && fail) return route.fulfill({ status: 502, body: "Hermes scheduler returned 401: Unauthorized" });
+    const json = path === "/api/projects" ? { projects: [{ slug: "notes", title: "Project notes" }] }
+      : path.endsWith("/crons") ? { jobs: [fixtures.hourly] }
+      : path.endsWith("/missions") ? [] : path.endsWith("/files") ? { entries: [] }
+      : { slug: "notes", job: null, runs: [] };
+    return route.fulfill({ json });
+  });
+  await page.goto("/tests/browser.html?theme=dark");
+  const folder = page.getByRole("button", { name: "Project notes", exact: true });
+  await folder.click();
+  await expect(page.locator(".row.cron")).toHaveCount(1);
+  fail = true;
+  await folder.click(); await folder.click();
+  await expect(page.getByRole("status")).toContainText("Crons unavailable");
+  await expect(page.getByRole("status")).toContainText("Showing last loaded jobs");
+  await expect(page.locator(".row.cron")).toHaveCount(1);
+  expect(await page.evaluate(() => localStorage.getItem("orb.jwt"))).toBe("local-browser-test");
+  fail = false; await page.getByRole("button", { name: "Retry crons" }).click();
+  await expect(page.getByRole("status")).toHaveCount(0);
+  await expect(page.locator(".row.cron")).toHaveCount(1);
+});
+
+test("creation defaults to the project conversation; missing route requires explicit local choice", async ({ page }) => {
+  await page.route("**/api/**", (route) => route.fulfill({ json: new URL(route.request().url()).pathname.endsWith("/crons/defaults") ? { deliver: "project:notes", route_ready: false } : { projects: [{ slug: "notes", title: "Project notes" }] } }));
+  await page.goto("/tests/browser.html?theme=light");
+  await page.getByRole("button", { name: "Project actions for Project notes" }).click();
+  await page.getByRole("menuitem", { name: "New cron" }).click();
+  await expect(page.getByLabel("Delivery", { exact: true })).toHaveValue("project:notes");
+  await expect(page.getByText(/No canonical conversation is bound/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Create", exact: true })).toBeDisabled();
+  await page.getByLabel("Delivery", { exact: true }).fill("local");
+  await expect(page.getByText(/no conversation message will be sent/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Create", exact: true })).toBeEnabled();
+});

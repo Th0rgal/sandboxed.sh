@@ -425,7 +425,7 @@ export default function App() {
   const [projects, setProjects] = createStore(structuredClone(seed));
   const [selected, setSelected] = createSignal<string | null>("a1");
   const [collapsed, setCollapsed] = createStore<Record<string, boolean>>({});
-  const [sidebar, setSidebar] = createSignal(true);
+  const [sidebar, setSidebar] = createSignal(!window.matchMedia("(max-width: 720px)").matches);
   const [sbWidth, setSbWidth] = createSignal(220);
   const [streamingId, setStreamingId] = createSignal<string | null>(null);
   const [newProject, setNewProject] = createSignal(seed[0].id);
@@ -601,6 +601,7 @@ export default function App() {
     requestAnimationFrame(() => scroller?.scrollTo({ top: scroller.scrollHeight, behavior: smooth ? "smooth" : "auto" }));
 
   const open = (id: string | null, push = true) => {
+    if (window.matchMedia("(max-width: 720px)").matches) setSidebar(false);
     batch(() => {
       setSelected(id);
       if (push) {
@@ -777,6 +778,9 @@ export default function App() {
 
   const onKey = (e: KeyboardEvent) => {
     if (e.defaultPrevented || hasFocusScope()) return;
+    if (e.key === "Escape" && sidebar() && window.matchMedia("(max-width: 720px)").matches) {
+      e.preventDefault(); setSidebar(false); return;
+    }
     if (nameDlg()) {
       if (e.key === "Escape") setNameDlg(null);
       return;
@@ -843,7 +847,8 @@ export default function App() {
 
   return (
     <div class={`app ${sidebar() ? "" : "sb-hidden"}`} style={{ "--sb-w": `${sbWidth()}px` }}>
-      <aside class="sidebar">
+      <button class="sidebar-backdrop" aria-label="Close sidebar" onClick={() => setSidebar(false)} tabIndex={-1} />
+      <aside id="orb-sidebar" class="sidebar">
         <div class="sb-top" data-tauri-drag-region />
         <nav class="sb-scroll" onContextMenu={(e) => e.preventDefault()}>
           <Show
@@ -927,7 +932,7 @@ export default function App() {
 
       <header class="titlebar" data-tauri-drag-region>
         <div class="tb-left">
-          <button class="icon-btn" title="Toggle sidebar (⌘B)" onClick={() => setSidebar(!sidebar())}>
+          <button class="icon-btn" aria-label="Toggle sidebar" aria-expanded={sidebar()} aria-controls="orb-sidebar" title="Toggle sidebar (⌘B)" onClick={() => setSidebar(!sidebar())}>
             <Ic.SidebarIcon />
           </button>
           <button class="icon-btn" title="Search">

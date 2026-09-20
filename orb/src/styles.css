@@ -129,14 +129,15 @@ button:focus-visible { outline: 1px solid var(--blue); outline-offset: -1px; }
 .app.sb-hidden { grid-template-columns: 0 1fr; }
 .app.sb-hidden .sidebar { display: none; }
 
-/* Orb's native minimum width is desktop-sized, but the web preview and
-   embedded/narrow windows must leave the editor usable. The sidebar remains
-   available through the titlebar toggle when there is room again. */
+/* Narrow windows use an overlay drawer controlled by the same sidebar toggle. */
+.sidebar-backdrop { display: none; }
 @media (max-width: 720px) {
   .app { grid-template-columns: 0 1fr; }
-  .sidebar { display: none !important; }
+  .app:not(.sb-hidden) .sidebar { display: flex; position: fixed; top: var(--tb-h); bottom: 0; left: 0; width: min(var(--sb-w), 85vw); z-index: 20; background: var(--bg); box-shadow: 8px 0 24px #0003; }
+  .sidebar .sb-top, .sidebar .sb-resize { display: none; }
+  .app:not(.sb-hidden) .sidebar-backdrop { display: block; position: fixed; inset: var(--tb-h) 0 0; z-index: 19; background: #0005; }
   .titlebar, .main { grid-column: 2; }
-  .app:not(.sb-hidden) .tb-left { position: static; width: auto; margin-left: 0; }
+  .app:not(.sb-hidden) .titlebar .tb-left { position: static; width: auto; margin-left: 0; }
   .scroll { padding: 0 14px; }
 }
 
@@ -919,3 +920,6 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
   .cs .s-row-ctrl, .cs .cs-input { width: 100%; max-width: none; }
   .cs-savebar { flex-wrap: wrap; }
 }
+
+.cron-unavailable { padding: 6px 12px; font-size: 12px; color: var(--fg-3); overflow-wrap: anywhere; }
+.cron-unavailable button { margin-top: 5px; }
