@@ -15,9 +15,10 @@ export function ProjectPicker(p: {
 }) {
   const [query,setQuery]=createSignal("");
   const [active,setActive]=createSignal(0);
+  const [armed,setArmed]=createSignal(false);
   const rows=createMemo(()=>p.projects.filter(x=>`${x.name} ${x.id}`.toLowerCase().includes(query().trim().toLowerCase())));
   let root!:HTMLDivElement;
-  createEffect(()=>{rows();setActive(0);});
+  createEffect(()=>{rows();setActive(0);setArmed(false);});
   onMount(()=>{
     const release=trapFocus(root,p.onClose);
     const outside=(e:PointerEvent)=>{if(!root.contains(e.target as Node))p.onClose();};
@@ -26,6 +27,7 @@ export function ProjectPicker(p: {
   });
   const move=(offset:number)=>{
     const count=rows().length;if(!count)return;
+    setArmed(true);
     setActive((active()+offset+count)%count);
     root.querySelector(`#project-option-${active()}`)?.scrollIntoView({block:"nearest"});
   };
@@ -38,7 +40,7 @@ export function ProjectPicker(p: {
       }}/>
     <div class="project-picker-label">Recents</div>
     <div class="project-options" id="project-options" role="listbox" aria-label="Projects">
-      <For each={rows()}>{(row,index)=><button id={`project-option-${index()}`} role="option" aria-selected={row.id===p.selected} class={`project-option ${index()===active()?"highlighted":""}`} onMouseMove={()=>setActive(index())} onClick={()=>p.onSelect(row.id)}>
+      <For each={rows()}>{(row,index)=><button id={`project-option-${index()}`} role="option" aria-selected={row.id===p.selected} class={`project-option ${armed()&&index()===active()?"highlighted":""}`} onPointerEnter={()=>{setArmed(true);setActive(index());}} onClick={()=>p.onSelect(row.id)}>
         <Ic.FolderIcon size={15}/><span>{row.name}</span><Show when={row.id===p.selected}><span class="project-check" aria-label="Current project">✓</span></Show>
       </button>}</For>
       <Show when={!rows().length}><p class="project-empty">{p.projects.length?"No matching projects":"No projects yet"}</p></Show>

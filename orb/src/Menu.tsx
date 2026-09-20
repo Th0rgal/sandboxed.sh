@@ -29,13 +29,14 @@ export function MenuList(p: { items: MenuEntry[]; onPick?: () => void }) {
   );
 }
 
-export function PopupMenu(p: { x: number; y: number; items: MenuEntry[]; onClose: () => void }) {
+export function PopupMenu(p: { x: number; y: number; items: MenuEntry[]; onClose: () => void; focus?: boolean }) {
   let el!: HTMLDivElement;
   let trigger: HTMLElement | null = null;
   onMount(() => {
     trigger = document.activeElement as HTMLElement | null;
     const buttons = () => Array.from(el.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
-    buttons()[0]?.focus();
+    // Keyboard open focuses the first item; pointer open uses hover only (no focus ring).
+    if (p.focus !== false) buttons()[0]?.focus();
     const r = el.getBoundingClientRect();
     const dx = Math.min(0, window.innerWidth - 8 - r.right);
     const dy = Math.min(0, window.innerHeight - 8 - r.bottom);
@@ -53,7 +54,9 @@ export function PopupMenu(p: { x: number; y: number; items: MenuEntry[]; onClose
         e.preventDefault();
         const items = buttons();
         const index = items.indexOf(document.activeElement as HTMLButtonElement);
-        const next = e.key === "Home" ? 0 : e.key === "End" ? items.length - 1 : (index + (e.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+        const next = e.key === "Home" || (e.key === "ArrowDown" && index < 0) ? 0
+          : e.key === "End" || (e.key === "ArrowUp" && index < 0) ? items.length - 1
+          : (index + (e.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
         items[next]?.focus();
       } else if (e.key === "Tab") p.onClose();
     };

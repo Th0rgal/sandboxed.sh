@@ -17,8 +17,8 @@ test("actual App project chooser searches, selects and creates with keyboard and
  await page.goto("/");
  await page.getByRole("button",{name:"Verity",exact:true}).click();
  const agent=page.getByRole("button",{name:/Importer slice/});await expect(agent).toBeVisible();
- expect((await agent.boundingBox())!.height).toBe(32);
- expect((await page.getByRole("button",{name:"Verity",exact:true}).boundingBox())!.height).toBe(32);
+  expect((await agent.boundingBox())!.height).toBe(30);
+  expect((await page.getByRole("button",{name:"Verity",exact:true}).boundingBox())!.height).toBe(30);
  await expect(agent).not.toContainText("project-0");
  await page.locator("#orb-sidebar").screenshot({path:"test-results/orb-sidebar-compact.png"});
  const trigger=page.getByRole("button",{name:"Choose project",exact:true});await trigger.click();

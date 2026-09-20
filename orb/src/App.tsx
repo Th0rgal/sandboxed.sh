@@ -937,16 +937,16 @@ export default function App() {
             fallback={
               <>
                 <button class={`row ${selected() === null ? "active" : ""}`} onClick={() => open(null)}>
-                  <Ic.NewAgentIcon />
+                  <span class="row-ico"><Ic.NewAgentIcon /></span>
                   <span class="row-label">New Agent</span>
                   <kbd>⌘N</kbd>
                 </button>
                 <button class={`row ${selected() === "machines" ? "active" : ""}`} onClick={() => open("machines")}>
-                  <Ic.MachinesIcon />
+                  <span class="row-ico"><Ic.MachinesIcon /></span>
                   <span class="row-label">Machines</span>
                 </button>
                 <button class={`row ${selected() === "providers" ? "active" : ""}`} onClick={() => open("providers")}>
-                  <Ic.ProvidersIcon />
+                  <span class="row-ico"><Ic.ProvidersIcon /></span>
                   <span class="row-label">Providers</span>
                 </button>
 
@@ -985,13 +985,13 @@ export default function App() {
             }
           >
             <button class="row" onClick={leaveSettings}>
-              <Ic.ArrowLeft />
+              <span class="row-ico"><Ic.ArrowLeft /></span>
               <span class="row-label">Back</span>
             </button>
             <For each={SETTINGS_TABS}>
               {(t) => (
                 <button class={`row ${settingsTab() === t.id ? "active" : ""}`} onClick={() => setSettingsTab(t.id)}>
-                  <t.icon />
+                  <span class="row-ico"><t.icon /></span>
                   <span class="row-label">{t.label}</span>
                 </button>
               )}

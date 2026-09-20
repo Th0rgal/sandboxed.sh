@@ -4,6 +4,7 @@ import { createStore } from "solid-js/store";
 import * as Ic from "./icons";
 import { MdSource, MdView } from "./Markdown";
 import { displayTitle } from "./goal";
+import { nodeLabel } from "./missionLaunch";
 import {
   isConnected,
   ApiError,
@@ -32,16 +33,46 @@ import { getProjectCronFromJob } from "./cronSchema";
 
 /** Sidebar section listing the core backend's projects with their missions
  * and hosted files. Replaces the demo projects when connected. */
+/** Known placement only: remote node, then workspace. Never invented. */
+export function missionMachine(m: { remote_job?: { node_id?: string } | null; remote_node_id?: string | null; workspace_name?: string | null }): string | undefined {
+  const id = m.remote_job?.node_id ?? m.remote_node_id ?? m.workspace_name;
+  return id ? nodeLabel(id) : undefined;
+}
+
+/** Delayed native title for truncated labels plus known repo/branch/machine. */
+export function rowDetail(title: string, extra: Array<string | undefined | null> = []): string | undefined {
+  const known = extra.map((part) => part?.trim()).filter((part): part is string => !!part);
+  const overflow = title.length > 28;
+  if (!overflow && !known.length) return undefined;
+  return [overflow ? title : undefined, ...known].filter(Boolean).join(" · ");
+}
+
 /** Where an agent runs: the workspace/machine name behind a cloud glyph.
  * Per agent, not per project — one project can run on several machines. */
 function MachineBadge(p: { name?: string | null }) {
   return (
     <Show when={p.name}>
-      <span class="row-machine" title={`Runs on ${p.name}`}>
+      <span class="row-machine" aria-hidden="true">
         <Ic.CloudIcon />
       </span>
     </Show>
   );
+}
+
+function useRowTip() {
+  const [tip, setTip] = createSignal<{ text: string; x: number; y: number } | null>(null);
+  let timer = 0;
+  const hide = () => { window.clearTimeout(timer); setTip(null); };
+  const show = (text: string | undefined, el: HTMLElement) => {
+    window.clearTimeout(timer);
+    if (!text) { setTip(null); return; }
+    timer = window.setTimeout(() => {
+      const box = el.getBoundingClientRect();
+      setTip({ text, x: Math.max(8, Math.min(box.left, window.innerWidth - 260)), y: box.bottom + 6 });
+    }, 480);
+  };
+  onCleanup(hide);
+  return { tip, show, hide };
 }
 
 export function LiveProjectsSection(p: {
@@ -83,6 +114,8 @@ export function LiveProjectsSection(p: {
   const [makingCron, setMakingCron] = createSignal(false);
   const [cronWarning, setCronWarning] = createSignal<string | null>(null);
   const [newCron, setNewCron] = createSignal<string | null>(null);
+  const [actionFocus, setActionFocus] = createSignal(true);
+  const rowTip = useRowTip();
   const currentConnection = (version: number) => isConnected() && connectionVersion() === version;
   const loadController = (slug: string) => {
     if (!isConnected()) return;
@@ -249,15 +282,20 @@ export function LiveProjectsSection(p: {
                 <button
                   class="row folder depth"
                   style={{ "--depth": dp.depth + 1 }}
+                  onPointerEnter={(e) => rowTip.show(rowDetail(entry.name), e.currentTarget)}
+                  onPointerLeave={rowTip.hide}
+                  onFocus={(e) => rowTip.show(rowDetail(entry.name), e.currentTarget)}
+                  onBlur={rowTip.hide}
                   onClick={() => toggleDir(dp.slug, childPath())}
                   onContextMenu={(e) => {
                     e.preventDefault();
+                    setActionFocus(false);
                     setActionMenu({ x: e.clientX, y: e.clientY, slug: dp.slug, path: childPath() });
                   }}
                 >
-                  <Show when={expanded[key()]} fallback={<Ic.FolderIcon />}>
+                  <span class="row-ico"><Show when={expanded[key()]} fallback={<Ic.FolderIcon />}>
                     <Ic.FolderOpenIcon />
-                  </Show>
+                  </Show></span>
                   <span class="row-label">{entry.name}</span>
                 </button>
                 <Show when={expanded[key()]}>
@@ -271,9 +309,13 @@ export function LiveProjectsSection(p: {
             <button
               class={`row file depth ${p.selected() === id() ? "active" : ""}`}
               style={{ "--depth": dp.depth + 1 }}
+              onPointerEnter={(e) => rowTip.show(rowDetail(entry.name), e.currentTarget)}
+              onPointerLeave={rowTip.hide}
+              onFocus={(e) => rowTip.show(rowDetail(entry.name), e.currentTarget)}
+              onBlur={rowTip.hide}
               onClick={() => p.open(id())}
             >
-              <Ic.FileIcon />
+              <span class="row-ico"><Ic.FileIcon /></span>
               <span class="row-label">{entry.name}</span>
             </button>
           );
@@ -301,22 +343,25 @@ export function LiveProjectsSection(p: {
             <div class={`group ${isOpen() ? "has" : ""}`}>
               <div class="row project" onContextMenu={(e) => {
                 e.preventDefault();
+                setActionFocus(false);
                 setActionMenu({ x: e.clientX, y: e.clientY, slug: project.slug, path: "" });
               }}>
                 <button class="row-main" aria-expanded={isOpen()} onClick={() => toggleProject(project.slug)}>
-                  <Show when={isOpen()} fallback={<Ic.FolderIcon />}>
+                  <span class="row-ico"><Show when={isOpen()} fallback={<Ic.FolderIcon />}>
                     <Ic.FolderOpenIcon />
-                  </Show>
+                  </Show></span>
                   <span class="row-label">{project.title || project.slug}</span>
                 </button>
                 <button
                   class="row-action"
                   aria-label={`Project actions for ${project.title || project.slug}`}
                   title="Project actions"
+                  onPointerDown={(e) => setActionFocus(e.pointerType !== "mouse")}
+                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setActionFocus(true); }}
                   onClick={(e) => {
                     e.stopPropagation();
                     const box = e.currentTarget.getBoundingClientRect();
-                    setActionMenu({ x: box.right - 150, y: box.bottom + 4, slug: project.slug, path: "" });
+                    setActionMenu({ x: Math.max(8, box.right - 176), y: box.bottom + 4, slug: project.slug, path: "" });
                   }}
                 >
                   <Ic.PlusIcon size={13} />
@@ -330,10 +375,13 @@ export function LiveProjectsSection(p: {
                     return (
                       <button
                         class={`row agent d1 cron ${p.selected() === `c:${project.slug}` ? "active" : ""}`}
-                        title="Controller (Hermes cron)"
+                        onPointerEnter={(e) => rowTip.show(rowDetail(job().name, ["Controller"]), e.currentTarget)}
+                        onPointerLeave={rowTip.hide}
+                        onFocus={(e) => rowTip.show(rowDetail(job().name, ["Controller"]), e.currentTarget)}
+                        onBlur={rowTip.hide}
                         onClick={() => p.open(`c:${project.slug}`)}
                       >
-                        <span class="glyph">
+                        <span class="row-ico glyph">
                           <CronGlyph job={job()} running={ticking()} />
                         </span>
                         <span class="row-label">{job().name}</span>
@@ -357,10 +405,13 @@ export function LiveProjectsSection(p: {
                   {(job) => (
                     <button
                       class={`row agent d1 cron ${p.selected() === `pc:${project.slug}:${job.id}` ? "active" : ""}`}
-                      title="Project cron"
+                      onPointerEnter={(e) => rowTip.show(rowDetail(job.name, ["Cron"]), e.currentTarget)}
+                      onPointerLeave={rowTip.hide}
+                      onFocus={(e) => rowTip.show(rowDetail(job.name, ["Cron"]), e.currentTarget)}
+                      onBlur={rowTip.hide}
                       onClick={() => p.open(`pc:${project.slug}:${job.id}`)}
                     >
-                      <span class="glyph"><CronGlyph job={job} /></span>
+                      <span class="row-ico glyph"><CronGlyph job={job} /></span>
                       <span class="row-label">{job.name}</span>
                       <span class="row-machine"><span class="row-machine-name cron-next">{!job.enabled || job.state === "paused" ? "paused" : untilLabel(job.next_run_at, Date.now())}</span></span>
                     </button>
@@ -370,13 +421,17 @@ export function LiveProjectsSection(p: {
                   {(m) => (
                     <button
                       class={`row agent d1 ${p.selected() === `m:${m.id}` ? "active" : ""}`}
+                      onPointerEnter={(e) => rowTip.show(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]), e.currentTarget)}
+                      onPointerLeave={rowTip.hide}
+                      onFocus={(e) => rowTip.show(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]), e.currentTarget)}
+                      onBlur={rowTip.hide}
                       onClick={() => p.open(`m:${m.id}`)}
                     >
-                      <span class="glyph">
+                      <span class="row-ico glyph">
                         <p.StatusGlyph agent={{ status: p.missionGlyph(m.status) }} busy={false} />
                       </span>
                       <span class="row-label">{displayTitle(m.title) || m.id}</span>
-                      <MachineBadge name={m.workspace_name} />
+                      <MachineBadge name={missionMachine(m)} />
                     </button>
                   )}
                 </For>
@@ -385,7 +440,7 @@ export function LiveProjectsSection(p: {
                     class="row done-toggle d1"
                     onClick={() => setShowDone(project.slug, !showDone[project.slug])}
                   >
-                    <Ic.ChevronRight size={11} class={`chev ${showDone[project.slug] ? "open" : ""}`} />
+                    <span class="row-ico"><Ic.ChevronRight size={11} class={`chev ${showDone[project.slug] ? "open" : ""}`} /></span>
                     <span class="row-label">
                       {doneOf(project.slug).length} finished
                     </span>
@@ -394,14 +449,18 @@ export function LiveProjectsSection(p: {
                     <For each={doneOf(project.slug)}>
                       {(m) => (
                         <button
-                          class={`row agent done d2 ${p.selected() === `m:${m.id}` ? "active" : ""}`}
+                          class={`row agent done d1 ${p.selected() === `m:${m.id}` ? "active" : ""}`}
+                          onPointerEnter={(e) => rowTip.show(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]), e.currentTarget)}
+                          onPointerLeave={rowTip.hide}
+                          onFocus={(e) => rowTip.show(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]), e.currentTarget)}
+                          onBlur={rowTip.hide}
                           onClick={() => p.open(`m:${m.id}`)}
                         >
-                          <span class="glyph">
+                          <span class="row-ico glyph">
                             <p.StatusGlyph agent={{ status: p.missionGlyph(m.status) }} busy={false} />
                           </span>
                           <span class="row-label">{displayTitle(m.title) || m.id}</span>
-                          <MachineBadge name={m.workspace_name} />
+                          <MachineBadge name={missionMachine(m)} />
                         </button>
                       )}
                     </For>
@@ -422,8 +481,9 @@ export function LiveProjectsSection(p: {
         <div class="row note">No projects on the core backend.</div>
       </Show>
       <Show when={actionMenu()}>
-        {(menu) => <PopupMenu {...menu()} items={menuItems(menu().slug, menu().path)} onClose={() => setActionMenu(null)} />}
+        {(menu) => <PopupMenu {...menu()} focus={actionFocus()} items={menuItems(menu().slug, menu().path)} onClose={() => setActionMenu(null)} />}
       </Show>
+      <Show when={rowTip.tip()}>{(tip) => <div class="row-tip" role="tooltip" style={{ left: `${tip().x}px`, top: `${tip().y}px` }}>{tip().text}</div>}</Show>
       <Show when={newFolder()}>
         {(target) => (
           <Dialog title="New folder" onClose={() => !makingFolder() && setNewFolder(null)} footer={<><button class="s-btn" disabled={makingFolder()} onClick={() => setNewFolder(null)}>Cancel</button><button class="s-btn primary" disabled={makingFolder()} onClick={createFolder}>{makingFolder() ? "Creating…" : "Create"}</button></>}>
