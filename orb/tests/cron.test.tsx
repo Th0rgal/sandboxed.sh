@@ -161,3 +161,11 @@ describe("schedule and menu interaction", () => {
     expect(close).toHaveBeenCalled(); expect(document.activeElement).toBe(trigger); trigger.remove();
   });
 });
+
+ it("keeps successful creation successful when storage cleanup throws", async () => {
+   const saved = vi.fn();
+   render(() => <CronForm creating draftKey="storage-failure" view={view()} save={async () => view()} onSaved={saved} />);
+   const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => { throw new Error("unavailable"); });
+   try { fireEvent.click(screen.getByText("Create")); await waitFor(() => expect(saved).toHaveBeenCalledOnce()); }
+   finally { remove.mockRestore(); }
+ });

@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use tauri::{Manager, Theme, WebviewWindow};
+use tauri::{Theme, WebviewWindow};
 
 /// Follow the frontend's persisted preference. `None` delegates to the OS,
 /// which makes titlebar material and the frontend change together for Auto.

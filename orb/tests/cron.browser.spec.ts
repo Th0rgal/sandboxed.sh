@@ -97,6 +97,7 @@ for (const theme of ["light", "dark"]) {
     await page.screenshot({ path: `test-results/cron-edit-${theme}.png`, fullPage: true, style: ".harness-controls { visibility: hidden; }" });
     await expect(page.getByRole("link")).toHaveCSS("cursor", "pointer");
     await expect(page.getByLabel("Disabled field")).toHaveCSS("cursor", "default");
+    await page.getByText("Advanced", { exact: true }).click();
     await expect(page.getByRole("combobox")).toHaveCSS("cursor", "pointer");
     expect(errors).toEqual([]);
   });
@@ -135,6 +136,7 @@ for (const theme of ["light", "dark"]) {
     await page.getByRole("button", { name: "Project notes", exact: true }).click();
     await page.getByRole("button", { name: /Saved local defaults/ }).click();
     await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page.getByText("Advanced", { exact: true }).click();
     await expect(page.getByText("Saved default: fixture-local-model")).toBeVisible();
     await expect(page.getByText("Saved default: custom")).toBeVisible();
     await expect(page.getByLabel("Model", { exact: true })).toHaveValue("");

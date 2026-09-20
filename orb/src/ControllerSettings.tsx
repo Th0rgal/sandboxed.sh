@@ -280,7 +280,8 @@ export function CronForm(p: {
         </div>
       </Section>
 
-      <Section title="Advanced" hint="Optional Hermes execution and delivery overrides.">
+      <details class="cs-advanced"><summary>Advanced</summary>
+      <Section title="Execution overrides" hint="Optional Hermes execution and delivery overrides.">
 
         <Row title="Model" desc={settings()?.model_snapshot ? `Saved default: ${settings()!.model_snapshot}` : undefined}>
           <input class="s-input cs-input" placeholder={settings()?.model_snapshot ? "No override" : "Hermes default"} aria-label="Model" value={draft.model} onInput={(e) => setDraft("model", e.currentTarget.value)} />
@@ -295,6 +296,7 @@ export function CronForm(p: {
         </select></Row>
         <Row title="Continuity" desc="Keep context across runs when supported by Hermes."><input aria-label="Continuity" type="checkbox" checked={draft.continuity} onChange={(e) => setDraft("continuity", e.currentTarget.checked)} /></Row>
       </Section>
+      </details>
 
       </fieldset>
       <Show when={p.creating || dirtyCount() > 0 || skillInput().trim() || error()}>
