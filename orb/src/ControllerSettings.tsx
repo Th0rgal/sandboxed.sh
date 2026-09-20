@@ -1,11 +1,12 @@
-import { For, Show, createEffect, createMemo, createSignal, on, type JSX } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, on, onCleanup, type JSX } from "solid-js";
 import { createStore } from "solid-js/store";
 import * as Ic from "./icons";
-import { updateController, type ControllerPatch, type ControllerView } from "./api";
-import { SchedulePicker, scheduleSummary } from "./SchedulePicker";
+import { getApiUrl, updateController, type ControllerPatch, type ControllerView } from "./api";
+import { ignoredCronFields } from "./cronSchema";
+import { SchedulePicker } from "./SchedulePicker";
 
 
-type Draft = {
+export type CronDraft = {
   name: string;
   schedule: string;
   prompt: string;
@@ -20,7 +21,7 @@ type Draft = {
   continuity: boolean;
 };
 
-function draftOf(view: ControllerView): Draft {
+export function draftOf(view: ControllerView): CronDraft {
   const j = view.job;
   const s = view.settings;
   return {
@@ -65,13 +66,37 @@ function Row(p: { title: string; desc?: string; stack?: boolean; children: JSX.E
   );
 }
 
-/** Settings for a project's controller: every field Hermes lets you edit. */
-export function ControllerSettingsPanel(p: { slug: string; view: ControllerView; onSaved: (v: ControllerView) => void; save?: (patch: ControllerPatch) => Promise<ControllerView> }) {
-  const [draft, setDraft] = createStore<Draft>(draftOf(p.view));
-  const [base, setBase] = createSignal<Draft>(draftOf(p.view));
+/** Shared creation and editing form. Drafts survive tabs, navigation and unmount. */
+export function CronForm(p: {
+  draftKey: string;
+  view: ControllerView;
+  creating?: boolean;
+  save: (patch: ControllerPatch) => Promise<ControllerView>;
+  onSaved: (view: ControllerView, warning?: string) => void;
+  onBusyChange?: (busy: boolean) => void;
+  onClose?: () => void;
+}) {
+  const draftPrefix = `orb.cronDraft:${getApiUrl()}:`;
+  const storageKey = `${draftPrefix}${p.draftKey}`;
+  let restored: { draft: CronDraft; base: CronDraft; skillInput?: string } | null = null;
+  try { restored = JSON.parse(sessionStorage.getItem(storageKey) ?? "null"); } catch { /* unavailable storage */ }
+  const [draft, setDraft] = createStore<CronDraft>(restored?.draft ?? draftOf(p.view));
+  const [base, setBase] = createSignal<CronDraft>(restored?.base ?? draftOf(p.view));
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
-  const [skillInput, setSkillInput] = createSignal("");
+  const [skillInput, setSkillInput] = createSignal(restored?.skillInput ?? "");
+  const persist = () => {
+    try {
+      if (dirtyCount() || skillInput().trim()) sessionStorage.setItem(storageKey, JSON.stringify({ draft, base: base(), skillInput: skillInput() }));
+      else sessionStorage.removeItem(storageKey);
+    } catch { /* beforeunload still protects edits when storage is unavailable */ }
+  };
+  createEffect(persist);
+  const beforeUnload = (e: BeforeUnloadEvent) => {
+    if (dirtyCount() || skillInput().trim() || saving()) { e.preventDefault(); e.returnValue = ""; }
+  };
+  window.addEventListener("beforeunload", beforeUnload);
+  onCleanup(() => { persist(); window.removeEventListener("beforeunload", beforeUnload); });
 
   // A fresh server view resets the form only while nothing is being edited.
   createEffect(
@@ -107,23 +132,52 @@ export function ControllerSettingsPanel(p: { slug: string; view: ControllerView;
   const dirtyCount = () => Object.keys(patch()).length;
 
   const save = async () => {
-    if (saving() || dirtyCount() === 0) return;
+    if (saving()) return;
+    addSkill();
+    if (!draft.name.trim() || !draft.prompt.trim() || !draft.schedule.trim()) {
+      setError("Name, instruction, and schedule are required."); return;
+    }
+    if (draft.name.trim().length > 200) { setError("Name must be 200 characters or fewer."); return; }
+    if (draft.repeat.trim() && (!/^\d+$/.test(draft.repeat) || !Number.isSafeInteger(Number(draft.repeat)) || Number(draft.repeat) < 1)) {
+      setError("Stops after must be a positive whole number, or empty for Never."); return;
+    }
+    if ((p.creating || patch().prompt !== undefined) && draft.prompt.length > (p.view.settings?.prompt_budget ?? 5000)) { setError("Instruction exceeds the allowed character budget."); return; }
+    if (!p.creating && dirtyCount() === 0) return;
     setSaving(true);
+    p.onBusyChange?.(true);
     setError(null);
     try {
-      const view = await (p.save ? p.save(patch()) : updateController(p.slug, patch()));
+      const changes: ControllerPatch = p.creating ? {
+        name: draft.name.trim(), schedule: draft.schedule.trim(), prompt: draft.prompt,
+        skills: [...draft.skills], deliver: draft.deliver.trim() || "local",
+        ...(draft.repeat ? { repeat: Number(draft.repeat) } : {}),
+        ...Object.fromEntries((["failure_deliver", "workdir", "model", "provider", "reasoning_effort"] as const).filter((key) => draft[key].trim()).map((key) => [key, draft[key].trim()])),
+        ...(draft.continuity ? { continuity: true } : {}),
+      } : patch();
+      const view = await p.save(changes);
+      const ignored = ignoredCronFields(changes, view);
+      const warning = ignored.length ? `Hermes did not retain: ${ignored.join(", ")}. Its cron API needs support for these settings.` : undefined;
       const next = draftOf(view);
+      if (warning && p.creating && view.job) {
+        const pending = { ...next, ...Object.fromEntries(ignored.map((key) => [key, draft[key as keyof CronDraft]])) };
+        try { sessionStorage.setItem(`${draftPrefix}edit:${view.slug}:${view.job.id}`, JSON.stringify({ base: next, draft: pending })); } catch { /* warning still identifies dropped values */ }
+      }
       setBase(next);
+      if (warning && !p.creating) { setError(warning); return; }
       setDraft(next);
-      p.onSaved(view);
+      setSkillInput("");
+      try { sessionStorage.removeItem(storageKey); } catch { /* storage may be unavailable */ }
+      p.onSaved(view, warning);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
+      p.onBusyChange?.(false);
     }
   };
   const discard = () => {
     setDraft(base());
+    setSkillInput("");
     setError(null);
   };
 
@@ -141,20 +195,21 @@ export function ControllerSettingsPanel(p: { slug: string; view: ControllerView;
 
   return (
     <div class="cs">
+      <fieldset class="cs-fieldset" disabled={saving()}>
       <Section title="Schedule">
         <Row title="Name">
-          <input class="s-input cs-input" value={draft.name} onInput={(e) => setDraft("name", e.currentTarget.value)} />
+          <input aria-label="Name" class="s-input cs-input" value={draft.name} onInput={(e) => setDraft("name", e.currentTarget.value)} />
         </Row>
-        <Row title="Runs" desc={scheduleSummary(draft.schedule)}>
+        <Row title="Runs">
           <SchedulePicker value={draft.schedule} onChange={(v) => setDraft("schedule", v)} />
         </Row>
         <Row title="Stops after" desc={`${settings()?.repeat_completed ?? 0} runs so far`}>
           <input
-            class="s-input cs-input cs-narrow"
+            aria-label="Stops after" class="s-input cs-input cs-narrow"
             inputmode="numeric"
             placeholder="Never"
             value={draft.repeat}
-            onInput={(e) => setDraft("repeat", e.currentTarget.value.replace(/[^0-9]/g, ""))}
+            onInput={(e) => setDraft("repeat", e.currentTarget.value)}
           />
         </Row>
       </Section>
@@ -162,7 +217,7 @@ export function ControllerSettingsPanel(p: { slug: string; view: ControllerView;
       <Section title="Instruction">
         <div class="cs-prompt-wrap">
           <textarea
-            class="cs-prompt"
+            aria-label="Instruction" class="cs-prompt"
             spellcheck={false}
             value={draft.prompt}
             onInput={(e) => setDraft("prompt", e.currentTarget.value)}
@@ -210,30 +265,44 @@ export function ControllerSettingsPanel(p: { slug: string; view: ControllerView;
 
       <Section title="Advanced" hint="Optional Hermes execution and delivery overrides.">
         <Row title="Deliver to">
-          <input class="s-input cs-input" placeholder="local" value={draft.deliver} onInput={(e) => setDraft("deliver", e.currentTarget.value)} />
+          <input class="s-input cs-input" placeholder="local" aria-label="Delivery" value={draft.deliver} onInput={(e) => setDraft("deliver", e.currentTarget.value)} />
         </Row>
         <Row title="Model">
-          <input class="s-input cs-input" placeholder="Hermes default" value={draft.model} onInput={(e) => setDraft("model", e.currentTarget.value)} />
+          <input class="s-input cs-input" placeholder="Hermes default" aria-label="Model" value={draft.model} onInput={(e) => setDraft("model", e.currentTarget.value)} />
         </Row>
         <Row title="Provider">
-          <input class="s-input cs-input" placeholder="Hermes default" value={draft.provider} onInput={(e) => setDraft("provider", e.currentTarget.value)} />
+          <input class="s-input cs-input" placeholder="Hermes default" aria-label="Provider" value={draft.provider} onInput={(e) => setDraft("provider", e.currentTarget.value)} />
         </Row>
+        <Row title="Failure delivery"><input class="s-input cs-input" placeholder="Same as delivery" aria-label="Failure delivery" value={draft.failure_deliver} onInput={(e) => setDraft("failure_deliver", e.currentTarget.value)} /></Row>
+        <Row title="Working directory"><input class="s-input cs-input" placeholder="Hermes default" aria-label="Working directory" value={draft.workdir} onInput={(e) => setDraft("workdir", e.currentTarget.value)} /></Row>
+        <Row title="Reasoning"><select aria-label="Reasoning" class="s-input cs-input" value={draft.reasoning_effort} onChange={(e) => setDraft("reasoning_effort", e.currentTarget.value)}>
+          <option value="">Hermes default</option><For each={["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]}>{(effort) => <option value={effort}>{effort}</option>}</For>
+        </select></Row>
+        <Row title="Continuity" desc="Keep context across runs when supported by Hermes."><input aria-label="Continuity" type="checkbox" checked={draft.continuity} onChange={(e) => setDraft("continuity", e.currentTarget.checked)} /></Row>
       </Section>
 
-      <Show when={dirtyCount() > 0 || error()}>
+      </fieldset>
+      <Show when={p.creating || dirtyCount() > 0 || skillInput().trim() || error()}>
         <div class="cs-savebar">
           <span class={error() ? "cs-warn" : ""}>
             {error() ?? `${dirtyCount()} unsaved change${dirtyCount() === 1 ? "" : "s"}`}
           </span>
           <span class="dlg-spacer" />
+          <Show when={p.onClose}><button class="s-btn sm quiet" disabled={saving()} onClick={() => {
+            if (!(dirtyCount() || skillInput().trim()) || window.confirm("Discard this cron draft?")) { discard(); p.onClose?.(); }
+          }}>Cancel</button></Show>
           <button class="s-btn sm quiet" disabled={saving()} onClick={discard}>
             Discard
           </button>
-          <button class="s-btn sm primary" disabled={saving() || dirtyCount() === 0} onClick={save}>
-            {saving() ? "Saving…" : "Save"}
+          <button class="s-btn sm primary" disabled={saving() || (!p.creating && dirtyCount() === 0 && !skillInput().trim())} onClick={save}>
+            {saving() ? (p.creating ? "Creating…" : "Saving…") : (p.creating ? "Create" : "Save")}
           </button>
         </div>
       </Show>
     </div>
   );
+}
+
+export function ControllerSettingsPanel(p: { slug: string; id?: string; view: ControllerView; onSaved: (v: ControllerView) => void; save?: (patch: ControllerPatch) => Promise<ControllerView> }) {
+  return <CronForm draftKey={`edit:${p.slug}:${p.id ?? "controller"}`} view={p.view} save={(patch) => p.save ? p.save(patch) : updateController(p.slug, patch)} onSaved={p.onSaved} />;
 }

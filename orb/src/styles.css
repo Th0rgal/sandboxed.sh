@@ -113,7 +113,8 @@ body {
 }
 body.resizing, body.resizing * { cursor: col-resize !important; }
 button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
-button:disabled { cursor: default; }
+button:disabled, select:disabled, input:disabled, textarea:disabled { cursor: default; }
+a[href], select { cursor: pointer; }
 input, textarea, [contenteditable="true"] { cursor: text; user-select: text; -webkit-user-select: text; }
 button:focus-visible { outline: 1px solid var(--blue); outline-offset: -1px; }
 
@@ -175,8 +176,8 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 .row.project { color: var(--fg-2); }
 .row.project:hover { color: var(--fg); }
 .row-main { display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0; height: 100%; text-align: left; }
-.row-action { display: none; color: var(--fg-3); height: 20px; width: 20px; border-radius: 4px; align-items: center; justify-content: center; }
-.row.project:hover .row-action { display: flex; }
+.row-action { display: flex; opacity: 0; color: var(--fg-3); height: 20px; width: 20px; border-radius: 4px; align-items: center; justify-content: center; }
+.row:hover .row-action, .row:focus-within .row-action { opacity: 1; }
 .row-action:hover { background: var(--bg-active); color: var(--fg); }
 .glyph { width: 16px; height: 16px; display: flex; align-items: center; justify-content: center; }
 .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--fg-4); opacity: .45; }
@@ -223,32 +224,22 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 .cs-input { width: 240px; max-width: 46vw; height: 26px; }
 .cs .s-row-ctrl { width: 240px; max-width: 46vw; }
 .cs .s-row-ctrl .sp { width: 100%; }
-.cs-input.cs-narrow { width: 84px; text-align: center; }
-/* ---------- schedule picker: one right-aligned line ---------- */
-.sp { display: inline-flex; align-items: center; gap: 6px; }
-.sp .s-input { height: 26px; }
-.sp-num { width: 52px; text-align: center; font-variant-numeric: tabular-nums; padding: 0 4px; }
-.sp-time { width: 96px; font-variant-numeric: tabular-nums; }
-.sp-datetime { width: 200px; }
-.sp-raw { width: 200px; font-family: var(--mono); font-size: 12px; }
-.sp-days { display: inline-flex; gap: 3px; }
-.sp-day {
-  width: 24px; height: 24px; border-radius: 50%; font-size: 11px; color: var(--fg-3);
-  background: var(--bg-btn); display: grid; place-items: center; transition: background .12s, color .12s;
-}
+.cs-input.cs-narrow { width: 240px; }
+/* ---------- schedule summary and full editor ---------- */
+.sp { width: 240px; max-width: 100%; }
+.sp-trigger { width: 100%; height: 26px; display: flex; align-items: center; justify-content: space-between; gap: 8px; text-align: left; }
+.sp-trigger > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-panel { position: fixed; z-index: 200; box-sizing: border-box; width: 240px; max-width: calc(100vw - 16px); padding: 12px; border: 1px solid var(--stroke); border-radius: 10px; background: var(--bg); box-shadow: 0 8px 30px #0003; }
+.sp-mode { display: grid; gap: 6px; font-size: 12px; color: var(--fg-3); }
+.sp-panel .s-input { width: 100%; min-width: 0; box-sizing: border-box; height: 28px; }
+.sp-fields { display: flex; gap: 8px; margin-top: 12px; }
+.sp-fields-interval .sp-num { width: 64px; flex: none; }
+.sp-fields-days { flex-direction: column; }
+.sp-days { display: flex; justify-content: space-between; gap: 3px; }
+.sp-day { width: 26px; height: 26px; border-radius: 50%; font-size: 11px; color: var(--fg-3); background: var(--bg-btn); }
 .sp-day:hover { color: var(--fg); }
 .sp-day.on { background: var(--send-bg); color: var(--send-fg); }
-.sp-pop { position: relative; }
-.sp-pop-btn {
-  height: 26px; padding: 0 8px 0 10px; border-radius: 6px; display: inline-flex; align-items: center; gap: 7px;
-  background: var(--bg-btn); border: 1px solid var(--stroke); color: var(--fg); font-size: 13px;
-}
-.sp-pop-btn svg { color: var(--fg-3); flex: none; }
-.sp-pop-btn:hover, .sp-pop-btn.on { background: var(--bg-active); }
-.sp-pop-menu { top: 30px; bottom: auto; right: 0; left: auto; min-width: 132px; padding: 4px; }
-.sp-pop-menu .menu-item { padding: 5px 9px; font-size: 12.5px; gap: 10px; }
-.sp-pop-menu .pick-name { flex: 1; }
-.sp-pop-menu .pick-check { width: 12px; color: var(--fg-2); }
+.sp-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 12px; font-size: 11px; color: var(--fg-3); }
 .sp input[type="time"]::-webkit-calendar-picker-indicator,
 .sp input[type="datetime-local"]::-webkit-calendar-picker-indicator { filter: invert(0.6); opacity: .6; }
 :root[data-theme="light"] .sp input::-webkit-calendar-picker-indicator { filter: none; }
@@ -870,14 +861,14 @@ textarea::placeholder { color: var(--placeholder); }
 .m-key { display: inline-flex; align-items: center; gap: 3px; font-family: var(--sans); color: var(--fg-3); }
 .m-note { font-size: 12px; color: var(--fg-3); margin-top: 1px; }
 .m-del { opacity: 0; }
-.m-row:hover .m-del { opacity: 1; }
+.m-row:hover .m-del, .m-row:focus-within .m-del { opacity: 1; }
 
 .m-dot.warn { background: var(--amber); }
 .m-dot.off { background: var(--red); }
 .m-row.cordoned { opacity: .55; }
-.m-row.editable { width: 100%; text-align: left; cursor: default; }
+.m-row.editable { width: 100%; text-align: left; cursor: pointer; }
 .m-edit-hint { font-size: 12px; color: var(--fg-4); opacity: 0; }
-.m-row.editable:hover .m-edit-hint { opacity: 1; }
+.m-row.editable:hover .m-edit-hint, .m-row.editable:focus-within .m-edit-hint { opacity: 1; }
 .m-edit {
   padding: 10px 10px 8px; border-radius: 8px;
   background: var(--bg-elev); border: 1px solid var(--stroke-soft);
@@ -915,3 +906,16 @@ textarea::placeholder { color: var(--placeholder); }
   font: 12.5px var(--sans); min-width: 220px;
 }
 .s-input:focus { outline: 0; border-color: var(--focus-border); }
+
+.dlg-wide { width: 660px; max-height: 80vh; overflow-y: auto; }
+.dlg-back:has(.dlg-wide) { padding-top: 6vh; }
+.cs-fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+input:disabled, textarea:disabled { cursor: default; }
+
+input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
+.cs .s-input { min-width: 0; }
+@media (max-width: 520px) {
+  .cs .s-row { flex-direction: column; align-items: stretch; gap: 6px; }
+  .cs .s-row-ctrl, .cs .cs-input { width: 100%; max-width: none; }
+  .cs-savebar { flex-wrap: wrap; }
+}

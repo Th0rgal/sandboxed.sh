@@ -12,6 +12,7 @@ export function MenuList(p: { items: MenuEntry[]; onPick?: () => void }) {
           <div class="menu-sep" />
         ) : (
           <button
+            role="menuitem"
             class={`menu-item ${it.danger ? "danger" : ""}`}
             onClick={() => {
               it.onClick();
@@ -30,6 +31,9 @@ export function MenuList(p: { items: MenuEntry[]; onPick?: () => void }) {
 export function PopupMenu(p: { x: number; y: number; items: MenuEntry[]; onClose: () => void }) {
   let el!: HTMLDivElement;
   onMount(() => {
+    const trigger = document.activeElement as HTMLElement | null;
+    const buttons = () => Array.from(el.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
+    buttons()[0]?.focus();
     const r = el.getBoundingClientRect();
     const dx = Math.min(0, window.innerWidth - 8 - r.right);
     const dy = Math.min(0, window.innerHeight - 8 - r.bottom);
@@ -41,7 +45,15 @@ export function PopupMenu(p: { x: number; y: number; items: MenuEntry[]; onClose
       if (!el.contains(e.target as Node)) p.onClose();
     };
     const key = (e: KeyboardEvent) => {
-      if (e.key === "Escape") p.onClose();
+      if (e.key === "Escape") {
+        e.preventDefault(); e.stopPropagation(); p.onClose(); trigger?.focus();
+      } else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
+        e.preventDefault();
+        const items = buttons();
+        const index = items.indexOf(document.activeElement as HTMLButtonElement);
+        const next = e.key === "Home" ? 0 : e.key === "End" ? items.length - 1 : (index + (e.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+        items[next]?.focus();
+      } else if (e.key === "Tab") p.onClose();
     };
     window.addEventListener("pointerdown", down, true);
     window.addEventListener("keydown", key);
@@ -53,6 +65,7 @@ export function PopupMenu(p: { x: number; y: number; items: MenuEntry[]; onClose
   return (
     <div
       ref={el}
+      role="menu"
       class="menu popup-menu"
       style={{ left: `${p.x}px`, top: `${p.y}px` }}
       onPointerDown={(e) => e.stopPropagation()}

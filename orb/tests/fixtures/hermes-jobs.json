@@ -1,0 +1,250 @@
+{
+  "hourly": {
+    "id": "142587e2c97a",
+    "name": "Project notes",
+    "prompt": "Summarize the local project notes.",
+    "skills": [
+      "project-notes"
+    ],
+    "skill": "project-notes",
+    "model": "gpt-5",
+    "provider": "openai",
+    "provider_snapshot": null,
+    "model_snapshot": null,
+    "base_url": null,
+    "script": null,
+    "no_agent": false,
+    "monitor_script": null,
+    "monitor_url": null,
+    "monitor_state": null,
+    "context_from": [
+      "self"
+    ],
+    "schedule": {
+      "kind": "interval",
+      "minutes": 60,
+      "display": "every 60m"
+    },
+    "schedule_display": "every 60m",
+    "repeat": {
+      "times": 8,
+      "completed": 0
+    },
+    "enabled": true,
+    "state": "scheduled",
+    "paused_at": null,
+    "paused_reason": null,
+    "created_at": "2026-09-20T07:52:13.628803+00:00",
+    "next_run_at": "2026-09-20T08:52:13.631914+00:00",
+    "last_run_at": null,
+    "last_status": null,
+    "last_error": null,
+    "last_delivery_error": null,
+    "last_delivery_unverified": null,
+    "failure_streak": 0,
+    "deliver": "local",
+    "origin": null,
+    "enabled_toolsets": null,
+    "workdir": "/tmp/orb-hermes-fixtures-hv9eudv5",
+    "reasoning_effort": "high",
+    "failure_deliver": "local"
+  },
+  "weekdays": {
+    "id": "cf173afc5eab",
+    "name": "Project notes",
+    "prompt": "Summarize the local project notes.",
+    "skills": [
+      "project-notes"
+    ],
+    "skill": "project-notes",
+    "model": "gpt-5",
+    "provider": "openai",
+    "provider_snapshot": null,
+    "model_snapshot": null,
+    "base_url": null,
+    "script": null,
+    "no_agent": false,
+    "monitor_script": null,
+    "monitor_url": null,
+    "monitor_state": null,
+    "context_from": null,
+    "schedule": {
+      "kind": "cron",
+      "expr": "0 9 * * 1-5",
+      "display": "0 9 * * 1-5"
+    },
+    "schedule_display": "0 9 * * 1-5",
+    "repeat": {
+      "times": null,
+      "completed": 0
+    },
+    "enabled": true,
+    "state": "scheduled",
+    "paused_at": null,
+    "paused_reason": null,
+    "created_at": "2026-09-20T07:52:13.656775+00:00",
+    "next_run_at": "2026-09-21T09:00:00+00:00",
+    "last_run_at": null,
+    "last_status": null,
+    "last_error": null,
+    "last_delivery_error": null,
+    "last_delivery_unverified": null,
+    "failure_streak": 0,
+    "deliver": "local",
+    "origin": null,
+    "enabled_toolsets": null,
+    "workdir": "/tmp/orb-hermes-fixtures-hv9eudv5",
+    "reasoning_effort": "high",
+    "failure_deliver": "local"
+  },
+  "once": {
+    "id": "894d9a2cfda8",
+    "name": "Project notes",
+    "prompt": "Summarize the local project notes.",
+    "skills": [
+      "project-notes"
+    ],
+    "skill": "project-notes",
+    "model": "gpt-5",
+    "provider": "openai",
+    "provider_snapshot": null,
+    "model_snapshot": null,
+    "base_url": null,
+    "script": null,
+    "no_agent": false,
+    "monitor_script": null,
+    "monitor_url": null,
+    "monitor_state": null,
+    "context_from": null,
+    "schedule": {
+      "kind": "once",
+      "run_at": "2099-04-05T09:00:00+02:00",
+      "display": "once at 2099-04-05 09:00"
+    },
+    "schedule_display": "once at 2099-04-05 09:00",
+    "repeat": {
+      "times": 1,
+      "completed": 0
+    },
+    "enabled": true,
+    "state": "scheduled",
+    "paused_at": null,
+    "paused_reason": null,
+    "created_at": "2026-09-20T07:52:13.670013+00:00",
+    "next_run_at": "2099-04-05T09:00:00+02:00",
+    "last_run_at": null,
+    "last_status": null,
+    "last_error": null,
+    "last_delivery_error": null,
+    "last_delivery_unverified": null,
+    "failure_streak": 0,
+    "deliver": "local",
+    "origin": null,
+    "enabled_toolsets": null,
+    "workdir": "/tmp/orb-hermes-fixtures-hv9eudv5",
+    "reasoning_effort": "high",
+    "failure_deliver": "local"
+  },
+  "updated": {
+    "id": "142587e2c97a",
+    "name": "Project notes",
+    "prompt": "Summarize the local project notes.",
+    "skills": [
+      "project-notes"
+    ],
+    "skill": "project-notes",
+    "model": "gpt-5",
+    "provider": "openai",
+    "provider_snapshot": null,
+    "model_snapshot": null,
+    "base_url": null,
+    "script": null,
+    "no_agent": false,
+    "monitor_script": null,
+    "monitor_url": null,
+    "monitor_state": null,
+    "context_from": [
+      "self"
+    ],
+    "schedule": {
+      "kind": "interval",
+      "minutes": 60,
+      "display": "every 60m"
+    },
+    "schedule_display": "every 60m",
+    "repeat": {
+      "times": 12,
+      "completed": 3
+    },
+    "enabled": true,
+    "state": "scheduled",
+    "paused_at": null,
+    "paused_reason": null,
+    "created_at": "2026-09-20T07:52:13.628803+00:00",
+    "next_run_at": "2026-09-20T08:52:13.631914+00:00",
+    "last_run_at": null,
+    "last_status": null,
+    "last_error": null,
+    "last_delivery_error": null,
+    "last_delivery_unverified": null,
+    "failure_streak": 0,
+    "deliver": "local",
+    "origin": null,
+    "enabled_toolsets": null,
+    "workdir": "/tmp/orb-hermes-fixtures-hv9eudv5",
+    "reasoning_effort": "high",
+    "failure_deliver": "local"
+  },
+  "run": {
+    "id": "142587e2c97a",
+    "name": "Project notes",
+    "prompt": "Summarize the local project notes.",
+    "skills": [
+      "project-notes"
+    ],
+    "skill": "project-notes",
+    "model": "gpt-5",
+    "provider": "openai",
+    "provider_snapshot": null,
+    "model_snapshot": null,
+    "base_url": null,
+    "script": null,
+    "no_agent": false,
+    "monitor_script": null,
+    "monitor_url": null,
+    "monitor_state": null,
+    "context_from": [
+      "self"
+    ],
+    "schedule": {
+      "kind": "interval",
+      "minutes": 60,
+      "display": "every 60m"
+    },
+    "schedule_display": "every 60m",
+    "repeat": {
+      "times": 12,
+      "completed": 3
+    },
+    "enabled": true,
+    "state": "scheduled",
+    "paused_at": null,
+    "paused_reason": null,
+    "created_at": "2026-09-20T07:52:13.628803+00:00",
+    "next_run_at": "2026-09-20T07:52:13.695298+00:00",
+    "last_run_at": null,
+    "last_status": null,
+    "last_error": null,
+    "last_delivery_error": null,
+    "last_delivery_unverified": null,
+    "failure_streak": 0,
+    "deliver": "local",
+    "origin": null,
+    "enabled_toolsets": null,
+    "workdir": "/tmp/orb-hermes-fixtures-hv9eudv5",
+    "reasoning_effort": "high",
+    "failure_deliver": "local",
+    "manual_run_at": "2026-09-20T07:52:13.695298+00:00",
+    "manual_run_prompt": null
+  }
+}

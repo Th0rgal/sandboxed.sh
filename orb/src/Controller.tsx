@@ -308,7 +308,7 @@ export function ControllerView(p: { slug: string; id?: string }) {
                 </div>
 
                 <Show when={tab() === "settings"}>
-                  <ControllerSettingsPanel slug={p.slug} view={view()!} onSaved={setView} save={p.id ? (patch) => updateProjectCron(p.slug, p.id!, patch) : undefined} />
+                  <ControllerSettingsPanel slug={p.slug} id={p.id} view={view()!} onSaved={setView} save={p.id ? (patch) => updateProjectCron(p.slug, p.id!, patch) : undefined} />
                 </Show>
                 <div class="cr-timeline" style={{ display: tab() === "runs" ? "block" : "none" }}>
                   <For each={entries()}>

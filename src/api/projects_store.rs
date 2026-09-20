@@ -1170,11 +1170,12 @@ impl ProjectsStore {
         let mut statement = connection
             .prepare("SELECT job_id FROM project_crons WHERE slug = ?1 ORDER BY created_at, job_id")
             .map_err(|e| e.to_string())?;
-        statement
+        let ids = statement
             .query_map(params![slug], |row| row.get(0))
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<String>, _>>()
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok(ids)
     }
 
     pub fn owns_project_cron(&self, slug: &str, job_id: &str) -> Result<bool, String> {

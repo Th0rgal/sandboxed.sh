@@ -2,13 +2,14 @@ import { onCleanup, onMount, type JSX } from "solid-js";
 
 export function Dialog(p: {
   title: string;
+  wide?: boolean;
   onClose: () => void;
   children: JSX.Element;
   footer: JSX.Element;
 }) {
   onMount(() => {
     const k = (e: KeyboardEvent) => {
-      if (e.key === "Escape") p.onClose();
+      if (e.key === "Escape" && !e.defaultPrevented) p.onClose();
     };
     window.addEventListener("keydown", k);
     onCleanup(() => window.removeEventListener("keydown", k));
@@ -16,7 +17,7 @@ export function Dialog(p: {
   return (
     <div class="dlg-back" onMouseDown={p.onClose}>
       <div
-        class="dlg"
+        class={`dlg ${p.wide ? "dlg-wide" : ""}`}
         onMouseDown={(e) => e.stopPropagation()}
         onClick={(e) => e.stopPropagation()}
       >

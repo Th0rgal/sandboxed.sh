@@ -58,7 +58,9 @@ fn main() {
             #[cfg(target_os = "macos")]
             {
                 use tauri::Manager;
-                use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState};
+                use window_vibrancy::{
+                    apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState,
+                };
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = apply_vibrancy(
                         &window,
@@ -70,7 +72,11 @@ fn main() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![paloma_ssh_pubkey, open_url, set_window_theme])
+        .invoke_handler(tauri::generate_handler![
+            paloma_ssh_pubkey,
+            open_url,
+            set_window_theme
+        ])
         .run(tauri::generate_context!())
         .expect("error while running orb");
 }

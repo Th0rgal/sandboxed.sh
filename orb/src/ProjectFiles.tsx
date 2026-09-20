@@ -23,7 +23,8 @@ import {
 import { CronGlyph, untilLabel } from "./Controller";
 import { Dialog, Field } from "./Dialog";
 import { PopupMenu, type MenuEntry } from "./Menu";
-import { SchedulePicker } from "./SchedulePicker";
+import { CronForm } from "./ControllerSettings";
+import { getProjectCronFromJob } from "./cronSchema";
 
 /** Sidebar section listing the core backend's projects with their missions
  * and hosted files. Replaces the demo projects when connected. */
@@ -69,15 +70,9 @@ export function LiveProjectsSection(p: {
   const [folderName, setFolderName] = createSignal("");
   const [folderError, setFolderError] = createSignal<string | null>(null);
   const [makingFolder, setMakingFolder] = createSignal(false);
-  const [newCron, setNewCron] = createSignal<string | null>(null);
-  const [cronName, setCronName] = createSignal("");
-  const [cronPrompt, setCronPrompt] = createSignal("");
-  const [cronSchedule, setCronSchedule] = createSignal("every 1h");
-  const [cronDeliver, setCronDeliver] = createSignal("local");
-  const [cronModel, setCronModel] = createSignal("");
-  const [cronProvider, setCronProvider] = createSignal("");
-  const [cronError, setCronError] = createSignal<string | null>(null);
   const [makingCron, setMakingCron] = createSignal(false);
+  const [cronWarning, setCronWarning] = createSignal<string | null>(null);
+  const [newCron, setNewCron] = createSignal<string | null>(null);
   const loadController = (slug: string) => {
     getProjectController(slug, 3)
       .then((view) => setControllers(slug, view))
@@ -158,7 +153,7 @@ export function LiveProjectsSection(p: {
     try {
       await mkdirProjectFile(target.slug, target.path ? `${target.path}/${name}` : name);
       loadDir(target.slug, target.path, true);
-      setExpanded(`${target.slug}:${target.path}`, true);
+      setExpanded(target.path ? `${target.slug}:${target.path}` : target.slug, true);
       setNewFolder(null);
     } catch (e) {
       setFolderError(e instanceof Error ? e.message : String(e));
@@ -171,27 +166,9 @@ export function LiveProjectsSection(p: {
     { kind: "item", label: "New agent", icon: Ic.NewAgentIcon, onClick: () => p.onNewAgent(slug) },
     { kind: "item", label: "New cron", icon: Ic.BellIcon, onClick: () => {
       setActionMenu(null);
-      setCronName(""); setCronPrompt(""); setCronSchedule("every 1h"); setCronDeliver("local"); setCronModel(""); setCronProvider(""); setCronError(null); setNewCron(slug);
+      setNewCron(slug);
     } },
   ];
-  const createCron = async () => {
-    const slug = newCron();
-    if (!slug || makingCron()) return;
-    if (!cronName().trim() || !cronPrompt().trim() || !cronSchedule().trim()) {
-      setCronError("Name, instruction, and schedule are required.");
-      return;
-    }
-    setMakingCron(true); setCronError(null);
-    try {
-      await createProjectCron(slug, { name: cronName().trim(), prompt: cronPrompt().trim(), schedule: cronSchedule().trim(), deliver: cronDeliver().trim() || undefined, model: cronModel().trim() || undefined, provider: cronProvider().trim() || undefined });
-      loadController(slug);
-      loadCrons(slug);
-      setNewCron(null);
-    } catch (e) {
-      setCronError(e instanceof Error ? e.message : String(e));
-    } finally { setMakingCron(false); }
-  };
-
   const toggleProject = (slug: string) => {
     const next = !expanded[slug];
     setExpanded(slug, next);
@@ -267,6 +244,7 @@ export function LiveProjectsSection(p: {
       <Show when={error()}>
         <div class="row note">{error()}</div>
       </Show>
+      <Show when={cronWarning()}><p class="st-error" role="alert">{cronWarning()}</p></Show>
       <For each={projects()}>
         {(project) => {
           const isOpen = () => !!expanded[project.slug];
@@ -401,15 +379,21 @@ export function LiveProjectsSection(p: {
         )}
       </Show>
       <Show when={newCron()}>
-        {(slug) => <Dialog title="New cron" onClose={() => !makingCron() && setNewCron(null)} footer={<><button class="s-btn" disabled={makingCron()} onClick={() => setNewCron(null)}>Cancel</button><button class="s-btn primary" disabled={makingCron()} onClick={createCron}>{makingCron() ? "Creating…" : "Create"}</button></>}>
-          <Field label={`Project: ${slug()}`}><input autofocus class="s-input" value={cronName()} placeholder="Cron name" onInput={(e) => setCronName(e.currentTarget.value)} /></Field>
-          <Field label="Runs"><SchedulePicker value={cronSchedule()} onChange={setCronSchedule} /></Field>
-          <Field label="Instruction"><textarea class="cs-prompt" value={cronPrompt()} placeholder="What should Hermes do on each run?" onInput={(e) => setCronPrompt(e.currentTarget.value)} /></Field>
-          <Field label="Delivery"><input class="s-input" value={cronDeliver()} placeholder="local" onInput={(e) => setCronDeliver(e.currentTarget.value)} /></Field>
-          <Field label="Model override"><input class="s-input" value={cronModel()} placeholder="Hermes default" onInput={(e) => setCronModel(e.currentTarget.value)} /></Field>
-          <Field label="Provider override"><input class="s-input" value={cronProvider()} placeholder="Hermes default" onInput={(e) => setCronProvider(e.currentTarget.value)} /></Field>
-          <Show when={cronError()}><p class="st-error">{cronError()}</p></Show>
+        {(slug) => <Dialog wide title="New cron" onClose={() => !makingCron() && setNewCron(null)} footer={<span>Unfinished drafts are kept until saved or discarded.</span>}>
+          <CronForm creating onBusyChange={setMakingCron} draftKey={`create:${slug()}`} view={{ slug: slug(), job: { id: "", name: "", schedule: "every 1h", enabled: true, failure_streak: 0 }, runs: [] }}
+            save={async (draft) => getProjectCronFromJob(slug(), await createProjectCron(slug(), draft))}
+            onClose={() => setNewCron(null)} onSaved={(view, warning) => {
+              setCronWarning(warning ? `Cron created. ${warning}` : null);
+              setExpanded(slug(), true);
+              loadDir(slug(), "", true);
+              loadMissions(slug());
+              loadController(slug());
+              loadCrons(slug());
+              p.open(`pc:${slug()}:${view.job!.id}`);
+              setNewCron(null);
+            }} />
         </Dialog>}
+
       </Show>
     </>
   );

@@ -1,4 +1,5 @@
 import { createSignal } from "solid-js";
+import { getProjectCronFromJob, hermesPatch, type HermesJob } from "./cronSchema";
 
 const URL_KEY = "orb.apiUrl";
 const JWT_KEY = "orb.jwt";
@@ -421,39 +422,36 @@ export async function controllerAction(slug: string, action: "pause" | "resume" 
 
 /** Additional Hermes jobs explicitly bound to this project by the core. */
 export async function listProjectCrons(slug: string): Promise<ControllerJob[]> {
-  const data = await api<{ jobs?: ControllerJob[] }>(`/api/projects/${encodeURIComponent(slug)}/crons`);
-  return data.jobs ?? [];
+  const data = await api<{ jobs?: HermesJob[] }>(`/api/projects/${encodeURIComponent(slug)}/crons`);
+  return (data.jobs ?? []).map((job) => getProjectCronFromJob(slug, job).job!);
 }
 
-export type ProjectCronDraft = Pick<ControllerPatch, "name" | "schedule" | "prompt" | "skills" | "deliver" | "model" | "provider"> & { repeat?: number };
+export type ProjectCronDraft = ControllerPatch;
 
-export async function createProjectCron(slug: string, draft: ProjectCronDraft): Promise<ControllerJob> {
-  const data = await api<{ job: ControllerJob }>(`/api/projects/${encodeURIComponent(slug)}/crons`, {
+export async function createProjectCron(slug: string, draft: ProjectCronDraft): Promise<HermesJob> {
+  const data = await api<{ job: HermesJob }>(`/api/projects/${encodeURIComponent(slug)}/crons`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(draft),
+    body: JSON.stringify(hermesPatch(draft)),
   });
   return data.job;
 }
 
 export async function getProjectCron(slug: string, id: string): Promise<ControllerView> {
-  const data = await api<{ job: ControllerJob & Partial<ControllerSettings> }>(`/api/projects/${encodeURIComponent(slug)}/crons/${encodeURIComponent(id)}`);
-  const job = data.job;
-  return { slug, job, settings: { prompt: job.prompt ?? "", prompt_chars: (job.prompt ?? "").length, skills: job.skills ?? [], repeat_completed: 0, no_agent: false, continuity: false, enabled_toolsets: [], deliver: job.deliver ?? null, repeat_times: (job as { repeat?: number }).repeat ?? null }, runs: [] };
+  const data = await api<{ job: HermesJob }>(`/api/projects/${encodeURIComponent(slug)}/crons/${encodeURIComponent(id)}`);
+  return getProjectCronFromJob(slug, data.job);
 }
 
 export async function updateProjectCron(slug: string, id: string, patch: ControllerPatch): Promise<ControllerView> {
-  const data = await api<{ job: ControllerJob & Partial<ControllerSettings> }>(`/api/projects/${encodeURIComponent(slug)}/crons/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch) });
+  const current = patch.continuity === undefined ? undefined : await api<{ job: HermesJob }>(`/api/projects/${encodeURIComponent(slug)}/crons/${encodeURIComponent(id)}`);
+  const data = await api<{ job: HermesJob }>(`/api/projects/${encodeURIComponent(slug)}/crons/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(hermesPatch(patch, current?.job)) });
   return getProjectCronFromJob(slug, data.job);
-}
-
-function getProjectCronFromJob(slug: string, job: ControllerJob & Partial<ControllerSettings>): ControllerView {
-  return { slug, job, settings: { prompt: job.prompt ?? "", prompt_chars: (job.prompt ?? "").length, skills: job.skills ?? [], repeat_completed: 0, no_agent: false, continuity: false, enabled_toolsets: [], deliver: job.deliver ?? null, repeat_times: (job as { repeat?: number }).repeat ?? null }, runs: [] };
 }
 
 export async function projectCronAction(slug: string, id: string, action: "pause" | "resume" | "run"): Promise<ControllerView> {
-  const data = await api<{ job: ControllerJob & Partial<ControllerSettings> }>(`/api/projects/${encodeURIComponent(slug)}/crons/${encodeURIComponent(id)}/action`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action }) });
-  return getProjectCronFromJob(slug, data.job);
+  await api<unknown>(`/api/projects/${encodeURIComponent(slug)}/crons/${encodeURIComponent(id)}/action`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action }) });
+  // trigger_job may return an execution receipt or boolean, not a job record.
+  return getProjectCron(slug, id);
 }
 
 /** Bumped after a project is created so every list re-fetches. */

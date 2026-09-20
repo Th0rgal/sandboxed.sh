@@ -20,9 +20,10 @@ function parseDow(spec: string): number[] | null {
     if (range) {
       const a = Number(range[1]);
       const b = Number(range[2]);
-      if (a > b) return null;
+      if (a > b || b > 7) return null;
       for (let d = a; d <= b; d++) out.add(d % 7);
     } else if (/^\d$/.test(part)) {
+      if (Number(part) > 7) return null;
       out.add(Number(part) % 7);
     } else {
       return null;
@@ -33,7 +34,7 @@ function parseDow(spec: string): number[] | null {
 
 export function parseSchedule(value: string): Parsed {
   const raw = value.trim();
-  const every = raw.match(/^(?:every\s+)?(\d+)\s*(m|min|mins|minutes?|h|hr|hrs|hours?|d|days?)$/i);
+  const every = raw.match(/^every\s+(\d+)\s*(m|min|mins|minutes?|h|hr|hrs|hours?|d|days?)$/i);
   if (every) {
     const unit = every[2][0].toLowerCase() as "m" | "h" | "d";
     return { mode: "interval", n: Math.max(1, Number(every[1])), unit };
@@ -45,7 +46,7 @@ export function parseSchedule(value: string): Parsed {
     const hour = Number(cron[2]);
     if (days && minute < 60 && hour < 24) return { mode: "days", hour, minute, days };
   }
-  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(raw)) return { mode: "once", local: raw.slice(0, 16) };
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(raw)) return { mode: "once", local: raw.slice(0, 16) };
   return { mode: "custom", raw };
 }
 
@@ -101,90 +102,33 @@ const MODES: { id: Parsed["mode"]; label: string }[] = [
   { id: "custom", label: "Custom" },
 ];
 
-/** Small pop-up menu in the macOS style: a quiet button, a checkmarked list. */
-function PopUp<T extends string>(p: { value: T; options: { id: T; label: string }[]; onPick: (v: T) => void }) {
+/** Structured editor for a Hermes cron schedule; emits the schedule string.
+ * A summary opens the full editor in a compact popover. */
+export function SchedulePicker(p: { value: string; onChange: (v: string) => void }) {
   const [open, setOpen] = createSignal(false);
   let root!: HTMLDivElement;
   let trigger!: HTMLButtonElement;
-  let menu!: HTMLDivElement;
+  let panel!: HTMLDivElement;
   const close = (restore = false) => {
-    if (!open()) return;
     setOpen(false);
-    if (restore) requestAnimationFrame(() => trigger?.focus());
-  };
-  const clamp = () => {
-    if (!menu) return;
-    const r = menu.getBoundingClientRect();
-    if (r.bottom > window.innerHeight - 8) {
-      menu.style.top = "auto";
-      menu.style.bottom = "30px";
-    }
-    if (r.left < 8) menu.style.transform = `translateX(${8 - r.left}px)`;
+    if (restore) trigger.focus();
   };
   onMount(() => {
     const outside = (e: PointerEvent) => {
       if (open() && !root.contains(e.target as Node)) close();
     };
-    const keys = (e: KeyboardEvent) => {
-      if (!open()) return;
-      if (e.key === "Escape") {
-        e.preventDefault();
-        close(true);
-      }
-    };
     window.addEventListener("pointerdown", outside, true);
-    window.addEventListener("keydown", keys);
-    onCleanup(() => {
-      window.removeEventListener("pointerdown", outside, true);
-      window.removeEventListener("keydown", keys);
-    });
+    onCleanup(() => window.removeEventListener("pointerdown", outside, true));
   });
-  const label = () => p.options.find((o) => o.id === p.value)?.label ?? p.value;
-  return (
-    <div ref={root} class="sp-pop">
-      <button
-        ref={trigger}
-        class={`sp-pop-btn ${open() ? "on" : ""}`}
-        aria-haspopup="menu"
-        aria-expanded={open()}
-        onClick={() => {
-          const next = !open();
-          setOpen(next);
-          if (next) requestAnimationFrame(clamp);
-        }}
-      >
-        {label()}
-        <svg width="8" height="12" viewBox="0 0 8 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M1.5 4.5 4 2l2.5 2.5M1.5 7.5 4 10l2.5-2.5" />
-        </svg>
-      </button>
-      <Show when={open()}>
-        <div ref={menu} class="menu sp-pop-menu" role="menu">
-          <For each={p.options}>
-            {(o) => (
-              <button
-                class={`menu-item ${o.id === p.value ? "on" : ""}`}
-                role="menuitemradio"
-                aria-checked={o.id === p.value}
-                onClick={() => {
-                  p.onPick(o.id);
-                  setOpen(false);
-                }}
-              >
-                <span class="pick-name">{o.label}</span>
-                <span class="pick-check">{o.id === p.value ? "✓" : ""}</span>
-              </button>
-            )}
-          </For>
-        </div>
-      </Show>
-    </div>
-  );
-}
-
-/** Structured editor for a Hermes cron schedule; emits the schedule string.
- * One line, right-aligned, like a system settings row. */
-export function SchedulePicker(p: { value: string; onChange: (v: string) => void }) {
+  const show = () => {
+    setOpen(true);
+    requestAnimationFrame(() => {
+      const box = trigger.getBoundingClientRect();
+      panel.style.left = `${Math.max(8, Math.min(box.right - 240, window.innerWidth - 248))}px`;
+      panel.style.top = `${Math.max(8, Math.min(box.bottom + 6, window.innerHeight - panel.offsetHeight - 8))}px`;
+      panel.querySelector<HTMLSelectElement>("select")?.focus();
+    });
+  };
   const parsed = createMemo(() => parseSchedule(p.value));
   // The mode the user picked wins over what the string happens to parse as,
   // so choosing "Custom" with an interval string keeps the raw editor.
@@ -215,12 +159,25 @@ export function SchedulePicker(p: { value: string; onChange: (v: string) => void
   };
 
   return (
-    <div class="sp">
-      <PopUp value={mode()} options={MODES} onPick={switchTo} />
+    <div ref={root} class="sp" onKeyDown={(e) => {
+      if (open() && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); close(true); }
+    }}>
+      <button ref={trigger} class="s-input sp-trigger" aria-label="Schedule" aria-haspopup="dialog" aria-expanded={open()} onClick={() => open() ? close() : show()}>
+        <span>{describeSchedule(parsed())}</span><span aria-hidden="true">⌄</span>
+      </button>
+      <Show when={open()}>
+      <div ref={panel} class="sp-panel" role="dialog" aria-label="Schedule editor">
+      <label class="sp-mode">Schedule
+        <select class="s-input" aria-label="Schedule type" value={mode()} onChange={(e) => switchTo(e.currentTarget.value as Parsed["mode"])}>
+          <For each={MODES}>{(m) => <option value={m.id}>{m.label}</option>}</For>
+        </select>
+      </label>
+      <div class={`sp-fields sp-fields-${mode()}`}>
+
       <Switch>
         <Match when={mode() === "interval"}>
           <input
-            class="s-input sp-num"
+            aria-label="Interval" class="s-input sp-num"
             inputmode="numeric"
             value={interval().n}
             onInput={(e) => {
@@ -228,29 +185,23 @@ export function SchedulePicker(p: { value: string; onChange: (v: string) => void
               if (n > 0) emit({ ...interval(), n });
             }}
           />
-          <PopUp
-            value={interval().unit}
-            options={[
-              { id: "m", label: interval().n === 1 ? "minute" : "minutes" },
-              { id: "h", label: interval().n === 1 ? "hour" : "hours" },
-              { id: "d", label: interval().n === 1 ? "day" : "days" },
-            ]}
-            onPick={(u) => emit({ ...interval(), unit: u })}
-          />
+          <select class="s-input" aria-label="Interval unit" value={interval().unit} onChange={(e) => emit({ ...interval(), unit: e.currentTarget.value as "m" | "h" | "d" })}>
+            <option value="m">minutes</option><option value="h">hours</option><option value="d">days</option>
+          </select>
         </Match>
 
         <Match when={mode() === "days"}>
           <div class="sp-days">
             <For each={WEEK_ORDER}>
               {(d) => (
-                <button class={`sp-day ${days().days.includes(d) ? "on" : ""}`} title={DAY_NAMES[d]} onClick={() => toggleDay(d)}>
+                <button class={`sp-day ${days().days.includes(d) ? "on" : ""}`} aria-label={DAY_NAMES[d]} aria-pressed={days().days.includes(d)} title={DAY_NAMES[d]} onClick={() => toggleDay(d)}>
                   {DAY_LABELS[d]}
                 </button>
               )}
             </For>
           </div>
           <input
-            class="s-input sp-time"
+            aria-label="Time" class="s-input sp-time"
             type="time"
             value={`${pad(days().hour)}:${pad(days().minute)}`}
             onInput={(e) => {
@@ -262,7 +213,7 @@ export function SchedulePicker(p: { value: string; onChange: (v: string) => void
 
         <Match when={mode() === "once"}>
           <input
-            class="s-input sp-datetime"
+            aria-label="Date and time" class="s-input sp-datetime"
             type="datetime-local"
             value={once()}
             onInput={(e) => e.currentTarget.value && emit({ mode: "once", local: e.currentTarget.value })}
@@ -271,7 +222,7 @@ export function SchedulePicker(p: { value: string; onChange: (v: string) => void
 
         <Match when={mode() === "custom"}>
           <input
-            class="s-input sp-raw"
+            aria-label="Schedule expression" class="s-input sp-raw"
             spellcheck={false}
             placeholder="0 9 * * 1-5"
             value={p.value}
@@ -279,13 +230,17 @@ export function SchedulePicker(p: { value: string; onChange: (v: string) => void
           />
         </Match>
       </Switch>
+      </div>
+      <div class="sp-foot"><span>Hermes timezone</span><button class="s-btn sm" onClick={() => close(true)}>Done</button></div>
+      </div>
+      </Show>
     </div>
   );
 }
 
-/** One-line readout for the row subtitle, e.g. "Weekdays at 09:00 · server time". */
+/** One-line readout for the row subtitle, e.g. "Weekdays at 09:00 · Hermes timezone". */
 export function scheduleSummary(value: string): string {
   const parsed = parseSchedule(value);
   const text = describeSchedule(parsed);
-  return parsed.mode === "days" || parsed.mode === "once" ? `${text} · server time` : text;
+  return parsed.mode === "days" || parsed.mode === "once" ? `${text} · Hermes timezone` : text;
 }
