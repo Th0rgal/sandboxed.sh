@@ -103,11 +103,14 @@ test("sidebar rows stay compact with distinct hover/selected and delayed real me
   await expect(tip).toBeHidden();
   await page.waitForTimeout(560);
   await expect(tip).toBeVisible();
-  await page.mouse.move(900, 80);
-  await page.mouse.down();
-  await page.mouse.up();
+  await live.click();
   await expect(tip).toBeHidden();
-  await otherLive.focus();
+  await page.waitForTimeout(560);
+  await expect(tip).toBeHidden();
+  await expect(live).not.toHaveAttribute("aria-describedby");
+  await live.focus();
+  await page.keyboard.press("Tab");
+  await expect(otherLive).toBeFocused();
   await expect(tip).toBeHidden();
   await page.waitForTimeout(560);
   await expect(tip).toBeVisible();

@@ -105,18 +105,21 @@ function useRowTip() {
   const bind = (content: RowTipContent) => ({
     onPointerEnter: (e: { currentTarget: HTMLElement }) => show(content, e.currentTarget),
     onPointerLeave: hide,
-    onFocus: (e: { currentTarget: HTMLElement }) => show(content, e.currentTarget),
+    onPointerDown: hide,
+    onFocus: (e: { currentTarget: HTMLElement }) => {
+      if (!e.currentTarget.matches(":focus-visible")) return;
+      show(content, e.currentTarget);
+    },
     onBlur: hide,
   });
   onMount(() => {
     const dismiss = (e: Event) => {
-      if (!tip()) return;
+      if (!tip() && !timer) return;
       if (e.type === "keydown") {
         if ((e as KeyboardEvent).key !== "Escape") return;
         e.preventDefault();
         e.stopPropagation();
       }
-      if (e.type === "pointerdown" && owner && (e.target instanceof Node) && owner.contains(e.target)) return;
       hide();
     };
     window.addEventListener("scroll", dismiss, true);
