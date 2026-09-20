@@ -880,9 +880,10 @@ async fn persist_turn_prompt(
     mission_id: Uuid,
     prompt: &str,
     source: &str,
+    message_id: Option<Uuid>,
 ) {
     let event = AgentEvent::UserMessage {
-        id: Uuid::new_v4(),
+        id: message_id.unwrap_or_else(Uuid::new_v4),
         content: prompt.to_string(),
         queued: false,
         mission_id: Some(mission_id),
@@ -1013,6 +1014,7 @@ pub(crate) async fn continue_on_node(
     mission_id: Uuid,
     placement: RemotePlacement,
     content: Option<String>,
+    message_id: Option<Uuid>,
 ) -> Result<Mission, (StatusCode, String)> {
     let _admission = super::DISPATCH_ADMISSION.lock().await;
     let _file_guard = super::dispatch_admission::durable_lock(&state.config)
@@ -1146,7 +1148,7 @@ pub(crate) async fn continue_on_node(
                 return Err((StatusCode::CONFLICT, message));
             }
         };
-    persist_turn_prompt(&owner, mission.id, &prompt, &source).await;
+    persist_turn_prompt(&owner, mission.id, &prompt, &source, message_id).await;
     Ok(resumed)
 }
 

@@ -4900,9 +4900,40 @@ pub async fn post_message(
     }
     let control = control_for_user(&state, &user).await;
     if let Some(mid) = target_mission_id {
-        remote_grok::reject_local_followup(&state.config.working_dir, &control.mission_store, mid)
-            .await
-            .map_err(|error| (StatusCode::CONFLICT, error))?;
+        if let Some(placement) =
+            remote_grok::placement(&state.config.working_dir, &control.mission_store, mid)
+                .await
+                .map_err(internal_error)?
+        {
+            if agent.is_some()
+                || req.github_pr.is_some()
+                || req.track.is_some()
+                || req.title.is_some()
+                || req.continue_identity.is_some()
+            {
+                return Err((StatusCode::CONFLICT, format!("{}: remote continuation supports content only; use a linked replacement for agent or writer identity changes", remote_grok::REMOTE_RESUME_REQUIRES_REPLACEMENT)));
+            }
+            // Public follow-ups can continue the native session on its node.
+            // Internal actor routes retain their fence against local execution.
+            remote_grok::continue_on_node(
+                &state,
+                &control,
+                &user.id,
+                mid,
+                placement,
+                Some(content),
+                Some(id),
+            )
+            .await?;
+            return Ok(Json(ControlMessageResponse {
+                id,
+                queued: false,
+                message_accepted: true,
+                mission_id: Some(mid),
+                previous_execution: None,
+                warnings,
+            }));
+        }
     }
     let (queued_tx, queued_rx) = oneshot::channel();
     tracing::info!(
@@ -16007,6 +16038,7 @@ pub async fn resume_mission(
             mission_id,
             placement,
             request.content,
+            None,
         )
         .await
         .map(Json);

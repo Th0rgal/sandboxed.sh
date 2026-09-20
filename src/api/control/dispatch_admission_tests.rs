@@ -6522,10 +6522,14 @@ async fn native_grok_remote_goal_streams_resumes_and_never_creates_host_loop() {
     })
     .await;
     let rejected = h
-        .request(false, id, json!({"content":"keep optimizing"}))
+        .request(
+            false,
+            id,
+            json!({"content":"keep optimizing", "title":"different work"}),
+        )
         .await;
     assert_eq!(rejected.status(), StatusCode::CONFLICT);
-    assert!(rejected.text().await.unwrap().contains("/resume"));
+    assert!(rejected.text().await.unwrap().contains("content only"));
     let (respond, response) = oneshot::channel();
     h.control
         .cmd_tx
@@ -6576,4 +6580,90 @@ async fn native_grok_remote_goal_streams_resumes_and_never_creates_host_loop() {
         store.get_mission(id).await.unwrap().unwrap().status == MissionStatus::Completed
     })
     .await;
+    wait_until("completed native ledger settles", 10, || async {
+        crate::remote_node::job_ledger::load(&h.state.config.working_dir)
+            .await
+            .unwrap()
+            .is_empty()
+    })
+    .await;
+
+    // Orb/MCP use the ordinary composer endpoint after a goal finishes.
+    fixture.set_state("running");
+    fixture.log.lock().unwrap().clear();
+    let message_id = Uuid::new_v4();
+    let followup = h
+        .request(
+            false,
+            id,
+            json!({
+                "content":"  keep optimizing  ", "client_message_id":message_id,
+                "unexpected_field":true
+            }),
+        )
+        .await;
+    assert_eq!(
+        followup.status(),
+        StatusCode::OK,
+        "{}",
+        followup.text().await.unwrap()
+    );
+    let ack: Value = followup.json().await.unwrap();
+    assert_eq!(ack["id"], message_id.to_string());
+    assert_eq!(ack["mission_id"], id.to_string());
+    assert_eq!(ack["queued"], false);
+    assert_eq!(ack["message_accepted"], true);
+    assert_eq!(
+        ack["warnings"],
+        json!(["unrecognized fields ignored: unexpected_field"])
+    );
+    let mut saw_followup = false;
+    while let Ok(event) = events.try_recv() {
+        if let AgentEvent::UserMessage {
+            id: event_id,
+            content,
+            mission_id,
+            ..
+        } = event
+        {
+            if event_id == message_id {
+                assert_eq!(content, "keep optimizing");
+                assert_eq!(mission_id, Some(id));
+                saw_followup = true;
+            }
+        }
+    }
+    assert!(
+        saw_followup,
+        "composer id is preserved in the remote user event"
+    );
+    let jobs = fixture.submissions.lock().unwrap().clone();
+    assert_eq!(jobs.len(), 3);
+    let command = jobs[2]["payload"]["command"].as_str().unwrap();
+    assert!(
+        command.contains(&format!("--resume '{session_id}'")),
+        "{command}"
+    );
+    assert!(command.ends_with("-p 'keep optimizing'"), "{command}");
+    let run = store.get_active_mission_run(id).await.unwrap().unwrap();
+    assert!(run.owner_actor_id.starts_with("remote-job:"));
+    assert!(
+        !store
+            .get_mission(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .requires_local_disk
+    );
+    let active_followup = h
+        .request(false, id, json!({"content":"another turn"}))
+        .await;
+    assert_eq!(active_followup.status(), StatusCode::CONFLICT);
+    assert!(active_followup
+        .text()
+        .await
+        .unwrap()
+        .contains(remote_grok::REMOTE_JOB_STILL_RUNNING));
+    assert_eq!(fixture.submissions.lock().unwrap().len(), 3);
+    assert!(store.get_mission_automations(id).await.unwrap().is_empty());
 }
