@@ -1,4 +1,5 @@
-import { LaunchStatus, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, nodeLabel, type LaunchReceipt } from "./missionLaunch";
+import { LaunchStatus, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, type LaunchReceipt, type RemoteSupport } from "./missionLaunch";
+import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, GoalTag } from "./goal";
 import { ProjectPicker, ProjectCreation } from "./ProjectPicker";
 import { hasFocusScope } from "./focusScope";
 import { For, Show, Switch, Match, createMemo, createSignal, createEffect, on, onCleanup, onMount, batch } from "solid-js";
@@ -13,7 +14,7 @@ import { Dialog, Field } from "./Dialog";
 import { MenuList, PopupMenu, type MenuEntry } from "./Menu";
 import { MdSource, MdView, safeHref } from "./Markdown";
 import { getMissionEvents, storedToStream, streamMission, heldAfterHistory, type StreamEvent } from "./stream";
-import { Transcript, applyStreamEvent, buildTranscript, type StreamItem } from "./Transcript";
+import { Transcript, UserTurn, applyStreamEvent, buildTranscript, type StreamItem } from "./Transcript";
 import { mergeById, pollWhileVisible } from "./poll";
 import { LiveProjectsSection, ProjectFileView } from "./ProjectFiles";
 import { ControllerView } from "./Controller";
@@ -35,6 +36,8 @@ import {
   type Mission,
   type ProjectSummary,
   type RemoteNodeView,
+  type RemoteLaunchCapability,
+  type RemoteNodesResponse,
   openExternalUrl,
 } from "./api";
 
@@ -216,8 +219,13 @@ function Composer(p: {
   onToggleFile?: (id: string) => void;
   /** Show the harness + model picker (new agents only). */
   picker?: boolean;
+  /** Server-confirmed remote support for a harness on the selected machine (new agents only). */
+  remoteSupport?: (backend: string) => { state: RemoteSupport; note: string };
 }) {
   const [text, setText] = createSignal("");
+  // `/goal <objective>` is recognised exactly like the server does it, so the
+  // indicator never claims goal mode for text the backend would treat as chat.
+  const goal = createMemo(() => goalDraft(text()));
   const [model, setModel] = createSignal(MODELS[0]);
   const live = () => isConnected() && harnessChoices().length > 0;
   const [menu, setMenu] = createSignal(false);
@@ -292,9 +300,18 @@ function Composer(p: {
     const m = choice()?.models.find((x) => x.value === pick()?.model);
     return m ? shortModelLabel(m.label) : (pick()?.model ?? "Model");
   };
+  const goalChip = (
+    <Show when={goal().kind !== "none"}>
+      <span class="goal-mode" role="status" aria-live="polite" aria-label={goal().kind === "goal" ? "Goal mode: the agent keeps iterating until the objective is met" : "Goal mode needs an objective after /goal"}>
+        <GoalTag detail={goal().kind === "empty" ? "add an objective" : undefined} />
+      </span>
+    </Show>
+  );
   const modelBtn = (
-    <Show when={p.picker !== false}>
+    <Show when={p.picker !== false || goal().kind !== "none"}>
       <div class="picks" onPointerDown={(e) => e.stopPropagation()}>
+        {goalChip}
+        <Show when={p.picker !== false}>
         <Show
           when={live()}
           fallback={
@@ -338,7 +355,7 @@ function Composer(p: {
                       }}
                     >
                       <span class="pick-name">{c.backend.name}</span>
-                      <span class="pick-meta">{c.models.length}</span>
+                      <span class={`pick-meta ${p.remoteSupport?.(c.backend.id).state ?? ""}`}>{p.remoteSupport?.(c.backend.id).note || c.models.length}</span>
                       <span class="pick-check">{c.backend.id === pick()?.backend ? "✓" : ""}</span>
                     </button>
                   )}
@@ -379,6 +396,7 @@ function Composer(p: {
               </div>
             </Show>
           </div>
+        </Show>
         </Show>
       </div>
     </Show>
@@ -474,6 +492,35 @@ export default function App() {
   /** Only missions still doing something: the sidebar is a place to act,
    * not a history. Everything else lives under its project. */
   const [fleetNodes, setFleetNodes] = createSignal<RemoteNodeView[]>([]);
+  /** Typed remote launch support as last advertised by the server. "loading"
+   * until the first answer; "error" keeps the last capability but says so. */
+  const [remoteLaunch, setRemoteLaunch] = createSignal<{ state: "loading" | "ready" | "error"; capability: RemoteLaunchCapability | null }>({ state: "loading", capability: null });
+  const acceptFleet = (fleet: RemoteNodesResponse) => {
+    setFleetNodes(fleet.nodes);
+    setRemoteLaunch({ state: "ready", capability: fleet.remote_launch ?? null });
+  };
+  const harnessName = (id: string) => harnessChoices().find((c) => c.backend.id === id)?.backend.name ?? id;
+  /** What the harness menu shows next to each harness for the selected machine. */
+  const remoteSupport = (backend: string): { state: RemoteSupport; note: string } => {
+    const machine = newMachine();
+    if (!isConnected() || machine === "core") return { state: "unknown", note: "" };
+    const rl = remoteLaunch();
+    if (rl.state === "loading") return { state: "unknown", note: `checking ${nodeLabel(machine)}…` };
+    const support = remoteHarnessSupport(rl.capability, backend);
+    if (support === "supported") return { state: "supported", note: "" };
+    if (support === "unsupported") return { state: "unsupported", note: `not on ${nodeLabel(machine)}` };
+    return { state: "unknown", note: rl.state === "error" ? "remote support unknown" : "no typed remote launch" };
+  };
+  /** One-line remote launch summary for a node row in the machine menu. */
+  const nodeLaunchNote = () => {
+    const rl = remoteLaunch();
+    if (rl.state === "loading") return "checking launch support…";
+    const cap = rl.capability;
+    if (!cap || cap.typed !== true) return rl.state === "error" ? "launch support unknown" : "no typed remote launch";
+    const names = (cap.harnesses ?? []).map(harnessName);
+    const summary = names.length ? names.join(", ") : "no harness enabled";
+    return rl.state === "error" ? `${summary} (last known)` : summary;
+  };
   const refreshMissions = async () => {
     try {
       const fresh = await listMissions();
@@ -484,9 +531,10 @@ export default function App() {
   };
   const refreshFleet = async () => {
     try {
-      setFleetNodes((await getRemoteNodes()).nodes);
+      acceptFleet(await getRemoteNodes());
     } catch {
-      /* keep last good list */
+      /* keep last good list, but stop claiming the capability is current */
+      setRemoteLaunch((prev) => ({ ...prev, state: "error" }));
     }
   };
   const currentMissionId = createMemo(() => {
@@ -667,20 +715,30 @@ export default function App() {
   const create = async (text: string) => {
     if (isConnected()) {
       if (creating()) return false;
-      const title = text.length > 42 ? text.slice(0, 42) : text;
+      const goal = goalDraft(text);
+      if (goal.kind === "empty") { setCreateError("Add an objective after /goal, for example “/goal Make the test suite pass”. Your draft is kept."); return false; }
+      // Goal mode rides on the prompt (server contract): the canonical
+      // `/goal <objective>` enters goal mode; the title is the objective.
+      const prompt = goal.kind === "goal" ? goalPrompt(goal.objective) : text;
+      const title = missionTitle(text);
       const machine = newMachine();
-      const receipt = {prompt:text,nodeId:machine,destination:nodeLabel(machine)};
+      const receipt = {prompt,nodeId:machine,destination:nodeLabel(machine)};
       const projectSlug = liveProjects().some((p) => p.slug === newProject()) ? newProject() : liveProjects()[0]?.slug;
       const pick = effectivePick();
       setCreating(true); setCreateError(null); setLaunchPreview(receipt);
       try {
         if (!pick || !harnessChoices().some(c => c.backend.id === pick.backend && c.models.some(m => m.value === pick.model))) throw new Error("Choose an available harness and model before starting. Your draft is kept.");
         if (machine !== "core") {
-          const fleet = await getRemoteNodes(); setFleetNodes(fleet.nodes);
-          const node = fleet.nodes.find(n => n.id === machine);
-          if (!fleet.enabled || !node || node.cordoned || !["online","degraded"].includes(node.status)) throw new Error(`${receipt.destination} is unavailable. Choose an available machine; your draft is kept.`);
+          // Fresh capability read every time: the server decides which
+          // harnesses a node can run. A read failure refuses rather than guesses.
+          let fleet: RemoteNodesResponse;
+          try { fleet = await getRemoteNodes(); }
+          catch (e) { setRemoteLaunch(prev => ({ ...prev, state: "error" })); throw new Error(remoteLaunchUnconfirmed(machine, e)); }
+          acceptFleet(fleet);
+          const refusal = remoteLaunchPreflight(fleet, machine, pick, harnessName);
+          if (refusal) throw new Error(refusal);
         }
-        const body = {title,prompt:text,project:projectSlug,backend:pick.backend,model_override:pick.model,...(machine === "core" ? {} : {remote_node_id:machine})};
+        const body = {title,prompt,project:projectSlug,backend:pick.backend,model_override:pick.model,...(machine === "core" ? {} : {remote_node_id:machine})};
         const signature = JSON.stringify(body);
         if (launchAttempt?.signature !== signature) launchAttempt = {signature,key:crypto.randomUUID()};
         const m = await createMission({...body,idempotency_key:launchAttempt.key});
@@ -697,7 +755,7 @@ export default function App() {
     }
     if (newMachine() === "core" || !MACHINES.some(m => m.id === newMachine())) { setCreateError("Reconnect the backend before launching on the selected machine. Your draft is kept."); return false; }
     const id = "n" + Date.now();
-    const title = text.length > 42 ? text.slice(0, 42) : text;
+    const title = missionTitle(text);
     const extra = attached()
       .map((fid) => projectFiles().find((f) => f.id === fid))
       .filter((f): f is { id: string; name: string; text: string } => !!f)
@@ -955,7 +1013,8 @@ export default function App() {
             <Match when={currentMissionId()}>
               {(id) => (
                 <>
-                  <span>{missions().find((m) => m.id === id())?.title || "Mission"}</span>
+                  <Show when={missionGoal(missions().find((m) => m.id === id()))}><GoalTag class="small" /></Show>
+                  <span>{displayTitle(missions().find((m) => m.id === id())?.title) || "Mission"}</span>
                   <Ic.CloudIcon class="dim" />
                 </>
               )}
@@ -1156,6 +1215,7 @@ export default function App() {
                                   <span class="menu-sub">
                                     {n.status}
                                     {n.cordoned ? " · cordoned" : ""}
+                                    {" · "}{nodeLaunchNote()}
                                   </span>
                                 </span>
                               </button>
@@ -1182,7 +1242,7 @@ export default function App() {
                 <Show when={createError()}>
                   <p class="st-error" role="alert">{createError()}</p>
                 </Show>
-                <Show when={launchPreview()}>{(receipt) => <div class="launch-preview"><div class="user"><span>{receipt().prompt}</span></div><LaunchStatus submitting destination={receipt().destination} /></div>}</Show>
+                <Show when={launchPreview()}>{(receipt) => <div class="launch-preview"><UserTurn text={receipt().prompt} /><LaunchStatus submitting destination={receipt().destination} goal={goalObjective(receipt().prompt)} /></div>}</Show>
                 <div hidden={creating()}>
                 <Composer
                   placeholder="Plan, Build, / for commands, @ for context"
@@ -1191,6 +1251,7 @@ export default function App() {
                   onStop={stop}
                   autofocus
                   tall
+                  remoteSupport={remoteSupport}
                   files={projectFiles()}
                   attached={attached()}
                   onToggleFile={(id) =>
@@ -1431,7 +1492,7 @@ function MissionView(p: { id: string; initial?: Mission }) {
         }}
       >
         <div class="col">
-          <LaunchStatus destination={missionDestination(mission(), receipt)} mission={mission()} activity={items().some(i => ["text","tool","think"].includes(i.kind))} />
+          <LaunchStatus destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={items().some(i => ["text","tool","think"].includes(i.kind))} />
           <Transcript items={viewItems()} />
           <Show when={error()}>
             <p class="s-lead" role="alert">{error()}</p>

@@ -29,12 +29,18 @@ it("a previous connection's delayed 401 cannot log out the new connection", asyn
 });
 
 
-it.each(["grok", "codex", "gemini", "chatgpt_ui", "unknown", undefined])("rejects unsupported remote %s before POST while keeping the input unchanged", async backend => {
-  const fetcher = vi.fn(); vi.stubGlobal("fetch", fetcher);
+it.each(["grok", "codex", "gemini", "chatgpt_ui", "unknown", undefined])("sends remote %s exactly as selected: harness support is server-advertised, not hardcoded here", async backend => {
+  // The pre-POST refusal lives in remoteLaunchPreflight (launch.test.ts) and
+  // reads GET /api/remote-nodes; createMission itself must never carry a
+  // client-side harness list that would reject grok once the server allows it.
+  const fetcher = vi.fn(async () => new Response(`REMOTE_HARNESS_UNSUPPORTED: backend '${backend}' cannot run on remote nodes`, {status:400}));
+  vi.stubGlobal("fetch", fetcher);
   const body = {remote_node_id:"dgx-spark",backend,model_override:"chosen-model",prompt:"Keep my draft"};
   const original = {...body};
-  await expect(createMission(body)).rejects.toThrow("Remote launches currently support Claude Code and OpenCode");
-  expect(fetcher).not.toHaveBeenCalled();expect(body).toEqual(original);
+  await expect(createMission(body)).rejects.toThrow("REMOTE_HARNESS_UNSUPPORTED");
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  expect(JSON.parse((fetcher.mock.calls[0] as unknown as [string, RequestInit])[1].body as string)).toEqual(original);
+  expect(body).toEqual(original);
 });
 
 it.each(["claudecode", "opencode"])("lets the server validate remote %s without changing selection or retrying", async backend => {

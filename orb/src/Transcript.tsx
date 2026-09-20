@@ -2,6 +2,7 @@ import { For, Show, createSignal, createEffect, createMemo } from "solid-js";
 import * as Ic from "./icons";
 import { MdView } from "./Markdown";
 import { createStore, reconcile } from "solid-js/store";
+import { goalDraft, GoalTag } from "./goal";
 
 import type { StreamItem } from "./transcriptModel";
 export { buildTranscript, applyStreamEvent } from "./transcriptModel";
@@ -54,6 +55,18 @@ function resultText(result: unknown): string {
   } catch {
     return String(result);
   }
+}
+
+/** A user turn. A `/goal <objective>` message is shown as a Goal turn with the
+ * exact objective, not the raw slash command; the text itself is untouched. */
+export function UserTurn(p: { text: string }) {
+  const goal = createMemo(() => goalDraft(p.text));
+  return (
+    <div class={`user ${goal().kind === "goal" ? "goal" : ""}`}>
+      <Show when={goal().kind === "goal"}><GoalTag /></Show>
+      <span>{goal().kind === "goal" ? (goal() as { objective: string }).objective : p.text}</span>
+    </div>
+  );
 }
 
 function ToolRow(p: { item: Extract<StreamItem, { kind: "tool" }> }) {
@@ -175,11 +188,7 @@ export function Transcript(p: { items: StreamItem[] }) {
             case "work":
               return <WorkFold items={item.items} />;
             case "user":
-              return (
-                <div class="user">
-                  <span>{item.text}</span>
-                </div>
-              );
+              return <UserTurn text={item.text} />;
             case "think":
               return <ThinkBlock item={item} />;
             case "text":

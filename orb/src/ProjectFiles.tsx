@@ -3,6 +3,7 @@ import { mergeById, pollWhileVisible } from "./poll";
 import { createStore } from "solid-js/store";
 import * as Ic from "./icons";
 import { MdSource, MdView } from "./Markdown";
+import { displayTitle } from "./goal";
 import {
   isConnected,
   ApiError,
@@ -374,7 +375,7 @@ export function LiveProjectsSection(p: {
                       <span class="glyph">
                         <p.StatusGlyph agent={{ status: p.missionGlyph(m.status) }} busy={false} />
                       </span>
-                      <span class="row-label">{m.title || m.id}</span>
+                      <span class="row-label">{displayTitle(m.title) || m.id}</span>
                       <MachineBadge name={m.workspace_name} />
                     </button>
                   )}
@@ -399,7 +400,7 @@ export function LiveProjectsSection(p: {
                           <span class="glyph">
                             <p.StatusGlyph agent={{ status: p.missionGlyph(m.status) }} busy={false} />
                           </span>
-                          <span class="row-label">{m.title || m.id}</span>
+                          <span class="row-label">{displayTitle(m.title) || m.id}</span>
                           <MachineBadge name={m.workspace_name} />
                         </button>
                       )}
