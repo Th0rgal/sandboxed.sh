@@ -1,0 +1,56 @@
+{
+  "samples": [
+    {
+      "optimistic": 1.0999994277954102,
+      "acceptedView": 4.40000057220459
+    },
+    {
+      "optimistic": 0.6000003814697266,
+      "acceptedView": 2.5
+    },
+    {
+      "optimistic": 0.5,
+      "acceptedView": 1.7000007629394531
+    },
+    {
+      "optimistic": 0.5,
+      "acceptedView": 2.3999996185302734
+    },
+    {
+      "optimistic": 0.39999961853027344,
+      "acceptedView": 2.40000057220459
+    },
+    {
+      "optimistic": 0.6000003814697266,
+      "acceptedView": 1.6999998092651367
+    },
+    {
+      "optimistic": 0.6000003814697266,
+      "acceptedView": 1.5999994277954102
+    },
+    {
+      "optimistic": 0.5,
+      "acceptedView": 2.09999942779541
+    },
+    {
+      "optimistic": 0.5,
+      "acceptedView": 2.299999237060547
+    },
+    {
+      "optimistic": 0.5,
+      "acceptedView": 1.5999994277954102
+    },
+    {
+      "optimistic": 0.5,
+      "acceptedView": 2.3000001907348633
+    },
+    {
+      "optimistic": 0.3000001907348633,
+      "acceptedView": 1.6000003814697266
+    }
+  ],
+  "optimisticMedian": 0.5,
+  "optimisticP95": 1.0999994277954102,
+  "acceptedViewMedian": 2.09999942779541,
+  "acceptedViewP95": 4.40000057220459
+}

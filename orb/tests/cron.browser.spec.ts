@@ -210,5 +210,5 @@ for (const status of [404, 500]) test(`cron ${status}: compact status preserves 
   await page.getByRole("button",{name:"Close",exact:true}).click();
   await page.screenshot({path:"test-results/orb-cron-unsupported.png"});
   fail=false;await page.getByRole("button",{name:"Reconnect backend"}).click();await expect(row).toHaveCount(0);expect(requests).toBeGreaterThan(failedCount);
- } else {expect(requests).toBeGreaterThan(failedCount);fail=false;await page.getByRole("button",{name:"Retry crons"}).click();await expect(row).toHaveCount(0);}
+ } else {await expect.poll(()=>requests).toBeGreaterThan(failedCount);fail=false;await page.getByRole("button",{name:"Retry crons"}).click();await expect(row).toHaveCount(0);}
 });

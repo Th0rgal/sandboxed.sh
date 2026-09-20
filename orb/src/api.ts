@@ -118,6 +118,12 @@ export interface Mission {
   status: string;
   title: string | null;
   history: MissionHistoryEntry[];
+  goal_mode?: boolean;
+  goal_objective?: string | null;
+  remote_node_id?: string | null;
+  terminal_reason?: string | null;
+  status_message?: string | null;
+  execution?: { state?: string; terminal_reason?: string | null };
   workspace_name?: string | null;
   agent?: string | null;
   backend?: string;
@@ -126,10 +132,10 @@ export interface Mission {
 }
 
 export interface CreateMissionBody {
+  idempotency_key?: string;
   title?: string;
   prompt?: string;
   remote_node_id?: string;
-  remote_command?: string;
   /** Stable project identifier — groups the mission under the project. */
   project?: string;
   /** Harness id (claudecode, codex, opencode, grok, gemini). */
@@ -553,54 +559,4 @@ export async function sendMissionMessage(id: string, text: string): Promise<{ id
 
 export async function cancelMission(id: string): Promise<void> {
   await api<void>(`/api/control/missions/${id}/cancel`, { method: "POST" });
-}
-
-const NODE_KEY_NAME = "orb-remote-agents";
-const NODE_KEY_STORAGE = "orb.nodeAgentKey";
-
-interface ProxyKeySummary {
-  id: string;
-  name: string;
-}
-
-/**
- * Remote nodes run jobs with a scrubbed env (env_clear on the node runner), so
- * the only way to hand an agent CLI credentials is inline in the command. We
- * mint a dedicated, revocable proxy API key on the core backend and point the
- * CLI at the core's /v1 proxy — the OAuth subscriptions stay on the core.
- */
-export async function ensureNodeAgentKey(): Promise<string> {
-  const stored = localStorage.getItem(NODE_KEY_STORAGE);
-  if (stored) return stored;
-  const keys = await api<ProxyKeySummary[]>("/api/proxy-keys");
-  const stale = keys.filter((k) => k.name === NODE_KEY_NAME);
-  // Raw values are only returned at creation time, so a stored key we no
-  // longer have the value for is useless — delete and re-mint.
-  for (const k of stale) {
-    await api(`/api/proxy-keys/${k.id}`, { method: "DELETE" }).catch(() => {});
-  }
-  const created = await api<{ key: string }>("/api/proxy-keys", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: NODE_KEY_NAME }),
-  });
-  localStorage.setItem(NODE_KEY_STORAGE, created.key);
-  return created.key;
-}
-
-/**
- * Command dispatched to a remote node. Prefers claude (headless) through the
- * core proxy via the Anthropic-native /v1/messages endpoint; falls back to
- * opencode through the OpenAI-compatible /v1/chat/completions endpoint.
- */
-export function buildRemoteAgentCommand(prompt: string, nodeKey: string): string {
-  const quoted = `'${prompt.replace(/'/g, `'\\''`)}'`;
-  const base = getApiUrl();
-  return (
-    `if command -v claude >/dev/null 2>&1; then ` +
-    `ANTHROPIC_BASE_URL='${base}' ANTHROPIC_AUTH_TOKEN='${nodeKey}' claude -p ${quoted}; ` +
-    `elif command -v opencode >/dev/null 2>&1; then ` +
-    `OPENAI_BASE_URL='${base}/v1' OPENAI_API_KEY='${nodeKey}' opencode run ${quoted}; ` +
-    `else echo 'no agent CLI on this node' >&2; exit 127; fi`
-  );
 }

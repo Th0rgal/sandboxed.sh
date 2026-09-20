@@ -1,3 +1,4 @@
+import { LaunchStatus, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, nodeLabel, type LaunchReceipt } from "./missionLaunch";
 import { ProjectPicker, ProjectCreation } from "./ProjectPicker";
 import { hasFocusScope } from "./focusScope";
 import { For, Show, Switch, Match, createMemo, createSignal, createEffect, on, onCleanup, onMount, batch } from "solid-js";
@@ -17,8 +18,6 @@ import { mergeById, pollWhileVisible } from "./poll";
 import { LiveProjectsSection, ProjectFileView } from "./ProjectFiles";
 import { ControllerView } from "./Controller";
 import {
-  buildRemoteAgentCommand,
-  ensureNodeAgentKey,
   createMission,
   getMission,
   getRemoteNodes,
@@ -64,12 +63,12 @@ const setHarnessPick = (p: HarnessPick) => {
     /* ignore */
   }
 };
-/** Effective pick: stored one if still offered, else Claude Code's first model. */
+/** Preserve an explicit selection; launch validation reports unavailable models. */
 const effectivePick = (): HarnessPick | null => {
   const choices = harnessChoices();
   if (!choices.length) return null;
   const stored = harnessPick();
-  if (stored && choices.some((c) => c.backend.id === stored.backend && c.models.some((m) => m.value === stored.model))) return stored;
+  if (stored) return stored;
   const first = choices.find((c) => c.backend.id === "claudecode") ?? choices[0];
   return { backend: first.backend.id, model: first.models[0].value };
 };
@@ -208,7 +207,7 @@ function StatusGlyph(p: { agent: { status: Agent["status"] }; busy: boolean }) {
 function Composer(p: {
   placeholder: string;
   busy: boolean;
-  onSend: (t: string) => void;
+  onSend: (t: string) => void | boolean | Promise<void | boolean>;
   onStop: () => void;
   autofocus?: boolean;
   tall?: boolean;
@@ -229,13 +228,16 @@ function Composer(p: {
     ta.style.height = "auto";
     ta.style.height = Math.min(ta.scrollHeight, 220) + "px";
   };
-  const send = () => {
+  const [sending, setSending] = createSignal(false);
+  const send = async () => {
     const t = text().trim();
-    if (!t || p.busy) return;
-    p.onSend(t);
-    setText("");
-    ta.value = "";
-    resize();
+    if (!t || p.busy || sending()) return;
+    setSending(true);
+    try {
+      const accepted = await p.onSend(t);
+      if (accepted !== false && text().trim() === t) { setText(""); ta.value = ""; resize(); }
+      else if (accepted === false && ta.isConnected) ta.focus();
+    } finally { setSending(false); }
   };
   onMount(() => p.autofocus && ta.focus());
   const close = () => {
@@ -445,6 +447,8 @@ export default function App() {
   const [liveProjects, setLiveProjects] = createSignal<ProjectSummary[]>([]);
   const [createError, setCreateError] = createSignal<string | null>(null);
   const [creating, setCreating] = createSignal(false);
+  const [launchPreview, setLaunchPreview] = createSignal<LaunchReceipt | null>(null);
+  let launchAttempt: { signature: string; key: string } | undefined;
   const [newMachine, setNewMachine] = createSignal(MACHINES[0].id);
   const [envOpen, setEnvOpen] = createSignal<"machine" | "project" | null>(null);
   const [history, setHistory] = createSignal<(string | null)[]>(["a1"]);
@@ -518,9 +522,9 @@ export default function App() {
   const machineLabel = () => {
     if (isConnected()) {
       if (newMachine() === "core") return "Core (agent-core)";
-      return fleetNodes().find((n) => n.id === newMachine())?.id ?? "Core (agent-core)";
+      return nodeLabel(newMachine());
     }
-    return MACHINES.find((m) => m.id === newMachine())?.name;
+    return MACHINES.find((m) => m.id === newMachine())?.name ?? nodeLabel(newMachine());
   };
   // Keyed on the connection only: the body reads selected()/newMachine()/
   // fleetNodes(), and tracking those made every fleet poll re-run the
@@ -536,13 +540,13 @@ export default function App() {
       // Seed agent ids only exist offline — don't land on a demo transcript.
       const sel = selected();
       if (sel && !sel.includes(":") && !["settings", "machines", "providers"].includes(sel)) open(null);
-      if (newMachine() !== "core" && !fleetNodes().some((n) => n.id === newMachine())) setNewMachine("core");
+      if (newMachine() === "local") setNewMachine("core");
     } else {
       // Backend views (missions, hosted files) can't render offline — e.g.
       // after a 401 cleared the token mid-session.
       const sel = selected();
       if (sel && (sel.startsWith("m:") || sel.startsWith("pf:") || sel.startsWith("c:"))) open(null);
-      if (newMachine() === "core" || fleetNodes().some((n) => n.id === newMachine())) setNewMachine(MACHINES[0].id);
+      // Keep an explicit machine selection across reconnects.
     }
   }));
   const currentFile = createMemo(() => {
@@ -662,31 +666,36 @@ export default function App() {
 
   const create = async (text: string) => {
     if (isConnected()) {
-      if (creating()) return;
+      if (creating()) return false;
       const title = text.length > 42 ? text.slice(0, 42) : text;
-      const node = fleetNodes().find((n) => n.id === newMachine());
-      // The picker falls back to the first live project when none was chosen
-      // explicitly — tag the mission with what the UI actually shows.
+      const machine = newMachine();
+      const receipt = {prompt:text,nodeId:machine,destination:nodeLabel(machine)};
       const projectSlug = liveProjects().some((p) => p.slug === newProject()) ? newProject() : liveProjects()[0]?.slug;
-      setCreating(true);
-      setCreateError(null);
       const pick = effectivePick();
-      const harness = pick ? { backend: pick.backend, model_override: pick.model } : {};
+      setCreating(true); setCreateError(null); setLaunchPreview(receipt);
       try {
-        const m = await createMission(
-          node
-            ? { title, prompt: text, remote_node_id: node.id, remote_command: buildRemoteAgentCommand(text, await ensureNodeAgentKey()), project: projectSlug, ...harness }
-            : { title, prompt: text, project: projectSlug, ...harness },
-        );
-        await refreshMissions();
+        if (!pick || !harnessChoices().some(c => c.backend.id === pick.backend && c.models.some(m => m.value === pick.model))) throw new Error("Choose an available harness and model before starting. Your draft is kept.");
+        if (machine !== "core") {
+          const fleet = await getRemoteNodes(); setFleetNodes(fleet.nodes);
+          const node = fleet.nodes.find(n => n.id === machine);
+          if (!fleet.enabled || !node || node.cordoned || !["online","degraded"].includes(node.status)) throw new Error(`${receipt.destination} is unavailable. Choose an available machine; your draft is kept.`);
+        }
+        const body = {title,prompt:text,project:projectSlug,backend:pick.backend,model_override:pick.model,...(machine === "core" ? {} : {remote_node_id:machine})};
+        const signature = JSON.stringify(body);
+        if (launchAttempt?.signature !== signature) launchAttempt = {signature,key:crypto.randomUUID()};
+        const m = await createMission({...body,idempotency_key:launchAttempt.key});
+        launchAttempt = undefined;
+        rememberLaunch(m.id, receipt);
+        setMissions(prev => [m, ...prev.filter(old => old.id !== m.id)]);
         open(`m:${m.id}`);
+        void refreshMissions();
+        return true;
       } catch (e) {
-        setCreateError(e instanceof Error ? e.message : String(e));
-      } finally {
-        setCreating(false);
-      }
-      return;
+        setCreateError(launchError(e));
+        return false;
+      } finally { setCreating(false); setLaunchPreview(null); }
     }
+    if (newMachine() === "core" || !MACHINES.some(m => m.id === newMachine())) { setCreateError("Reconnect the backend before launching on the selected machine. Your draft is kept."); return false; }
     const id = "n" + Date.now();
     const title = text.length > 42 ? text.slice(0, 42) : text;
     const extra = attached()
@@ -998,7 +1007,7 @@ export default function App() {
           <Match when={currentMissionId()}>
             {(id) => (
               <Show when={id()} keyed>
-                {(mid) => <MissionView id={mid} />}
+                {(mid) => <MissionView id={mid} initial={missions().find(m => m.id === mid)} />}
               </Show>
             )}
           </Match>
@@ -1042,7 +1051,7 @@ export default function App() {
           when={current()}
           keyed
           fallback={
-            <div class="new-agent">
+            <div class={`new-agent ${creating() ? "launching" : ""}`}>
               <div class="new-inner">
                 <div class="na-meta">
                   <div class="na-drop" onPointerDown={(e) => e.stopPropagation()}>
@@ -1171,8 +1180,10 @@ export default function App() {
                   </div>
                 </div>
                 <Show when={createError()}>
-                  <p class="st-error">{createError()}</p>
+                  <p class="st-error" role="alert">{createError()}</p>
                 </Show>
+                <Show when={launchPreview()}>{(receipt) => <div class="launch-preview"><div class="user"><span>{receipt().prompt}</span></div><LaunchStatus submitting destination={receipt().destination} /></div>}</Show>
+                <div hidden={creating()}>
                 <Composer
                   placeholder="Plan, Build, / for commands, @ for context"
                   busy={creating()}
@@ -1186,6 +1197,7 @@ export default function App() {
                     setAttached(attached().includes(id) ? attached().filter((x) => x !== id) : [...attached(), id])
                   }
                 />
+                </div>
               </div>
             </div>
           }
@@ -1297,8 +1309,9 @@ export default function App() {
   );
 }
 
-function MissionView(p: { id: string }) {
-  const [mission, setMission] = createSignal<Mission | null>(null);
+function MissionView(p: { id: string; initial?: Mission }) {
+  const receipt = recalledLaunch(p.id);
+  const [mission, setMission] = createSignal<Mission | null>(p.initial ?? null);
   const [items, setItems] = createSignal<StreamItem[]>([]);
   const [error, setError] = createSignal<string | null>(null);
   let scroller: HTMLDivElement | undefined;
@@ -1362,6 +1375,11 @@ function MissionView(p: { id: string }) {
       p.id,
       (ev) => {
         if (ev.type === "mission_status_changed" || ev.type === "status") {
+          if (ev.type === "mission_status_changed" && typeof ev.data.status === "string") {
+            const status = ev.data.status;
+            setMission(old => ({ ...(old ?? {id:p.id,title:null,history:[],created_at:"",updated_at:""}), status,
+              status_message: typeof ev.data.summary === "string" ? ev.data.summary : old?.status_message }));
+          }
           void refresh();
           return;
         }
@@ -1381,21 +1399,20 @@ function MissionView(p: { id: string }) {
 
   const busy = () => {
     const s = mission()?.status;
-    return s === "active" || s === "running";
+    return !!s && ["active","running","pending","queued","starting","resuming"].includes(s);
   };
 
   const viewItems = () => {
-    const list = items();
+    const list = withInitialPrompt(items(), mission(), receipt);
     if (busy()) return list;
     // Terminal mission: force-close any bubble left open by a dropped
     // assistant_message finalizer.
     return list.map((i) => (i.kind === "text" && i.live ? { ...i, live: false } : i));
   };
 
-  const sendMsg = (text: string) => {
-    void sendMissionMessage(p.id, text)
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
-      .then(() => refresh());
+  const sendMsg = async (text: string) => {
+    try { await sendMissionMessage(p.id, text); void refresh(); return true; }
+    catch (e) { setError(launchError(e)); return false; }
   };
 
   const stopM = () => {
@@ -1414,12 +1431,10 @@ function MissionView(p: { id: string }) {
         }}
       >
         <div class="col">
+          <LaunchStatus destination={missionDestination(mission(), receipt)} mission={mission()} activity={items().some(i => ["text","tool","think"].includes(i.kind))} />
           <Transcript items={viewItems()} />
-          <Show when={busy() && !items().some((i) => (i.kind === "text" && i.live) || (i.kind === "think" && !i.done))}>
-            <p class="s-lead shimmer">Working…</p>
-          </Show>
           <Show when={error()}>
-            <p class="s-lead">{error()}</p>
+            <p class="s-lead" role="alert">{error()}</p>
           </Show>
         </div>
       </div>
