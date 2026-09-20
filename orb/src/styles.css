@@ -797,9 +797,9 @@ textarea::placeholder { color: var(--placeholder); }
 }
 .row.folder:hover .row-action { display: flex; }
 .row.file { color: var(--fg-2); }
-.row.d1 { padding-left: 22px; }
-.row.d2 { padding-left: 22px; }
-.row.depth { padding-left: calc(8px + var(--depth, 0) * 14px); }
+/* Nested missions sit on the same left edge as the project folder (Cursor). */
+.row.d1, .row.d2 { padding-left: 6px; }
+.row.depth { padding-left: calc(6px + (var(--depth, 1) - 1) * 12px); }
 .row-tip {
   position: fixed; z-index: 80; max-width: min(280px, calc(100vw - 16px)); padding: 7px 9px; border-radius: 8px;
   background: var(--menu-bg); color: var(--fg); border: 1px solid var(--stroke-strong);
