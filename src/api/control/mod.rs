@@ -10974,16 +10974,28 @@ pub async fn create_mission(
     // The initial prompt, keyed by the id of its queued broadcast so a later
     // non-queued event for the same message replaces it in live clients.
     let mut initial_prompt: Option<(Uuid, String)> = None;
+    // A remote launch is owned by the node job from the moment it exists. A
+    // deferred goal is the FLEET-001 scheduler's dispatch ticket: for a
+    // remote mission it would make the mission eligible for a LOCAL harness
+    // during every await below (node placement, proxy-key mint, the node
+    // submit round-trip). Incident 620cdb74 (2026-09-20): the scheduler
+    // started a local runner for a typed dgx-spark launch while the submit
+    // was in flight, persisted the prompt a second time (source=scheduler),
+    // and left the remote job without its run lease. Remote prompts are
+    // persisted exactly once by `persist_remote_mission_prompt` instead.
+    let remote_launch = remote_node_id.is_some() && remote_plan.is_some();
     if let Some(prompt) = nonblank(&req.prompt) {
         // Canonicalise `/goal\n…` to the space form before storing: the
         // deferred goal is later re-injected verbatim, and the backend goal
         // drivers only recognise `/goal <objective>` with a space.
         let prompt = canonical_goal_message(&prompt).unwrap_or(prompt);
-        control
-            .mission_store
-            .set_deferred_goal(mission.id, Some(prompt.clone()))
-            .await
-            .map_err(internal_error)?;
+        if !remote_launch {
+            control
+                .mission_store
+                .set_deferred_goal(mission.id, Some(prompt.clone()))
+                .await
+                .map_err(internal_error)?;
+        }
         // A `/goal …` prompt is a goal-mode mandate from the very first turn.
         // Persist it here, synchronously on the same store that created the
         // mission — the event-loop hook that also does this only sees events
@@ -11049,7 +11061,7 @@ pub async fn create_mission(
                     .update_mission_status_with_reason(
                         mission.id,
                         MissionStatus::Failed,
-                        Some("remote_dispatch_failed"),
+                        Some(REMOTE_DISPATCH_FAILED),
                     )
                     .await;
                 let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
@@ -12401,6 +12413,21 @@ async fn finalize_remote_mission(
 /// node's job API, mark the mission Active immediately, and finalize it from
 /// a background poll loop. Unlike [`dispatch_remote_mission_mvp`], the create
 /// request does not block for the command's duration.
+/// Terminal reason of a remote launch whose dispatch failed or whose
+/// submitting process died before the node acceptance became durable.
+pub(crate) const REMOTE_DISPATCH_FAILED: &str = "remote_dispatch_failed";
+pub(crate) const REMOTE_DISPATCH_INTERRUPTED: &str = "remote_dispatch_interrupted";
+
+/// Dispatch a remote mission job with the run lease taken FIRST.
+///
+/// The lease (`owner remote-job:<job_id>`, state `waiting_remote_job`) is the
+/// durable ownership fence every local execution path checks:
+/// `begin_mission_run` refuses a second non-terminal run, so a targeted
+/// message, the FLEET-001 scheduler or a resume cannot start a local harness
+/// while placement, proxy-key minting and the node submit are awaiting.
+/// Taking it after the submit (the pre-620cdb74 order) left that whole window
+/// open. Every failure below settles the lease so a failed mission never
+/// keeps a phantom run; the ledger handle keeps owning a maybe-accepted job.
 async fn dispatch_remote_job(
     state: &Arc<AppState>,
     control: &ControlState,
@@ -12415,6 +12442,62 @@ async fn dispatch_remote_job(
     .map_err(|e| e.to_string())?
     .ok_or_else(|| "remote node placement unexpectedly returned local".to_string())?
     .clone();
+    let job_id = Uuid::new_v4();
+    match ensure_remote_job_lease(control.mission_store.as_ref(), mission.id, job_id, &node.id)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let owner = control
+                .mission_store
+                .get_active_mission_run(mission.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|run| run.owner_actor_id);
+            return Err(format!(
+                "remote job run lease for mission {} could not be taken before dispatch (execution already owned by {}); refusing to start a second execution",
+                mission.id,
+                owner.as_deref().unwrap_or("an unavailable mission state")
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "remote job run lease could not be acquired before dispatch: {error}"
+            ));
+        }
+    }
+    let dispatched = submit_leased_remote_job(state, control, mission, node, job_id, plan).await;
+    if dispatched.is_err() {
+        if let Err(error) = finish_remote_job_lease(
+            control.mission_store.as_ref(),
+            mission.id,
+            job_id,
+            REMOTE_DISPATCH_FAILED,
+        )
+        .await
+        {
+            tracing::warn!(
+                mission_id = %mission.id,
+                %job_id,
+                %error,
+                "remote job run lease could not be settled after a failed dispatch"
+            );
+        }
+    }
+    dispatched
+}
+
+/// The submit half of `dispatch_remote_job`; `job_id` already owns the
+/// mission's run lease.
+async fn submit_leased_remote_job(
+    state: &Arc<AppState>,
+    control: &ControlState,
+    mission: &Mission,
+    node: crate::remote_node::RemoteNodeConfig,
+    job_id: Uuid,
+    plan: &RemoteHarnessPlan,
+) -> Result<Mission, String> {
     let shared_token = std::env::var(&node.token_env)
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -12424,7 +12507,6 @@ async fn dispatch_remote_job(
                 node.id, node.token_env
             )
         })?;
-    let job_id = Uuid::new_v4();
     let claims = crate::remote_node::LeaseClaims {
         mission_id: mission.id,
         node_id: node.id.clone(),
@@ -12880,6 +12962,92 @@ pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
     });
 }
 
+/// The store that persists `mission_id`, live session first, then an offline
+/// persisted store. `None` when no store knows the mission (yet).
+async fn find_remote_mission_owner(
+    state: &Arc<AppState>,
+    mission_id: Uuid,
+) -> Option<(RemoteMissionOwner, MissionStatus)> {
+    for session in state.control.all_sessions().await {
+        if let Ok(Some(mission)) = session.mission_store.get_mission(mission_id).await {
+            return Some((RemoteMissionOwner::live(&session), mission.status));
+        }
+    }
+    match super::mission_workspace_gc::persisted_mission_store(state.as_ref(), mission_id).await {
+        Ok(Some((store, status))) => Some((RemoteMissionOwner::offline(store), status)),
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(
+                %mission_id,
+                ?err,
+                "remote job persisted owner lookup failed; will retry"
+            );
+            None
+        }
+    }
+}
+
+/// Settle a raw remote launch whose submitting process died between taking
+/// the run lease and persisting node acceptance. Ownership stays with the
+/// tentative ledger handle (its cancellation observer) — only the mission's
+/// own lease and presentation are closed, and only when this job owns them
+/// or no one does. A lease held by anyone else is left untouched.
+async fn settle_interrupted_remote_launch(state: &Arc<AppState>, mission_id: Uuid, job_id: Uuid) {
+    let Some((owner, status)) = find_remote_mission_owner(state, mission_id).await else {
+        tracing::info!(%mission_id, %job_id, "interrupted remote launch kept: owning mission not found; will retry");
+        return;
+    };
+    let store = owner.mission_store.as_ref();
+    match store.get_active_mission_run(mission_id).await {
+        Ok(Some(run)) if run.owner_actor_id == remote_job_lease_owner(job_id) => {
+            if let Err(error) =
+                finish_remote_job_lease(store, mission_id, job_id, REMOTE_DISPATCH_INTERRUPTED)
+                    .await
+            {
+                tracing::warn!(%mission_id, %job_id, %error, "interrupted remote launch lease could not be settled; will retry");
+                return;
+            }
+        }
+        Ok(Some(run)) => {
+            tracing::info!(%mission_id, %job_id, owner = %run.owner_actor_id, "interrupted remote launch: mission run owned elsewhere; leaving it");
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%mission_id, %job_id, %error, "interrupted remote launch: run ownership unreadable; will retry");
+            return;
+        }
+    }
+    if !matches!(status, MissionStatus::Pending | MissionStatus::Active) {
+        return;
+    }
+    let _ = store.set_deferred_goal(mission_id, None).await;
+    match store
+        .update_mission_status_with_reason(
+            mission_id,
+            MissionStatus::Failed,
+            Some(REMOTE_DISPATCH_INTERRUPTED),
+        )
+        .await
+    {
+        Ok(()) => {
+            tracing::warn!(%mission_id, %job_id, "remote launch interrupted before node acceptance was durable; mission failed, job cancellation reconciling");
+            owner.send(AgentEvent::MissionStatusChanged {
+                completion: None,
+                execution: None,
+                mission_id,
+                status: MissionStatus::Failed,
+                summary: Some(format!(
+                    "Remote launch interrupted before node acceptance of job {job_id} was durable; cancellation is being reconciled"
+                )),
+            });
+        }
+        Err(error) => {
+            tracing::warn!(%mission_id, %job_id, %error, "interrupted remote launch status could not be persisted; will retry");
+        }
+    }
+}
+
 async fn reconcile_pending_handles(
     state: &Arc<AppState>,
     working_dir: &std::path::Path,
@@ -12906,6 +13074,19 @@ async fn reconcile_pending_handles(
                             handle.started_at,
                             working_dir.to_path_buf(),
                         );
+                        // A raw remote launch (no validation identity) whose
+                        // submit never became durable: its mission holds the
+                        // pre-submit run lease and no deferred goal, so no
+                        // local runner can ever pick it up — but nothing
+                        // else would settle it either.
+                        if handle.identity.is_none() {
+                            settle_interrupted_remote_launch(
+                                state,
+                                handle.mission_id,
+                                handle.job_id,
+                            )
+                            .await;
+                        }
                     }
                     _ => {
                         tracing::warn!(
@@ -12975,41 +13156,7 @@ async fn reconcile_pending_handles(
             // Reattach even when the owner has not booted a control session:
             // durable node work must still be observed/cancelled while an
             // OAuth user remains offline after restart.
-            let mut owning: Option<(RemoteMissionOwner, MissionStatus)> = None;
-            for session in state.control.all_sessions().await {
-                if let Ok(Some(mission)) =
-                    session.mission_store.get_mission(handle.mission_id).await
-                {
-                    owning = Some((RemoteMissionOwner::live(&session), mission.status));
-                    break;
-                }
-            }
-            if owning.is_none() {
-                match super::mission_workspace_gc::persisted_mission_store(
-                    state.as_ref(),
-                    handle.mission_id,
-                )
-                .await
-                {
-                    Ok(Some((store, status))) => {
-                        tracing::info!(
-                            mission_id = %handle.mission_id,
-                            job_id = %handle.job_id,
-                            "re-attaching remote job for offline persisted owner"
-                        );
-                        owning = Some((RemoteMissionOwner::offline(store), status));
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            mission_id = %handle.mission_id,
-                            job_id = %handle.job_id,
-                            ?err,
-                            "remote job persisted owner lookup failed; will retry"
-                        );
-                    }
-                }
-            }
+            let owning = find_remote_mission_owner(state, handle.mission_id).await;
             let Some((owner, mission_status)) = owning else {
                 tracing::info!(
                     mission_id = %handle.mission_id,
@@ -25087,7 +25234,43 @@ async fn control_actor_loop(
                                 {
                                     let mission_id = next.id;
                                     let priority = next.scheduling.priority;
-                                    if let Ok(Some(goal)) =
+                                    // A non-terminal run means another owner
+                                    // (a remote job observer, a runner that has
+                                    // not settled yet) already executes this
+                                    // mission. Dispatching a local runner on
+                                    // top of it would either be rejected by
+                                    // the run lease or, worse, duplicate the
+                                    // prompt. Fail closed on a store error too.
+                                    let execution_unowned = match mission_store
+                                        .get_active_mission_run(mission_id)
+                                        .await
+                                    {
+                                        Ok(None) => true,
+                                        Ok(Some(run)) => {
+                                            tracing::warn!(
+                                                mission_id = %mission_id,
+                                                owner = %run.owner_actor_id,
+                                                state = ?run.execution_state,
+                                                "Scheduler: mission execution is already owned; not starting a local runner"
+                                            );
+                                            scheduler_inflight.insert(
+                                                mission_id,
+                                                tokio::time::Instant::now(),
+                                            );
+                                            false
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                mission_id = %mission_id,
+                                                "Scheduler: run ownership unreadable; deferring dispatch: {e}"
+                                            );
+                                            false
+                                        }
+                                    };
+                                    if !execution_unowned {
+                                        // Skip this pass; the cooldown record
+                                        // (or the next pass) re-evaluates.
+                                    } else if let Ok(Some(goal)) =
                                         mission_store.get_deferred_goal(mission_id).await
                                     {
                                         // Deliberately do NOT clear the goal here. The
