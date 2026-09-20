@@ -1,5 +1,8 @@
 use super::*;
-use crate::api::{mission_store::SqliteMissionStore, projects_store::ProjectsStore};
+use crate::api::{
+    mission_store::{SqliteMissionStore, StoredEvent},
+    projects_store::ProjectsStore,
+};
 use serde_json::{json, Value};
 
 type AdmissionHooks = std::sync::Mutex<HashMap<(Uuid, &'static str), oneshot::Sender<()>>>;
@@ -5507,7 +5510,11 @@ async fn remote_build_ledger_repository_proves_a_disjoint_pr_writer_only_when_kn
             Some(m.id),
             "{case}: an assigned PR always conflicts"
         );
-        h.unchanged(&m).await;
+        assert_eq!(
+            store.get_mission(m.id).await.unwrap().unwrap().status,
+            MissionStatus::Active,
+            "{case}: admission reads never change the parked mission"
+        );
     }
 }
 
