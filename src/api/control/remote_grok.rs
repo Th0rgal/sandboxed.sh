@@ -2,7 +2,7 @@
 //!
 //! A `backend: "grok"` launch runs the real `grok` CLI on the node (not an
 //! OpenCode stand-in): `grok --output-format streaming-json --always-approve
-//! [--model <id>] [--resume <session>] -p <prompt>` under the node's raw job
+//! [--model <id>] (--session-id <new> | --resume <existing>) -p <prompt>` under the node's raw job
 //! executor, which clears the environment and sets `HOME` to the per-mission
 //! job directory. Three things distinguish it from the Claude/OpenCode plans:
 //!
@@ -17,8 +17,8 @@
 //! - **Events stream.** The observer reads the job log incrementally
 //!   (`GET /jobs/:id/log?offset=`), parses the CLI's streaming-json lines and
 //!   broadcasts `Thinking`/`TextDelta`/`SessionIdUpdate` like the local
-//!   runner. The `end` event's `sessionId` is persisted as the mission's
-//!   native identity so later turns resume the same CLI session.
+//!   runner. New session UUIDs are persisted under the run generation before
+//!   dispatch, so interruption before the `end` event remains resumable.
 //! - **Goals are native.** Grok 1.0.34 executes literal `/goal <objective>`
 //!   through planning, implementation and verification. A paused native goal
 //!   continues with `--resume <session> -p '/goal resume'`. The host never
@@ -87,6 +87,7 @@ pub(crate) fn plan(model: Option<String>, prompt: String) -> RemoteHarnessPlan {
         model: Some(model.unwrap_or_else(resolve_grok_default_model)),
         prompt,
         resume_session_id: None,
+        new_session_id: Some(Uuid::new_v4().to_string()),
     }
 }
 
@@ -98,6 +99,7 @@ pub(crate) fn execution(
     model: Option<&str>,
     prompt: &str,
     resume_session_id: Option<&str>,
+    new_session_id: Option<&str>,
     label: String,
 ) -> RemoteExecution {
     let mut command = String::from(
@@ -117,6 +119,12 @@ pub(crate) fn execution(
     if let Some(session) = resume_session_id.map(str::trim).filter(|s| !s.is_empty()) {
         command.push_str(" --resume ");
         command.push_str(&shell_single_quote(session));
+    }
+    if resume_session_id.is_none() {
+        if let Some(session) = new_session_id {
+            command.push_str(" --session-id ");
+            command.push_str(&shell_single_quote(session));
+        }
     }
     command.push_str(" --cwd \"$PWD\" -p ");
     command.push_str(&shell_single_quote(&positional_prompt(prompt)));
@@ -191,6 +199,8 @@ pub(crate) fn heartbeat_supports_grok(
 pub(crate) enum StreamUpdate {
     Text,
     Thinking,
+    TextSnapshot(String),
+    ThinkingSnapshot(String),
     SessionId(String),
     End,
     AuthRequired,
@@ -211,6 +221,7 @@ pub(crate) struct GrokStream {
     partial: String,
     dropping_line: bool,
     text_segment: String,
+    thinking_active: bool,
     pub(crate) text: String,
     pub(crate) thinking: String,
     pub(crate) session_id: Option<String>,
@@ -243,6 +254,7 @@ impl GrokStream {
                 self.dropping_line = false;
             }
         }
+        self.snapshot_pending(&mut updates);
         updates
     }
 
@@ -253,7 +265,22 @@ impl GrokStream {
             let line = std::mem::take(&mut self.partial);
             self.feed_line(&line, &mut updates);
         }
+        self.snapshot_pending(&mut updates);
         updates
+    }
+
+    // Materialize once per contiguous output segment, never once per delta.
+    // Boundaries preserve the exact position of tool events within each chunk.
+    fn snapshot_pending(&self, updates: &mut [StreamUpdate]) {
+        if let Some(last) = updates.last_mut() {
+            match last {
+                StreamUpdate::Text => *last = StreamUpdate::TextSnapshot(self.text.clone()),
+                StreamUpdate::Thinking => {
+                    *last = StreamUpdate::ThinkingSnapshot(self.thinking.clone())
+                }
+                _ => {}
+            }
+        }
     }
 
     fn feed_line(&mut self, raw: &str, updates: &mut Vec<StreamUpdate>) {
@@ -263,6 +290,7 @@ impl GrokStream {
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             if grok_line_requests_interactive_login(line) && !self.auth_required {
+                self.snapshot_pending(updates);
                 self.auth_required = true;
                 updates.push(StreamUpdate::AuthRequired);
             }
@@ -280,12 +308,20 @@ impl GrokStream {
             self.diagnostics.push_back(diagnostic);
             return;
         };
+        let is_text = grok_event_text(&value).is_some() && grok_event_reasoning(&value).is_none();
+        let is_thinking = grok_event_reasoning(&value).is_some();
+        if !matches!(updates.last(), Some(StreamUpdate::Text) if is_text)
+            && !matches!(updates.last(), Some(StreamUpdate::Thinking) if is_thinking)
+        {
+            self.snapshot_pending(updates);
+        }
         self.json_events += 1;
         if let Some(model) = grok_event_model(&value) {
             self.model = Some(model);
         }
         if let Some(session) = grok_event_session_id(&value) {
             if self.session_id.as_deref() != Some(session.as_str()) {
+                self.snapshot_pending(updates);
                 self.session_id = Some(session.clone());
                 updates.push(StreamUpdate::SessionId(session));
             }
@@ -295,6 +331,13 @@ impl GrokStream {
             .and_then(|t| t.as_str())
             .map(|t| t.to_ascii_lowercase());
         if matches!(kind.as_deref(), Some("tool_call" | "tool_call_update")) {
+            self.snapshot_pending(updates);
+            // Text after a tool belongs to a new assistant segment. Native
+            // goals emit several such segments before their final snapshot.
+            // Keep accumulated output, but compare snapshots only to the
+            // current segment (available_commands does not end a segment).
+            self.text_segment.clear();
+            self.thinking_active = false;
             self.progress = true;
             let update = value
                 .get("data")
@@ -306,6 +349,7 @@ impl GrokStream {
             return;
         }
         if grok_event_is_error(&value) {
+            self.snapshot_pending(updates);
             let message = value
                 .get("error")
                 .map(|e| match e.as_str() {
@@ -319,6 +363,7 @@ impl GrokStream {
             return;
         }
         if kind.as_deref() == Some("end") {
+            self.snapshot_pending(updates);
             self.ended = true;
             self.progress = true;
             self.stop_reason = value
@@ -332,13 +377,20 @@ impl GrokStream {
         if let Some(reasoning) = grok_event_reasoning(&value) {
             if !reasoning.is_empty() {
                 self.progress = true;
+                if !self.thinking_active {
+                    self.thinking.clear();
+                    self.thinking_active = true;
+                }
                 append_bounded(&mut self.thinking, &reasoning);
-                updates.push(StreamUpdate::Thinking);
+                if !matches!(updates.last(), Some(StreamUpdate::Thinking)) {
+                    updates.push(StreamUpdate::Thinking);
+                }
             }
             return;
         }
         if let Some(text) = grok_event_text(&value) {
             if !text.is_empty() {
+                self.thinking_active = false;
                 self.progress = true;
                 // Native CLI emits deltas followed by the same full text snapshot.
                 if text == self.text_segment && !self.text_segment.is_empty() {
@@ -347,11 +399,15 @@ impl GrokStream {
                     let suffix = &text[self.text_segment.len()..];
                     append_bounded(&mut self.text, suffix);
                     self.text_segment.clear();
-                    updates.push(StreamUpdate::Text);
+                    if !matches!(updates.last(), Some(StreamUpdate::Text)) {
+                        updates.push(StreamUpdate::Text);
+                    }
                 } else {
                     append_bounded(&mut self.text, &text);
                     append_bounded(&mut self.text_segment, &text);
-                    updates.push(StreamUpdate::Text);
+                    if !matches!(updates.last(), Some(StreamUpdate::Text)) {
+                        updates.push(StreamUpdate::Text);
+                    }
                 }
             }
         }
@@ -420,6 +476,7 @@ pub(crate) struct NativeGrokObserver {
     streaming: LogStreaming,
     stream: GrokStream,
     thinking_open: bool,
+    thinking_snapshot: String,
     session_persisted: Option<String>,
     auth_cancel_requested: bool,
     running_since: Option<std::time::Instant>,
@@ -448,6 +505,7 @@ impl NativeGrokObserver {
             streaming: LogStreaming::Unknown,
             stream: GrokStream::default(),
             thinking_open: false,
+            thinking_snapshot: String::new(),
             auth_cancel_requested: false,
             running_since: None,
         })
@@ -601,20 +659,24 @@ impl NativeGrokObserver {
                         self.owner.send(event);
                     }
                 }
-                StreamUpdate::Thinking => {
+                StreamUpdate::ThinkingSnapshot(content) => {
                     self.thinking_open = true;
+                    self.thinking_snapshot = content.clone();
                     self.owner.send(AgentEvent::Thinking {
-                        content: self.stream.thinking.clone(),
+                        content,
                         done: false,
                         mission_id: Some(self.mission_id),
                     });
                 }
-                StreamUpdate::Text => {
+                StreamUpdate::TextSnapshot(content) => {
                     self.close_thinking();
                     self.owner.send(AgentEvent::TextDelta {
-                        content: self.stream.text.clone(),
+                        content,
                         mission_id: Some(self.mission_id),
                     });
+                }
+                StreamUpdate::Text | StreamUpdate::Thinking => {
+                    unreachable!("unmaterialized stream snapshot")
                 }
                 StreamUpdate::SessionId(session_id) => {
                     self.persist_session(&session_id).await;
@@ -635,7 +697,7 @@ impl NativeGrokObserver {
     fn close_thinking(&mut self) {
         if self.thinking_open {
             self.thinking_open = false;
-            let content = std::mem::take(&mut self.stream.thinking);
+            let content = std::mem::take(&mut self.thinking_snapshot);
             self.owner
                 .send(super::super::mission_runner::thinking_final_event(
                     content,
@@ -901,6 +963,22 @@ pub(crate) async fn placement(
     }))
 }
 
+/// Every message entry point must fail closed before starting a Core runner.
+pub(crate) async fn reject_local_followup(
+    ledger_dir: &std::path::Path,
+    store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+) -> Result<(), String> {
+    if let Some(placement) = placement(ledger_dir, store, mission_id).await? {
+        let mission = store
+            .get_mission(mission_id)
+            .await?
+            .ok_or("mission not found")?;
+        return Err(local_resume_refusal(&mission, &placement));
+    }
+    Ok(())
+}
+
 /// Why a local resume of a remotely placed mission is refused. Used by
 /// `resume_mission_impl` so internal callers (watchdog, MCP) never start a
 /// local harness beside — or instead of — the node job.
@@ -1039,6 +1117,7 @@ pub(crate) async fn continue_on_node(
         model: mission_model(&mission),
         prompt: prompt.clone(),
         resume_session_id: Some(session_id),
+        new_session_id: None,
     };
     require_node_managed_auth(state, &placement.node_id, &plan)
         .await
@@ -1079,6 +1158,163 @@ fn internal(error: impl std::fmt::Display) -> (StatusCode, String) {
 mod tests {
     use super::*;
 
+    const SPARK_STREAM: &str =
+        include_str!("../../../tests/fixtures/native_grok_goal_resume.jsonl");
+    const SPARK_TEXT: &str = include_str!("../../../tests/fixtures/native_grok_goal_resume.txt");
+
+    fn assert_spark_stream(stream: &GrokStream, updates: &[StreamUpdate]) {
+        assert_eq!(stream.json_events, 420);
+        assert_eq!(stream.text, SPARK_TEXT);
+        assert!(stream.ended);
+        assert_eq!(stream.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(
+            stream.session_id.as_deref(),
+            Some("01a0beb8-9ccf-7a43-bf61-ef87af487088")
+        );
+        assert!(!stream.auth_required);
+        assert!(stream.error.is_none());
+        assert!(stream.diagnostics.is_empty());
+        assert!(stream.partial.is_empty());
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|u| matches!(
+                    u,
+                    StreamUpdate::Tool {
+                        completed: false,
+                        ..
+                    }
+                ))
+                .count(),
+            35
+        );
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|u| matches!(
+                    u,
+                    StreamUpdate::Tool {
+                        completed: true,
+                        ..
+                    }
+                ))
+                .count(),
+            76
+        );
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|u| matches!(u, StreamUpdate::SessionId(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|u| matches!(u, StreamUpdate::End))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn real_spark_goal_resume_stream_preserves_progress_and_deduplicates_snapshot() {
+        let mut stream = GrokStream::default();
+        let mut updates = Vec::new();
+        for line in SPARK_STREAM.lines() {
+            updates.extend(stream.feed(line));
+            updates.extend(stream.feed("\n"));
+            if !stream.ended && !stream.text.is_empty() {
+                assert!(updates
+                    .iter()
+                    .any(|u| matches!(u, StreamUpdate::TextSnapshot(_))));
+            }
+        }
+        updates.extend(stream.finish());
+        assert_spark_stream(&stream, &updates);
+    }
+
+    #[tokio::test]
+    async fn real_spark_stream_survives_bounded_log_cursors_and_unterminated_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stream.jsonl");
+        // Exercise finish() as well as lines split across node log chunks.
+        std::fs::write(&path, SPARK_STREAM.trim_end_matches('\n')).unwrap();
+        for chunk_size in [257, 4096, 65536] {
+            let mut stream = GrokStream::default();
+            let mut updates = Vec::new();
+            let mut offset = 0;
+            loop {
+                let (data, next, len) =
+                    crate::node::read_log_chunk(&path, offset, chunk_size, true)
+                        .await
+                        .unwrap();
+                assert!(next > offset);
+                assert!(data.len() <= chunk_size as usize);
+                updates.extend(stream.feed(&data));
+                assert!(stream.partial.len() <= 1024 * 1024);
+                offset = next;
+                if offset == len {
+                    break;
+                }
+            }
+            assert!(!stream.ended);
+            updates.extend(stream.finish());
+            assert_spark_stream(&stream, &updates);
+        }
+    }
+
+    #[test]
+    fn stream_coalesces_delta_bursts_without_moving_tools_or_copying_per_delta() {
+        let mut stream = GrokStream::default();
+        let deltas: String = (0..500)
+            .map(|i| format!("{{\"type\":\"text\",\"data\":\"{i},\"}}\n"))
+            .collect();
+        let segment: String = (0..500).map(|i| format!("{i},")).collect();
+        let thought = "{\"type\":\"thought\",\"data\":\"p\"}\n";
+        let chunk = format!(
+            "{}{}{{\"type\":\"tool_call\",\"toolCallId\":\"t\"}}\n{}",
+            thought.repeat(500),
+            deltas,
+            deltas
+        );
+        let updates = stream.feed(&chunk);
+        assert_eq!(updates.len(), 4, "one snapshot per segment, not per event");
+        assert_eq!(updates[0], StreamUpdate::ThinkingSnapshot("p".repeat(500)));
+        assert_eq!(updates[1], StreamUpdate::TextSnapshot(segment.clone()));
+        assert!(matches!(updates[2], StreamUpdate::Tool { .. }));
+        assert_eq!(updates[3], StreamUpdate::TextSnapshot(segment.repeat(2)));
+        let copied_bytes: usize = updates
+            .iter()
+            .map(|u| match u {
+                StreamUpdate::TextSnapshot(s) | StreamUpdate::ThinkingSnapshot(s) => s.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(copied_bytes, 500 + segment.len() * 3);
+    }
+
+    #[test]
+    fn real_fixed_session_fixture_matches_preallocated_cli_identity() {
+        let fixture = include_str!("../../../tests/fixtures/native_grok_fixed_session.jsonl");
+        let id = "a1778740-4e51-4de4-b8c3-0f16d68b07de";
+        let mut stream = GrokStream::default();
+        for line in fixture.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if value["type"] != "end" {
+                assert!(grok_event_session_id(&value).is_none());
+            }
+            stream.feed(&format!("{line}\n"));
+        }
+        assert_eq!(stream.session_id.as_deref(), Some(id));
+        let fresh = execution(None, "/goal objective", None, Some(id), "grok".into());
+        assert!(fresh.command.contains(&format!("--session-id '{id}'")));
+        assert!(!fresh.command.contains("--resume"));
+        let resumed = execution(None, "/goal resume", Some(id), None, "grok".into());
+        assert!(resumed.command.contains(&format!("--resume '{id}'")));
+        assert!(!resumed.command.contains("--session-id"));
+    }
+
     #[test]
     fn plan_preserves_native_goal_and_pins_a_model() {
         let plan = super::plan(None, "/goal ship the vanity generator".into());
@@ -1086,6 +1322,7 @@ mod tests {
             model,
             prompt,
             resume_session_id,
+            new_session_id,
         } = plan
         else {
             panic!("grok plan");
@@ -1097,13 +1334,18 @@ mod tests {
         assert_eq!(prompt, "/goal ship the vanity generator");
         assert_eq!(resume_session_id, None);
 
+        assert!(Uuid::parse_str(new_session_id.as_deref().unwrap()).is_ok());
         let plain = super::plan(Some("grok-4.6".into()), "say hi".into());
         assert_eq!(
             plain,
             RemoteHarnessPlan::Grok {
                 model: Some("grok-4.6".into()),
                 prompt: "say hi".into(),
-                resume_session_id: None
+                resume_session_id: None,
+                new_session_id: match &plain {
+                    RemoteHarnessPlan::Grok { new_session_id, .. } => new_session_id.clone(),
+                    _ => unreachable!(),
+                }
             }
         );
     }
@@ -1114,6 +1356,7 @@ mod tests {
             Some("grok-4.6"),
             "-list files it's here",
             Some("sess-1"),
+            None,
             "grok/grok-4.6".into(),
         );
         assert_eq!(exec.managed_auth, vec!["grok".to_string()]);
@@ -1138,7 +1381,7 @@ mod tests {
             "no path literal beyond the guard: {command}"
         );
 
-        let fresh = execution(None, "hi", None, "grok".into());
+        let fresh = execution(None, "hi", None, None, "grok".into());
         assert!(fresh.command.ends_with("exec grok --output-format streaming-json --always-approve --no-plan --cwd \"$PWD\" -p 'hi'"), "{}", fresh.command);
         assert!(!fresh.command.contains("--resume"));
         assert!(!fresh.command.contains("--session-id"));
@@ -1151,6 +1394,7 @@ mod tests {
             Some("grok-4.6"),
             "/goal resume",
             Some("native-session"),
+            None,
             "grok".into(),
         )
         .command;
@@ -1189,14 +1433,20 @@ mod tests {
     fn stream_parses_text_thought_end_and_partial_lines() {
         let mut stream = GrokStream::default();
         let mut updates = stream.feed("A new version of Grok Build is available: 0.1.210 -> 1.0.34\n{\"type\":\"thought\",\"data\":\"plan\"}\n{\"type\":\"text\",\"data\":\"Hel\"}\n{\"type\":\"text\",\"da");
-        assert_eq!(updates, vec![StreamUpdate::Thinking, StreamUpdate::Text]);
+        assert_eq!(
+            updates,
+            vec![
+                StreamUpdate::ThinkingSnapshot("plan".into()),
+                StreamUpdate::TextSnapshot("Hel".into())
+            ]
+        );
         assert_eq!(stream.text, "Hel");
         assert_eq!(stream.thinking, "plan");
         updates = stream.feed("ta\":\"lo <goal_continue/>\"}\n{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"abc123\",\"requestId\":\"r1\"}\n");
         assert_eq!(
             updates,
             vec![
-                StreamUpdate::Text,
+                StreamUpdate::TextSnapshot("Hello <goal_continue/>".into()),
                 StreamUpdate::SessionId("abc123".into()),
                 StreamUpdate::End
             ]
@@ -1230,7 +1480,10 @@ mod tests {
         assert!(stream
             .feed("{\"type\":\"text\",\"data\":\"tail\"}")
             .is_empty());
-        assert_eq!(stream.finish(), vec![StreamUpdate::Text]);
+        assert_eq!(
+            stream.finish(),
+            vec![StreamUpdate::TextSnapshot("tail".into())]
+        );
         assert_eq!(stream.text, "tail");
     }
 

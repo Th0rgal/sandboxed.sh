@@ -886,10 +886,16 @@ model/tool progress for 120 seconds is cancelled with a startup diagnostic
 (the timer excludes queued time). No automatic device-login flow is started.
 
 Orb streams thought/text/tool events, suppresses the CLI's repeated final
-text snapshot, and saves emitted native session IDs under the current job
-lease. `POST /api/control/missions/:id/resume` continues on the recorded node
+text snapshot, and coalesces text/thought deltas into snapshots at chunk and
+tool boundaries. Before submitting a new job, Core persists a preallocated
+native session UUID under the current run generation and passes it with
+`--session-id`. An interruption before the final stream event therefore
+retains the native identity. `POST /api/control/missions/:id/resume` continues on the recorded node
 using `--resume <session> -p '/goal resume'` for a goal, or passes explicit
-request `content` verbatim. PR/track writers and requests changing workspace or
+request `content` verbatim. New sessions use only `--session-id`; continuation
+uses only `--resume`. `/api/control/message` and targeted actor messages reject
+remote follow-ups with a conflict directing callers to the node resume route;
+they never start a local harness. PR/track writers and requests changing workspace or
 writer identity require a linked replacement through normal create admission. It uses the same lease-before-submit fence as
 initial dispatch. If the node or native session is missing, the API returns
 `REMOTE_RESUME_REQUIRES_REPLACEMENT`: create a remote mission with

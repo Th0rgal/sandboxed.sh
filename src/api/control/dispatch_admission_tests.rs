@@ -6324,10 +6324,7 @@ async fn typed_remote_launch_is_server_planned_idempotent_and_explicit_about_sup
         .unwrap();
     assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     let detail = refused.text().await.unwrap();
-    assert!(
-        detail.starts_with("REMOTE_AUTH_REQUIRED: "),
-        "{detail}"
-    );
+    assert!(detail.starts_with("REMOTE_AUTH_REQUIRED: "), "{detail}");
     assert!(detail.contains("managed-auth"), "{detail}");
     let caps = remote_launch_capabilities();
     assert!(caps.typed && caps.raw_command && caps.proxy_url_configured);
@@ -6388,22 +6385,35 @@ async fn typed_remote_launch_is_server_planned_idempotent_and_explicit_about_sup
     .await;
 }
 
-
 #[tokio::test]
 async fn native_grok_remote_goal_streams_resumes_and_never_creates_host_loop() {
-    let fixture = spawn_fixture_node("native-grok", "REMOTE_NATIVE_GROK_TEST_TOKEN", "running").await;
+    let fixture =
+        spawn_fixture_node("native-grok", "REMOTE_NATIVE_GROK_TEST_TOKEN", "running").await;
     let h = Harness::with_nodes(vec![fixture.node.clone()]).await;
-    h.state.backend_registry.write().await.register(Arc::new(crate::backend::grok::GrokBackend::new()));
-    h.state.fleet.record_heartbeat("native-grok", serde_json::from_value(json!({
-        "node_id":"native-grok", "online":true, "capacity_total":1, "capacity_available":1,
-        "active_leases":0, "version":"test", "managed_auth":["grok"]
-    })).unwrap());
+    h.state
+        .backend_registry
+        .write()
+        .await
+        .register(Arc::new(crate::backend::grok::GrokBackend::new()));
+    h.state.fleet.record_heartbeat(
+        "native-grok",
+        serde_json::from_value(json!({
+            "node_id":"native-grok", "online":true, "capacity_total":1, "capacity_available":1,
+            "active_leases":0, "version":"test", "managed_auth":["grok"]
+        }))
+        .unwrap(),
+    );
     let mut events = h.control.events_tx.subscribe();
     let objective = "/goal Validate the GB10 implementation and reproducible benchmarks";
     let response = h.state.http_client.post(format!("{}/missions", h.url)).json(&json!({
         "backend":"grok", "model_override":"grok-4.6", "remote_node_id":"native-grok", "prompt":objective
     })).send().await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK, "{}", response.text().await.unwrap());
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        response.text().await.unwrap()
+    );
     let created: Value = response.json().await.unwrap();
     let id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
     let store = h.control.mission_store.clone();
@@ -6411,7 +6421,23 @@ async fn native_grok_remote_goal_streams_resumes_and_never_creates_host_loop() {
     assert_eq!(payload["managed_auth"], json!(["grok"]));
     assert_eq!(payload["env"], json!({"NO_COLOR":"1"}));
     let command = payload["command"].as_str().unwrap();
-    assert!(command.ends_with(&format!("-p '{}'", objective)), "{command}");
+    assert!(
+        command.ends_with(&format!("-p '{}'", objective)),
+        "{command}"
+    );
+    let session_id = store
+        .get_mission(id)
+        .await
+        .unwrap()
+        .unwrap()
+        .session_id
+        .unwrap();
+    assert!(Uuid::parse_str(&session_id).is_ok());
+    assert!(
+        command.contains(&format!("--session-id '{session_id}'")),
+        "{command}"
+    );
+    assert!(!command.contains("--resume"));
     assert!(!command.contains("goal_complete"));
     assert!(!command.contains("opencode"));
     assert_eq!(created["backend"], "grok");
@@ -6426,42 +6452,128 @@ async fn native_grok_remote_goal_streams_resumes_and_never_creates_host_loop() {
     ).into();
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
-            if let Ok(AgentEvent::TextDelta { content, mission_id }) = events.recv().await {
-                if mission_id == Some(id) && content == "Hello 🦀" { break; }
+            if let Ok(AgentEvent::TextDelta {
+                content,
+                mission_id,
+            }) = events.recv().await
+            {
+                if mission_id == Some(id) && content == "Hello 🦀" {
+                    break;
+                }
             }
         }
-    }).await.expect("live text before terminal");
-    assert_eq!(store.get_mission(id).await.unwrap().unwrap().status, MissionStatus::Active);
-    store.update_mission_status(id, MissionStatus::Interrupted).await.unwrap();
-    let job_id = Uuid::parse_str(fixture.submissions.lock().unwrap()[0]["job_id"].as_str().unwrap()).unwrap();
-    finish_remote_job_lease(store.as_ref(), id, job_id, "operator_interrupted").await.unwrap();
-    fixture.log.lock().unwrap().push_str("{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"native-session-1\"}\n");
+    })
+    .await
+    .expect("live text before terminal");
+    assert_eq!(
+        store.get_mission(id).await.unwrap().unwrap().status,
+        MissionStatus::Active
+    );
+    store
+        .update_mission_status(id, MissionStatus::Interrupted)
+        .await
+        .unwrap();
+    let job_id = Uuid::parse_str(
+        fixture.submissions.lock().unwrap()[0]["job_id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    finish_remote_job_lease(store.as_ref(), id, job_id, "operator_interrupted")
+        .await
+        .unwrap();
+    // Interrupted before end: the preallocated session must remain resumable.
     fixture.set_state("succeeded");
     wait_until("native identity survives interruption", 20, || async {
-        store.get_mission(id).await.unwrap().unwrap().session_id.is_some()
-    }).await;
-    assert_eq!(store.get_mission(id).await.unwrap().unwrap().status, MissionStatus::Interrupted);
-    assert_eq!(store.get_mission(id).await.unwrap().unwrap().session_id.as_deref(), Some("native-session-1"));
+        store
+            .get_mission(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .session_id
+            .is_some()
+    })
+    .await;
+    assert_eq!(
+        store.get_mission(id).await.unwrap().unwrap().status,
+        MissionStatus::Interrupted
+    );
+    assert_eq!(
+        store
+            .get_mission(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .session_id
+            .as_deref(),
+        Some(session_id.as_str())
+    );
     assert!(store.get_mission_automations(id).await.unwrap().is_empty());
-    assert_eq!(fixture.submissions.lock().unwrap().len(), 1, "no host iteration");
+    assert_eq!(
+        fixture.submissions.lock().unwrap().len(),
+        1,
+        "no host iteration"
+    );
     wait_until("native ledger settles", 10, || async {
-        crate::remote_node::job_ledger::load(&h.state.config.working_dir).await.unwrap().is_empty()
-    }).await;
+        crate::remote_node::job_ledger::load(&h.state.config.working_dir)
+            .await
+            .unwrap()
+            .is_empty()
+    })
+    .await;
+    let rejected = h
+        .request(false, id, json!({"content":"keep optimizing"}))
+        .await;
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    assert!(rejected.text().await.unwrap().contains("/resume"));
+    let (respond, response) = oneshot::channel();
+    h.control
+        .cmd_tx
+        .send(ControlCommand::UserMessage {
+            id: Uuid::new_v4(),
+            content: "keep optimizing".into(),
+            agent: None,
+            target_mission_id: Some(id),
+            strict: false,
+            source: Some("test".into()),
+            respond,
+        })
+        .await
+        .unwrap();
+    let ack = tokio::time::timeout(std::time::Duration::from_secs(10), response)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(ack, UserMessageAck::Rejected(reason) if reason.contains("/resume")));
+    assert_eq!(fixture.submissions.lock().unwrap().len(), 1);
+    assert!(store.get_active_mission_run(id).await.unwrap().is_none());
     fixture.set_state("running");
     fixture.log.lock().unwrap().clear();
     let resumed = h.request(true, id, json!({})).await;
-    assert_eq!(resumed.status(), StatusCode::OK, "{}", resumed.text().await.unwrap());
+    assert_eq!(
+        resumed.status(),
+        StatusCode::OK,
+        "{}",
+        resumed.text().await.unwrap()
+    );
     let jobs = fixture.submissions.lock().unwrap().clone();
     assert_eq!(jobs.len(), 2);
     let command = jobs[1]["payload"]["command"].as_str().unwrap();
-    assert!(command.contains("--resume 'native-session-1'"), "{command}");
+    assert!(
+        command.contains(&format!("--resume '{session_id}'")),
+        "{command}"
+    );
+    assert!(!command.contains("--session-id"));
     assert!(command.ends_with("-p '/goal resume'"), "{command}");
     let duplicate = h.request(true, id, json!({})).await;
     assert_eq!(duplicate.status(), StatusCode::CONFLICT);
     assert_eq!(fixture.submissions.lock().unwrap().len(), 2);
-    fixture.log.lock().unwrap().push_str("{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"native-session-1\"}\n");
+    fixture.log.lock().unwrap().push_str(&format!(
+        "{{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"{session_id}\"}}\n"
+    ));
     fixture.set_state("succeeded");
     wait_until("resumed native goal completes", 20, || async {
         store.get_mission(id).await.unwrap().unwrap().status == MissionStatus::Completed
-    }).await;
+    })
+    .await;
 }

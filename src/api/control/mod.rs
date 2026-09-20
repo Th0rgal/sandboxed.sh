@@ -4899,6 +4899,11 @@ pub async fn post_message(
         reset_stall_guard(mid);
     }
     let control = control_for_user(&state, &user).await;
+    if let Some(mid) = target_mission_id {
+        remote_grok::reject_local_followup(&state.config.working_dir, &control.mission_store, mid)
+            .await
+            .map_err(|error| (StatusCode::CONFLICT, error))?;
+    }
     let (queued_tx, queued_rx) = oneshot::channel();
     tracing::info!(
         user_id = %user.id,
@@ -10569,7 +10574,8 @@ pub async fn create_mission(
     }
 
     if let (Some(node_id), Some(plan)) = (remote_node_id.as_deref(), remote_plan.as_ref()) {
-        remote_grok::require_node_managed_auth(&state, node_id, plan).await
+        remote_grok::require_node_managed_auth(&state, node_id, plan)
+            .await
             .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     }
 
@@ -11302,6 +11308,7 @@ pub(crate) enum RemoteHarnessPlan {
         model: Option<String>,
         prompt: String,
         resume_session_id: Option<String>,
+        new_session_id: Option<String>,
     },
     /// Explicit `remote_command` compatibility: runs verbatim, own auth.
     Raw { command: String },
@@ -11320,13 +11327,18 @@ pub(crate) enum RemoteHarnessPlan {
 
 impl RemoteHarnessPlan {
     pub(crate) fn uses_core_proxy(&self) -> bool {
-        matches!(self, RemoteHarnessPlan::ClaudeCode { .. } | RemoteHarnessPlan::OpenCode { .. })
+        matches!(
+            self,
+            RemoteHarnessPlan::ClaudeCode { .. } | RemoteHarnessPlan::OpenCode { .. }
+        )
     }
 
     pub(crate) fn label(&self) -> String {
         match self {
             RemoteHarnessPlan::Raw { .. } => "raw command".to_string(),
-            RemoteHarnessPlan::Grok { model, .. } => format!("grok/{}", model.as_deref().unwrap_or("node default model")),
+            RemoteHarnessPlan::Grok { model, .. } => {
+                format!("grok/{}", model.as_deref().unwrap_or("node default model"))
+            }
             RemoteHarnessPlan::ClaudeCode { model, .. } => format!(
                 "claudecode/{}",
                 model.as_deref().unwrap_or("node default model")
@@ -11480,7 +11492,18 @@ pub(crate) fn remote_execution_for_plan(
 ) -> RemoteExecution {
     let label = plan.label();
     match plan {
-        RemoteHarnessPlan::Grok { model, prompt, resume_session_id } => remote_grok::execution(model.as_deref(), prompt, resume_session_id.as_deref(), label),
+        RemoteHarnessPlan::Grok {
+            model,
+            prompt,
+            resume_session_id,
+            new_session_id,
+        } => remote_grok::execution(
+            model.as_deref(),
+            prompt,
+            resume_session_id.as_deref(),
+            new_session_id.as_deref(),
+            label,
+        ),
         RemoteHarnessPlan::Raw { command } => RemoteExecution {
             managed_auth: Vec::new(),
             command: command.clone(),
@@ -12516,6 +12539,27 @@ async fn submit_leased_remote_job(
     job_id: Uuid,
     plan: &RemoteHarnessPlan,
 ) -> Result<Mission, String> {
+    if let RemoteHarnessPlan::Grok {
+        new_session_id: Some(session_id),
+        resume_session_id: None,
+        ..
+    } = plan
+    {
+        let run = control
+            .mission_store
+            .get_active_mission_run(mission.id)
+            .await?
+            .filter(|run| run.owner_actor_id == remote_job_lease_owner(job_id))
+            .ok_or("native Grok session allocation lost its run lease")?;
+        let fence = crate::api::mission_store::SessionUpdateRun::from(&run);
+        if !control
+            .mission_store
+            .update_mission_session_id(mission.id, session_id, "grok", Some(&fence))
+            .await?
+        {
+            return Err("native Grok session allocation rejected by run generation fence".into());
+        }
+    }
     let shared_token = std::env::var(&node.token_env)
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -13344,7 +13388,8 @@ async fn poll_remote_job(
             finished_at: terminal.then(chrono::Utc::now),
         }
     };
-    let mut grok = remote_grok::NativeGrokObserver::attach(&owner, &node.id, mission_id, job_id).await;
+    let mut grok =
+        remote_grok::NativeGrokObserver::attach(&owner, &node.id, mission_id, job_id).await;
     let mut last_state = "queued".to_string();
     let mut failures = 0u32;
     // Once received, terminal proof survives a subsequent observation outage
@@ -13439,7 +13484,9 @@ async fn poll_remote_job(
                 let terminal = crate::remote_node::job_state_confirms_termination(&status.state);
                 if let Some(observer) = grok.as_mut() {
                     observer.pump(&client, &node, &shared_token).await;
-                    observer.check_startup(&status, &client, &node, &shared_token).await;
+                    observer
+                        .check_startup(&status, &client, &node, &shared_token)
+                        .await;
                     if terminal && !observer.caught_up() {
                         terminal_observation = Some(status.clone());
                         continue;
@@ -13464,7 +13511,9 @@ async fn poll_remote_job(
                     let (success, content, status_reason) = if let Some(observer) = grok.as_mut() {
                         let verdict = observer.verdict(&status, &node.id).await;
                         (verdict.success, verdict.content, verdict.status_reason)
-                    } else { (success, content, "remote_node_job") };
+                    } else {
+                        (success, content, "remote_node_job")
+                    };
                     if should_finalize_remote_job(inactive_status) {
                         if let Err(error) = finalize_remote_mission(
                             &owner,
@@ -15935,15 +15984,32 @@ pub async fn resume_mission(
     tracing::info!(mission_id = %mission_id, actor = %actor, "FLEET-004 mission resume requested");
 
     if let Some(placement) = remote_grok::placement(
-        &state.config.working_dir, &control.mission_store, mission_id,
-    ).await.map_err(internal_error)? {
-        if request.clean_workspace || request.skip_message || request.github_pr.is_some()
-            || request.track.is_some() || request.title.is_some() || request.continue_identity.is_some() {
+        &state.config.working_dir,
+        &control.mission_store,
+        mission_id,
+    )
+    .await
+    .map_err(internal_error)?
+    {
+        if request.clean_workspace
+            || request.skip_message
+            || request.github_pr.is_some()
+            || request.track.is_some()
+            || request.title.is_some()
+            || request.continue_identity.is_some()
+        {
             return Err((StatusCode::CONFLICT, format!("{}: remote continuation supports content only; use a linked replacement for workspace or writer identity changes", remote_grok::REMOTE_RESUME_REQUIRES_REPLACEMENT)));
         }
         return remote_grok::continue_on_node(
-            &state, &control, &actor, mission_id, placement, request.content,
-        ).await.map(Json);
+            &state,
+            &control,
+            &actor,
+            mission_id,
+            placement,
+            request.content,
+        )
+        .await
+        .map(Json);
     }
 
     let outcome: Result<Mission, (StatusCode, String)> = async {
@@ -20557,7 +20623,9 @@ async fn control_actor_loop(
     ) -> Result<(Mission, String), String> {
         let mission = load_mission_record(mission_store, mission_id).await?;
 
-        if let Some(placement) = remote_grok::placement(&config.working_dir, mission_store, mission_id).await? {
+        if let Some(placement) =
+            remote_grok::placement(&config.working_dir, mission_store, mission_id).await?
+        {
             return Err(remote_grok::local_resume_refusal(&mission, &placement));
         }
 
@@ -20821,6 +20889,29 @@ async fn control_actor_loop(
             }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
+                // Reject remote messages before admission can retag or reactivate
+                // the mission. The actual node continuation is the resume route.
+                let message_target = match &cmd {
+                    ControlCommand::UserMessage { target_mission_id, .. } => *target_mission_id,
+                    ControlCommand::AdmitDispatch { command, .. } => match command.as_ref() {
+                        ControlCommand::UserMessage { target_mission_id, .. } => *target_mission_id,
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(mid) = message_target {
+                    if let Err(error) = remote_grok::reject_local_followup(&config.working_dir, &mission_store, mid).await {
+                        let rejected = match cmd {
+                            ControlCommand::AdmitDispatch { command, .. } => *command,
+                            command => command,
+                        };
+                        if let ControlCommand::UserMessage { respond, .. } = rejected {
+                            let _ = respond.send(UserMessageAck::Rejected(error));
+                        }
+                        continue;
+                    }
+                }
+
                 // Internal wakes also need current track ownership. They carry
                 // no controller assertion or retag, but use the same admission
                 // and rollback boundary as HTTP dispatch.
@@ -20905,6 +20996,13 @@ async fn control_actor_loop(
                     }
                     ControlCommand::AdmitDispatch { .. } => unreachable!("nested admission"),
                     ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, strict, source, respond } => {
+                        if let Some(mid) = target_mission_id {
+                            if let Err(error) = remote_grok::reject_local_followup(&config.working_dir, &mission_store, mid).await {
+                                let _ = respond.send(UserMessageAck::Rejected(error));
+                                continue;
+                            }
+                        }
+
                         if recovered_consumed_user_messages.contains_key(&id) {
                             // The previous actor had already started this exact
                             // deterministic delivery. Its run was interrupted
@@ -20985,6 +21083,16 @@ async fn control_actor_loop(
                         // loop. Non-grok backends and non-/goal messages fall
                         // through unchanged. See `api/grok_goal.rs`.
                         let goal_target_mission = effective_target.or(main_mission_id);
+                        if target_mission_id.is_none() {
+                            if let Some(mid) = goal_target_mission {
+                                if let Err(error) = remote_grok::reject_local_followup(&config.working_dir, &mission_store, mid).await {
+                                    accepted_user_message_ids.remove(&id);
+                                    let _ = respond.send(UserMessageAck::Rejected(error));
+                                    continue;
+                                }
+                            }
+                        }
+
                         let mut content = content;
                         // Canonicalise `/goal\n…` to the space form at the single
                         // entry point, so every downstream space-only parser (the
