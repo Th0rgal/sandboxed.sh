@@ -163,7 +163,6 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 .row {
   display: flex; align-items: center; gap: 8px;
   width: 100%; height: 30px; padding: 0 6px;
-  margin-bottom: 0;
   border-radius: 6px;
   text-align: left;
   color: var(--fg);
@@ -305,7 +304,12 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 
 .menu-item.quiet { color: var(--fg-3); }
 .menu-item.quiet:hover { color: var(--fg); }
-.group.has { margin-bottom: 4px; }
+.group { display: flex; flex-direction: column; gap: 2px; }
+.group.has { margin-bottom: 8px; }
+.group.has > .row.project {
+  background: color-mix(in srgb, var(--fg) 6%, transparent);
+}
+.group.has > .row.project:hover { background: var(--bg-hover); }
 .sb-foot {
   flex: none;
   display: flex;
