@@ -65,3 +65,16 @@ Final client checks: 37 unit/component tests, 22 browser tests and production
 frontend build pass. In the final 12-launch sample, optimistic DOM latency was
 0.5 ms median / 1.1 ms p95; accepted-view latency was 2.1 / 4.4 ms. The held-POST
 case waited about 1.1 seconds while continuing to show the prompt/status.
+
+## Connection isolation follow-up
+
+Cron loading and capability resets now respect disconnected state. Sidebar reads
+capture the connection version and discard responses from older connections;
+cron defaults and capability checks follow the same rule. A delayed 401 cannot
+clear a newer connection, and repeated logout is idempotent.
+
+Verification: 39 unit/component tests, 28 browser tests, and the frontend build
+pass. New cases cover concurrent 401s, logout without subsequent polling until
+reconnect, and held old-connection 200/401/404/500 cron responses. The 500 polling
+case explicitly checks page visibility and waits for the request count with
+`expect.poll`. No native or voice code changed.

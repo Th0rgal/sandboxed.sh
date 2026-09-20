@@ -82,9 +82,12 @@ export function LiveProjectsSection(p: {
   const [makingCron, setMakingCron] = createSignal(false);
   const [cronWarning, setCronWarning] = createSignal<string | null>(null);
   const [newCron, setNewCron] = createSignal<string | null>(null);
+  const currentConnection = (version: number) => isConnected() && connectionVersion() === version;
   const loadController = (slug: string) => {
+    if (!isConnected()) return;
+    const version = connectionVersion();
     getProjectController(slug, 3)
-      .then((view) => setControllers(slug, view))
+      .then((view) => { if (currentConnection(version)) setControllers(slug, view); })
       .catch(() => {});
   };
   const missingCronApi = (error: unknown) => error instanceof ApiError && [404, 405].includes(error.status) && !/project not found/i.test(error.detail);
@@ -93,33 +96,46 @@ export function LiveProjectsSection(p: {
     else { setCronRetryable(slug, !(error instanceof ApiError) || error.status >= 500 || [408, 429].includes(error.status)); setCronErrors(slug, error instanceof Error ? error.message : String(error)); }
   };
   const loadCrons = async (slug: string, force = false) => {
-    if (cronUnsupported() && !force) return;
-    try { const jobs = await listProjectCrons(slug); setCrons(slug, jobs); setCronErrors(slug, null); setCronUnsupported(false); }
-    catch (error) { cronFailure(slug, error); }
+    if (!isConnected() || (cronUnsupported() && !force)) return;
+    const version = connectionVersion();
+    try {
+      const jobs = await listProjectCrons(slug);
+      if (!currentConnection(version)) return;
+      setCrons(slug, jobs); setCronErrors(slug, null); setCronUnsupported(false);
+    } catch (error) { if (currentConnection(version)) cronFailure(slug, error); }
   };
   createEffect(on(connectionVersion, () => {
     setCronUnsupported(false);
+    setCronChecking(false);
+    setCronInfo(null);
+    if (!isConnected()) return;
     for (const slug of Object.keys(expanded)) if (expanded[slug] && !slug.includes(":")) void loadCrons(slug);
   }, { defer: true }));
   const beginCron = async (slug: string) => {
     setActionMenu(null);
+    if (!isConnected()) return;
+    const version = connectionVersion();
     if (cronUnsupported()) { setCronInfo(slug); return; }
     setCronChecking(true);
     try {
       const defaults = await getProjectCronDefaults(slug);
+      if (!currentConnection(version)) return;
       setCronDefaults(defaults); setDefaultsError(null); setNewCron(slug);
-    } catch (error) { cronFailure(slug, error); setCronInfo(slug); }
-    finally { setCronChecking(false); }
+    } catch (error) { if (currentConnection(version)) { cronFailure(slug, error); setCronInfo(slug); } }
+    finally { if (currentConnection(version)) setCronChecking(false); }
   };
 
   const refresh = () => {
     if (!isConnected()) return;
+    const version = connectionVersion();
     listProjects()
       .then((list) => {
+        if (!currentConnection(version)) return;
         setProjects(list);
         setError(null);
       })
       .catch((e) => {
+        if (!currentConnection(version)) return;
         const msg = e instanceof Error ? e.message : String(e);
         setError(
           /^(404|405)\b/.test(msg)
@@ -146,22 +162,27 @@ export function LiveProjectsSection(p: {
   });
 
   const loadMissions = (slug: string) => {
+    if (!isConnected()) return;
+    const version = connectionVersion();
     listProjectMissions(slug)
       .then((list) => {
+        if (!currentConnection(version)) return;
         const merged = mergeById(missions[slug] ?? [], list);
         if (merged !== missions[slug]) setMissions(slug, merged);
       })
       .catch(() => {
-        if (!missions[slug]) setMissions(slug, []);
+        if (currentConnection(version) && !missions[slug]) setMissions(slug, []);
       });
   };
 
   const loadDir = (slug: string, path: string, force = false) => {
+    if (!isConnected()) return;
+    const version = connectionVersion();
     const key = `${slug}:${path}`;
     if (dirs[key] && !force) return;
     listProjectFiles(slug, path)
-      .then((entries) => setDirs(key, entries))
-      .catch(() => setDirs(key, []));
+      .then((entries) => { if (currentConnection(version)) setDirs(key, entries); })
+      .catch(() => { if (currentConnection(version)) setDirs(key, []); });
   };
 
   const beginFolder = (slug: string, path: string) => {
@@ -412,7 +433,7 @@ export function LiveProjectsSection(p: {
           </Dialog>
         )}
       </Show>
-      <Show when={cronInfo()}>{(slug) => <Dialog title="Project crons" onClose={() => setCronInfo(null)} footer={<><button class="s-btn sm" onClick={() => setCronInfo(null)}>Close</button><button class="s-btn sm" disabled={cronChecking()} onClick={async () => { setCronChecking(true); await loadCrons(slug(), true); setCronChecking(false); if (!cronUnsupported() && !cronErrors[slug()]) setCronInfo(null); }}>Check again</button></>}>
+      <Show when={cronInfo()}>{(slug) => <Dialog title="Project crons" onClose={() => setCronInfo(null)} footer={<><button class="s-btn sm" onClick={() => setCronInfo(null)}>Close</button><button class="s-btn sm" disabled={cronChecking()} onClick={async () => { if (!isConnected()) return; const version = connectionVersion(); setCronChecking(true); await loadCrons(slug(), true); if (!currentConnection(version)) return; setCronChecking(false); if (!cronUnsupported() && !cronErrors[slug()]) setCronInfo(null); }}>Check again</button></>}>
         <p>{cronUnsupported() ? "This backend does not support project crons yet. Update the connected backend, then choose Check again. Your canonical controller and existing project content remain available." : cronRetryable[slug()] ? "Project crons could not refresh. Previously loaded jobs are retained. Try again when the scheduler is available." : "The backend rejected this cron request. Check backend access and configuration, then check again. Previously loaded jobs are retained."}</p>
       </Dialog>}</Show>
       <Show when={newCron()}>

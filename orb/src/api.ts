@@ -29,8 +29,10 @@ export function setConnection(url: string, token: string) {
 }
 
 export function clearConnection() {
+  const hadConnection = connected() || !!getJwt();
   localStorage.removeItem(JWT_KEY);
   setConnected(false);
+  if (!hadConnection) return;
   bumpConnectionVersion(v => v + 1);
 }
 
@@ -56,6 +58,7 @@ export class ApiError extends Error {
 }
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const version = connectionVersion();
   const jwt = getJwt();
   const headers: Record<string, string> = {
     ...((init?.headers as Record<string, string> | undefined) ?? {}),
@@ -63,7 +66,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   };
   const res = await fetch(`${getApiUrl()}${path}`, { ...init, headers });
   if (res.status === 401) {
-    clearConnection();
+    if (connectionVersion() === version) clearConnection();
     throw new Error("401 Unauthorized — reconnect in Settings → Backend");
   }
   if (!res.ok) {
