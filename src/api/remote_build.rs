@@ -2499,6 +2499,7 @@ printf '%s' "$REMOTE_BUILD_TEST_HTTP_STATUS"
                 command: "true".into(),
                 timeout_secs: None,
                 env: None,
+                managed_auth: Vec::new(),
             },
         };
         let overhead = serde_json::to_vec(&request).unwrap().len();

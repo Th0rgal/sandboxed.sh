@@ -11,6 +11,7 @@ pub(crate) mod dispatch_admission;
 #[cfg(test)]
 pub(crate) mod dispatch_admission_tests;
 pub(crate) mod execution_ownership;
+mod remote_grok;
 #[cfg(test)]
 use dispatch_admission::admit_dispatch;
 pub use dispatch_admission::DispatchAdmission;
@@ -4898,6 +4899,42 @@ pub async fn post_message(
         reset_stall_guard(mid);
     }
     let control = control_for_user(&state, &user).await;
+    if let Some(mid) = target_mission_id {
+        if let Some(placement) =
+            remote_grok::placement(&state.config.working_dir, &control.mission_store, mid)
+                .await
+                .map_err(internal_error)?
+        {
+            if agent.is_some()
+                || req.github_pr.is_some()
+                || req.track.is_some()
+                || req.title.is_some()
+                || req.continue_identity.is_some()
+            {
+                return Err((StatusCode::CONFLICT, format!("{}: remote continuation supports content only; use a linked replacement for agent or writer identity changes", remote_grok::REMOTE_RESUME_REQUIRES_REPLACEMENT)));
+            }
+            // Public follow-ups can continue the native session on its node.
+            // Internal actor routes retain their fence against local execution.
+            remote_grok::continue_on_node(
+                &state,
+                &control,
+                &user.id,
+                mid,
+                placement,
+                Some(content),
+                Some(id),
+            )
+            .await?;
+            return Ok(Json(ControlMessageResponse {
+                id,
+                queued: false,
+                message_accepted: true,
+                mission_id: Some(mid),
+                previous_execution: None,
+                warnings,
+            }));
+        }
+    }
     let (queued_tx, queued_rx) = oneshot::channel();
     tracing::info!(
         user_id = %user.id,
@@ -6060,17 +6097,29 @@ pub async fn list_missions(
         .collect();
     let wait_starts =
         user_wait_starts_for_runs(control.mission_store.as_ref(), active_runs.values()).await;
+    let (remote_handles, remote_outcomes) = remote_job_projection_inputs(&state).await;
+    let now = chrono::Utc::now();
     let values = missions
         .into_iter()
         .map(|mission| {
             let value = serde_json::to_value(&mission).unwrap_or(serde_json::Value::Null);
-            attach_execution_to_mission_value(
+            let value = attach_execution_to_mission_value(
                 value,
                 &mission,
                 active_runs.get(&mission.id),
                 wait_starts
                     .get(&mission.id)
                     .and_then(|started| started.as_deref()),
+            );
+            attach_remote_job_to_mission_value(
+                value,
+                remote_job_projection(
+                    &remote_handles,
+                    &remote_outcomes,
+                    active_runs.get(&mission.id),
+                    mission.id,
+                    now,
+                ),
             )
         })
         .collect();
@@ -7061,6 +7110,28 @@ pub async fn get_mission(
                 &mission,
                 active_run.as_ref(),
                 wait_started_at.as_deref(),
+            );
+            // Remote placement must be visible on the read model: the row's
+            // workspace/backend describe a local harness that a raw remote
+            // mission never runs.
+            let placement_run = match active_run.clone() {
+                Some(run) => Some(run),
+                None => control
+                    .mission_store
+                    .get_latest_mission_run(mission.id)
+                    .await
+                    .map_err(internal_error)?,
+            };
+            let (handles, outcomes) = remote_job_projection_inputs(&state).await;
+            value = attach_remote_job_to_mission_value(
+                value,
+                remote_job_projection(
+                    &handles,
+                    &outcomes,
+                    placement_run.as_ref(),
+                    mission.id,
+                    chrono::Utc::now(),
+                ),
             );
             let host_configured =
                 state.config.spark_arbiter_url.is_some() || state.config.spark_ssh_target.is_some();
@@ -9790,7 +9861,7 @@ pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     body: Option<Json<CreateMissionRequest>>,
-) -> Result<(axum::http::HeaderMap, Json<Mission>), (StatusCode, String)> {
+) -> Result<(axum::http::HeaderMap, Json<serde_json::Value>), (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
 
     let mut req = body.map(|b| b.0).unwrap_or(CreateMissionRequest {
@@ -9882,15 +9953,24 @@ pub async fn create_mission(
                 if let Ok(Some(existing)) =
                     control_state.mission_store.get_mission(mission_id).await
                 {
-                    tracing::info!(
-                        mission_id = %existing.id,
-                        idempotency_key = key,
-                        "create_mission coalesced onto the mission holding this dispatch key"
-                    );
-                    if let Ok(value) = axum::http::HeaderValue::from_str(&existing.id.to_string()) {
-                        headers.insert("x-coalesced-with", value);
+                    // A dispatch that already failed closed (for example a
+                    // rejected remote submission) is not the work the retry
+                    // asks for; only live or finished attempts coalesce.
+                    if existing.status != MissionStatus::Failed {
+                        tracing::info!(
+                            mission_id = %existing.id,
+                            idempotency_key = key,
+                            "create_mission coalesced onto the mission holding this dispatch key"
+                        );
+                        if let Ok(value) =
+                            axum::http::HeaderValue::from_str(&existing.id.to_string())
+                        {
+                            headers.insert("x-coalesced-with", value);
+                        }
+                        let value =
+                            mission_create_response(&state, &control_state, existing).await?;
+                        return Ok((headers, Json(value)));
                     }
-                    return Ok((headers, Json(existing)));
                 }
             }
         }
@@ -9919,7 +9999,8 @@ pub async fn create_mission(
             if let Ok(value) = axum::http::HeaderValue::from_str(&existing.id.to_string()) {
                 headers.insert("x-coalesced-with", value);
             }
-            return Ok((headers, Json(existing)));
+            let value = mission_create_response(&state, &control_state, existing).await?;
+            return Ok((headers, Json(value)));
         }
     }
 
@@ -10434,13 +10515,23 @@ pub async fn create_mission(
         .map(str::trim)
         .filter(|command| !command.is_empty())
         .map(str::to_string);
+    // Server-owned remote execution: the selected harness/model decide what
+    // runs on the node (an explicit raw `remote_command` stays supported).
+    // Planned before the mission exists so an unsupported selection is a
+    // clean 400, never a failed mission.
+    let remote_plan = match remote_node_id.as_deref() {
+        Some(_) => Some(
+            plan_remote_harness(
+                remote_command.as_deref(),
+                backend.as_deref().unwrap_or(""),
+                model_override.as_deref(),
+                req.prompt.as_deref(),
+            )
+            .map_err(|message| (StatusCode::BAD_REQUEST, message))?,
+        ),
+        None => None,
+    };
     if let Some(node_id) = remote_node_id.as_deref() {
-        if remote_command.is_none() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "remote_command is required when remote_node_id is set".to_string(),
-            ));
-        }
         if remote_dispatch_is_scheduled_for_future(
             Some(node_id),
             req.not_before,
@@ -10511,6 +10602,12 @@ pub async fn create_mission(
             )
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         }
+    }
+
+    if let (Some(node_id), Some(plan)) = (remote_node_id.as_deref(), remote_plan.as_ref()) {
+        remote_grok::require_node_managed_auth(&state, node_id, plan)
+            .await
+            .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     }
 
     let control = control_for_user(&state, &user).await;
@@ -10917,16 +11014,31 @@ pub async fn create_mission(
     // deferred goal as soon as parallel capacity allows, honoring `not_before`
     // when set. Unlike the old create-then-message pattern, this cannot be
     // dropped at capacity.
+    // The initial prompt, keyed by the id of its queued broadcast so a later
+    // non-queued event for the same message replaces it in live clients.
+    let mut initial_prompt: Option<(Uuid, String)> = None;
+    // A remote launch is owned by the node job from the moment it exists. A
+    // deferred goal is the FLEET-001 scheduler's dispatch ticket: for a
+    // remote mission it would make the mission eligible for a LOCAL harness
+    // during every await below (node placement, proxy-key mint, the node
+    // submit round-trip). Incident 620cdb74 (2026-09-20): the scheduler
+    // started a local runner for a typed dgx-spark launch while the submit
+    // was in flight, persisted the prompt a second time (source=scheduler),
+    // and left the remote job without its run lease. Remote prompts are
+    // persisted exactly once by `persist_remote_mission_prompt` instead.
+    let remote_launch = remote_node_id.is_some() && remote_plan.is_some();
     if let Some(prompt) = nonblank(&req.prompt) {
         // Canonicalise `/goal\n…` to the space form before storing: the
         // deferred goal is later re-injected verbatim, and the backend goal
         // drivers only recognise `/goal <objective>` with a space.
         let prompt = canonical_goal_message(&prompt).unwrap_or(prompt);
-        control
-            .mission_store
-            .set_deferred_goal(mission.id, Some(prompt.clone()))
-            .await
-            .map_err(internal_error)?;
+        if !remote_launch {
+            control
+                .mission_store
+                .set_deferred_goal(mission.id, Some(prompt.clone()))
+                .await
+                .map_err(internal_error)?;
+        }
         // A `/goal …` prompt is a goal-mode mandate from the very first turn.
         // Persist it here, synchronously on the same store that created the
         // mission — the event-loop hook that also does this only sees events
@@ -10942,34 +11054,57 @@ pub async fn create_mission(
             mission.goal_objective = Some(objective);
         }
         // Surface the queued goal so UIs show it as pending until dispatch.
+        let prompt_event_id = Uuid::new_v4();
         let _ = control.events_tx.send(AgentEvent::UserMessage {
-            id: Uuid::new_v4(),
-            content: prompt,
+            id: prompt_event_id,
+            content: prompt.clone(),
             queued: true,
             mission_id: Some(mission.id),
             source: Some(format!("api:{}", user.id)),
         });
+        initial_prompt = Some((prompt_event_id, prompt));
     }
 
-    if let (Some(remote_node_id), Some(remote_command)) =
-        (remote_node_id.as_deref(), remote_command.as_deref())
+    if let (Some(remote_node_id), Some(remote_plan)) =
+        (remote_node_id.as_deref(), remote_plan.as_ref())
     {
         // All remote commands use the durable node job API. The legacy
         // synchronous `/execute` path has no cancellation handle if its HTTP
         // wait expires, so routing `remote_async=false` through it could orphan
         // a process on the node. The response contract here is unchanged: the
         // mission is returned Active while its durable poller owns completion.
-        let dispatch =
-            dispatch_remote_job(&state, &control, &mission, remote_node_id, remote_command).await;
+        //
+        // A raw remote mission never starts a local harness, so nothing else
+        // would ever persist its prompt: the queued broadcast above is
+        // deliberately dropped by the store until a runner starts the turn.
+        // Persist it here, before dispatch and before the response, so the
+        // mission's history and event replay carry the user's mandate even
+        // when dispatch fails.
+        let dispatch = match persist_remote_mission_prompt(
+            &control,
+            mission.id,
+            &user.id,
+            initial_prompt.take(),
+        )
+        .await
+        {
+            Ok(()) => {
+                dispatch_remote_job(&state, &control, &mission, remote_node_id, remote_plan).await
+            }
+            Err(message) => Err(message),
+        };
         match dispatch {
-            Ok(updated) => return Ok((headers, Json(updated))),
+            Ok(updated) => {
+                let value = mission_create_response(&state, &control, updated).await?;
+                return Ok((headers, Json(value)));
+            }
             Err(message) => {
                 let _ = control
                     .mission_store
                     .update_mission_status_with_reason(
                         mission.id,
                         MissionStatus::Failed,
-                        Some("remote_dispatch_failed"),
+                        Some(REMOTE_DISPATCH_FAILED),
                     )
                     .await;
                 let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
@@ -10984,7 +11119,49 @@ pub async fn create_mission(
         }
     }
 
-    Ok((headers, Json(mission)))
+    let value = mission_create_response(&state, &control, mission).await?;
+    Ok((headers, Json(value)))
+}
+
+/// Create/coalesce responses carry the same execution and remote placement
+/// projection as mission reads, so a client can render an honest state from
+/// the response alone (the Orb treats `remote_job.node_id`/`phase` as the
+/// authoritative placement of a typed remote launch).
+async fn mission_create_response(
+    state: &Arc<AppState>,
+    control: &ControlState,
+    mission: Mission,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let active_run = control
+        .mission_store
+        .get_active_mission_run(mission.id)
+        .await
+        .map_err(internal_error)?;
+    let placement_run = match active_run.clone() {
+        Some(run) => Some(run),
+        None => control
+            .mission_store
+            .get_latest_mission_run(mission.id)
+            .await
+            .map_err(internal_error)?,
+    };
+    let value = attach_execution_to_mission_value(
+        serde_json::to_value(&mission).map_err(internal_error)?,
+        &mission,
+        active_run.as_ref(),
+        None,
+    );
+    let (handles, outcomes) = remote_job_projection_inputs(state).await;
+    Ok(attach_remote_job_to_mission_value(
+        value,
+        remote_job_projection(
+            &handles,
+            &outcomes,
+            placement_run.as_ref(),
+            mission.id,
+            chrono::Utc::now(),
+        ),
+    ))
 }
 
 fn remote_dispatch_is_scheduled_for_future(
@@ -11064,10 +11241,12 @@ async fn dispatch_remote_mission_mvp(
     finalize_remote_mission(
         &owner,
         mission.id,
+        None,
         &node.id,
         success,
         content,
         "remote_node_mvp",
+        false,
     )
     .await?;
     state
@@ -11113,11 +11292,628 @@ impl RemoteMissionOwner {
         }
     }
 
+    /// Native streaming events have one persistence owner. Live events are
+    /// saved in broadcast order by the session logger; direct writes would
+    /// race queued deltas and place them after the canonical assistant message.
+    /// Recovery without a live session still needs durable events.
+    async fn publish_native(&self, event: AgentEvent) {
+        if self.events_tx.is_none() {
+            if let Some(id) = event.mission_id() {
+                let _ = self.mission_store.log_event(id, &event).await;
+            }
+        }
+        self.send(event);
+    }
+
     fn send(&self, event: AgentEvent) {
         if let Some(events_tx) = &self.events_tx {
             let _ = events_tx.send(event);
         }
     }
+}
+
+/// Harnesses a remote node can run for a typed launch. Nodes ship the
+/// `claude`, `opencode`, and native `grok` CLIs. Other harnesses are rejected
+/// before the mission exists instead of being silently swapped.
+pub(crate) const REMOTE_NODE_HARNESSES: &[&str] = &["claudecode", "opencode", "grok"];
+
+/// Stable prefixes of the plain-text `400` bodies a typed remote launch can
+/// return before any mission exists. Clients match on the prefix, not the
+/// prose.
+pub(crate) const REMOTE_HARNESS_UNSUPPORTED: &str = "REMOTE_HARNESS_UNSUPPORTED";
+pub(crate) const REMOTE_PROMPT_REQUIRED: &str = "REMOTE_PROMPT_REQUIRED";
+pub(crate) const REMOTE_MODEL_REQUIRED: &str = "REMOTE_MODEL_REQUIRED";
+
+/// Capability block advertised on `GET /api/remote-nodes` so clients can tell
+/// a backend that plans typed launches server-side from one that still
+/// requires a raw `remote_command` (the field is absent there).
+pub(crate) fn remote_launch_capabilities() -> crate::remote_node::RemoteLaunchCapabilities {
+    crate::remote_node::RemoteLaunchCapabilities {
+        typed: true,
+        harnesses: REMOTE_NODE_HARNESSES
+            .iter()
+            .map(|h| h.to_string())
+            .collect(),
+        raw_command: true,
+        proxy_url_configured: super::mission_runner::public_api_base_url_from_env().is_some(),
+        error_prefixes: vec![
+            REMOTE_HARNESS_UNSUPPORTED.to_string(),
+            REMOTE_PROMPT_REQUIRED.to_string(),
+            REMOTE_MODEL_REQUIRED.to_string(),
+            remote_grok::REMOTE_AUTH_REQUIRED.to_string(),
+        ],
+    }
+}
+
+/// What a remote mission will execute on its node, decided by the server
+/// from the client's selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteHarnessPlan {
+    Grok {
+        model: Option<String>,
+        prompt: String,
+        resume_session_id: Option<String>,
+        new_session_id: Option<String>,
+    },
+    /// Explicit `remote_command` compatibility: runs verbatim, own auth.
+    Raw { command: String },
+    /// Claude Code CLI on the node, model routed through this core's proxy.
+    ClaudeCode {
+        model: Option<String>,
+        prompt: String,
+    },
+    /// OpenCode CLI on the node, model routed through this core's
+    /// OpenAI-compatible proxy endpoint.
+    OpenCode {
+        model: Option<String>,
+        prompt: String,
+    },
+}
+
+impl RemoteHarnessPlan {
+    pub(crate) fn uses_core_proxy(&self) -> bool {
+        matches!(
+            self,
+            RemoteHarnessPlan::ClaudeCode { .. } | RemoteHarnessPlan::OpenCode { .. }
+        )
+    }
+
+    pub(crate) fn label(&self) -> String {
+        match self {
+            RemoteHarnessPlan::Raw { .. } => "raw command".to_string(),
+            RemoteHarnessPlan::Grok { model, .. } => {
+                format!("grok/{}", model.as_deref().unwrap_or("node default model"))
+            }
+            RemoteHarnessPlan::ClaudeCode { model, .. } => format!(
+                "claudecode/{}",
+                model.as_deref().unwrap_or("node default model")
+            ),
+            RemoteHarnessPlan::OpenCode { model, .. } => format!(
+                "opencode/{}",
+                model.as_deref().unwrap_or("node default model")
+            ),
+        }
+    }
+}
+
+/// Decide the node execution for a remote launch. An explicit raw command
+/// wins (compatibility with scripted callers). Otherwise the selected
+/// backend must be one nodes can run and the prompt must be present; a
+/// selection nodes cannot honour is an explicit error naming what is
+/// supported, never a fallback to a different harness.
+pub(crate) fn plan_remote_harness(
+    remote_command: Option<&str>,
+    backend: &str,
+    model_override: Option<&str>,
+    prompt: Option<&str>,
+) -> Result<RemoteHarnessPlan, String> {
+    if let Some(command) = remote_command.map(str::trim).filter(|c| !c.is_empty()) {
+        return Ok(RemoteHarnessPlan::Raw {
+            command: command.to_string(),
+        });
+    }
+    let prompt = prompt
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            format!("{REMOTE_PROMPT_REQUIRED}: a remote launch needs a prompt (or an explicit remote_command)")
+        })?
+        .to_string();
+    let model = model_override
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
+    match backend {
+        "grok" => Ok(remote_grok::plan(model, prompt)),
+        "claudecode" => Ok(RemoteHarnessPlan::ClaudeCode {
+            // Claude Code expects bare model ids.
+            model: model.map(|m| {
+                m.strip_prefix("anthropic/")
+                    .map(str::to_string)
+                    .unwrap_or(m)
+            }),
+            prompt,
+        }),
+        "opencode" => {
+            // A node has no authenticated default provider: the only model
+            // that can run there is the one this core registers and routes.
+            // The exact id is the provider map key; a client-supplied
+            // `builtin/` prefix is the local runner's argument shape, not
+            // part of the id.
+            let model = model
+                .map(|m| m.trim_start_matches("builtin/").to_string())
+                .filter(|m| !m.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "{REMOTE_MODEL_REQUIRED}: an OpenCode remote launch needs model_override (provider/model, e.g. xai/grok-4.6); nodes have no authenticated default model"
+                    )
+                })?;
+            Ok(RemoteHarnessPlan::OpenCode {
+                model: Some(model),
+                prompt,
+            })
+        }
+        other => Err(format!(
+            "{REMOTE_HARNESS_UNSUPPORTED}: backend '{other}' cannot run on remote nodes: only {} are installed there. \
+             Pick one of those, \
+             or pass an explicit remote_command.",
+            REMOTE_NODE_HARNESSES.join(" or ")
+        )),
+    }
+}
+
+/// Concrete node job for a plan: the shell command plus the environment the
+/// node injects into it (proxy URL/key never appear in the command line).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteExecution {
+    pub(crate) managed_auth: Vec<String>,
+    pub(crate) command: String,
+    pub(crate) env: Option<HashMap<String, String>>,
+    pub(crate) label: String,
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Env var the node job receives the per-mission proxy key in. The OpenCode
+/// config references it (`{env:…}`) so neither the config nor the command
+/// line ever contains the secret.
+pub(crate) const REMOTE_PROXY_KEY_ENV: &str = "SANDBOXED_PROXY_API_KEY";
+/// OpenCode reads an inline JSON config from this env var (verified with the
+/// installed 1.18 CLI), so the job never writes into or overwrites a cwd
+/// `opencode.json`.
+pub(crate) const REMOTE_OPENCODE_CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
+
+/// Prompts are positional CLI arguments; one starting with `-` would be
+/// parsed as an option (and yargs' `--` terminator swallows the message on
+/// `opencode run`, verified). A leading space is inert for the model and
+/// keeps the argument positional on every CLI version.
+fn positional_prompt(prompt: &str) -> String {
+    if prompt.starts_with('-') {
+        format!(" {prompt}")
+    } else {
+        prompt.to_string()
+    }
+}
+
+/// OpenCode on a node reaches this core exactly like a local OpenCode
+/// mission does: a `builtin` provider (`@ai-sdk/openai-compatible`, base URL
+/// `<core>/v1`) whose model map carries the exact requested id, so the proxy
+/// receives `xai/grok-4.6` (or any `provider/model`) unchanged and applies
+/// its own chain/passthrough resolution. The stock `openai` provider only
+/// advertises OpenAI's catalog and would reject non-GPT ids before any
+/// request.
+pub(crate) fn remote_opencode_config(model: &str, api_base_url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "provider": {
+            "builtin": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Builtin",
+                "models": { model: { "name": model } },
+                "options": {
+                    "baseURL": format!("{}/v1", api_base_url.trim_end_matches('/')),
+                    "apiKey": format!("{{env:{REMOTE_PROXY_KEY_ENV}}}")
+                }
+            }
+        }
+    })
+}
+
+/// `--model` argument for the node: `builtin/<exact id>` (the local runner's
+/// `opencode_model_argument` shape for proxy-routed models).
+fn remote_opencode_model_argument(model: &str) -> String {
+    match model.strip_prefix("builtin/") {
+        Some(_) => model.to_string(),
+        None => format!("builtin/{model}"),
+    }
+}
+
+pub(crate) fn remote_execution_for_plan(
+    plan: &RemoteHarnessPlan,
+    api_base_url: &str,
+    proxy_key: &str,
+) -> RemoteExecution {
+    let label = plan.label();
+    match plan {
+        RemoteHarnessPlan::Grok {
+            model,
+            prompt,
+            resume_session_id,
+            new_session_id,
+        } => remote_grok::execution(
+            model.as_deref(),
+            prompt,
+            resume_session_id.as_deref(),
+            new_session_id.as_deref(),
+            label,
+        ),
+        RemoteHarnessPlan::Raw { command } => RemoteExecution {
+            managed_auth: Vec::new(),
+            command: command.clone(),
+            env: None,
+            label,
+        },
+        RemoteHarnessPlan::ClaudeCode { model, prompt } => {
+            let mut command = String::from(
+                "command -v claude >/dev/null 2>&1 || { echo 'claude is not installed on this node' >&2; exit 127; }; \
+                 claude -p --dangerously-skip-permissions",
+            );
+            if let Some(model) = model {
+                command.push_str(" --model ");
+                command.push_str(&shell_single_quote(model));
+            }
+            command.push(' ');
+            command.push_str(&shell_single_quote(&positional_prompt(prompt)));
+            let env = HashMap::from([
+                ("ANTHROPIC_BASE_URL".to_string(), api_base_url.to_string()),
+                ("ANTHROPIC_AUTH_TOKEN".to_string(), proxy_key.to_string()),
+                ("NO_COLOR".to_string(), "1".to_string()),
+                ("GH_NO_PAGER".to_string(), "1".to_string()),
+                ("GH_PROMPT_DISABLED".to_string(), "1".to_string()),
+            ]);
+            RemoteExecution {
+                managed_auth: Vec::new(),
+                command,
+                env: Some(env),
+                label,
+            }
+        }
+        RemoteHarnessPlan::OpenCode { model, prompt } => {
+            // Inline config through OPENCODE_CONFIG_CONTENT: nothing is
+            // written into the job cwd (the node's per-mission directory,
+            // also its HOME), and nothing depends on the service user's home.
+            let mut command = String::from(
+                "command -v opencode >/dev/null 2>&1 || { echo 'opencode is not installed on this node' >&2; exit 127; }; \
+                 opencode run --format json",
+            );
+            let mut env = HashMap::from([
+                (REMOTE_PROXY_KEY_ENV.to_string(), proxy_key.to_string()),
+                ("NO_COLOR".to_string(), "1".to_string()),
+            ]);
+            // `plan_remote_harness` guarantees a model for OpenCode; the
+            // config registers exactly that id under `builtin`.
+            let model = model.as_deref().unwrap_or_default();
+            command.push_str(" --model ");
+            command.push_str(&shell_single_quote(&remote_opencode_model_argument(model)));
+            env.insert(
+                REMOTE_OPENCODE_CONFIG_ENV.to_string(),
+                remote_opencode_config(model, api_base_url).to_string(),
+            );
+            command.push(' ');
+            command.push_str(&shell_single_quote(&positional_prompt(prompt)));
+            RemoteExecution {
+                managed_auth: Vec::new(),
+                command,
+                env: Some(env),
+                label,
+            }
+        }
+    }
+}
+
+/// Name of the per-mission proxy key a typed remote launch mints. Keyed by
+/// mission so a re-attached observer or a boot sweep can retire it by name.
+pub(crate) fn remote_launch_key_name(mission_id: Uuid) -> String {
+    format!("remote-launch:{mission_id}")
+}
+
+/// Delete every proxy key minted for `mission_id`'s remote launches.
+pub(crate) async fn retire_remote_launch_keys(
+    proxy_keys: &super::proxy_keys::ProxyApiKeyStore,
+    mission_id: Uuid,
+) {
+    if let Err(error) = proxy_keys
+        .delete_named_except(&remote_launch_key_name(mission_id), None)
+        .await
+    {
+        tracing::warn!(%mission_id, %error, "remote launch proxy key retirement failed");
+    }
+}
+
+/// Boot sweep: a `remote-launch:*` key minted before `boot_cutoff` whose
+/// mission holds no ledger handle belongs to a launch of a previous process
+/// that never reached submission or whose observer already finished. No node
+/// job can still be using it (submission always follows the tentative ledger
+/// record). Keys minted after the cutoff belong to this process's launches
+/// and are left alone even when the ledger snapshot predates their handle.
+pub(crate) async fn retire_orphaned_remote_launch_keys(
+    proxy_keys: &super::proxy_keys::ProxyApiKeyStore,
+    handles: &[crate::remote_node::job_ledger::JobHandle],
+    boot_cutoff: chrono::DateTime<chrono::Utc>,
+) {
+    let live: HashSet<Uuid> = handles.iter().map(|handle| handle.mission_id).collect();
+    for key in proxy_keys.list().await {
+        let Some(mission_id) = key
+            .name
+            .strip_prefix("remote-launch:")
+            .and_then(|id| Uuid::parse_str(id).ok())
+        else {
+            continue;
+        };
+        if key.created_at >= boot_cutoff {
+            continue;
+        }
+        if !live.contains(&mission_id) {
+            tracing::info!(%mission_id, key_id = %key.id, "retiring orphaned remote launch proxy key");
+            let _ = proxy_keys.delete(key.id).await;
+        }
+    }
+}
+
+/// Owner id of the run lease held by a raw remote mission job's poll loop.
+pub(crate) fn remote_job_lease_owner(job_id: Uuid) -> String {
+    format!("remote-job:{job_id}")
+}
+
+/// Whether a run lease belongs to a raw remote mission job observer.
+pub(crate) fn is_remote_mission_job_owner(owner_actor_id: &str) -> bool {
+    owner_actor_id.starts_with("remote-job:")
+}
+
+/// Scope label recorded on a remote job lease so placement survives in the
+/// durable run row after the ledger handle is retired.
+fn remote_job_lease_scope(node_id: &str) -> String {
+    format!("remote-node:{node_id}")
+}
+
+/// Persist the initial prompt of a raw remote mission as a real (non-queued)
+/// user message. Returns an error message shaped for the dispatch-failure
+/// path: a remote mission whose prompt cannot be persisted must not be
+/// dispatched, because nothing later would ever record what the user asked.
+async fn persist_remote_mission_prompt(
+    control: &ControlState,
+    mission_id: Uuid,
+    user_id: &str,
+    prompt: Option<(Uuid, String)>,
+) -> Result<(), String> {
+    let Some((id, content)) = prompt else {
+        return Ok(());
+    };
+    let event = AgentEvent::UserMessage {
+        id,
+        content,
+        queued: false,
+        mission_id: Some(mission_id),
+        source: Some(format!("api:{user_id}")),
+    };
+    control
+        .mission_store
+        .log_event(mission_id, &event)
+        .await
+        .map_err(|error| format!("remote mission prompt could not be persisted: {error}"))?;
+    let _ = control.events_tx.send(event);
+    Ok(())
+}
+
+/// Make an accepted raw remote mission job authoritative execution evidence.
+///
+/// Raw remote missions never start a local harness, so without this lease the
+/// mission is an Active row with no runner and no run — exactly what the
+/// stuck-mission watchdog repairs as an orphan (incident ab1792b4,
+/// 2026-09-20: the watchdog interrupted a freshly dispatched dgx-spark
+/// mission seven seconds after acceptance and the poll loop then cancelled
+/// the node job as if an operator had asked for it). The poll loop refreshes
+/// this lease on every successful observation and finishes it with the
+/// job's terminal reason.
+///
+/// Returns the lease when this job owns it. A lease owned by anyone else is
+/// left untouched; a mission that already left Active/Pending gets none.
+async fn ensure_remote_job_lease(
+    mission_store: &dyn MissionStore,
+    mission_id: Uuid,
+    job_id: Uuid,
+    node_id: &str,
+) -> Result<Option<MissionRun>, String> {
+    let owner_actor_id = remote_job_lease_owner(job_id);
+    if let Some(run) = mission_store.get_active_mission_run(mission_id).await? {
+        if run.owner_actor_id != owner_actor_id {
+            return Ok(None);
+        }
+        mission_store
+            .heartbeat_mission_run(
+                run.run_id,
+                run.generation,
+                MissionExecutionState::WaitingRemoteJob,
+                None,
+            )
+            .await?;
+        return mission_store.get_active_mission_run(mission_id).await;
+    }
+    let Some(mission) = mission_store.get_mission(mission_id).await? else {
+        return Ok(None);
+    };
+    if !matches!(
+        mission.status,
+        MissionStatus::Active | MissionStatus::Pending
+    ) {
+        return Ok(None);
+    }
+    let run = mission_store
+        .begin_mission_run(
+            mission_id,
+            &owner_actor_id,
+            Some(&remote_job_lease_scope(node_id)),
+        )
+        .await?;
+    mission_store
+        .heartbeat_mission_run(
+            run.run_id,
+            run.generation,
+            MissionExecutionState::WaitingRemoteJob,
+            None,
+        )
+        .await?;
+    mission_store.get_active_mission_run(mission_id).await
+}
+
+/// Finish the run lease held by `job_id`'s observer. Returns the settled run
+/// (for the terminal status event) when this job owned the lease.
+pub(crate) async fn finish_remote_job_lease(
+    mission_store: &dyn MissionStore,
+    mission_id: Uuid,
+    job_id: Uuid,
+    terminal_reason: &str,
+) -> Result<Option<MissionRun>, String> {
+    let Some(run) = mission_store.get_active_mission_run(mission_id).await? else {
+        return Ok(None);
+    };
+    if run.owner_actor_id != remote_job_lease_owner(job_id) {
+        return Ok(None);
+    }
+    mission_store
+        .finish_mission_run(run.run_id, run.generation, Some(terminal_reason))
+        .await?;
+    Ok(mission_store
+        .get_latest_mission_run(mission_id)
+        .await?
+        .filter(|latest| latest.run_id == run.run_id))
+}
+
+/// Placement metadata of a raw remote mission job for mission read models.
+///
+/// While the job is in flight the durable ledger handle is the source; after
+/// it is retired the run lease (owner `remote-job:<id>`, scope
+/// `remote-node:<id>`) still names the placement. The fleet monitor's bounded
+/// in-memory outcome adds the last node-reported state when it is known.
+/// `None` means the mission never dispatched a raw remote job.
+fn remote_job_projection(
+    handles: &[crate::remote_node::job_ledger::JobHandle],
+    outcomes: &[crate::remote_node::DispatchOutcome],
+    run: Option<&MissionRun>,
+    mission_id: Uuid,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<serde_json::Value> {
+    use crate::remote_node::job_ledger::JobHandleKind;
+    let handle = handles
+        .iter()
+        .filter(|handle| {
+            // Remote-build submissions also write tentative handles; those
+            // carry a validation identity and belong to a harness tool call,
+            // not to a raw remote mission.
+            handle.mission_id == mission_id
+                && (handle.kind == JobHandleKind::Mission
+                    || (handle.kind == JobHandleKind::Tentative && handle.identity.is_none()))
+        })
+        .max_by_key(|handle| (handle.submission_sequence, handle.started_at));
+    let lease = run.filter(|run| is_remote_mission_job_owner(&run.owner_actor_id));
+    let (job_id, node_id) = match (handle, lease) {
+        (Some(handle), _) => (handle.job_id, handle.node_id.clone()),
+        (None, Some(run)) => {
+            let job_id = run
+                .owner_actor_id
+                .strip_prefix("remote-job:")
+                .and_then(|id| Uuid::parse_str(id).ok())?;
+            let node_id = run
+                .scope_unit
+                .as_deref()
+                .and_then(|scope| scope.strip_prefix("remote-node:"))
+                .unwrap_or("unknown")
+                .to_string();
+            (job_id, node_id)
+        }
+        (None, None) => return None,
+    };
+    let outcome = outcomes
+        .iter()
+        .find(|outcome| outcome.job_id == Some(job_id));
+    let last_proof = handle.and_then(|handle| match (handle.heartbeat_at, handle.accepted_at) {
+        (Some(heartbeat), Some(accepted)) => Some(heartbeat.max(accepted)),
+        (Some(heartbeat), None) => Some(heartbeat),
+        (None, accepted) => accepted,
+    });
+    let observed_age_secs =
+        last_proof.map(|proof| now.signed_duration_since(proof).num_seconds().max(0));
+    let phase = match handle {
+        Some(handle) if handle.kind == JobHandleKind::Tentative => "submit_ambiguous",
+        Some(handle) if handle.accepted_at.is_none() => "submit_ambiguous",
+        Some(_) => {
+            if observed_age_secs
+                .is_some_and(|age| age <= super::supervision::REMOTE_JOB_UNOBSERVED_SECS)
+            {
+                "observed"
+            } else {
+                "unobserved"
+            }
+        }
+        None => match lease {
+            Some(run) if run.execution_state.is_terminal() => "finished",
+            _ => "lease_only",
+        },
+    };
+    Some(serde_json::json!({
+        "job_id": job_id,
+        "node_id": node_id,
+        "phase": phase,
+        "node_state": outcome.map(|outcome| outcome.state.clone()),
+        "exit_code": outcome.and_then(|outcome| outcome.exit_code),
+        "error": outcome.and_then(|outcome| outcome.error.clone()),
+        "accepted_at": handle.and_then(|handle| handle.accepted_at),
+        "heartbeat_at": handle.and_then(|handle| handle.heartbeat_at),
+        "observed_age_secs": observed_age_secs,
+        "started_at": handle
+            .map(|handle| handle.started_at)
+            .or_else(|| outcome.map(|outcome| outcome.started_at)),
+        "finished_at": outcome.and_then(|outcome| outcome.finished_at),
+        "lease_state": lease.map(|run| run.execution_state),
+        "terminal_reason": lease.and_then(|run| run.terminal_reason.clone()),
+    }))
+}
+
+/// Ledger handles and recent fleet outcomes for [`remote_job_projection`].
+/// An unreadable ledger degrades to "no in-flight handle" for read models;
+/// liveness decisions never go through this path.
+async fn remote_job_projection_inputs(
+    state: &AppState,
+) -> (
+    Vec<crate::remote_node::job_ledger::JobHandle>,
+    Vec<crate::remote_node::DispatchOutcome>,
+) {
+    let handles = match crate::remote_node::job_ledger::load(&state.config.working_dir).await {
+        Ok(handles) => handles,
+        Err(error) => {
+            tracing::debug!(
+                ?error,
+                "remote job ledger unreadable for mission read model"
+            );
+            Vec::new()
+        }
+    };
+    (handles, state.fleet.recent_outcomes(256))
+}
+
+fn attach_remote_job_to_mission_value(
+    mut value: serde_json::Value,
+    remote_job: Option<serde_json::Value>,
+) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "remote_job".to_string(),
+            remote_job.unwrap_or(serde_json::Value::Null),
+        );
+    }
+    value
 }
 
 async fn remote_build_wait_owner(
@@ -11634,13 +12430,16 @@ pub(crate) async fn deliver_pending_remote_build_wakes(state: &AppState) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finalize_remote_mission(
     owner: &RemoteMissionOwner,
     mission_id: Uuid,
+    job_id: Option<Uuid>,
     node_id: &str,
     success: bool,
     content: String,
     status_reason: &str,
+    native_stream: bool,
 ) -> Result<(), String> {
     let event = AgentEvent::AssistantMessage {
         id: Uuid::new_v4(),
@@ -11656,8 +12455,12 @@ async fn finalize_remote_mission(
         resumable: !success,
         completion_evidence: None,
     };
-    let _ = owner.mission_store.log_event(mission_id, &event).await;
-    owner.send(event);
+    if native_stream {
+        owner.publish_native(event).await;
+    } else {
+        let _ = owner.mission_store.log_event(mission_id, &event).await;
+        owner.send(event);
+    }
     let status = if success {
         MissionStatus::Completed
     } else {
@@ -11667,9 +12470,30 @@ async fn finalize_remote_mission(
         .mission_store
         .update_mission_status_with_reason(mission_id, status, Some(status_reason))
         .await?;
+    // Settle the observer's run lease with the same reason so execution
+    // truth and presentation status agree; the terminal event carries it.
+    let execution = match job_id {
+        Some(job_id) => finish_remote_job_lease(
+            owner.mission_store.as_ref(),
+            mission_id,
+            job_id,
+            status_reason,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                %mission_id,
+                %job_id,
+                %error,
+                "remote job run lease could not be finished after mission finalization"
+            );
+            None
+        }),
+        None => None,
+    };
     owner.send(AgentEvent::MissionStatusChanged {
         completion: None,
-        execution: None,
+        execution,
         mission_id,
         status,
         summary: Some(format!("Remote node '{node_id}' finished")),
@@ -11681,12 +12505,27 @@ async fn finalize_remote_mission(
 /// node's job API, mark the mission Active immediately, and finalize it from
 /// a background poll loop. Unlike [`dispatch_remote_mission_mvp`], the create
 /// request does not block for the command's duration.
+/// Terminal reason of a remote launch whose dispatch failed or whose
+/// submitting process died before the node acceptance became durable.
+pub(crate) const REMOTE_DISPATCH_FAILED: &str = "remote_dispatch_failed";
+pub(crate) const REMOTE_DISPATCH_INTERRUPTED: &str = "remote_dispatch_interrupted";
+
+/// Dispatch a remote mission job with the run lease taken FIRST.
+///
+/// The lease (`owner remote-job:<job_id>`, state `waiting_remote_job`) is the
+/// durable ownership fence every local execution path checks:
+/// `begin_mission_run` refuses a second non-terminal run, so a targeted
+/// message, the FLEET-001 scheduler or a resume cannot start a local harness
+/// while placement, proxy-key minting and the node submit are awaiting.
+/// Taking it after the submit (the pre-620cdb74 order) left that whole window
+/// open. Every failure below settles the lease so a failed mission never
+/// keeps a phantom run; the ledger handle keeps owning a maybe-accepted job.
 async fn dispatch_remote_job(
     state: &Arc<AppState>,
     control: &ControlState,
     mission: &Mission,
     remote_node_id: &str,
-    remote_command: &str,
+    plan: &RemoteHarnessPlan,
 ) -> Result<Mission, String> {
     let node = crate::remote_node::placement_for_selected_node(
         &state.config.remote_nodes,
@@ -11695,6 +12534,83 @@ async fn dispatch_remote_job(
     .map_err(|e| e.to_string())?
     .ok_or_else(|| "remote node placement unexpectedly returned local".to_string())?
     .clone();
+    let job_id = Uuid::new_v4();
+    match ensure_remote_job_lease(control.mission_store.as_ref(), mission.id, job_id, &node.id)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let owner = control
+                .mission_store
+                .get_active_mission_run(mission.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|run| run.owner_actor_id);
+            return Err(format!(
+                "remote job run lease for mission {} could not be taken before dispatch (execution already owned by {}); refusing to start a second execution",
+                mission.id,
+                owner.as_deref().unwrap_or("an unavailable mission state")
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "remote job run lease could not be acquired before dispatch: {error}"
+            ));
+        }
+    }
+    let dispatched = submit_leased_remote_job(state, control, mission, node, job_id, plan).await;
+    if dispatched.is_err() {
+        if let Err(error) = finish_remote_job_lease(
+            control.mission_store.as_ref(),
+            mission.id,
+            job_id,
+            REMOTE_DISPATCH_FAILED,
+        )
+        .await
+        {
+            tracing::warn!(
+                mission_id = %mission.id,
+                %job_id,
+                %error,
+                "remote job run lease could not be settled after a failed dispatch"
+            );
+        }
+    }
+    dispatched
+}
+
+/// The submit half of `dispatch_remote_job`; `job_id` already owns the
+/// mission's run lease.
+async fn submit_leased_remote_job(
+    state: &Arc<AppState>,
+    control: &ControlState,
+    mission: &Mission,
+    node: crate::remote_node::RemoteNodeConfig,
+    job_id: Uuid,
+    plan: &RemoteHarnessPlan,
+) -> Result<Mission, String> {
+    if let RemoteHarnessPlan::Grok {
+        new_session_id: Some(session_id),
+        resume_session_id: None,
+        ..
+    } = plan
+    {
+        let run = control
+            .mission_store
+            .get_active_mission_run(mission.id)
+            .await?
+            .filter(|run| run.owner_actor_id == remote_job_lease_owner(job_id))
+            .ok_or("native Grok session allocation lost its run lease")?;
+        let fence = crate::api::mission_store::SessionUpdateRun::from(&run);
+        if !control
+            .mission_store
+            .update_mission_session_id(mission.id, session_id, "grok", Some(&fence))
+            .await?
+        {
+            return Err("native Grok session allocation rejected by run generation fence".into());
+        }
+    }
     let shared_token = std::env::var(&node.token_env)
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -11704,7 +12620,6 @@ async fn dispatch_remote_job(
                 node.id, node.token_env
             )
         })?;
-    let job_id = Uuid::new_v4();
     let claims = crate::remote_node::LeaseClaims {
         mission_id: mission.id,
         node_id: node.id.clone(),
@@ -11714,15 +12629,53 @@ async fn dispatch_remote_job(
     };
     let lease_token = crate::remote_node::create_lease_token(&claims, &shared_token)
         .map_err(|e| e.to_string())?;
+    // A harness launch talks back to this core through the model proxy with
+    // a key minted for this mission only; the key travels in the job env,
+    // never in the logged command line. Raw commands carry their own auth.
+    // Minted last, after every other fallible pre-submit step, so each path
+    // below that can fail after this point retires it explicitly.
+    let (execution, proxy_key_id) = if plan.uses_core_proxy() {
+        let api_base_url = super::mission_runner::public_api_base_url_from_env()
+            .ok_or_else(|| {
+                "SANDBOXED_PUBLIC_URL is not configured; a remote harness launch needs a core URL the node can reach".to_string()
+            })?;
+        let key = state
+            .proxy_api_keys
+            .create(remote_launch_key_name(mission.id))
+            .await
+            .map_err(|error| format!("remote launch proxy key could not be minted: {error}"))?;
+        (
+            remote_execution_for_plan(plan, &api_base_url, &key.key),
+            Some(key.id),
+        )
+    } else {
+        (remote_execution_for_plan(plan, "", ""), None)
+    };
     let request = crate::remote_node::SubmitJobRequest {
         job_id,
         mission_id: mission.id,
         lease_token,
         payload: crate::remote_node::JobPayload::RawCommand {
-            command: remote_command.to_string(),
+            command: execution.command.clone(),
             timeout_secs: None,
-            env: None,
+            env: execution.env.clone(),
+            managed_auth: execution.managed_auth.clone(),
         },
+    };
+    let proxy_keys = Arc::clone(&state.proxy_api_keys);
+    // Key retirement: on every early failure below and when this process's
+    // observer finishes. A re-attached observer after restart retires by
+    // name (`retire_remote_launch_keys`), and the reconciler's first pass
+    // sweeps keys whose mission holds no ledger handle, so nothing relies on
+    // the periodic `cleanup_keys`.
+    let retire_proxy_key = {
+        let proxy_keys = Arc::clone(&proxy_keys);
+        let mission_id = mission.id;
+        move || async move {
+            if proxy_key_id.is_some() {
+                retire_remote_launch_keys(&proxy_keys, mission_id).await;
+            }
+        }
     };
 
     let client = crate::remote_node::RemoteNodeClient::default();
@@ -11731,7 +12684,7 @@ async fn dispatch_remote_job(
     // Record the generated id before the POST. If the process dies after the
     // node accepts but before the HTTP result is observed, restart recovery
     // still has enough information to cancel the maybe-accepted job.
-    crate::remote_node::job_ledger::record(
+    let tentative_recorded = crate::remote_node::job_ledger::record(
         &ledger_dir,
         crate::remote_node::job_ledger::JobHandle {
             mission_id: mission.id,
@@ -11748,8 +12701,13 @@ async fn dispatch_remote_job(
             wake_on_terminal: false,
         },
     )
-    .await
-    .map_err(|error| format!("remote job recovery handle could not be prepared: {error}"))?;
+    .await;
+    if let Err(error) = tentative_recorded {
+        retire_proxy_key().await;
+        return Err(format!(
+            "remote job recovery handle could not be prepared: {error}"
+        ));
+    }
     let accepted = match client.submit_job(&node, &shared_token, &request).await {
         Ok(accepted) => accepted,
         Err(crate::remote_node::RemoteNodeError::Request(message)) => {
@@ -11766,6 +12724,7 @@ async fn dispatch_remote_job(
                 submit_started_at,
                 ledger_dir,
             );
+            retire_proxy_key().await;
             return Err(format!(
                 "remote job submit outcome is ambiguous; cancellation is being reconciled: {message}"
             ));
@@ -11774,6 +12733,7 @@ async fn dispatch_remote_job(
             // A node HTTP rejection is definitive: the handler did not queue
             // the job, so this pre-submit handle can be discarded.
             crate::remote_node::job_ledger::remove(&ledger_dir, job_id).await;
+            retire_proxy_key().await;
             return Err(error.to_string());
         }
     };
@@ -11812,10 +12772,37 @@ async fn dispatch_remote_job(
             submit_started_at,
             state.config.working_dir.clone(),
         );
+        retire_proxy_key().await;
         return Err(format!(
             "remote job accepted but recovery handle could not be persisted: {err}"
         ));
     }
+
+    // Durable execution truth BEFORE the presentation status flips to Active.
+    // A raw remote mission has no local runner, so this lease (refreshed by
+    // the poll loop) and the ledger handle above are what the stuck-mission
+    // watchdog and startup recovery consult instead of the runner list. The
+    // ledger handle alone already fences liveness, so a lease failure is
+    // logged rather than treated as a dispatch failure.
+    let lease = match ensure_remote_job_lease(
+        control.mission_store.as_ref(),
+        mission.id,
+        job_id,
+        &node.id,
+    )
+    .await
+    {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(
+                mission_id = %mission.id,
+                job_id = %job_id,
+                %error,
+                "remote job run lease could not be acquired; the ledger handle remains the liveness proof"
+            );
+            None
+        }
+    };
 
     if let Err(err) = control
         .mission_store
@@ -11851,17 +12838,18 @@ async fn dispatch_remote_job(
                 started_at,
             )
             .await;
+            retire_proxy_key().await;
         });
         return Err(err);
     }
     let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
         completion: None,
-        execution: None,
+        execution: lease,
         mission_id: mission.id,
         status: MissionStatus::Active,
         summary: Some(format!(
-            "Dispatched job {} to remote node '{}'",
-            job_id, node.id
+            "Dispatched job {} to remote node '{}' ({}; node state: {})",
+            job_id, node.id, execution.label, accepted.state
         )),
     });
 
@@ -11900,6 +12888,7 @@ async fn dispatch_remote_job(
                     started_at,
                 )
                 .await;
+                retire_proxy_key().await;
             });
         },
     )
@@ -11959,16 +12948,28 @@ async fn observe_untracked_remote_job_cancellation(
 ) {
     let client = crate::remote_node::RemoteNodeClient::default();
     let mut terminal: Option<crate::remote_node::NodeJobStatus> = None;
+    let mut consecutive_missing: u8 = 0;
     loop {
         if terminal.is_none() {
             if let Err(error) = client.cancel_job(&node, &shared_token, job_id).await {
                 tracing::warn!(%mission_id, %job_id, node_id = %node.id, ?error,
                     "untracked remote job cancellation failed; retaining fence and retrying");
             }
-            if let Ok(status) = client.get_job(&node, &shared_token, job_id).await {
-                if crate::remote_node::job_state_confirms_termination(&status.state) {
+            match client.get_job(&node, &shared_token, job_id).await {
+                Ok(status) if crate::remote_node::job_state_confirms_termination(&status.state) => {
+                    consecutive_missing = 0;
                     terminal = Some(status);
                 }
+                Err(error) if error.is_not_found() => {
+                    consecutive_missing = consecutive_missing.saturating_add(1);
+                    if consecutive_missing >= 10 {
+                        terminal = Some(crate::remote_node::missing_job_cancelled(
+                            mission_id, job_id,
+                        ));
+                    }
+                }
+                Ok(_) => consecutive_missing = 0,
+                Err(_) => {}
             }
         }
         if let Some(status) = &terminal {
@@ -12007,10 +13008,18 @@ async fn observe_untracked_remote_job_cancellation(
 /// Missing owners, configuration, credentials and stale observations are not
 /// terminal evidence: retain the durable ownership fence and retry recovery.
 pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
+    // Captured synchronously, before any request can be served: only proxy
+    // keys minted before this instant are boot leftovers. A launch minting
+    // its key between the ledger snapshot and the key listing below is a
+    // live launch of THIS process and must keep its key.
+    let boot_cutoff = chrono::Utc::now();
     tokio::spawn(async move {
         // Let control sessions boot before touching their stores.
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         let working_dir = state.config.working_dir.clone();
+        // The leaked-key sweep runs once, after the first SUCCESSFUL ledger
+        // read (an unreadable first pass must not skip it forever).
+        let mut sweep_done = false;
         // Job ids a poll loop was already re-attached for (or that were
         // finalized), so retry passes never double-attach.
         let mut settled: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
@@ -12030,6 +13039,14 @@ pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
                     continue;
                 }
             };
+            if !sweep_done {
+                // Sweep leaked launch keys once per boot, against the FULL
+                // ledger (every mission with any handle keeps its key), and
+                // before the empty-ledger early return below.
+                retire_orphaned_remote_launch_keys(&state.proxy_api_keys, &handles, boot_cutoff)
+                    .await;
+                sweep_done = true;
+            }
             let pending: Vec<_> = handles
                 .into_iter()
                 .filter(|h| !settled.contains(&h.job_id))
@@ -12071,6 +13088,92 @@ pub fn spawn_remote_job_reconciler(state: Arc<AppState>) {
     });
 }
 
+/// The store that persists `mission_id`, live session first, then an offline
+/// persisted store. `None` when no store knows the mission (yet).
+async fn find_remote_mission_owner(
+    state: &Arc<AppState>,
+    mission_id: Uuid,
+) -> Option<(RemoteMissionOwner, MissionStatus)> {
+    for session in state.control.all_sessions().await {
+        if let Ok(Some(mission)) = session.mission_store.get_mission(mission_id).await {
+            return Some((RemoteMissionOwner::live(&session), mission.status));
+        }
+    }
+    match super::mission_workspace_gc::persisted_mission_store(state.as_ref(), mission_id).await {
+        Ok(Some((store, status))) => Some((RemoteMissionOwner::offline(store), status)),
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(
+                %mission_id,
+                ?err,
+                "remote job persisted owner lookup failed; will retry"
+            );
+            None
+        }
+    }
+}
+
+/// Settle a raw remote launch whose submitting process died between taking
+/// the run lease and persisting node acceptance. Ownership stays with the
+/// tentative ledger handle (its cancellation observer) — only the mission's
+/// own lease and presentation are closed, and only when this job owns them
+/// or no one does. A lease held by anyone else is left untouched.
+async fn settle_interrupted_remote_launch(state: &Arc<AppState>, mission_id: Uuid, job_id: Uuid) {
+    let Some((owner, status)) = find_remote_mission_owner(state, mission_id).await else {
+        tracing::info!(%mission_id, %job_id, "interrupted remote launch kept: owning mission not found; will retry");
+        return;
+    };
+    let store = owner.mission_store.as_ref();
+    match store.get_active_mission_run(mission_id).await {
+        Ok(Some(run)) if run.owner_actor_id == remote_job_lease_owner(job_id) => {
+            if let Err(error) =
+                finish_remote_job_lease(store, mission_id, job_id, REMOTE_DISPATCH_INTERRUPTED)
+                    .await
+            {
+                tracing::warn!(%mission_id, %job_id, %error, "interrupted remote launch lease could not be settled; will retry");
+                return;
+            }
+        }
+        Ok(Some(run)) => {
+            tracing::info!(%mission_id, %job_id, owner = %run.owner_actor_id, "interrupted remote launch: mission run owned elsewhere; leaving it");
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%mission_id, %job_id, %error, "interrupted remote launch: run ownership unreadable; will retry");
+            return;
+        }
+    }
+    if !matches!(status, MissionStatus::Pending | MissionStatus::Active) {
+        return;
+    }
+    let _ = store.set_deferred_goal(mission_id, None).await;
+    match store
+        .update_mission_status_with_reason(
+            mission_id,
+            MissionStatus::Failed,
+            Some(REMOTE_DISPATCH_INTERRUPTED),
+        )
+        .await
+    {
+        Ok(()) => {
+            tracing::warn!(%mission_id, %job_id, "remote launch interrupted before node acceptance was durable; mission failed, job cancellation reconciling");
+            owner.send(AgentEvent::MissionStatusChanged {
+                completion: None,
+                execution: None,
+                mission_id,
+                status: MissionStatus::Failed,
+                summary: Some(format!(
+                    "Remote launch interrupted before node acceptance of job {job_id} was durable; cancellation is being reconciled"
+                )),
+            });
+        }
+        Err(error) => {
+            tracing::warn!(%mission_id, %job_id, %error, "interrupted remote launch status could not be persisted; will retry");
+        }
+    }
+}
+
 async fn reconcile_pending_handles(
     state: &Arc<AppState>,
     working_dir: &std::path::Path,
@@ -12097,6 +13200,19 @@ async fn reconcile_pending_handles(
                             handle.started_at,
                             working_dir.to_path_buf(),
                         );
+                        // A raw remote launch (no validation identity) whose
+                        // submit never became durable: its mission holds the
+                        // pre-submit run lease and no deferred goal, so no
+                        // local runner can ever pick it up — but nothing
+                        // else would settle it either.
+                        if handle.identity.is_none() {
+                            settle_interrupted_remote_launch(
+                                state,
+                                handle.mission_id,
+                                handle.job_id,
+                            )
+                            .await;
+                        }
                     }
                     _ => {
                         tracing::warn!(
@@ -12166,41 +13282,7 @@ async fn reconcile_pending_handles(
             // Reattach even when the owner has not booted a control session:
             // durable node work must still be observed/cancelled while an
             // OAuth user remains offline after restart.
-            let mut owning: Option<(RemoteMissionOwner, MissionStatus)> = None;
-            for session in state.control.all_sessions().await {
-                if let Ok(Some(mission)) =
-                    session.mission_store.get_mission(handle.mission_id).await
-                {
-                    owning = Some((RemoteMissionOwner::live(&session), mission.status));
-                    break;
-                }
-            }
-            if owning.is_none() {
-                match super::mission_workspace_gc::persisted_mission_store(
-                    state.as_ref(),
-                    handle.mission_id,
-                )
-                .await
-                {
-                    Ok(Some((store, status))) => {
-                        tracing::info!(
-                            mission_id = %handle.mission_id,
-                            job_id = %handle.job_id,
-                            "re-attaching remote job for offline persisted owner"
-                        );
-                        owning = Some((RemoteMissionOwner::offline(store), status));
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            mission_id = %handle.mission_id,
-                            job_id = %handle.job_id,
-                            ?err,
-                            "remote job persisted owner lookup failed; will retry"
-                        );
-                    }
-                }
-            }
+            let owning = find_remote_mission_owner(state, handle.mission_id).await;
             let Some((owner, mission_status)) = owning else {
                 tracing::info!(
                     mission_id = %handle.mission_id,
@@ -12225,6 +13307,7 @@ async fn reconcile_pending_handles(
                     settled.insert(handle.job_id);
                     let fleet = Arc::clone(&state.fleet);
                     let ledger_dir = working_dir.to_path_buf();
+                    let proxy_keys = Arc::clone(&state.proxy_api_keys);
                     tokio::spawn(async move {
                         poll_remote_job(
                             &ledger_dir,
@@ -12238,6 +13321,7 @@ async fn reconcile_pending_handles(
                             handle.started_at,
                         )
                         .await;
+                        retire_remote_launch_keys(&proxy_keys, handle.mission_id).await;
                     });
                 }
                 _ => {
@@ -12367,11 +13451,16 @@ async fn poll_remote_job(
             finished_at: terminal.then(chrono::Utc::now),
         }
     };
+    let mut grok =
+        remote_grok::NativeGrokObserver::attach(&owner, &node.id, mission_id, job_id).await;
     let mut last_state = "queued".to_string();
     let mut failures = 0u32;
     // Once received, terminal proof survives a subsequent observation outage
     // while mission/ledger persistence is retried.
     let mut terminal_observation: Option<crate::remote_node::NodeJobStatus> = None;
+    // The preserved-status terminal note is durable once; retries of the
+    // ledger cleanup must not duplicate it.
+    let mut preserved_terminal_noted = false;
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
 
@@ -12432,10 +13521,12 @@ async fn poll_remote_job(
                     let _ = finalize_remote_mission(
                         &owner,
                         mission_id,
+                        Some(job_id),
                         &node.id,
                         false,
                         content,
                         "remote_node_lost",
+                        grok.is_some(),
                     )
                     .await;
                     fleet.record_outcome(outcome(
@@ -12455,6 +13546,16 @@ async fn poll_remote_job(
             Ok(status) => {
                 failures = 0;
                 let terminal = crate::remote_node::job_state_confirms_termination(&status.state);
+                if let Some(observer) = grok.as_mut() {
+                    observer.pump(&client, &node, &shared_token).await;
+                    observer
+                        .check_startup(&status, &client, &node, &shared_token)
+                        .await;
+                    if terminal && !observer.caught_up() {
+                        terminal_observation = Some(status.clone());
+                        continue;
+                    }
+                }
                 if terminal {
                     terminal_observation = Some(status.clone());
                     let success = status.state == "succeeded";
@@ -12471,14 +13572,22 @@ async fn poll_remote_job(
                             .unwrap_or_default(),
                         status.log_tail.as_deref().unwrap_or("(empty)"),
                     );
+                    let (success, content, status_reason) = if let Some(observer) = grok.as_mut() {
+                        let verdict = observer.verdict(&status, &node.id).await;
+                        (verdict.success, verdict.content, verdict.status_reason)
+                    } else {
+                        (success, content, "remote_node_job")
+                    };
                     if should_finalize_remote_job(inactive_status) {
                         if let Err(error) = finalize_remote_mission(
                             &owner,
                             mission_id,
+                            Some(job_id),
                             &node.id,
                             success,
                             content,
-                            "remote_node_job",
+                            status_reason,
+                            grok.is_some(),
                         )
                         .await
                         {
@@ -12494,6 +13603,62 @@ async fn poll_remote_job(
                             state = %status.state,
                             "remote job reached a terminal state after operator interruption; preserving mission status"
                         );
+                        // The status is preserved, but the outcome must still
+                        // be visible in the mission's durable history; the
+                        // incident mission had no record at all of what
+                        // happened to its node job. Log once, then settle
+                        // the observer's lease with the node's verdict.
+                        if !preserved_terminal_noted {
+                            let note = AgentEvent::AssistantMessage {
+                                id: Uuid::new_v4(),
+                                content: format!(
+                                    "Remote node '{}' job {} reached state '{}' (exit {:?}) after the mission left Active ({}); the mission status is preserved.{}\n\nlog tail:\n{}",
+                                    node.id,
+                                    job_id,
+                                    status.state,
+                                    status.exit_code,
+                                    inactive_status
+                                        .map(|status| status.to_string())
+                                        .unwrap_or_else(|| "unknown".to_string()),
+                                    status
+                                        .error
+                                        .as_deref()
+                                        .map(|e| format!("\nerror: {e}"))
+                                        .unwrap_or_default(),
+                                    status.log_tail.as_deref().unwrap_or("(empty)"),
+                                ),
+                                success: true,
+                                cost_cents: 0,
+                                cost_source: crate::agents::CostSource::Unknown,
+                                usage: None,
+                                model: None,
+                                model_normalized: None,
+                                mission_id: Some(mission_id),
+                                shared_files: None,
+                                resumable: false,
+                                completion_evidence: None,
+                            };
+                            if let Err(error) =
+                                owner.mission_store.log_event(mission_id, &note).await
+                            {
+                                tracing::warn!(%mission_id, %job_id, %error,
+                                    "remote terminal note persistence failed; retaining ownership and retrying");
+                                continue;
+                            }
+                            owner.send(note);
+                            preserved_terminal_noted = true;
+                        }
+                        if let Err(error) = finish_remote_job_lease(
+                            owner.mission_store.as_ref(),
+                            mission_id,
+                            job_id,
+                            &format!("remote_job_{}", status.state),
+                        )
+                        .await
+                        {
+                            tracing::warn!(%mission_id, %job_id, %error,
+                                "remote job run lease could not be finished after preserved interruption");
+                        }
                     }
                     if let Err(error) = crate::remote_node::job_ledger::finalize_with_artifacts(
                         ledger_dir,
@@ -12518,27 +13683,73 @@ async fn poll_remote_job(
                     ));
                     return;
                 }
+                // A successful non-terminal observation is the liveness proof
+                // the watchdog and startup recovery consult: refresh both the
+                // durable ledger handle and the mission's run lease. Either
+                // one being fresh is enough, so a single failed write cannot
+                // orphan a live job.
+                if let Err(error) =
+                    crate::remote_node::job_ledger::heartbeat(ledger_dir, job_id).await
+                {
+                    tracing::warn!(%mission_id, %job_id, %error,
+                        "remote job ledger heartbeat failed; run lease heartbeat still proves liveness");
+                }
+                if inactive_status.is_none() {
+                    if let Err(error) = ensure_remote_job_lease(
+                        owner.mission_store.as_ref(),
+                        mission_id,
+                        job_id,
+                        &node.id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%mission_id, %job_id, %error,
+                            "remote job run lease heartbeat failed; ledger heartbeat still proves liveness");
+                    }
+                }
                 if status.state != last_state {
-                    // Sparse progress note: only on job state changes.
-                    let event = AgentEvent::AssistantMessage {
-                        id: Uuid::new_v4(),
-                        content: format!(
-                            "Remote job {} on node '{}' is now {}",
-                            job_id, node.id, status.state
-                        ),
-                        success: true,
-                        cost_cents: 0,
-                        cost_source: crate::agents::CostSource::Unknown,
-                        usage: None,
-                        model: None,
-                        model_normalized: None,
-                        mission_id: Some(mission_id),
-                        shared_files: None,
-                        resumable: false,
-                        completion_evidence: None,
-                    };
-                    let _ = owner.mission_store.log_event(mission_id, &event).await;
-                    owner.send(event);
+                    if grok.is_some() {
+                        tracing::debug!(%mission_id, %job_id, node = %node.id,
+                            state = %status.state, "native remote job state changed");
+                        owner
+                            .publish_native(AgentEvent::MissionStatusChanged {
+                                completion: None,
+                                execution: owner
+                                    .mission_store
+                                    .get_latest_mission_run(mission_id)
+                                    .await
+                                    .ok()
+                                    .flatten(),
+                                mission_id,
+                                status: inactive_status.unwrap_or(MissionStatus::Active),
+                                summary: Some(format!(
+                                    "Remote node '{}' is {}",
+                                    node.id, status.state
+                                )),
+                            })
+                            .await;
+                    } else {
+                        // Sparse progress note: only on job state changes.
+                        let event = AgentEvent::AssistantMessage {
+                            id: Uuid::new_v4(),
+                            content: format!(
+                                "Remote job {} on node '{}' is now {}",
+                                job_id, node.id, status.state
+                            ),
+                            success: true,
+                            cost_cents: 0,
+                            cost_source: crate::agents::CostSource::Unknown,
+                            usage: None,
+                            model: None,
+                            model_normalized: None,
+                            mission_id: Some(mission_id),
+                            shared_files: None,
+                            resumable: false,
+                            completion_evidence: None,
+                        };
+                        let _ = owner.mission_store.log_event(mission_id, &event).await;
+                        owner.send(event);
+                    }
                     fleet.record_outcome(outcome(&status.state, None, None, false));
                     last_state = status.state.clone();
                 }
@@ -14786,8 +15997,10 @@ pub async fn clone_mission(
         extra: Default::default(),
     };
 
-    let (_headers, cloned) = create_mission(State(state), Extension(user), Some(Json(req))).await?;
-    let clone_id = cloned.0.id;
+    let (_headers, Json(cloned)) =
+        create_mission(State(state), Extension(user), Some(Json(req))).await?;
+    let cloned: Mission = serde_json::from_value(cloned).map_err(internal_error)?;
+    let clone_id = cloned.id;
 
     // Optionally seed the clone with the source's conversation history
     // (retry-with-context). `control` still holds the store handle after the
@@ -14809,7 +16022,7 @@ pub async fn clone_mission(
         "FLEET-002 mission cloned"
     );
 
-    Ok(cloned)
+    Ok(Json(cloned))
 }
 
 /// Request body for resuming a mission
@@ -14856,6 +16069,36 @@ pub async fn resume_mission(
 
     let control = control_for_user(&state, &user).await;
     tracing::info!(mission_id = %mission_id, actor = %actor, "FLEET-004 mission resume requested");
+
+    if let Some(placement) = remote_grok::placement(
+        &state.config.working_dir,
+        &control.mission_store,
+        mission_id,
+    )
+    .await
+    .map_err(internal_error)?
+    {
+        if request.clean_workspace
+            || request.skip_message
+            || request.github_pr.is_some()
+            || request.track.is_some()
+            || request.title.is_some()
+            || request.continue_identity.is_some()
+        {
+            return Err((StatusCode::CONFLICT, format!("{}: remote continuation supports content only; use a linked replacement for workspace or writer identity changes", remote_grok::REMOTE_RESUME_REQUIRES_REPLACEMENT)));
+        }
+        return remote_grok::continue_on_node(
+            &state,
+            &control,
+            &actor,
+            mission_id,
+            placement,
+            request.content,
+            None,
+        )
+        .await
+        .map(Json);
+    }
 
     let outcome: Result<Mission, (StatusCode, String)> = async {
         let (tx, rx) = oneshot::channel();
@@ -16755,6 +17998,7 @@ fn spawn_control_session(
             events_tx.clone(),
             Arc::clone(&tool_hub),
             workspaces.clone(),
+            config.working_dir.clone(),
         ));
         tokio::spawn(ack_promotion_loop(
             Arc::clone(&state.mission_store),
@@ -19467,6 +20711,12 @@ async fn control_actor_loop(
     ) -> Result<(Mission, String), String> {
         let mission = load_mission_record(mission_store, mission_id).await?;
 
+        if let Some(placement) =
+            remote_grok::placement(&config.working_dir, mission_store, mission_id).await?
+        {
+            return Err(remote_grok::local_resume_refusal(&mission, &placement));
+        }
+
         // Check if mission can be resumed. Paused remains Paused until the
         // actor has acquired the durable writer lock and accepted the resume.
         // Failed missions can be resumed to retry after transient errors (e.g., 529 overloaded)
@@ -19727,6 +20977,29 @@ async fn control_actor_loop(
             }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
+                // Reject remote messages before admission can retag or reactivate
+                // the mission. The actual node continuation is the resume route.
+                let message_target = match &cmd {
+                    ControlCommand::UserMessage { target_mission_id, .. } => *target_mission_id,
+                    ControlCommand::AdmitDispatch { command, .. } => match command.as_ref() {
+                        ControlCommand::UserMessage { target_mission_id, .. } => *target_mission_id,
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(mid) = message_target {
+                    if let Err(error) = remote_grok::reject_local_followup(&config.working_dir, &mission_store, mid).await {
+                        let rejected = match cmd {
+                            ControlCommand::AdmitDispatch { command, .. } => *command,
+                            command => command,
+                        };
+                        if let ControlCommand::UserMessage { respond, .. } = rejected {
+                            let _ = respond.send(UserMessageAck::Rejected(error));
+                        }
+                        continue;
+                    }
+                }
+
                 // Internal wakes also need current track ownership. They carry
                 // no controller assertion or retag, but use the same admission
                 // and rollback boundary as HTTP dispatch.
@@ -19811,6 +21084,13 @@ async fn control_actor_loop(
                     }
                     ControlCommand::AdmitDispatch { .. } => unreachable!("nested admission"),
                     ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, strict, source, respond } => {
+                        if let Some(mid) = target_mission_id {
+                            if let Err(error) = remote_grok::reject_local_followup(&config.working_dir, &mission_store, mid).await {
+                                let _ = respond.send(UserMessageAck::Rejected(error));
+                                continue;
+                            }
+                        }
+
                         if recovered_consumed_user_messages.contains_key(&id) {
                             // The previous actor had already started this exact
                             // deterministic delivery. Its run was interrupted
@@ -19891,6 +21171,16 @@ async fn control_actor_loop(
                         // loop. Non-grok backends and non-/goal messages fall
                         // through unchanged. See `api/grok_goal.rs`.
                         let goal_target_mission = effective_target.or(main_mission_id);
+                        if target_mission_id.is_none() {
+                            if let Some(mid) = goal_target_mission {
+                                if let Err(error) = remote_grok::reject_local_followup(&config.working_dir, &mission_store, mid).await {
+                                    accepted_user_message_ids.remove(&id);
+                                    let _ = respond.send(UserMessageAck::Rejected(error));
+                                    continue;
+                                }
+                            }
+                        }
+
                         let mut content = content;
                         // Canonicalise `/goal\n…` to the space form at the single
                         // entry point, so every downstream space-only parser (the
@@ -24188,7 +25478,43 @@ async fn control_actor_loop(
                                 {
                                     let mission_id = next.id;
                                     let priority = next.scheduling.priority;
-                                    if let Ok(Some(goal)) =
+                                    // A non-terminal run means another owner
+                                    // (a remote job observer, a runner that has
+                                    // not settled yet) already executes this
+                                    // mission. Dispatching a local runner on
+                                    // top of it would either be rejected by
+                                    // the run lease or, worse, duplicate the
+                                    // prompt. Fail closed on a store error too.
+                                    let execution_unowned = match mission_store
+                                        .get_active_mission_run(mission_id)
+                                        .await
+                                    {
+                                        Ok(None) => true,
+                                        Ok(Some(run)) => {
+                                            tracing::warn!(
+                                                mission_id = %mission_id,
+                                                owner = %run.owner_actor_id,
+                                                state = ?run.execution_state,
+                                                "Scheduler: mission execution is already owned; not starting a local runner"
+                                            );
+                                            scheduler_inflight.insert(
+                                                mission_id,
+                                                tokio::time::Instant::now(),
+                                            );
+                                            false
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                mission_id = %mission_id,
+                                                "Scheduler: run ownership unreadable; deferring dispatch: {e}"
+                                            );
+                                            false
+                                        }
+                                    };
+                                    if !execution_unowned {
+                                        // Skip this pass; the cooldown record
+                                        // (or the next pass) re-evaluates.
+                                    } else if let Ok(Some(goal)) =
                                         mission_store.get_deferred_goal(mission_id).await
                                     {
                                         // Deliberately do NOT clear the goal here. The
@@ -34290,6 +35616,362 @@ Investigate <service/> failures.
     }
 
     #[test]
+    fn remote_harness_plan_is_explicit_about_node_support() {
+        // Explicit raw command wins regardless of backend.
+        assert_eq!(
+            plan_remote_harness(Some(" hostname "), "grok", None, Some("p")).unwrap(),
+            RemoteHarnessPlan::Raw {
+                command: "hostname".into()
+            }
+        );
+        assert_eq!(
+            plan_remote_harness(
+                None,
+                "claudecode",
+                Some("anthropic/claude-opus-5"),
+                Some("do it")
+            )
+            .unwrap(),
+            RemoteHarnessPlan::ClaudeCode {
+                model: Some("claude-opus-5".into()),
+                prompt: "do it".into()
+            }
+        );
+        assert_eq!(
+            plan_remote_harness(None, "opencode", Some("xai/grok-4.6"), Some("do it")).unwrap(),
+            RemoteHarnessPlan::OpenCode {
+                model: Some("xai/grok-4.6".into()),
+                prompt: "do it".into()
+            }
+        );
+        assert_eq!(
+            plan_remote_harness(
+                None,
+                "opencode",
+                Some("builtin/xai/grok-4.6"),
+                Some("do it")
+            )
+            .unwrap(),
+            RemoteHarnessPlan::OpenCode {
+                model: Some("xai/grok-4.6".into()),
+                prompt: "do it".into()
+            }
+        );
+        let no_model = plan_remote_harness(None, "opencode", None, Some("do it"))
+            .expect_err("opencode needs a routed model");
+        assert!(
+            no_model.starts_with("REMOTE_MODEL_REQUIRED: "),
+            "{no_model}"
+        );
+        let rejected = plan_remote_harness(None, "unknown", Some("grok-4.6"), Some("do it"))
+            .expect_err("unknown harness");
+        assert!(
+            rejected.starts_with("REMOTE_HARNESS_UNSUPPORTED: "),
+            "{rejected}"
+        );
+        assert!(rejected.contains("'unknown'"), "{rejected}");
+        assert!(rejected.contains("claudecode or opencode"), "{rejected}");
+        let no_prompt =
+            plan_remote_harness(None, "claudecode", None, Some("   ")).expect_err("prompt");
+        assert!(
+            no_prompt.starts_with("REMOTE_PROMPT_REQUIRED: "),
+            "{no_prompt}"
+        );
+    }
+
+    #[test]
+    fn remote_execution_routes_selected_model_through_core_proxy_env() {
+        let plan = RemoteHarnessPlan::ClaudeCode {
+            model: Some("claude-opus-5".into()),
+            prompt: "say 'hi'".into(),
+        };
+        let exec = remote_execution_for_plan(&plan, "https://core.example", "sk-proxy-abc");
+        assert!(
+            exec.command
+                .contains("claude -p --dangerously-skip-permissions --model 'claude-opus-5' "),
+            "{}",
+            exec.command
+        );
+        // Single quotes inside the prompt are shell-escaped.
+        assert!(
+            exec.command.ends_with(&shell_single_quote("say 'hi'")),
+            "{}",
+            exec.command
+        );
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+        assert!(!exec.command.contains("sk-proxy-abc"));
+        let env = exec.env.unwrap();
+        assert_eq!(env["ANTHROPIC_BASE_URL"], "https://core.example");
+        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "sk-proxy-abc");
+        assert_eq!(exec.label, "claudecode/claude-opus-5");
+
+        let plan = RemoteHarnessPlan::OpenCode {
+            model: Some("xai/grok-4.6".into()),
+            prompt: "build".into(),
+        };
+        let exec = remote_execution_for_plan(&plan, "https://core.example/", "sk-proxy-abc");
+        assert!(
+            exec.command
+                .contains("opencode run --format json --model 'builtin/xai/grok-4.6' 'build'"),
+            "{}",
+            exec.command
+        );
+        assert!(!exec.command.contains("opencode.json"), "{}", exec.command);
+        assert!(!exec.command.contains("sk-proxy-abc"));
+        let env = exec.env.unwrap();
+        assert_eq!(env[REMOTE_PROXY_KEY_ENV], "sk-proxy-abc");
+        let config: serde_json::Value =
+            serde_json::from_str(&env[REMOTE_OPENCODE_CONFIG_ENV]).unwrap();
+        assert_eq!(
+            config["provider"]["builtin"]["options"]["baseURL"],
+            "https://core.example/v1"
+        );
+        assert_eq!(
+            config["provider"]["builtin"]["options"]["apiKey"],
+            "{env:SANDBOXED_PROXY_API_KEY}"
+        );
+        assert_eq!(
+            config["provider"]["builtin"]["models"]["xai/grok-4.6"]["name"],
+            "xai/grok-4.6"
+        );
+        assert!(!env[REMOTE_OPENCODE_CONFIG_ENV].contains("sk-proxy-abc"));
+        // Map key and --model agree even when the client sent `builtin/`,
+        // and a leading-dash prompt stays positional.
+        let plan = plan_remote_harness(None, "opencode", Some("builtin/xai/grok-4.6"), Some("-x"))
+            .unwrap();
+        let exec = remote_execution_for_plan(&plan, "https://core.example", "k");
+        assert!(
+            exec.command
+                .contains("--model 'builtin/xai/grok-4.6' ' -x'"),
+            "{}",
+            exec.command
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(&exec.env.unwrap()[REMOTE_OPENCODE_CONFIG_ENV]).unwrap();
+        assert!(config["provider"]["builtin"]["models"]["xai/grok-4.6"].is_object());
+        let plan = RemoteHarnessPlan::ClaudeCode {
+            model: None,
+            prompt: "--help".into(),
+        };
+        assert!(remote_execution_for_plan(&plan, "u", "k")
+            .command
+            .ends_with("' --help'"));
+
+        let raw = remote_execution_for_plan(
+            &RemoteHarnessPlan::Raw {
+                command: "hostname".into(),
+            },
+            "",
+            "",
+        );
+        assert_eq!(raw.env, None);
+        assert_eq!(raw.command, "hostname");
+    }
+
+    #[tokio::test]
+    async fn boot_key_sweep_removes_old_orphans_and_keeps_new_process_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            super::super::proxy_keys::ProxyApiKeyStore::new(dir.path().join("keys.json")).await;
+        let old_orphan = Uuid::new_v4();
+        let old_live = Uuid::new_v4();
+        let unrelated = store.create("dashboard-key".into()).await.unwrap();
+        store
+            .create(remote_launch_key_name(old_orphan))
+            .await
+            .unwrap();
+        store
+            .create(remote_launch_key_name(old_live))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let boot_cutoff = chrono::Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // A launch of this process, minted after the cutoff, absent from
+        // the (empty) ledger snapshot because its handle is not written yet.
+        let fresh = Uuid::new_v4();
+        store.create(remote_launch_key_name(fresh)).await.unwrap();
+        let live_handle = crate::remote_node::job_ledger::JobHandle {
+            mission_id: old_live,
+            node_id: "dgx-spark".into(),
+            job_id: Uuid::new_v4(),
+            started_at: boot_cutoff,
+            submission_sequence: 0,
+            accepted_at: Some(boot_cutoff),
+            heartbeat_at: None,
+            disk_reservation_bytes: 0,
+            kind: crate::remote_node::job_ledger::JobHandleKind::Mission,
+            identity: None,
+            wait_for_completion: None,
+            wake_on_terminal: false,
+        };
+        retire_orphaned_remote_launch_keys(&store, std::slice::from_ref(&live_handle), boot_cutoff)
+            .await;
+        let mut names: Vec<String> = store.list().await.into_iter().map(|k| k.name).collect();
+        names.sort();
+        let mut expected = vec![
+            unrelated.name.clone(),
+            remote_launch_key_name(old_live),
+            remote_launch_key_name(fresh),
+        ];
+        expected.sort();
+        assert_eq!(names, expected);
+        // Empty ledger: only the pre-cutoff orphan goes; the fresh key stays.
+        retire_orphaned_remote_launch_keys(&store, &[], boot_cutoff).await;
+        let mut names: Vec<String> = store.list().await.into_iter().map(|k| k.name).collect();
+        names.sort();
+        let mut expected = vec![unrelated.name, remote_launch_key_name(fresh)];
+        expected.sort();
+        assert_eq!(names, expected);
+    }
+
+    /// Bounded real-CLI resolution proof (no paid inference): the installed
+    /// OpenCode, configured exactly as a node job is (inline
+    /// `OPENCODE_CONFIG_CONTENT`, cwd = HOME = scratch dir, key only in env),
+    /// must send the exact requested model id and the env key to the
+    /// proxy-shaped endpoint. A local mock answers one canned streamed
+    /// completion. Skipped when the CLI is not installed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_opencode_execution_resolves_model_against_mock_proxy() {
+        if !std::process::Command::new("bash")
+            .args(["-lc", "command -v opencode"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("opencode CLI not installed; skipping mock-proxy fixture");
+            return;
+        }
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post({
+                let seen = seen.clone();
+                move |headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        let model = body["model"].as_str().unwrap_or_default().to_string();
+                        let auth = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        seen.lock().unwrap().push((model.clone(), auth));
+                        let chunk = |delta: serde_json::Value, finish: Option<&str>| {
+                            format!(
+                                "data: {}\n\n",
+                                serde_json::json!({
+                                    "id": "c1", "object": "chat.completion.chunk", "created": 1,
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                                })
+                            )
+                        };
+                        let body = format!(
+                            "{}{}data: [DONE]\n\n",
+                            chunk(
+                                serde_json::json!({"role": "assistant", "content": "ok"}),
+                                None
+                            ),
+                            chunk(serde_json::json!({}), Some("stop"))
+                        );
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            body,
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let plan =
+            plan_remote_harness(None, "opencode", Some("xai/grok-4.6"), Some("say ok")).unwrap();
+        let exec = remote_execution_for_plan(&plan, &base, "sk-proxy-fixture-key");
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = tokio::process::Command::new("bash");
+        // The node runs the command verbatim under `bash -lc`; a `timeout`
+        // prefix would turn the leading `command -v` builtin into a program
+        // lookup. The tokio timeout below bounds the run instead.
+        command
+            .arg("-lc")
+            .arg(&exec.command)
+            .kill_on_drop(true)
+            .current_dir(dir.path())
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", dir.path())
+            .env("LANG", "C.UTF-8")
+            .envs(exec.env.clone().unwrap());
+        let output = tokio::time::timeout(std::time::Duration::from_secs(170), command.output())
+            .await
+            .expect("opencode run must finish")
+            .unwrap();
+        server.abort();
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!seen.is_empty(), "the CLI never called the proxy endpoint");
+        for (model, auth) in &seen {
+            assert_eq!(model, "xai/grok-4.6");
+            assert_eq!(auth, "Bearer sk-proxy-fixture-key");
+        }
+        assert!(String::from_utf8_lossy(&output.stdout).contains("\"ok\""));
+    }
+
+    /// Bounded real-CLI fixture (no inference, no cost): the installed
+    /// OpenCode must accept the per-job config and list the exact proxy
+    /// model id under the `builtin` provider from a cwd that is also HOME,
+    /// the way node jobs run. Skipped when the CLI is not installed.
+    #[test]
+    fn remote_opencode_config_is_accepted_by_installed_cli_catalog() {
+        let Ok(output) = std::process::Command::new("bash")
+            .args(["-lc", "command -v opencode"])
+            .output()
+        else {
+            return;
+        };
+        if !output.status.success() {
+            eprintln!("opencode CLI not installed; skipping catalog fixture");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let listed = std::process::Command::new("bash")
+            .args(["-lc", "timeout 120 opencode models builtin"])
+            .current_dir(dir.path())
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", dir.path())
+            .env("LANG", "C.UTF-8")
+            .env(
+                REMOTE_OPENCODE_CONFIG_ENV,
+                remote_opencode_config("xai/grok-4.6", "http://127.0.0.1:9").to_string(),
+            )
+            .env(REMOTE_PROXY_KEY_ENV, "phony-fixture-key")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            listed.status.success()
+                && stdout
+                    .lines()
+                    .any(|line| line.trim() == "builtin/xai/grok-4.6"),
+            "status={:?} stdout={stdout} stderr={}",
+            listed.status,
+            String::from_utf8_lossy(&listed.stderr)
+        );
+    }
+
+    #[test]
     fn remote_terminal_result_preserves_operator_selected_status() {
         assert!(should_finalize_remote_job(None));
         assert!(should_finalize_remote_job(Some(MissionStatus::Active)));
@@ -34347,16 +36029,28 @@ Investigate <service/> failures.
         finalize_remote_mission(
             &owner,
             mission.id,
+            None,
             "node-a",
             true,
             "remote result".to_string(),
             "remote_node_job",
+            true,
         )
         .await
         .unwrap();
 
         let finalized = store.get_mission(mission.id).await.unwrap().unwrap();
         assert_eq!(finalized.status, MissionStatus::Completed);
+        let events = store
+            .get_events(mission.id, Some(&["assistant_message"]), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "offline native finalization remains durable"
+        );
+        assert_eq!(events[0].content, "remote result");
     }
 
     #[test]

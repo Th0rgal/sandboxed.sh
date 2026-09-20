@@ -347,7 +347,7 @@ pub(crate) fn grok_event_reasoning(value: &serde_json::Value) -> Option<String> 
     None
 }
 
-fn grok_event_session_id(value: &serde_json::Value) -> Option<String> {
+pub(crate) fn grok_event_session_id(value: &serde_json::Value) -> Option<String> {
     value
         .get("session_id")
         .or_else(|| value.get("sessionId"))
@@ -357,7 +357,7 @@ fn grok_event_session_id(value: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn grok_event_model(value: &serde_json::Value) -> Option<String> {
+pub(crate) fn grok_event_model(value: &serde_json::Value) -> Option<String> {
     value
         .get("model")
         .or_else(|| {
@@ -435,7 +435,7 @@ pub(crate) fn grok_event_usage(value: &serde_json::Value) -> Option<crate::cost:
     token_usage.has_usage().then_some(token_usage)
 }
 
-fn grok_event_is_error(value: &serde_json::Value) -> bool {
+pub(crate) fn grok_event_is_error(value: &serde_json::Value) -> bool {
     value
         .get("type")
         .and_then(|v| v.as_str())
@@ -447,7 +447,7 @@ fn grok_event_is_error(value: &serde_json::Value) -> bool {
 /// stderr when it can't authenticate non-interactively, then blocks on a local
 /// OAuth callback that never arrives in a headless mission. Matching any of
 /// these lets the runner fail fast instead of hanging.
-fn grok_line_requests_interactive_login(line: &str) -> bool {
+pub(crate) fn grok_line_requests_interactive_login(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower.contains("signing in with grok")
         || lower.contains("open this url to sign in")
