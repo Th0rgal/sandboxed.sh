@@ -259,6 +259,7 @@ function Composer(p: {
     const { value, caret } = insertAtCaret(cur, ta.selectionStart ?? cur.length, ta.selectionEnd ?? cur.length, t);
     ta.value = value;
     setText(value);
+    p.onDraft?.(value);
     resize();
     ta.setSelectionRange(caret, caret);
     ta.focus();
