@@ -99,10 +99,9 @@
 }
 
 * { box-sizing: border-box; }
-html, body, #root { height: 100%; margin: 0; }
+html, body, #root, .app { height: 100%; margin: 0; background: transparent; }
 body {
   /* Transparent so the macOS vibrancy shows through the sidebar. */
-  background: transparent;
   color: var(--fg);
   font: 13px/1.4 var(--sans);
   -webkit-font-smoothing: antialiased;
@@ -144,8 +143,8 @@ button:focus-visible { outline: 1.5px solid var(--focus-border); outline-offset:
 /* ---------- sidebar ---------- */
 .sidebar {
   grid-row: 1 / 3;
-  /* Near-opaque tint keeps native vibrancy close to the reference neutral. */
-  background: color-mix(in srgb, var(--bg-sidebar) 96%, transparent);
+  /* Tinted glass: the desktop blurs through at ~30%. */
+  background: color-mix(in srgb, var(--bg-sidebar) 70%, transparent);
   border-right: 1px solid var(--stroke-soft);
   display: flex;
   flex-direction: column;
