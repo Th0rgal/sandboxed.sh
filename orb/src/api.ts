@@ -364,11 +364,6 @@ export interface ProjectFileEntry {
   modified?: string;
 }
 
-export async function listProjects(): Promise<ProjectSummary[]> {
-  const data = await api<{ projects?: ProjectSummary[] }>("/api/projects");
-  return data.projects ?? [];
-}
-
 /** Create (or update) a project record on the core. Slug: lowercase, dashes. */
 export async function createProject(body: { slug: string; title?: string; objective?: string }): Promise<ProjectSummary> {
   return api("/api/projects", {
@@ -376,6 +371,28 @@ export async function createProject(body: { slug: string; title?: string; object
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+/** Display-name rename: same slug, new title. */
+export const updateProject = createProject;
+
+const archivedSlugs = new Set<string>();
+
+/** Board archive. The roster row stays; the project leaves the live list. */
+export async function archiveProject(slug: string): Promise<void> {
+  await api(`/api/projects/${encodeURIComponent(slug)}/action`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "archive" }),
+  });
+  archivedSlugs.add(slug);
+}
+
+export async function listProjects(): Promise<ProjectSummary[]> {
+  const data = await api<{ projects?: ProjectSummary[] }>("/api/projects");
+  return (data.projects ?? []).filter(
+    (p) => p.status !== "archived" && p.status !== "deleted" && !archivedSlugs.has(p.slug),
+  );
 }
 
 /** A project's controller: the Hermes cron job that drives it. */

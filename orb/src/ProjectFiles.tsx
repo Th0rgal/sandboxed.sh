@@ -12,6 +12,9 @@ import {
   listProjectFiles,
   listProjectMissions,
   listProjects,
+  updateProject,
+  archiveProject,
+  bumpProjects,
   createProjectCron,
   listProjectCrons,
   getProjectCronDefaults,
@@ -145,7 +148,7 @@ function useRowTip() {
 
 export function LiveProjectsSection(p: {
   selected: () => string | null;
-  open: (id: string) => void;
+  open: (id: string | null) => void;
   missionGlyph: (status: string) => "idle" | "running" | "pr-closed" | "pr-merged";
   StatusGlyph: (props: { agent: { status: "idle" | "running" | "pr-closed" | "pr-merged" }; busy: boolean }) => any;
   /** "+" on a project row: start a new agent in that project. */
@@ -183,6 +186,11 @@ export function LiveProjectsSection(p: {
   const [cronWarning, setCronWarning] = createSignal<string | null>(null);
   const [newCron, setNewCron] = createSignal<string | null>(null);
   const [actionFocus, setActionFocus] = createSignal(true);
+  const [rename, setRename] = createSignal<{ slug: string; title: string } | null>(null);
+  const [renameValue, setRenameValue] = createSignal("");
+  const [renameError, setRenameError] = createSignal<string | null>(null);
+  const [renaming, setRenaming] = createSignal(false);
+  const [actionError, setActionError] = createSignal<string | null>(null);
   const rowTip = useRowTip();
   const currentConnection = (version: number) => isConnected() && connectionVersion() === version;
   const loadController = (slug: string) => {
@@ -316,11 +324,57 @@ export function LiveProjectsSection(p: {
       setMakingFolder(false);
     }
   };
-  const menuItems = (slug: string, path: string): MenuEntry[] => [
-    { kind: "item", label: "New folder", icon: Ic.FolderIcon, onClick: () => beginFolder(slug, path) },
-    { kind: "item", label: "New agent", icon: Ic.NewAgentIcon, onClick: () => p.onNewAgent(slug) },
-    { kind: "item", label: cronChecking() ? "Checking crons…" : "New cron", icon: Ic.BellIcon, onClick: () => { if (!cronChecking()) void beginCron(slug); } },
-  ];
+  const beginRename = (slug: string) => {
+    const project = projects().find((x) => x.slug === slug);
+    const title = (project?.title || slug).trim();
+    setRename({ slug, title });
+    setRenameValue(title);
+    setRenameError(null);
+  };
+  const saveRename = async () => {
+    const target = rename();
+    const title = renameValue().trim();
+    if (!target || renaming()) return;
+    if (!title) { setRenameError("Enter a name."); return; }
+    setRenaming(true);
+    setRenameError(null);
+    try {
+      await updateProject({ slug: target.slug, title });
+      bumpProjects();
+      setRename(null);
+    } catch (e) {
+      setRenameError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRenaming(false);
+    }
+  };
+  const archive = async (slug: string) => {
+    setActionError(null);
+    try {
+      await archiveProject(slug);
+      setProjects((list) => list.filter((x) => x.slug !== slug));
+      bumpProjects();
+      const sel = p.selected();
+      if (sel === `c:${slug}` || sel?.startsWith(`pc:${slug}:`) || sel?.startsWith(`pf:${slug}:`)) p.open(null);
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+    }
+  };
+  const menuItems = (slug: string, path: string): MenuEntry[] => {
+    const items: MenuEntry[] = [
+      { kind: "item", label: "New folder", icon: Ic.FolderIcon, onClick: () => beginFolder(slug, path) },
+      { kind: "item", label: "New agent", icon: Ic.NewAgentIcon, onClick: () => p.onNewAgent(slug) },
+      { kind: "item", label: cronChecking() ? "Checking crons…" : "New cron", icon: Ic.BellIcon, onClick: () => { if (!cronChecking()) void beginCron(slug); } },
+    ];
+    if (!path) {
+      items.push(
+        { kind: "sep" },
+        { kind: "item", label: "Rename", icon: Ic.PencilIcon, onClick: () => beginRename(slug) },
+        { kind: "item", label: "Archive", icon: Ic.ArchiveIcon, onClick: () => void archive(slug) },
+      );
+    }
+    return items;
+  };
   const toggleProject = (slug: string) => {
     const next = !expanded[slug];
     setExpanded(slug, next);
@@ -406,6 +460,7 @@ export function LiveProjectsSection(p: {
         <div class="row note">{error()}</div>
       </Show>
       <Show when={cronWarning()}><p class="st-error" role="alert">{cronWarning()}</p></Show>
+      <Show when={actionError()}><p class="st-error" role="alert">{actionError()}</p></Show>
       <For each={projects()}>
         {(project) => {
           const isOpen = () => !!expanded[project.slug];
@@ -562,6 +617,16 @@ export function LiveProjectsSection(p: {
           </>
         )}</Show>
       </div>
+      <Show when={rename()}>
+        {(target) => (
+          <Dialog title="Rename" onClose={() => !renaming() && setRename(null)} footer={<><button class="s-btn" disabled={renaming()} onClick={() => setRename(null)}>Cancel</button><button class="s-btn primary" disabled={renaming()} onClick={() => void saveRename()}>{renaming() ? "Saving…" : "Save"}</button></>}>
+            <Field label={target().slug}>
+              <input autofocus class="s-input" placeholder="Project name" value={renameValue()} onInput={(e) => setRenameValue(e.currentTarget.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void saveRename(); } }} />
+            </Field>
+            <Show when={renameError()}><p class="st-error">{renameError()}</p></Show>
+          </Dialog>
+        )}
+      </Show>
       <Show when={newFolder()}>
         {(target) => (
           <Dialog title="New folder" onClose={() => !makingFolder() && setNewFolder(null)} footer={<><button class="s-btn" disabled={makingFolder()} onClick={() => setNewFolder(null)}>Cancel</button><button class="s-btn primary" disabled={makingFolder()} onClick={createFolder}>{makingFolder() ? "Creating…" : "Create"}</button></>}>

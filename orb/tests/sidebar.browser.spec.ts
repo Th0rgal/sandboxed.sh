@@ -173,6 +173,8 @@ test("project action menu is compact, pointer hover has no focus ring, keyboard 
   const box = await menu.boundingBox();
   expect(box!.width).toBeLessThanOrEqual(220);
   const first = page.getByRole("menuitem", { name: "New folder" });
+  await expect(page.getByRole("menuitem", { name: "Rename" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Archive" })).toBeVisible();
   await expect(first).not.toBeFocused();
   const outline = await first.evaluate((el) => getComputedStyle(el).outlineStyle);
   expect(outline === "none" || outline === "").toBeTruthy();
