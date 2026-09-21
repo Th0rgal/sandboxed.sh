@@ -69,19 +69,20 @@ item. Do not open a decision. Do not wait for the next tick to "re-check CI."
 they do not share a branch (repair on `#76` plus merge of `#85` is allowed). A
 second writer on the *same* branch is the lease violation.
 
-**Owner chat updates the grant only when the order is durable.** An explicit
-standing grant — "you may merge in this repo", "review-first from now on" —
-is not a comment: `set_project_grant` and update `merge_authority`. A one-off
-"Merge these PRs" is a scoped decision for the named PRs only; record it as
-`pending_user`/`decided` with the PR list, do **not** widen `merge_authority`
-to `full`. The grant schema cannot represent a PR-limited authorization.
-Touch `material_bar` only when the owner actually changes what is worth a
-delivery. If the order is ambiguous, record `pending_user`, proceed with the
-conservative **existing** in-grant default, and apply `set_project_grant`
-only when the owner answers with a durable grant. On 24h expiry, keep the
-current grant — never guess a `merge_authority` value. Do not stall the tick.
-A stale "never merge to main" in the prompt or an old GRANT block does not
-outrank a later owner standing order.
+**Owner orders: grant vs steer.** An explicit standing grant — "you may merge
+in this repo", "review-first from now on" — is not a comment: `set_project_grant`
+and update `merge_authority`. A one-off "Merge these PRs" or "look at the
+notes folder" is a **steer** (`add_project_steer` / Orb cron composer), not
+chat folklore and not a grant. Do **not** scrape the bound Hermes session for
+operator intent. Do **not** widen `merge_authority` to `full` because of a
+steer. The grant still wins for standing authority. Touch `material_bar` only
+when the owner actually changes what is worth a delivery. If a durable order
+is ambiguous, record `pending_user`, proceed with the conservative **existing**
+in-grant default, and apply `set_project_grant` only when the owner answers
+with a durable grant. On 24h expiry, keep the current grant — never guess a
+`merge_authority` value. Do not stall the tick. A stale "never merge to main"
+in the prompt or an old GRANT block does not outrank a later owner standing
+order.
 
 Precedence, highest wins:
 
@@ -248,6 +249,11 @@ any prompt rewrite — see `references/controller-setup-questions.md`.
 
 ## Controller tick
 
+0. **Read unconsumed steers** from `get_situation` / `get_project` (`steers.pending`).
+   If any exist they **outrank** “nothing to do” / `[SILENT]`: acknowledge each
+   in `[CTRL:]` and the report, then act. Pass only the IDs actually handled in `update_project_status.consumed_steer_ids`. Reports and `[CTRL:]` trailers do not consume the inbox.
+   A steer is a one-off; the grant is still the standing authority. Do not scrape
+   Hermes chat for operator intent. Do not invent `@` syntax in this tick.
 1. Read this policy, then `get_project_tasks` (the checklist) plus the
    tracker markdown by section for IDs/heads (never the markdown in full).
 2. Load only the references the router matches — at most four per tick.
@@ -316,7 +322,7 @@ repeated failure `repeat-loop-guard` · tool-call limits `context-budget`.
 - **Never cancel operator-relaunched missions without explicit confirmation.** If a mission you previously owned was relaunched or resumed by the operator, it is no longer yours to reap: do not cancel, pause, or supersede it unless the operator explicitly confirms. When in doubt, ask and keep your own work in a separate mission.
 - **Campaigns are one host-workspace mission with `track=campaign` — never hand-written systemd units.** Long-running or recurring campaign work runs as a single mission on a host workspace tagged `track=campaign`; do not create ad-hoc systemd services/timers for it. The API enforces campaign uniqueness and returns **409 Conflict** on a duplicate — treat a 409 as "the campaign already exists", not an error to retry around.
 - **STATE_SIGNATURE key = your project canonical roster slug, always.** Use exactly the slug of the project you drive (e.g. `verity-core`, `verity-lido`, `lean-silicon`, `verity-benchmark`, `coldcard-rng-cracker`). Never invent new keys (no camelCase names, phase names, or sub-tracks as keys — use the `track` field for that); a novel key creates a duplicate project on every surface. Nicknames (`coldcard`, `ec-defensive-research`) are aliases — they must resolve to the roster slug, never replace it.
-- **One list, one controller.** The right-rail roadmap is `project_tracks`. Do not add a second cron that "watches the roadmap". Do not treat the markdown tracker as that list. The bound conversation already is the project. A `/goal` is not a second roadmap.
+- **One list, one controller.** The right-rail roadmap is `project_tracks`. Do not add a second cron that "watches the roadmap". Do not treat the markdown tracker as that list. The operator surface is the Orb cron view plus steers, not the bound Hermes session (that route is delivery plumbing). A `/goal` is not a second roadmap.
 - **Deliver into the project session, never `origin` without an origin.** Cron jobs for a project use `deliver: project:<slug>`. `deliver: origin` with `origin: None` is a silent drop (Coldcard skip-scan watch, 2026-08-13). If you cannot capture origin, you must name the project.
 - **Do not delete the project's controller because it is noisy.** A repeating `blocked` trailer is a stall to escalate, not spam to silence. Removing the cron removes the only path that can write into the dedicated session.
 - **Acknowledge what you have absorbed.** When a failed/interrupted mission has been superseded (retry dispatched, work re-planned, or intentionally dropped), immediately mark it `acknowledged` — an unacknowledged terminal mission is an open operator alert. The attention surface only counts UNacknowledged failures; leaving absorbed failures unacknowledged cries wolf on every board.

@@ -88,6 +88,8 @@ struct ProjectSlugParams {
 
 #[derive(Debug, Deserialize)]
 struct UpdateProjectStatusParams {
+    #[serde(default)]
+    consumed_steer_ids: Vec<String>,
     slug: String,
     mode: String,
     #[serde(default)]
@@ -163,6 +165,12 @@ struct SetProjectGrantParams {
     material_bar: Option<String>,
     #[serde(default)]
     autonomy_level: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AddProjectSteerParams {
+    slug: String,
+    body: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -358,6 +366,8 @@ struct StartMissionParams {
     /// `origin_session_id` so clients group it as a worker of that session.
     #[serde(default)]
     origin_session_id: Option<String>,
+    #[serde(default)]
+    attachments: Option<Vec<Value>>,
 }
 
 /// PR writers own an outcome, not one conversational turn. Make that runtime
@@ -1657,7 +1667,19 @@ impl AssistantMcp {
                         "supersedes_mission_id": {"type": "string", "description": "The failed/interrupted attempt this mission relays (same project). It is tagged superseded_by and acknowledged, so the board stops flagging it. Use this on every handoff/relay instead of a separate acknowledge_mission call."},
                         "next_check_at": {"type": "string", "description": "When the track should next be checked (RFC3339)."},
                         "estimated_disk_gib": {"type": "integer", "minimum": 1, "maximum": 512, "description": "Expected peak local scratch use. Set this for Lean/build-heavy missions; omit for small/no-build work."},
-                        "origin_session_id": {"type": "string", "description": "Hermes session id of the conversation spawning this mission. Dashboards group the mission as a worker of that session, AND the mission-status webhook carries it back so the completion is delivered into that conversation instead of an isolated webhook session — always pass it when starting a mission from a conversation. Injected automatically by the Hermes-side plugin; pass through unchanged, never another session's id."}
+                        "origin_session_id": {"type": "string", "description": "Implementation routing hint (Hermes session id). Injected by the Hermes plugin when present. Controllers should pass project/track instead; completion is a mission row, not a chat callback. Never invent another session's id."},
+                        "attachments": {
+                            "type": "array",
+                            "description": "Ordinary files to materialize under .paloma/ before the harness starts. Not vendor-CLI @ syntax.",
+                            "items": {
+                                "type": "object",
+                                "required": ["kind"],
+                                "properties": {
+                                    "kind": {"type": "string", "enum": ["file", "folder", "controller"]},
+                                    "path": {"type": "string", "description": "Project-relative path for file/folder chips."}
+                                }
+                            }
+                        }
                     }
                 }),
             },
@@ -1743,7 +1765,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "get_project".to_string(),
-                description: "Get one project's compact snapshot: slug, mode, next_action, blocker, grant, open decisions, bound conversation, and the highest-priority items (live / awaiting / recent unabsorbed attempts). `items` are the durable work — do not treat the mission list as the inventory. The snapshot is capped (see items_omitted / item_counts); call list_missions with a track filter for one item. Prefer this over an unfiltered list_missions and over markdown trackers.".to_string(),
+                description: "Get one project's compact snapshot: slug, mode, next_action, blocker, grant, pending operator steers, open decisions, bound conversation, and the highest-priority items (live / awaiting / recent unabsorbed attempts). `items` are the durable work — do not treat the mission list as the inventory. Pending steers outrank “nothing to do”. The snapshot is capped (see items_omitted / item_counts); call list_missions with a track filter for one item. Prefer this over an unfiltered list_missions and over markdown trackers.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["slug"],
@@ -1752,7 +1774,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "get_situation".to_string(),
-                description: "One bounded read of a project's plan: `summary` (total, verified_satisfied, claim_only, open, blocked, live_attempts, source_unavailable, cursor) and every track with its derived_state (ready | executing | waiting | blocked | satisfied | claim_only | cancelled), origin (declared | absorbed), owner attempt, and title. This is the only progress number to quote; do not recount items yourself. `claim_only` tracks were marked done without evidence — never report them as verified. An unchanged `cursor` since your last tick means nothing moved.".to_string(),
+                description: "One bounded read of a project's plan: `summary` (total, verified_satisfied, claim_only, open, blocked, live_attempts, source_unavailable, cursor), `steers` (pending operator orders for this tick, plus last consumed), and every track with its derived_state (ready | executing | waiting | blocked | satisfied | claim_only | cancelled), origin (declared | absorbed), owner attempt, and title. Read pending steers first — they outrank “nothing to do” / [SILENT]. This is the only progress number to quote; do not recount items yourself. `claim_only` tracks were marked done without evidence — never report them as verified. An unchanged `cursor` since your last tick means nothing moved. Steers are not standing authority; the grant still wins.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["slug"],
@@ -1769,7 +1791,8 @@ impl AssistantMcp {
                         "slug": {"type": "string"},
                         "mode": {"type": "string", "enum": ["active", "blocked", "paused"]},
                         "next_action": {"type": "string", "description": "The next concrete step, or the resume/unblock condition."},
-                        "blocker": {"type": "string", "description": "What you are blocked on. Set only when mode=blocked."}
+                        "blocker": {"type": "string", "description": "What you are blocked on. Set only when mode=blocked."},
+                        "consumed_steer_ids": {"type": "array", "items": {"type": "string"}, "description": "IDs from steers.pending that this tick actually read and handled. Omit to leave all pending."}
                     }
                 }),
             },
@@ -1884,6 +1907,18 @@ impl AssistantMcp {
                         "pause_reason": {"type": "string"},
                         "resume_condition": {"type": "string", "description": "A condition you can check yourself, e.g. 'FTDI device enumerates on spark-de79'."},
                         "material_bar": {"type": "string"}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "add_project_steer".to_string(),
+                description: "Queue a one-off operator order for the project's next controller tick. Pending steers appear on get_situation / get_project and outrank “nothing to do”; acknowledge only handled IDs using update_project_status.consumed_steer_ids. This is not a grant — standing authority still uses set_project_grant.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug", "body"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "body": {"type": "string", "description": "What the next tick must acknowledge and act on."}
                     }
                 }),
             },
@@ -2536,6 +2571,7 @@ impl AssistantMcp {
             // carries it back so the result reaches that conversation.
             "origin": "hermes",
             "origin_session_id": origin_session_id,
+            "attachments": params.attachments,
         });
         let response = self.api_post("/api/control/missions", body).await?;
         if !response.status().is_success() {
@@ -2994,6 +3030,7 @@ impl AssistantMcp {
             "mode": params.mode,
             "next_action": params.next_action,
             "blocker": params.blocker,
+            "consumed_steer_ids": params.consumed_steer_ids,
         });
         let response = self
             .api_post(&format!("/api/projects/{slug}/status"), body)
@@ -3130,6 +3167,19 @@ impl AssistantMcp {
             .api_post(&format!("/api/projects/{slug}/grant"), body)
             .await?;
         Self::response_value(response, "set project grant").await
+    }
+
+    async fn add_project_steer(&self, params: AddProjectSteerParams) -> Result<Value, String> {
+        let slug = params.slug.trim();
+        self.assert_project_scope(slug)?;
+        let body = json!({
+            "body": params.body,
+            "origin": "mcp",
+        });
+        let response = self
+            .api_post(&format!("/api/projects/{slug}/steers"), body)
+            .await?;
+        Self::response_value(response, "add project steer").await
     }
 
     async fn record_project_decision(
@@ -3858,6 +3908,10 @@ impl AssistantMcp {
                 let params: SetProjectGrantParams = parse_params(arguments)?;
                 self.set_project_grant(params).await
             }
+            "add_project_steer" => {
+                let params: AddProjectSteerParams = parse_params(arguments)?;
+                self.add_project_steer(params).await
+            }
             "record_project_decision" => {
                 let params: RecordProjectDecisionParams = parse_params(arguments)?;
                 self.record_project_decision(params).await
@@ -4353,6 +4407,7 @@ fn compact_project(raw: Value) -> Value {
         "open_decisions": kept_decisions,
         "open_decisions_omitted": decisions_total.saturating_sub(kept_decisions.len()),
         "conversation": conversation,
+        "steers": compact_steers(raw.get("steers")),
     })
 }
 
@@ -4400,7 +4455,40 @@ fn compact_situation(raw: Value) -> Value {
         "items_total": items_total,
         "items_omitted": items_total.saturating_sub(kept.len()),
         "dormant_hidden": dormant_hidden,
+        "steers": compact_steers(raw.get("steers")),
     })
+}
+
+fn compact_steers(raw: Option<&Value>) -> Value {
+    let Some(raw) = raw else {
+        return json!({ "pending": [], "recent": [] });
+    };
+    let compact_row = |row: &Value| {
+        json!({
+            "id": row.get("id").cloned().unwrap_or(Value::Null),
+            "body": row.get("body").cloned().unwrap_or(Value::Null),
+            "created_at": row.get("created_at").cloned().unwrap_or(Value::Null),
+            "consumed_at": row.get("consumed_at").cloned().unwrap_or(Value::Null),
+            "origin": row.get("origin").cloned().unwrap_or(Value::Null),
+        })
+    };
+    let pending: Vec<Value> = raw
+        .get("pending")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(compact_row)
+        .collect();
+    let recent: Vec<Value> = raw
+        .get("recent")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(compact_row)
+        .collect();
+    json!({ "pending": pending, "recent": recent })
 }
 
 fn truncate_snippet(text: &str, max: usize) -> String {
@@ -6087,6 +6175,7 @@ mod tests {
             "reopen_project_track",
             "get_project_grant",
             "set_project_grant",
+            "add_project_steer",
             "record_project_decision",
             "answer_project_decision",
             "get_project_tasks",
@@ -6429,6 +6518,15 @@ mod tests {
                 "session_id": "20260813_213628_202eac",
                 "source": "binding",
                 "bound_at": "2026-08-13T20:57:04Z"
+            },
+            "steers": {
+                "pending": [{
+                    "id": "steer-1",
+                    "body": format!("look at {}", "notes/".repeat(80)),
+                    "created_at": "2026-09-21T11:00:00Z",
+                    "origin": "orb"
+                }],
+                "recent": []
             }
         }));
 
@@ -6462,6 +6560,13 @@ mod tests {
         let desired = compact["items"][2]["desired_state"].as_str().unwrap();
         assert!(desired.chars().count() <= 201, "{desired}");
         assert!(desired.ends_with('…'));
+        assert_eq!(compact["steers"]["pending"][0]["id"], "steer-1");
+        let body = compact["steers"]["pending"][0]["body"].as_str().unwrap();
+        assert_eq!(
+            body,
+            format!("look at {}", "notes/".repeat(80)),
+            "operator instructions must not be truncated"
+        );
     }
 
     #[test]

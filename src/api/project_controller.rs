@@ -14,8 +14,10 @@
 //! markdown file per run under `cron/output/<job_id>/`). Actions go through
 //! the `hermes cron` CLI so Hermes stays the single writer of its own store.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
@@ -28,6 +30,7 @@ type ApiError = (StatusCode, String);
 
 const DEFAULT_RUNS: usize = 30;
 const MAX_RUNS: usize = 100;
+const CONTROLLER_WAKE_WINDOW: Duration = Duration::from_secs(90);
 /// Run outputs start with the full prompt (tens of KB of skill text); the
 /// controller's answer is the last section, so only the tail is read.
 const OUTPUT_TAIL_BYTES: u64 = 48 * 1024;
@@ -679,6 +682,17 @@ fn recorded_controller_id(state: &super::routes::AppState, slug: &str) -> Option
         .and_then(|p| p.controller_cron_id)
 }
 
+pub(crate) async fn snapshot_view(
+    state: &super::routes::AppState,
+    slug: &str,
+) -> Option<ControllerView> {
+    let recorded = recorded_controller_id(state, slug);
+    let slug = slug.to_string();
+    tokio::task::spawn_blocking(move || controller_view_sync(&slug, recorded, MAX_RUNS))
+        .await
+        .ok()
+}
+
 async fn get_controller(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(slug): AxumPath<String>,
@@ -830,6 +844,84 @@ async fn controller_action(
     Ok(Json(view))
 }
 
+fn controller_wake_guard() -> &'static Mutex<HashMap<String, Instant>> {
+    static GUARD: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    GUARD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// In-window dedupe so a burst of terminal webhooks collapses to one run.
+pub fn claim_controller_wake(slug: &str, now: Instant) -> bool {
+    let Ok(mut map) = controller_wake_guard().lock() else {
+        return false;
+    };
+    map.retain(|_, previous| now.saturating_duration_since(*previous) < CONTROLLER_WAKE_WINDOW);
+    if let Some(prev) = map.get(slug) {
+        if now.saturating_duration_since(*prev) < CONTROLLER_WAKE_WINDOW {
+            return false;
+        }
+    }
+    map.insert(slug.to_string(), now);
+    true
+}
+
+// Automatic wake has stricter eligibility than the operator's explicit Run
+// action: never infer ownership from a matching delivery target or job order.
+fn automatic_wake_job(
+    project: &super::projects_store::ProjectRecord,
+    jobs: &[serde_json::Value],
+) -> Option<String> {
+    if project.status != "active"
+        || project
+            .mode
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case("paused"))
+    {
+        return None;
+    }
+    let recorded = project.controller_cron_id.as_deref()?.trim();
+    let job = jobs
+        .iter()
+        .find(|job| job.get("id").and_then(|v| v.as_str()) == Some(recorded))?;
+    if job.get("enabled").and_then(|v| v.as_bool()) == Some(false)
+        || matches!(
+            job.get("state").and_then(|v| v.as_str()),
+            Some("paused" | "disabled" | "running")
+        )
+    {
+        return None;
+    }
+    str_field(job, "id")
+}
+
+/// Best-effort automatic wake; explicit operator Run now is a separate action.
+pub async fn wake_controller_for_slug(state: Arc<super::routes::AppState>, slug: &str) {
+    if std::env::var("SANDBOXED_SH_CONTROLLER_TERMINAL_WAKE").as_deref() != Ok("1")
+        || !super::projects_overview::is_plain_key(slug)
+    {
+        return;
+    }
+    let slug = super::projects_overview::canonicalize_project_slug(slug);
+    let lookup_slug = slug.clone();
+    let target = tokio::task::spawn_blocking(move || {
+        let project = state.projects.get_project(&lookup_slug).ok().flatten()?;
+        let home = hermes_home()?;
+        let id = automatic_wake_job(&project, &load_jobs(&home))?;
+        Some((home, id))
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some((home, job_id)) = target else { return };
+    if !claim_controller_wake(&slug, Instant::now()) {
+        return;
+    }
+    if let Err((_, error)) =
+        run_hermes_cron(&home, &["run".into(), job_id, "--accept-hooks".into()]).await
+    {
+        tracing::warn!(project = %slug, %error, "controller wake after mission terminal failed");
+    }
+}
+
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
     Router::new()
         .route(
@@ -842,6 +934,66 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_wake_respects_pause_and_only_the_registered_controller() {
+        let store = super::super::projects_store::ProjectsStore::open_in_memory().unwrap();
+        let mut project = store
+            .upsert_project("lido", None, None, None, Some("canonical"))
+            .unwrap();
+        let mut jobs = vec![
+            serde_json::json!({"id":"duplicate", "enabled":true, "state":"scheduled", "controller":{"project":"lido"}}),
+            serde_json::json!({"id":"canonical", "enabled":true, "state":"scheduled", "controller":{"project":"lido"}}),
+        ];
+        assert_eq!(
+            automatic_wake_job(&project, &jobs).as_deref(),
+            Some("canonical")
+        );
+        for status in ["paused", "archived"] {
+            project.status = status.into();
+            assert!(automatic_wake_job(&project, &jobs).is_none());
+        }
+        project.status = "active".into();
+        store.set_mode("lido", "paused", None, None).unwrap();
+        project = store.get_project("lido").unwrap().unwrap();
+        assert!(automatic_wake_job(&project, &jobs).is_none());
+        project.mode = Some("active".into());
+        for state in ["paused", "disabled", "running"] {
+            jobs[1]["state"] = serde_json::json!(state);
+            assert!(automatic_wake_job(&project, &jobs).is_none());
+        }
+        jobs[1]["state"] = serde_json::json!("scheduled");
+        jobs[1]["enabled"] = serde_json::json!(false);
+        assert!(automatic_wake_job(&project, &jobs).is_none());
+        // Explicit operator resolution still finds the disabled job for Run.
+        assert_eq!(
+            str_field(
+                find_job(&jobs, &["lido".into()], Some("canonical")).unwrap(),
+                "id"
+            )
+            .as_deref(),
+            Some("canonical")
+        );
+        jobs.remove(1);
+        assert!(
+            automatic_wake_job(&project, &jobs).is_none(),
+            "missing registered job cannot fall back to a duplicate"
+        );
+        project.controller_cron_id = None;
+        assert!(automatic_wake_job(&project, &jobs).is_none());
+    }
+
+    #[test]
+    fn controller_wake_dedupes_inside_the_window() {
+        let slug = format!("wake-{}", uuid::Uuid::new_v4());
+        let t0 = Instant::now();
+        assert!(claim_controller_wake(&slug, t0));
+        assert!(!claim_controller_wake(&slug, t0 + Duration::from_secs(10)));
+        assert!(claim_controller_wake(
+            &slug,
+            t0 + CONTROLLER_WAKE_WINDOW + Duration::from_secs(1)
+        ));
+    }
 
     #[test]
     fn response_is_the_last_section_without_trailers() {

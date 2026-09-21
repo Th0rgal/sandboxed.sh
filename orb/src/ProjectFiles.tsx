@@ -257,14 +257,23 @@ export function LiveProjectsSection(p: {
     if (missingCronApi(error)) setCronUnsupported(true);
     else { setCronRetryable(slug, !(error instanceof ApiError) || error.status >= 500 || [408, 429].includes(error.status)); setCronErrors(slug, error instanceof Error ? error.message : String(error)); }
   };
-  const loadCrons = async (slug: string, force = false) => {
-    if (!isConnected() || (cronUnsupported() && !force)) return;
+  const cronLoads = new Map<string, Promise<void>>();
+  const loadCrons = (slug: string, force = false): Promise<void> => {
+    if (!isConnected() || (cronUnsupported() && !force)) return Promise.resolve();
     const version = connectionVersion();
-    try {
-      const jobs = await listProjectCrons(slug);
-      if (!currentConnection(version)) return;
-      setCrons(slug, jobs); setCronErrors(slug, null); setCronUnsupported(false);
-    } catch (error) { if (currentConnection(version)) cronFailure(slug, error); }
+    const key = `${version}:${slug}`;
+    const pending = cronLoads.get(key);
+    if (pending) return pending;
+    const request = (async () => {
+      try {
+        const jobs = await listProjectCrons(slug);
+        if (!currentConnection(version)) return;
+        setCrons(slug, jobs); setCronErrors(slug, null); setCronUnsupported(false);
+      } catch (error) { if (currentConnection(version)) cronFailure(slug, error); }
+      finally { cronLoads.delete(key); }
+    })();
+    cronLoads.set(key, request);
+    return request;
   };
   createEffect(on(connectionVersion, () => {
     setCronUnsupported(false);

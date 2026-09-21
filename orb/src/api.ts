@@ -168,6 +168,7 @@ export interface Mission {
   model_override?: string | null;
   /** Reasoning effort in force for the next turn. Absent means backend default. */
   model_effort?: string | null;
+  project?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -189,6 +190,13 @@ export interface CreateMissionBody {
   /** Model id understood by that harness, e.g. claude-fable-5-1. */
   model_override?: string;
   model_effort?: string;
+  attachments?: MissionAttachment[];
+}
+
+export type MissionAttachmentKind = "file" | "folder" | "controller";
+export interface MissionAttachment {
+  kind: MissionAttachmentKind;
+  path?: string;
 }
 
 export interface BackendInfo {
@@ -618,11 +626,45 @@ export async function createMission(body: CreateMissionBody): Promise<Mission> {
   });
 }
 
-export async function sendMissionMessage(id: string, text: string): Promise<{ id: string; queued: boolean }> {
-  return api("/api/control/message", {
+export async function sendMissionMessage(
+  id: string,
+  text: string,
+  attachments?: MissionAttachment[],
+): Promise<{ id: string; queued: boolean; message_accepted?: boolean }> {
+  const receipt = await api<{ id: string; queued: boolean; message_accepted?: boolean }>("/api/control/message", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content: text, mission_id: id }),
+    body: JSON.stringify({ content: text, mission_id: id, ...(attachments?.length ? { attachments } : {}) }),
+  });
+  if (receipt.message_accepted === false) throw new Error("Message was not accepted. Your draft is kept.");
+  return receipt;
+}
+
+export interface ProjectSteer {
+  id: string;
+  body: string;
+  created_at: string;
+  consumed_at?: string | null;
+  origin: string;
+}
+
+export interface ProjectSteers {
+  slug?: string;
+  pending: ProjectSteer[];
+  recent: ProjectSteer[];
+}
+
+export async function getProjectSteers(slug: string): Promise<ProjectSteers> {
+  const result = await api<ProjectSteers>(`/api/projects/${encodeURIComponent(slug)}/steers`);
+  if (!Array.isArray(result.pending) || !Array.isArray(result.recent)) throw new Error("Steer inbox unavailable");
+  return result;
+}
+
+export async function addProjectSteer(slug: string, body: string, origin = "orb"): Promise<ProjectSteers> {
+  return api(`/api/projects/${encodeURIComponent(slug)}/steers`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body, origin }),
   });
 }
 

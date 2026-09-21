@@ -181,10 +181,10 @@ test("creation defaults to the project conversation; missing route requires expl
   await page.getByRole("button", { name: "Project actions for Project notes" }).click();
   await page.getByRole("menuitem", { name: "New cron" }).click();
   await expect(page.getByLabel("Delivery", { exact: true })).toHaveValue("project:notes");
-  await expect(page.getByText(/No canonical conversation is bound/)).toBeVisible();
+  await expect(page.getByText(/No delivery route is bound yet/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Create", exact: true })).toBeDisabled();
   await page.getByLabel("Delivery", { exact: true }).fill("local");
-  await expect(page.getByText(/no conversation message will be sent/)).toBeVisible();
+  await expect(page.getByText(/no conversation copy/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Create", exact: true })).toBeEnabled();
 });
 
@@ -275,4 +275,47 @@ for (const staleStatus of [200, 401, 404, 500]) test(`old connection cron ${stal
   await expect(page.locator(".row.cron")).toHaveCount(2);
   await expect(page.getByRole("status")).toHaveCount(0);
   expect(await page.evaluate(() => localStorage.getItem("orb.jwt"))).toBe("local-browser-test");
+});
+
+test("primary controller steers the next tick and Run now hits controller/action", async ({ page }) => {
+  const requests: { method: string; path: string; body: any }[] = [];
+  let pending: { id: string; body: string; created_at: string; origin: string }[] = [];
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    const method = request.method();
+    const body = request.postDataJSON();
+    requests.push({ method, path, body });
+    if (path === "/api/projects") return route.fulfill({ json: { projects: [{ slug: "notes", title: "Project notes" }] } });
+    if (path.endsWith("/steers")) {
+      if (method === "POST") {
+        pending = [{ id: "s1", body: body.body, created_at: "2026-09-21T11:00:00Z", origin: "orb" }];
+      }
+      return route.fulfill({ json: { pending, recent: [] } });
+    }
+    if (path.endsWith("/controller/action")) return route.fulfill({ json: { slug: "notes", job: fixtures.hourly, runs: [] } });
+    if (path.endsWith("/controller")) return route.fulfill({ json: { slug: "notes", job: fixtures.hourly, runs: [] } });
+    if (path.endsWith("/missions")) return route.fulfill({ json: [] });
+    if (path.endsWith("/files")) return route.fulfill({ json: { entries: [] } });
+    if (path.endsWith("/crons")) return route.fulfill({ json: { jobs: [] } });
+    return route.fulfill({ json: {} });
+  });
+  await page.goto("/tests/browser.html?theme=light");
+  await page.getByRole("button", { name: "Project notes", exact: true }).click();
+  await page.locator(".row.cron").first().click();
+  const input = page.getByPlaceholder("Steer the next tick…");
+  await expect(input).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: "Run now" })).toBeVisible();
+  await input.fill("review the open PRs");
+  await page.getByRole("button", { name: "Steer", exact: true }).click();
+  await expect.poll(() => requests.some((r) => r.method === "POST" && r.path.endsWith("/steers"))).toBe(true);
+  const steer = requests.find((r) => r.method === "POST" && r.path.endsWith("/steers"));
+  expect(steer?.body).toMatchObject({ body: "review the open PRs", origin: "orb" });
+  await expect.poll(() => requests.some((r) => r.method === "POST" && r.path.endsWith("/controller/action"))).toBe(true);
+  const action = requests.find((r) => r.method === "POST" && r.path.endsWith("/controller/action"));
+  expect(action?.body).toMatchObject({ action: "run" });
+  await expect(page.getByText("review the open PRs")).toBeVisible();
+  await page.screenshot({path:"test-results/orb-steer-light.png", fullPage:true});
+  await page.evaluate(() => document.documentElement.dataset.theme = "dark");
+  await page.screenshot({path:"test-results/orb-steer-dark.png", fullPage:true});
 });
