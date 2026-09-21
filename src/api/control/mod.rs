@@ -5066,6 +5066,8 @@ pub async fn post_message(
     if content.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "content is required".to_string()));
     }
+    crate::api::mission_payload::validate_user_content(&content)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let id = req.client_message_id.unwrap_or_else(Uuid::new_v4);
     let agent = req.agent;
     let target_mission_id = req.mission_id;
@@ -10322,6 +10324,11 @@ pub async fn create_mission(
         attachments: None,
         extra: Default::default(),
     });
+
+    if let Some(prompt) = req.prompt.as_deref() {
+        crate::api::mission_payload::validate_user_content(prompt)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    }
 
     if let Some(attachments) = req.attachments.as_ref().filter(|a| !a.is_empty()) {
         if req.remote_node_id.is_some() {
@@ -16589,6 +16596,10 @@ pub async fn resume_mission(
     body: Option<Json<ResumeMissionRequest>>,
 ) -> Result<Json<Mission>, (StatusCode, String)> {
     let request = body.map(|b| b.0).unwrap_or_default();
+    if let Some(content) = request.content.as_deref() {
+        crate::api::mission_payload::validate_user_content(content)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    }
     let clean_workspace = request.clean_workspace;
     let skip_message = request.skip_message;
     let actor = resolve_actor(request.actor.clone(), &user);

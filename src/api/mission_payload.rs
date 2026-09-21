@@ -492,6 +492,16 @@ fn collect_files(
 const SNAPSHOT_MARKER: &str = "<!-- paloma:attachment:";
 const SNAPSHOT_CAP: usize = 16 * 1024 * 1024;
 
+/// Attachment references are generated only after a snapshot is durably staged.
+/// Reject the reserved prefix at public ingress, before accepting any work, so
+/// arbitrary prose can neither forge a reference nor fail later at dispatch.
+pub fn validate_user_content(content: &str) -> Result<(), String> {
+    if content.contains(SNAPSHOT_MARKER) {
+        return Err("Message contains a reserved attachment reference. Remove it and use the attachment picker to attach context.".into());
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 struct MessageSnapshot {
     mission_id: Uuid,
@@ -516,6 +526,7 @@ pub fn stage_message(
     content: &str,
     payload: &MissionPayload,
 ) -> Result<(String, MaterializeReport), String> {
+    validate_user_content(content)?;
     validate(payload)?;
     let path = message_snapshot_path(working_dir, mission_id, message_id);
     if !path.try_exists().map_err(|e| e.to_string())? {

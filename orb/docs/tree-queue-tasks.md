@@ -5,7 +5,9 @@ Finished groups, folders and files. `visibleTree` derives depth, sibling positio
 ancestor continuation columns and explicit expanded-parent links. One connector
 renderer handles every row, including loading and empty notes. Lazy loading,
 project actions, selection, prefetch and tooltips remain; arrow keys navigate the
-visible hierarchy. Legacy demo rows keep their separate styles.
+visible hierarchy, skipping noninteractive loading/empty notes. PR #923’s folder
+creation actions, mission-ID copy menus, project settings and editor changes are
+preserved on the updated base. Legacy demo rows keep their separate styles.
 
 User transcript rows retain the server message ID and a monotonic queued →
 delivered state. HTTP receipts, SSE, stored history and the queue snapshot join by
@@ -48,7 +50,11 @@ then lets the scheduler dispatch through the native driver fixture. It checks
 ordered original IDs in replay metadata, exact immutable attachment versions in
 the actual turn cwd, and absence of transport metadata in harness input. It also
 checks unknown-mission rejection. PR #922's immutable attachment snapshots and
-steer acknowledgments remain intact.
+steer acknowledgments remain intact. Public create/follow-up/resume content rejects
+the reserved attachment-reference prefix before accepting work, with a clear 400
+error and retained Orb draft; server-generated references still fail closed when
+their immutable snapshot is missing. The shared tree model is named
+`treeModel.ts` to avoid case-insensitive resolution conflicts with `Tree.tsx`.
 
 ## Work and task adapters
 

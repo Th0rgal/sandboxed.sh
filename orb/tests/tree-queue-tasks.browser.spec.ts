@@ -7,7 +7,7 @@ async function setup(page: Page, mixed = false) {
   });
   const mission = {id:"active",title:"Queue and task review",status:"active",project:"test",backend:"codex",history:[],created_at:"",updated_at:""};
   const done = Array.from({length:6},(_,i)=>({...mission,id:`done-${i}`,title:`Finished mission ${i+1}`,status:"completed"}));
-  let reject = false, loseReply = false, sequence = 5;
+  let reject: boolean | string = false, loseReply = false, sequence = 5;
   const pending: Array<{id:string;content:string;mission_id:string}> = [];
   const posts: Array<Record<string,any>> = [];
   const events: StoredEvent[] = [
@@ -24,6 +24,7 @@ async function setup(page: Page, mixed = false) {
     const req=route.request(), url=new URL(req.url()),path=url.pathname;
     if(path==="/api/control/message") {
       const body=req.postDataJSON();posts.push(body);
+      if(typeof reject === "string") return route.fulfill({status:400,contentType:"text/plain",body:reject});
       if(reject) return route.fulfill({json:{id:body.client_message_id,queued:false,message_accepted:false}});
       const id=body.client_message_id;
       const suffix=body.attachments?.length ? `\n\n<!-- paloma:attachment:${id} -->\nAttached context: read \`.paloma/messages/${id}/.paloma/attach.md\` (paths in that manifest are relative to \`.paloma/messages/${id}\`).` : "";
@@ -54,7 +55,7 @@ async function setup(page: Page, mixed = false) {
     return route.fulfill({json});
   });
   await page.goto("/"); await page.getByRole("button",{name:"test",exact:true}).click();
-  return {posts,pending,events,releaseSlow,loseNextReply:()=>loseReply=true,setReject:(value:boolean)=>reject=value,setStatus:(status:string)=>mission.status=status,
+  return {posts,pending,events,releaseSlow,loseNextReply:()=>loseReply=true,setReject:(value:boolean|string)=>reject=value,setStatus:(status:string)=>mission.status=status,
     deliver:(index=0)=>{
       const row=pending.splice(index,1)[0];
       events.push({id:++sequence,event_id:row.id,sequence,event_type:"user_message",content:row.content,timestamp:"",metadata:{queued:false}});
@@ -92,6 +93,9 @@ test("mixed tree supports five levels, keyboard, selection, lazy loading and emp
   await page.locator('#orb-sidebar').screenshot({path:"test-results/orb-tree-loading-dark.png"});state.releaseSlow();
   await expect(page.getByText("Empty folder",{exact:true})).toHaveCount(2);
   await page.getByRole("button",{name:"Empty project",exact:true}).click();await expect(page.getByText("No missions or files yet.")).toBeVisible();
+  await page.getByRole("button",{name:"empty-dir",exact:true}).focus();await page.keyboard.press("ArrowDown");
+  await expect(page.getByRole("button",{name:"slow",exact:true})).toBeFocused();
+  await page.keyboard.press("End");await expect(page.getByRole("button",{name:"Empty project",exact:true})).toBeFocused();
   for(const theme of ["dark","light"]){await page.evaluate(theme=>document.documentElement.dataset.theme=theme,theme);await page.screenshot({path:`test-results/orb-tree-deep-${theme}.png`});}
   await page.getByRole("button",{name:"src",exact:true}).click();await expect(deep).toHaveCount(0);
   await page.locator('#orb-sidebar').screenshot({path:"test-results/orb-tree-collapsed-selected.png"});
@@ -142,4 +146,18 @@ test("retry after a lost HTTP receipt reuses the accepted message ID",async({pag
   await field.press("Enter");await expect(field).toHaveValue("");
   expect(state.posts).toHaveLength(2);expect(state.posts[0].client_message_id).toBe(state.posts[1].client_message_id);
   expect(state.pending).toHaveLength(1);await expect(page.locator('.queued-messages li')).toHaveCount(1);
+});
+
+
+test("reserved attachment reference rejection keeps the follow-up draft and attachments",async({page})=>{
+  const state=await setup(page,true);state.releaseSlow();
+  await page.getByRole("button",{name:"Queue and task review",exact:true}).click();
+  const field=page.getByPlaceholder("Send follow-up");
+  await field.fill("@README");await page.getByRole("option",{name:"README.md",exact:true}).click();
+  state.setReject("Message contains a reserved attachment reference. Remove it and use the attachment picker to attach context.");
+  const prose="Quoted prose: "+"<!-- paloma:"+"attachment:malformed";
+  await field.fill(prose);await field.press("Enter");
+  await expect(page.getByRole("alert")).toContainText("reserved attachment reference");
+  await expect(field).toHaveValue(prose);await expect(page.locator('.attach-chip')).toContainText("README.md");
+  await expect(page.locator('.queued-messages')).toHaveCount(0);
 });

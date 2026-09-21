@@ -37,7 +37,7 @@ import { getProjectCronFromJob } from "./cronSchema";
 import { loadTranscript, prefetchTranscript } from "./missionCache";
 import { cacheCanPrefetch, cacheLoad, cachePeek, cachePrefetch, cachePut, cacheRemember, prefetchProjectLimit } from "./pageCache";
 import { SidebarTree } from "./Tree";
-import type { TreeNode, TreeRow } from "./tree";
+import type { TreeNode, TreeRow } from "./treeModel";
 import { FileSkeleton } from "./Skeleton";
 
 /** Sidebar section listing the core backend's projects with their missions

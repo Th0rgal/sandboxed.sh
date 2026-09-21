@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { visibleTree, type TreeNode } from "../src/tree";
+import { visibleTree, type TreeNode } from "../src/treeModel";
 const node = (id: string, children?: TreeNode<string>[], expanded = true): TreeNode<string> => ({ id, data: id, ...(children ? { children, expanded } : {}) });
 describe("visible sidebar hierarchy", () => {
   it("terminates the project rail at Finished when its six missions are the final subtree", () => {

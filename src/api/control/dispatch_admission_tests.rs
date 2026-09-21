@@ -7350,3 +7350,81 @@ async fn http_deferred_queue_preserves_ids_order_attachments_and_restart() {
     );
     NATIVE_FIXTURES.lock().unwrap().remove(&m.id);
 }
+
+#[tokio::test]
+async fn http_reserved_attachment_prose_is_rejected_before_acceptance() {
+    let h = Harness::new().await;
+    let before = h
+        .control
+        .mission_store
+        .list_missions(100, 0)
+        .await
+        .unwrap()
+        .len();
+    let target = Uuid::new_v4();
+    for reference in ["malformed".to_string(), format!("{} -->", Uuid::new_v4())] {
+        let content = format!("Quoted prose: <!-- paloma:attachment:{reference}");
+        for attached in [false, true] {
+            let attachments = if attached {
+                json!([{"kind":"controller"}])
+            } else {
+                json!([])
+            };
+            for (path, body) in [
+                (
+                    "/missions".to_string(),
+                    json!({"prompt":content,"project":"lido","attachments":attachments}),
+                ),
+                (
+                    "/message".to_string(),
+                    json!({"content":content,"mission_id":target,"attachments":attachments}),
+                ),
+                (
+                    format!("/missions/{target}/resume"),
+                    json!({"content":content}),
+                ),
+            ] {
+                let response = h
+                    .state
+                    .http_client
+                    .post(format!("{}{path}", h.url))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert!(response
+                    .text()
+                    .await
+                    .unwrap()
+                    .contains("reserved attachment reference"));
+            }
+        }
+    }
+    assert_eq!(
+        h.control
+            .mission_store
+            .list_missions(100, 0)
+            .await
+            .unwrap()
+            .len(),
+        before
+    );
+    let queue: Value = h
+        .state
+        .http_client
+        .get(format!("{}/queue", h.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queue, json!([]));
+    assert!(!h
+        .state
+        .config
+        .working_dir
+        .join(".sandboxed-sh/message-payloads")
+        .exists());
+}
