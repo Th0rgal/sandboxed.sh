@@ -145,48 +145,6 @@ export class TranscriptReducer {
   }
 }
 
-/**
- * Punctuation that can never be an answer on its own. Deliberately narrow:
- * `---`, `***`, `|`, backticks and brackets are all meaningful Markdown and are
- * not listed, so real content is never at risk.
- */
-const FILLER_ONLY = /^[.\u2026,;]+$/;
-
-/**
- * A finalized assistant bubble holding nothing but filler punctuation, with
- * real output still to come.
- *
- * Asking OpenCode "What's the status of the Pareto audit?" produced a bare `.`
- * between two batches of tool calls, before the real answer — rendered as its
- * own paragraph, and splitting what was one stretch of work into "Worked 5
- * tools" and "Worked 1 tool". The emission comes from the model, not from an
- * adapter: nothing in the runner synthesizes it, and the bubble arrives
- * finalized rather than growing into text.
- *
- * Three conditions keep this from eating anything real:
- *  - `live` bubbles are never hidden, so a `.` that is the first token of a
- *    sentence still being streamed stays and grows normally;
- *  - something must come after it, so if `.` is all the agent ever said the
- *    user sees it rather than an empty transcript;
- *  - only sentence punctuation counts, so code, rules and tables are untouched.
- *
- * Presentation only — the underlying items, and the events behind them, are
- * unchanged.
- */
-export function isFillerBubble(item: StreamItem, index: number, items: StreamItem[]): boolean {
-  if (item.kind !== "text" || item.live) return false;
-  if (!FILLER_ONLY.test(item.text.trim())) return false;
-  // An error is not an answer: it must not license hiding the only output there
-  // was. Only real text that followed does.
-  return items.slice(index + 1).some((it) => it.kind === "text");
-}
-
-/** The transcript as shown: filler bubbles dropped, everything else intact. */
-export function withoutFiller(items: StreamItem[]): StreamItem[] {
-  const keep = items.filter((item, index) => !isFillerBubble(item, index, items));
-  return keep.length === items.length ? items : keep;
-}
-
 export function buildTranscript(events: StreamEvent[]): StreamItem[] {
   const reducer=new TranscriptReducer();
   for(const event of events)reducer.apply(event);

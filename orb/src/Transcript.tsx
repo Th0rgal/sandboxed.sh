@@ -4,7 +4,7 @@ import { MdView } from "./Markdown";
 import { createStore, reconcile } from "solid-js/store";
 import { goalDraft, GoalTag } from "./goal";
 
-import { withoutFiller, type StreamItem } from "./transcriptModel";
+import type { StreamItem } from "./transcriptModel";
 export { buildTranscript, applyStreamEvent } from "./transcriptModel";
 export type { StreamItem } from "./transcriptModel";
 
@@ -130,12 +130,9 @@ function ThinkBlock(p: { item: Extract<StreamItem, { kind: "think" }> }) {
 type WorkItem = Extract<StreamItem, { kind: "tool" | "think" }>;
 type Grouped = StreamItem | { kind: "work"; key: string; items: WorkItem[] };
 
-function groupWork(input: StreamItem[], previous: Grouped[] = []): Grouped[] {
+function groupWork(items: StreamItem[], previous: Grouped[] = []): Grouped[] {
   const cached = new Map(previous.filter(x => x.kind === "work").map(x => [x.key, x]));
   const out: Grouped[] = [];
-  // Dropping a filler bubble also rejoins the work around it, so one stretch of
-  // tool calls reads as one fold instead of being split in two by a stray ".".
-  const items = withoutFiller(input);
   for (const it of items) {
     const last = out[out.length - 1];
     if (it.kind === "tool" || it.kind === "think") {
