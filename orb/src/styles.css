@@ -1399,15 +1399,16 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 
 .cr-steer-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 0; }
 
-/* Fork uses the same searchable sheet and quiet menu rows as the composer. */
-.fork-picker { max-height: min(340px, 45vh); overflow-y: auto; margin: 14px -8px 0; padding: 0 4px; }
-.fork-group-title { padding: 12px 10px 5px; color: var(--fg-3); font-size: 11px; }
-.fork-group:first-child .fork-group-title { padding-top: 0; }
-.fork-option { display: flex; align-items: center; gap: 12px; width: 100%; padding: 9px 10px; text-align: left; border-radius: 6px; color: var(--fg-2); }
-.fork-option:hover, .fork-option:focus-visible, .fork-option[aria-pressed="true"] { background: var(--bg-active); color: var(--fg); }
-.fork-option span:first-child { flex: 1; }
-.fork-check { color: var(--fg-2); }
-.fork-empty { padding: 20px 10px; color: var(--fg-3); }
+/* Cascading harness → model menu, anchored to the conversation footer. */
+.fork-anchor { position: relative; }
+.fork-cascade { position: absolute; bottom: 25px; left: 0; display: flex; align-items: flex-end; z-index: 80; gap: 3px; }
+.fork-cascade .menu { position: static; min-width: 180px; max-height: min(440px, 65vh); overflow-y: auto; }
+.fork-cascade .fork-models { width: 240px; }
+.fork-cascade .menu-item { width: 100%; text-align: left; }
+.fork-cascade .menu-item > span:first-child { flex: 1; }
+.fork-chevron { margin-left: auto; color: var(--fg-3); }
+.fork-harnesses [aria-expanded="true"] { background: var(--bg-active); }
+.fork-cascade .st-error { white-space: normal; max-width: 220px; padding: 8px; }
 .fork-efforts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding-top: 14px; color: var(--fg-3); font-size: 11px; }
 .fork-efforts > span { margin-right: 8px; }
 .fork-efforts button { padding: 4px 7px; border-radius: 5px; color: var(--fg-2); }
@@ -1422,4 +1423,4 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 button.fork-trigger { color: inherit; cursor: pointer; }
 button.fork-trigger:hover { color: var(--fg); }
 
-.prompt-sheet:has(.fork-picker) { width: min(520px, calc(100vw - 36px)); background: var(--menu-bg); }
+

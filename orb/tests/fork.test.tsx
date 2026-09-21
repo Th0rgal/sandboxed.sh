@@ -16,10 +16,8 @@ it("forks into a new mission without changing or stopping the running source", a
   const stop = vi.spyOn(api, "cancelMission");
   const opened = vi.fn();
   const ui = render(() => <ForkMission mission={mission} choices={choices} destination="DGX Spark" onClose={() => {}} onFork={opened} />);
-  expect(ui.container.textContent).toContain("Files are shared");
-  fireEvent.input(ui.getByLabelText("Search models"), { target: { value: "astra" } });
-  fireEvent.click(ui.getByRole("button", { name: /GPT-6 Astra/ }));
-  fireEvent.click(ui.getByRole("button", { name: "Fork and continue" }));
+  fireEvent.click(ui.getByRole("menuitem", { name: "Codex" }));
+  fireEvent.click(ui.getByRole("menuitem", { name: /GPT-6 Astra/ }));
   await waitFor(() => expect(opened).toHaveBeenCalledWith(expect.objectContaining({ id: "fork" })));
   expect(fork).toHaveBeenCalledWith("source", expect.objectContaining({ backend: "codex", model_override: "gpt-6-astra" }));
   expect(update).not.toHaveBeenCalled(); expect(stop).not.toHaveBeenCalled();
