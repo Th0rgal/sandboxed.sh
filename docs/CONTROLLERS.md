@@ -271,9 +271,17 @@ A tick acknowledges only the steer IDs it actually read and handled, using
 Cron deliveries and `[CTRL:]` trailers never clear it: another order may have
 arrived during the tick, or fallen outside the bounded inbox read.
 
-Orb attachments are local mission context. Follow-ups get separate snapshots
-under `.paloma/messages/<id>/.paloma/`; the durable queued message references its
-own manifest. A later send cannot replace an earlier send's files. The manifest
+Orb attachments are local mission context. Before queue acceptance, follow-ups
+save immutable snapshots in private server storage keyed by mission and message
+ID. The durable queue carries that reference, including through deferred-goal
+aggregation and replay. Only turn dispatch copies the snapshot into
+`.paloma/messages/<message-id>/.paloma/`; queued or rejected sends never write to
+the running mission's workspace. Retries keep the accepted file version, and a
+missing snapshot or failed destination write fails the turn explicitly. Initial
+mission sidecars are saved before publishing the scheduler's deferred-goal ticket.
+Failed saves fail the creation and release its reservations; coalesced retries
+verify that the requested attachment selections were actually saved.
+A later send cannot replace an earlier send's files. The manifest
 records missing, secret, linked, oversized and capped files. Source symlinks and
 hard links are excluded; destination writes do not follow symlinks. Limits are
 16 attachments, 512 KiB per file, 40 files / 256 KiB per folder, and a bounded

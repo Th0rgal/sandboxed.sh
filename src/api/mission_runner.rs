@@ -3565,6 +3565,9 @@ async fn run_mission_turn(
 ) -> AgentResult {
     #[cfg(test)]
     if let Some(result) = super::control::dispatch_admission_tests::native_goal_fixture(
+        &config,
+        &workspaces,
+        mission_store.as_ref(),
         mission_id,
         &user_message,
         events_tx.clone(),
@@ -3844,27 +3847,20 @@ async fn run_mission_turn(
         mission_work_dir
     };
 
-    let user_message =
-        match crate::api::mission_payload::read_sidecar(&config.working_dir, mission_id) {
-            Ok(Some(payload)) if !payload.attachments.is_empty() => {
-                let Some(project) = payload.project.as_deref() else {
-                    return AgentResult::failure("attachments require a project", 0);
-                };
-                let files_root =
-                    crate::api::mission_payload::project_files_root(&config.working_dir, project);
-                if let Err(error) = crate::api::mission_payload::materialize(
-                    &mission_work_dir,
-                    &files_root,
-                    &payload,
-                ) {
-                    return AgentResult::failure(format!("materialize attachments: {error}"), 0);
-                }
+    let user_message = match crate::api::mission_payload::materialize_turn(
+        &config.working_dir,
+        &mission_work_dir,
+        mission_id,
+        &user_message,
+    ) {
+        Ok(message) => {
+            if message != user_message {
                 convo.push_str("\nRead attached context in `.paloma/attach.md`.\n");
-                format!("{user_message}\n\nRead attached context in `.paloma/attach.md`.")
             }
-            Ok(_) => user_message,
-            Err(e) => return AgentResult::failure(format!("read attachments: {e}"), 0),
-        };
+            message
+        }
+        Err(error) => return AgentResult::failure(format!("materialize attachments: {error}"), 0),
+    };
 
     // For Telegram missions, append channel instructions and memory awareness
     // to CLAUDE.md so the backend LLM adopts the bot persona.

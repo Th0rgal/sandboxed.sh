@@ -1893,18 +1893,6 @@ impl AssistantMcp {
                 }),
             },
             ToolDefinition {
-                name: "add_project_steer".to_string(),
-                description: "Queue a one-off operator order for the project's next controller tick. Pending steers appear on get_situation / get_project and outrank “nothing to do”; acknowledge only handled IDs using update_project_status.consumed_steer_ids. This is not a grant — standing authority still uses set_project_grant.".to_string(),
-                input_schema: json!({
-                    "type": "object",
-                    "required": ["slug", "body"],
-                    "properties": {
-                        "slug": {"type": "string"},
-                        "body": {"type": "string", "description": "What the next tick must acknowledge and act on."}
-                    }
-                }),
-            },
-            ToolDefinition {
                 name: "set_project_grant".to_string(),
                 description: "Record the owner's autonomy grant for a project after they answer the setup questions: the normalized autonomy level, merge authority, budget, parallel missions, pause reason + machine-checkable resume condition, and the material-report bar. The project must already exist.".to_string(),
                 input_schema: json!({
@@ -1919,6 +1907,18 @@ impl AssistantMcp {
                         "pause_reason": {"type": "string"},
                         "resume_condition": {"type": "string", "description": "A condition you can check yourself, e.g. 'FTDI device enumerates on spark-de79'."},
                         "material_bar": {"type": "string"}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "add_project_steer".to_string(),
+                description: "Queue a one-off operator order for the project's next controller tick. Pending steers appear on get_situation / get_project and outrank “nothing to do”; acknowledge only handled IDs using update_project_status.consumed_steer_ids. This is not a grant — standing authority still uses set_project_grant.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["slug", "body"],
+                    "properties": {
+                        "slug": {"type": "string"},
+                        "body": {"type": "string", "description": "What the next tick must acknowledge and act on."}
                     }
                 }),
             },

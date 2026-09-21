@@ -3,6 +3,8 @@
 //! Paloma writes `.paloma/attach/…`, `.paloma/controller.md`, and
 //! `.paloma/attach.md`. Vendor CLIs only see paths.
 
+use base64::Engine;
+use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -45,6 +47,9 @@ fn directory(path: &Path, create: bool) -> Result<File, String> {
                 if create {
                     let c = CString::new(name.as_bytes()).map_err(|_| "invalid path")?;
                     let result = unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o700) };
+                    if result == 0 {
+                        dir.sync_all().map_err(|e| e.to_string())?;
+                    }
                     if result != 0
                         && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
                     {
@@ -66,6 +71,10 @@ fn bounded_read(path: &Path, cap: usize) -> Result<Vec<u8>, String> {
         path.file_name().ok_or("missing name")?,
         libc::O_RDONLY | libc::O_NONBLOCK,
     )?;
+    bounded_read_file(file, cap)
+}
+
+fn bounded_read_file(file: File, cap: usize) -> Result<Vec<u8>, String> {
     let meta = file.metadata().map_err(|e| e.to_string())?;
     if !meta.is_file() || meta.nlink() != 1 {
         return Err("not a regular single-link file".into());
@@ -81,6 +90,10 @@ fn bounded_read(path: &Path, cap: usize) -> Result<Vec<u8>, String> {
 }
 
 fn safe_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    atomic_write(path, bytes, false).map(|_| ())
+}
+
+fn atomic_write(path: &Path, bytes: &[u8], exclusive: bool) -> Result<bool, String> {
     let parent = directory(path.parent().ok_or("missing parent")?, true)?;
     let name = CString::new(path.file_name().ok_or("missing name")?.as_bytes())
         .map_err(|_| "invalid path")?;
@@ -95,19 +108,34 @@ fn safe_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         file.write_all(bytes).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
         let rc = unsafe {
-            libc::renameat(
-                parent.as_raw_fd(),
-                temp_name.as_ptr(),
-                parent.as_raw_fd(),
-                name.as_ptr(),
-            )
+            if exclusive {
+                libc::renameat2(
+                    parent.as_raw_fd(),
+                    temp_name.as_ptr(),
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            } else {
+                libc::renameat(
+                    parent.as_raw_fd(),
+                    temp_name.as_ptr(),
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                )
+            }
         };
         if rc != 0 {
-            return Err(std::io::Error::last_os_error().to_string());
+            let error = std::io::Error::last_os_error();
+            if exclusive && error.raw_os_error() == Some(libc::EEXIST) {
+                return Ok(false);
+            }
+            return Err(error.to_string());
         }
-        Ok(())
+        parent.sync_all().map_err(|e| e.to_string())?;
+        Ok(true)
     })();
-    if result.is_err() {
+    if exclusive || result.is_err() {
         unsafe {
             libc::unlinkat(parent.as_raw_fd(), temp_name.as_ptr(), 0);
         }
@@ -147,7 +175,7 @@ pub struct MissionPayload {
     pub controller_md: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaterializeReport {
     pub written: Vec<String>,
     pub skipped: Vec<String>,
@@ -185,8 +213,10 @@ pub fn read_sidecar(
     mission_id: Uuid,
 ) -> Result<Option<MissionPayload>, String> {
     let path = sidecar_path(working_dir, mission_id);
-    if !path.exists() {
-        return Ok(None);
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+        Ok(_) => {}
     }
     let raw = bounded_read(&path, 2 * 1024 * 1024)?;
     serde_json::from_slice(&raw)
@@ -242,20 +272,29 @@ pub fn materialize(
     project_files_root: &Path,
     payload: &MissionPayload,
 ) -> Result<MaterializeReport, String> {
-    let paloma = cwd.join(".paloma");
+    let (files, report) = prepare(project_files_root, payload)?;
+    for (path, bytes) in files {
+        safe_write(&cwd.join(path), &bytes)?;
+    }
+    Ok(report)
+}
+
+fn prepare(
+    project_files_root: &Path,
+    payload: &MissionPayload,
+) -> Result<(BTreeMap<String, Vec<u8>>, MaterializeReport), String> {
     validate(payload)?;
-    directory(&paloma.join("attach"), true)?;
+    let mut files = BTreeMap::new();
     let mut report = MaterializeReport::default();
     let mut manifest = String::from("# Attached context\n\nYou were given these paths. Read them; do not invent Paloma-specific `@` syntax.\n\n");
 
     for attachment in &payload.attachments {
         match attachment.kind {
             AttachmentKind::Controller => {
-                let dest = paloma.join("controller.md");
                 let body = payload.controller_md.as_deref().unwrap_or(
                     "# Controller snapshot\n\nNo controller snapshot was available when this mission started.\n",
                 );
-                safe_write(&dest, body.as_bytes())?;
+                files.insert(".paloma/controller.md".into(), body.as_bytes().to_vec());
                 report.written.push(".paloma/controller.md".into());
                 manifest.push_str("- `.paloma/controller.md` — controller snapshot (grant, last `[CTRL:]`, tracks, live missions, pending steers)\n");
             }
@@ -267,10 +306,6 @@ pub fn materialize(
                     continue;
                 }
                 let src = project_files_root.join(&rel);
-                if !src.is_file() {
-                    report.skipped.push(format!("{rel_str} (missing)"));
-                    continue;
-                }
                 let bytes = match bounded_read(&src, FILE_BYTE_CAP) {
                     Ok(bytes) => bytes,
                     Err(error) => {
@@ -278,15 +313,8 @@ pub fn materialize(
                         continue;
                     }
                 };
-                if bytes.len() > FILE_BYTE_CAP {
-                    report
-                        .skipped
-                        .push(format!("{rel_str} (over {FILE_BYTE_CAP} bytes)"));
-                    continue;
-                }
-                let dest = paloma.join("attach").join(&rel);
-                safe_write(&dest, &bytes)?;
                 let dest_rel = format!(".paloma/attach/{rel_str}");
+                files.insert(dest_rel.clone(), bytes);
                 report.written.push(dest_rel.clone());
                 manifest.push_str(&format!("- `{dest_rel}` (from `{rel_str}`)\n"));
             }
@@ -294,23 +322,33 @@ pub fn materialize(
                 let rel = safe_rel(attachment.path.as_deref().unwrap_or(""))?;
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
                 let src_dir = project_files_root.join(&rel);
-                if !src_dir.is_dir() {
-                    report.skipped.push(format!("{rel_str}/ (missing)"));
-                    continue;
-                }
-                let mut files = Vec::new();
+                let src_dir = match directory(&src_dir, false) {
+                    Ok(dir) => dir,
+                    Err(error) => {
+                        report.skipped.push(format!("{rel_str}/ ({error})"));
+                        continue;
+                    }
+                };
+                let mut folder_files = Vec::new();
                 let mut visited = 0;
-                collect_files(&src_dir, &rel, &mut files, &mut visited, 0, &mut report);
-                files.sort();
+                collect_files(
+                    &src_dir,
+                    &rel,
+                    &mut folder_files,
+                    &mut visited,
+                    0,
+                    &mut report,
+                );
+                folder_files.sort_by(|a, b| a.0.cmp(&b.0));
                 let mut used = 0usize;
                 let mut count = 0usize;
-                for (rel_file, abs) in files {
+                for (rel_file, file) in folder_files {
                     let rel_file_str = rel_file.to_string_lossy().replace('\\', "/");
                     if is_secret_path(&rel_file_str) {
                         report.skipped.push(format!("{rel_file_str} (secret)"));
                         continue;
                     }
-                    let meta = match std::fs::metadata(&abs) {
+                    let meta = match file.metadata() {
                         Ok(meta) => meta,
                         Err(_) => continue,
                     };
@@ -322,7 +360,7 @@ pub fn materialize(
                         report.skipped.push(format!("{rel_file_str} (folder cap)"));
                         continue;
                     }
-                    let bytes = match bounded_read(&abs, FOLDER_BYTE_CAP - used) {
+                    let bytes = match bounded_read_file(file, FOLDER_BYTE_CAP - used) {
                         Ok(bytes) => bytes,
                         Err(error) => {
                             report.truncated = true;
@@ -330,11 +368,10 @@ pub fn materialize(
                             continue;
                         }
                     };
-                    let dest = paloma.join("attach").join(&rel_file);
-                    safe_write(&dest, &bytes)?;
                     used += bytes.len();
                     count += 1;
                     let dest_rel = format!(".paloma/attach/{rel_file_str}");
+                    files.insert(dest_rel.clone(), bytes);
                     report.written.push(dest_rel.clone());
                     manifest.push_str(&format!("- `{dest_rel}` (from `{rel_file_str}`)\n"));
                 }
@@ -353,9 +390,9 @@ pub fn materialize(
             manifest.push_str(&format!("- {skip}\n"));
         }
     }
-    safe_write(&paloma.join("attach.md"), manifest.as_bytes())?;
+    files.insert(".paloma/attach.md".into(), manifest.into_bytes());
     report.written.push(".paloma/attach.md".into());
-    Ok(report)
+    Ok((files, report))
 }
 
 pub fn validate(payload: &MissionPayload) -> Result<(), String> {
@@ -389,46 +426,194 @@ pub fn validate(payload: &MissionPayload) -> Result<(), String> {
 }
 
 fn collect_files(
-    dir: &Path,
+    dir: &File,
     prefix: &Path,
-    out: &mut Vec<(PathBuf, PathBuf)>,
+    out: &mut Vec<(PathBuf, File)>,
     visited: &mut usize,
     depth: usize,
     report: &mut MaterializeReport,
 ) {
-    if depth > 32 || *visited >= 4000 {
+    if depth > 32 || *visited >= 4000 || out.len() >= FOLDER_FILE_CAP {
         report.truncated = true;
         return;
     }
-    if directory(dir, false).is_err() {
-        return;
-    }
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return;
+    // Linux procfs exposes this already-open descriptor. Keep it alive while
+    // enumerating and open every child relative to it, never via a raced path.
+    let read = match std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd())) {
+        Ok(read) => read,
+        Err(error) => {
+            report
+                .skipped
+                .push(format!("{} ({error})", prefix.display()));
+            return;
+        }
     };
-    for entry in read.flatten() {
-        *visited += 1;
-        if *visited > 4000 {
+    for entry in read {
+        if *visited >= 4000 || out.len() >= FOLDER_FILE_CAP {
             report.truncated = true;
             break;
         }
+        *visited += 1;
+        let Ok(entry) = entry else {
+            report
+                .skipped
+                .push(format!("{} (unreadable entry)", prefix.display()));
+            continue;
+        };
         let rel = prefix.join(entry.file_name());
         if is_secret_path(&rel.to_string_lossy()) {
             report.skipped.push(format!("{} (secret)", rel.display()));
             continue;
         }
-        let Ok(kind) = entry.file_type() else {
-            continue;
+        let file = match open_child(dir, &entry.file_name(), libc::O_RDONLY | libc::O_NONBLOCK) {
+            Ok(file) => file,
+            Err(error) => {
+                report.skipped.push(format!("{} ({error})", rel.display()));
+                continue;
+            }
         };
-        if kind.is_symlink() {
-            continue;
-        }
-        if kind.is_dir() {
-            collect_files(&entry.path(), &rel, out, visited, depth + 1, report);
-        } else if kind.is_file() {
-            out.push((rel, entry.path()));
+        let Ok(meta) = file.metadata() else { continue };
+        if meta.is_dir() {
+            collect_files(&file, &rel, out, visited, depth + 1, report);
+        } else if meta.is_file() {
+            out.push((rel, file));
+        } else {
+            report
+                .skipped
+                .push(format!("{} (not a regular file)", rel.display()));
         }
     }
+}
+
+// Queue content carries a durable, mission-scoped reference. Keeping the ID in
+// the reference also survives the scheduler combining deferred messages or
+// assigning a new dispatch ID. Only this exact server format is resolved; paths
+// from prose are never opened. Snapshots are immutable once published.
+const SNAPSHOT_MARKER: &str = "<!-- paloma:attachment:";
+const SNAPSHOT_CAP: usize = 16 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+struct MessageSnapshot {
+    mission_id: Uuid,
+    message_id: Uuid,
+    content: String,
+    payload: MissionPayload,
+    files: BTreeMap<String, String>, // base64, including the manifest
+    report: MaterializeReport,
+}
+
+fn message_snapshot_path(working_dir: &Path, mission_id: Uuid, message_id: Uuid) -> PathBuf {
+    working_dir
+        .join(".sandboxed-sh/message-payloads")
+        .join(mission_id.to_string())
+        .join(format!("{message_id}.json"))
+}
+
+pub fn stage_message(
+    working_dir: &Path,
+    mission_id: Uuid,
+    message_id: Uuid,
+    content: &str,
+    payload: &MissionPayload,
+) -> Result<(String, MaterializeReport), String> {
+    validate(payload)?;
+    let path = message_snapshot_path(working_dir, mission_id, message_id);
+    if !path.try_exists().map_err(|e| e.to_string())? {
+        let project = payload
+            .project
+            .as_deref()
+            .ok_or("attachments require a project")?;
+        let (files, report) = prepare(&project_files_root(working_dir, project), payload)?;
+        let snapshot = MessageSnapshot {
+            mission_id,
+            message_id,
+            content: content.into(),
+            payload: payload.clone(),
+            report,
+            files: files
+                .into_iter()
+                .map(|(p, bytes)| (p, base64::engine::general_purpose::STANDARD.encode(bytes)))
+                .collect(),
+        };
+        let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?;
+        if bytes.len() > SNAPSHOT_CAP {
+            return Err("attachment snapshot too large".into());
+        }
+        // A competing retry may win publication. Read and verify the winner;
+        // never overwrite the context attached to an already accepted ID.
+        atomic_write(&path, &bytes, true)?;
+    }
+    let snapshot = read_message_snapshot(working_dir, mission_id, message_id)?;
+    if snapshot.content != content
+        || snapshot.payload.attachments != payload.attachments
+        || snapshot.payload.project != payload.project
+    {
+        return Err("message ID already has different attachment content".into());
+    }
+    let relative = format!(".paloma/messages/{message_id}");
+    Ok((format!("{content}\n\n{SNAPSHOT_MARKER}{message_id} -->\nAttached context: read `{relative}/.paloma/attach.md` (paths in that manifest are relative to `{relative}`)."), snapshot.report))
+}
+
+fn read_message_snapshot(
+    working_dir: &Path,
+    mission_id: Uuid,
+    message_id: Uuid,
+) -> Result<MessageSnapshot, String> {
+    let bytes = bounded_read(
+        &message_snapshot_path(working_dir, mission_id, message_id),
+        SNAPSHOT_CAP,
+    )?;
+    let snapshot: MessageSnapshot = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if snapshot.mission_id != mission_id || snapshot.message_id != message_id {
+        return Err("attachment identity mismatch".into());
+    }
+    Ok(snapshot)
+}
+
+pub fn materialize_turn(
+    working_dir: &Path,
+    cwd: &Path,
+    mission_id: Uuid,
+    content: &str,
+) -> Result<String, String> {
+    let mut content = content.to_owned();
+    if let Some(payload) = read_sidecar(working_dir, mission_id)? {
+        if !payload.attachments.is_empty() {
+            let project = payload
+                .project
+                .as_deref()
+                .ok_or("attachments require a project")?;
+            materialize(cwd, &project_files_root(working_dir, project), &payload)?;
+            content.push_str("\n\nRead attached context in `.paloma/attach.md`.");
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for part in content.split(SNAPSHOT_MARKER).skip(1) {
+        let id = part
+            .split_once(" -->")
+            .ok_or("invalid attachment reference")?
+            .0;
+        let id = Uuid::parse_str(id).map_err(|_| "invalid attachment ID")?;
+        if !seen.insert(id) {
+            continue;
+        }
+        if seen.len() > 64 {
+            return Err("too many attachment references in one turn".into());
+        }
+        let snapshot = read_message_snapshot(working_dir, mission_id, id)?;
+        let dest = cwd.join(format!(".paloma/messages/{id}"));
+        for (path, encoded) in snapshot.files {
+            let path = safe_rel(&path)?;
+            if !path.starts_with(".paloma") {
+                return Err("invalid snapshot file".into());
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|e| e.to_string())?;
+            safe_write(&dest.join(path), &bytes)?;
+        }
+    }
+    Ok(content)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -717,6 +902,205 @@ mod tests {
             );
             assert!(tmp.path().join(version).join(".paloma/attach.md").is_file());
         }
+    }
+
+    #[test]
+    fn source_top_folder_and_ancestor_symlinks_are_skipped() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("files");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(outside.join("nested")).unwrap();
+        std::fs::write(outside.join("nested/private"), "must not copy").unwrap();
+        symlink(&outside, root.join("top")).unwrap();
+        for path in ["top", "top/nested"] {
+            let payload = MissionPayload {
+                attachments: vec![MissionAttachment {
+                    kind: AttachmentKind::Folder,
+                    path: Some(path.into()),
+                }],
+                ..Default::default()
+            };
+            let (files, report) = prepare(&root, &payload).unwrap();
+            assert_eq!(files.len(), 1, "only manifest, {path}");
+            assert!(!report.skipped.is_empty(), "explain top folder exclusion");
+        }
+        let dir = directory(&outside, false).unwrap();
+        std::fs::rename(&outside, tmp.path().join("moved")).unwrap();
+        symlink(&root, &outside).unwrap();
+        let mut files = Vec::new();
+        let mut report = MaterializeReport::default();
+        collect_files(
+            &dir,
+            Path::new("original"),
+            &mut files,
+            &mut 0,
+            0,
+            &mut report,
+        );
+        assert_eq!(
+            files.len(),
+            1,
+            "enumeration stays attached to the opened directory"
+        );
+        assert_eq!(
+            bounded_read_file(files.pop().unwrap().1, 100).unwrap(),
+            b"must not copy"
+        );
+    }
+
+    #[test]
+    fn folder_traversal_stops_at_file_entry_and_depth_caps() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..100 {
+            std::fs::write(tmp.path().join(format!("f{i}")), "x").unwrap();
+        }
+        let dir = directory(tmp.path(), false).unwrap();
+        let mut files = Vec::new();
+        let mut visited = 0;
+        let mut report = MaterializeReport::default();
+        collect_files(
+            &dir,
+            Path::new("notes"),
+            &mut files,
+            &mut visited,
+            0,
+            &mut report,
+        );
+        assert_eq!(files.len(), FOLDER_FILE_CAP);
+        assert_eq!(visited, FOLDER_FILE_CAP);
+        assert!(report.truncated);
+        files.clear();
+        visited = 3999;
+        collect_files(
+            &dir,
+            Path::new("notes"),
+            &mut files,
+            &mut visited,
+            0,
+            &mut report,
+        );
+        assert_eq!(visited, 4000);
+        assert_eq!(files.len(), 1);
+        files.clear();
+        collect_files(
+            &dir,
+            Path::new("notes"),
+            &mut files,
+            &mut 0,
+            33,
+            &mut report,
+        );
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn staged_messages_are_immutable_scoped_and_replayed_only_at_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = project_files_root(tmp.path(), "lido");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note"), "accepted version").unwrap();
+        let payload = MissionPayload {
+            project: Some("lido".into()),
+            attachments: vec![MissionAttachment {
+                kind: AttachmentKind::File,
+                path: Some("note".into()),
+            }],
+            ..Default::default()
+        };
+        let mid = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let (message, _) = stage_message(tmp.path(), mid, id, "read", &payload).unwrap();
+        assert!(!cwd.exists());
+        std::fs::write(root.join("note"), "later version").unwrap();
+        assert_eq!(
+            stage_message(tmp.path(), mid, id, "read", &payload)
+                .unwrap()
+                .0,
+            message
+        );
+        assert!(stage_message(tmp.path(), mid, id, "different", &payload).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+        // Reconstruct from the durable reference alone, including a scheduler
+        // prompt containing multiple original message references.
+        let combined = format!("{message}\n{message}");
+        materialize_turn(tmp.path(), &cwd, mid, &combined).unwrap();
+        let copied = cwd.join(format!(".paloma/messages/{id}/.paloma/attach/note"));
+        assert_eq!(
+            std::fs::read_to_string(&copied).unwrap(),
+            "accepted version"
+        );
+        std::fs::remove_dir_all(&cwd).unwrap();
+        materialize_turn(tmp.path(), &cwd, mid, &message).unwrap();
+        assert_eq!(std::fs::read_to_string(copied).unwrap(), "accepted version");
+        assert!(materialize_turn(tmp.path(), &cwd, Uuid::new_v4(), &message).is_err());
+        std::fs::remove_file(message_snapshot_path(tmp.path(), mid, id)).unwrap();
+        assert!(
+            materialize_turn(tmp.path(), &cwd, mid, &message).is_err(),
+            "missing payload cannot silently dispatch"
+        );
+    }
+
+    #[test]
+    fn dispatch_rejects_destination_ancestor_and_top_folder_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = project_files_root(tmp.path(), "lido");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note"), "data").unwrap();
+        let payload = MissionPayload {
+            project: Some("lido".into()),
+            attachments: vec![MissionAttachment {
+                kind: AttachmentKind::File,
+                path: Some("note".into()),
+            }],
+            ..Default::default()
+        };
+        let mid = Uuid::new_v4();
+        let (message, _) =
+            stage_message(tmp.path(), mid, Uuid::new_v4(), "read", &payload).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let alias = tmp.path().join("alias");
+        symlink(&outside, &alias).unwrap();
+        for cwd in [alias.clone(), alias.join("nested")] {
+            assert!(materialize_turn(tmp.path(), &cwd, mid, &message).is_err());
+        }
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn dispatch_uses_resolved_container_cwd_and_relative_manifest_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("workspace/checkout")).unwrap();
+        let files = project_files_root(tmp.path(), "lido");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::write(files.join("note"), "container context").unwrap();
+        let payload = MissionPayload {
+            project: Some("lido".into()),
+            attachments: vec![MissionAttachment {
+                kind: AttachmentKind::File,
+                path: Some("note".into()),
+            }],
+            ..Default::default()
+        };
+        let mid = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let (message, _) = stage_message(tmp.path(), mid, id, "read", &payload).unwrap();
+        let cwd = super::super::mission_runner::resolve_mission_working_directory(
+            &rootfs,
+            crate::workspace::WorkspaceType::Container,
+            "/workspace/checkout",
+        )
+        .unwrap();
+        materialize_turn(tmp.path(), &cwd, mid, &message).unwrap();
+        let relative = format!(".paloma/messages/{id}/.paloma/attach.md");
+        assert!(message.contains(&relative));
+        assert!(!message.contains(rootfs.to_str().unwrap()));
+        assert!(rootfs.join("workspace/checkout").join(relative).is_file());
     }
 
     #[test]

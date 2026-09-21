@@ -4969,42 +4969,18 @@ pub async fn post_message(
                 );
             }
         }
-        let workspace = workspace::resolve_workspace(
-            &state.workspaces,
-            &state.config,
-            Some(mission.workspace_id),
+        let (content, report) = crate::api::mission_payload::stage_message(
+            &state.config.working_dir,
+            mid,
+            id,
+            &content,
+            &payload,
         )
-        .await;
-        let cwd = match mission.working_directory.as_deref() {
-            Some(requested) => super::mission_runner::resolve_mission_working_directory(
-                &workspace.path,
-                workspace.workspace_type,
-                requested,
-            )
-            .map_err(|e| (StatusCode::BAD_REQUEST, e))?,
-            None => workspace::mission_workspace_dir_for_workspace(&workspace, mid),
-        };
-        let project = payload.project.as_deref().ok_or((
-            StatusCode::BAD_REQUEST,
-            "attachments require a project".into(),
-        ))?;
-        crate::api::mission_payload::validate(&payload)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-        let files =
-            crate::api::mission_payload::project_files_root(&state.config.working_dir, project);
-        // The durable queue already persists content. A unique immutable overlay
-        // makes that content reference the exact snapshot for this send, including
-        // native live steering; no mission-wide sidecar is overwritten.
-        let relative = format!(".paloma/messages/{}", Uuid::new_v4());
-        let report =
-            crate::api::mission_payload::materialize(&cwd.join(&relative), &files, &payload)
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("attachments: {e}")))?;
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("attachments: {e}")))?;
         if !report.skipped.is_empty() || report.truncated {
-            warnings.push(format!(
-                "Some attachments were skipped or capped; see {relative}/.paloma/attach.md"
-            ));
+            warnings.push(format!("Some attachments were skipped or capped; see .paloma/messages/{id}/.paloma/attach.md"));
         }
-        format!("{content}\n\nAttached context: read `{relative}/.paloma/attach.md` (paths in that manifest are relative to `{relative}`).")
+        content
     } else {
         content
     };
@@ -9933,6 +9909,23 @@ async fn interrupt_new_mission(control: &ControlState, mission_id: Uuid, reason:
     });
 }
 
+// Coalescing a create must not acknowledge attachment selections that were
+// never saved on the existing mission. New context belongs in a follow-up.
+fn verify_coalesced_attachments(
+    config: &Config,
+    req: &CreateMissionRequest,
+    existing: &Mission,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(attachments) = req.attachments.as_ref().filter(|a| !a.is_empty()) {
+        let saved = crate::api::mission_payload::read_sidecar(&config.working_dir, existing.id)
+            .map_err(internal_error)?;
+        if !saved.is_some_and(|p| p.attachments == *attachments && p.project == req.project) {
+            return Err((StatusCode::CONFLICT, format!("mission {} already exists with different or unavailable attachments; send the attachments as a follow-up or use a distinct title", existing.id)));
+        }
+    }
+    Ok(())
+}
+
 pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -10055,6 +10048,7 @@ pub async fn create_mission(
                     // rejected remote submission) is not the work the retry
                     // asks for; only live or finished attempts coalesce.
                     if existing.status != MissionStatus::Failed {
+                        verify_coalesced_attachments(&state.config, &req, &existing)?;
                         tracing::info!(
                             mission_id = %existing.id,
                             idempotency_key = key,
@@ -10088,6 +10082,7 @@ pub async fn create_mission(
         )
         .await
         {
+            verify_coalesced_attachments(&state.config, &req, &existing)?;
             tracing::info!(
                 mission_id = %existing.id,
                 title = %title,
@@ -11107,6 +11102,61 @@ pub async fn create_mission(
         mission.origin_session_id = origin_session_id.map(str::to_string);
     }
 
+    // Persist attachments before publishing the deferred-goal dispatch ticket.
+    // The scheduler can run at every await after set_deferred_goal.
+    if let Some(attachments) = req.attachments.as_ref().filter(|rows| !rows.is_empty()) {
+        let mut payload = crate::api::mission_payload::MissionPayload {
+            attachments: attachments.clone(),
+            project: mission.project.project.clone(),
+            controller_md: None,
+        };
+        if attachments
+            .iter()
+            .any(|row| row.kind == crate::api::mission_payload::AttachmentKind::Controller)
+        {
+            if let Some(project) = mission.project.project.as_deref() {
+                payload.controller_md = Some(
+                    super::projects_overview::controller_snapshot_markdown(&state, project).await,
+                );
+            }
+        }
+        if let Err(error) = crate::api::mission_payload::write_sidecar(
+            &state.config.working_dir,
+            mission.id,
+            &payload,
+        ) {
+            // A retry must not coalesce onto a half-created mission and report
+            // success while discarding both its prompt and attachments.
+            control
+                .mission_store
+                .update_mission_status_with_reason(
+                    mission.id,
+                    MissionStatus::Failed,
+                    Some("attachment_persistence_failed"),
+                )
+                .await
+                .map_err(internal_error)?;
+            state
+                .projects
+                .release_leases_for_attempt(&mission.id.to_string())
+                .map_err(internal_error)?;
+            release_local_mission_disk(&state.config, mission.id)
+                .await
+                .map_err(internal_error)?;
+            let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                completion: None,
+                execution: None,
+                mission_id: mission.id,
+                status: MissionStatus::Failed,
+                summary: Some("attachment_persistence_failed".into()),
+            });
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persist attachments: {error}"),
+            ));
+        }
+    }
+
     // Atomic create+start: stash the initial prompt as the deferred goal. The
     // FLEET-001 scheduler pass (every ~5s) dispatches pending missions with a
     // deferred goal as soon as parallel capacity allows, honoring `not_before`
@@ -11161,31 +11211,6 @@ pub async fn create_mission(
             source: Some(format!("api:{}", user.id)),
         });
         initial_prompt = Some((prompt_event_id, prompt));
-    }
-
-    if let Some(attachments) = req.attachments.as_ref().filter(|rows| !rows.is_empty()) {
-        let mut payload = crate::api::mission_payload::MissionPayload {
-            attachments: attachments.clone(),
-            project: mission.project.project.clone(),
-            controller_md: None,
-        };
-        if attachments
-            .iter()
-            .any(|row| row.kind == crate::api::mission_payload::AttachmentKind::Controller)
-        {
-            if let Some(project) = mission.project.project.as_deref() {
-                payload.controller_md = Some(
-                    super::projects_overview::controller_snapshot_markdown(&state, project).await,
-                );
-            }
-        }
-        crate::api::mission_payload::write_sidecar(&state.config.working_dir, mission.id, &payload)
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("persist attachments: {e}"),
-                )
-            })?;
     }
 
     if let (Some(remote_node_id), Some(remote_plan)) =
@@ -26491,6 +26516,9 @@ async fn run_single_control_turn(
     #[cfg(test)]
     if let Some(mid) = mission_id {
         if let Some(result) = dispatch_admission_tests::native_goal_fixture(
+            &config,
+            &workspaces,
+            Some(&mission_store),
             mid,
             &user_message,
             events_tx.clone(),
@@ -26592,6 +26620,25 @@ async fn run_single_control_turn(
                 config.working_dir.clone(),
             )),
         )
+    };
+
+    let user_message = if let Some(mid) = mission_id {
+        match crate::api::mission_payload::materialize_turn(
+            &config.working_dir,
+            &working_dir_path,
+            mid,
+            &user_message,
+        ) {
+            Ok(message) => message,
+            Err(error) => {
+                return crate::agents::AgentResult::failure(
+                    format!("materialize attachments: {error}"),
+                    0,
+                )
+            }
+        }
+    } else {
+        user_message
     };
 
     if let Some(ws) = runtime_workspace.as_ref() {
