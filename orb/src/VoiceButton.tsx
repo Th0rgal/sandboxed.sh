@@ -79,7 +79,8 @@ const fmt = (ms: number) => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 };
 
-const WAVE_BARS = 120;
+const WAVE_BARS = 40;
+const WAVE_ENV = Array.from({ length: WAVE_BARS }, (_, i) => Math.sin((i / (WAVE_BARS - 1)) * Math.PI));
 const silentWave = () => Array.from({ length: WAVE_BARS }, () => 0);
 
 export function VoiceButton(p: {
@@ -104,6 +105,9 @@ export function VoiceButton(p: {
   let rec: Recorder | null = null;
   let tick: number | undefined;
   let errTimer: number | undefined;
+  let waveRaf = 0;
+  let pendingLevel = 0;
+  let wavePhase = 0;
   let token = 0; // bumps on every start/cancel; late results with an old token are dropped
   let disposed = false;
   /** Conversation the current recording was started for; fixed at start, checked at every hand-off. */
@@ -150,10 +154,22 @@ export function VoiceButton(p: {
       candidate = await record()({
         onLevel: (l) => {
           if (!live()) return;
-          setBars((prev) => {
-            const next = prev.slice(1);
-            next.push(Math.max(0, Math.min(1, l)));
-            return next;
+          pendingLevel = Math.max(l, pendingLevel * 0.9);
+          if (waveRaf) return;
+          waveRaf = requestAnimationFrame(() => {
+            waveRaf = 0;
+            if (!live()) return;
+            const level = pendingLevel;
+            pendingLevel *= 0.84;
+            wavePhase += 0.32;
+            const phase = wavePhase;
+            setBars((prev) =>
+              prev.map((v, i) => {
+                const wobble = 0.42 + 0.58 * Math.abs(Math.sin(phase + i * 0.52));
+                const target = level * WAVE_ENV[i] * wobble;
+                return v + (target - v) * 0.42;
+              }),
+            );
           });
         },
         maxSeconds: VOICE_MAX_SECONDS,
@@ -195,6 +211,7 @@ export function VoiceButton(p: {
     const scope = activeScope;
     rec = null;
     stopTimer();
+    if (waveRaf) { cancelAnimationFrame(waveRaf); waveRaf = 0; }
     setState("transcribing");
     try {
       const wav = await r.stop();
@@ -204,16 +221,22 @@ export function VoiceButton(p: {
       if (my !== token || disposed) return; // cancelled or navigated away meanwhile
       if (scope !== p.scope) return; // composer now belongs to another conversation
       const text = result.text.trim();
+      if (my === token && !disposed) setState("idle");
       if (!text) {
         showError(new VoiceError("empty", "No speech detected."));
       } else {
-        p.onText(text);
+        // Insert after the composer field is shown again — WKWebView paints
+        // a ghosted double glyph if we write into a `display:none` textarea.
+        queueMicrotask(() => {
+          if (my !== token || disposed || scope !== p.scope) return;
+          p.onText(text);
+        });
       }
     } catch (e) {
       if (my !== token || disposed) return;
       showError(e);
     } finally {
-      if (my === token && !disposed) setState("idle");
+      if (my === token && !disposed && status() !== "idle") setState("idle");
     }
   };
 
@@ -222,6 +245,9 @@ export function VoiceButton(p: {
     rec?.cancel();
     rec = null;
     stopTimer();
+    if (waveRaf) { cancelAnimationFrame(waveRaf); waveRaf = 0; }
+    pendingLevel = 0;
+    setBars(silentWave());
     setState("idle");
   };
 
@@ -287,6 +313,7 @@ export function VoiceButton(p: {
     window.removeEventListener("keydown", onKey, true);
     window.removeEventListener("pointerdown", onPointerDownOutside);
     clearTimeout(errTimer);
+    if (waveRaf) cancelAnimationFrame(waveRaf);
     if (status() === "transcribing") void bridge()?.cancel().catch(() => {});
     cancelRecording();
   });

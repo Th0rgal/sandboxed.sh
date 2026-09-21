@@ -99,6 +99,7 @@
 }
 
 * { box-sizing: border-box; }
+:root { --t: 90ms; --ease: cubic-bezier(.2, .7, .2, 1); }
 html, body, #root, .app { height: 100%; margin: 0; background: transparent; }
 body {
   /* Transparent so the macOS vibrancy shows through the sidebar. */
@@ -114,7 +115,14 @@ body.resizing, body.resizing * { cursor: col-resize !important; }
 button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
 button:disabled, select:disabled, input:disabled, textarea:disabled { cursor: default; }
 a[href], select { cursor: pointer; }
-input, textarea, [contenteditable="true"] { cursor: text; user-select: text; -webkit-user-select: text; }
+input, textarea, [contenteditable="true"] { cursor: text; user-select: text; -webkit-user-select: text; -webkit-font-smoothing: antialiased; }
+.row, .icon-btn, .plus, .send, .voice-btn, .voice-x, .voice-ok, .voice-lang,
+.model, .na-drop-btn, .under-loc, .ctx, button.under-model, .row-action,
+.section-add, .gear-btn, .pill, .menu-item, .project-option, .env-btn, .cron-retry {
+  transition: background-color var(--t) var(--ease), color var(--t) var(--ease), opacity var(--t) var(--ease), border-color var(--t) var(--ease);
+}
+.row-ico, .row-ico svg { transition: color var(--t) var(--ease); }
+.row:active:not(.active) { background: var(--bg-active); }
 button:focus-visible { outline: 1.5px solid var(--focus-border); outline-offset: 0; border-radius: 5px; }
 
 .app {
@@ -555,9 +563,11 @@ code {
   gap: 8px;
 }
 .composer.voice-on.tall { min-height: 42px; padding: 7px 10px 7px 11px; }
-.composer.voice-on .composer-field,
 .composer.voice-on .picks,
 .composer.voice-on .send-slot { display: none; }
+.composer.voice-on .composer-field {
+  position: absolute; width: 0; height: 0; overflow: hidden; opacity: 0; pointer-events: none;
+}
 .composer.voice-on .plus-wrap { grid-column: 1; grid-row: 1; }
 .composer.voice-on .voice-slot {
   grid-column: 2; grid-row: 1;
@@ -1040,14 +1050,15 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 .voice-menu .pick-meta { color: var(--fg-4); font-size: 11px; margin-left: auto; }
 .voice-wave {
   flex: 1; min-width: 0; height: 22px; width: 100%;
-  display: flex; align-items: center; gap: 1.5px;
+  display: flex; align-items: center; justify-content: center; gap: 2px;
   color: color-mix(in srgb, var(--fg) 48%, transparent);
 }
 .voice-wave span {
-  flex: 1; min-width: 1px; max-width: 3px;
+  flex: none; width: 2px;
   height: calc(2px + var(--v, 0) * 18px);
   border-radius: 1px;
   background: currentColor;
+  transition: height 70ms linear;
 }
 .voice-time {
   font: 12px/20px var(--sans); color: var(--fg-3); min-width: 32px;
@@ -1082,7 +1093,13 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 .launch-status.failed { color: var(--amber); }
 .launch-pulse { width: 5px; height: 5px; border-radius: 50%; background: currentColor; animation: launch-pulse 1.4s ease-in-out infinite; }
 @keyframes launch-pulse { 50% { opacity: .25; } }
-@media (prefers-reduced-motion: reduce) { .launch-pulse { animation: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .launch-pulse { animation: none; }
+  .row, .icon-btn, .plus, .send, .voice-btn, .voice-x, .voice-ok, .voice-lang,
+  .model, .na-drop-btn, .under-loc, .ctx, button.under-model, .row-action,
+  .section-add, .gear-btn, .pill, .menu-item, .project-option, .env-btn, .cron-retry,
+  .row-ico, .row-ico svg, .voice-wave span { transition: none; }
+}
 
 /* ---------- goal mode ---------- */
 /* One compact tag everywhere a `/goal` shows up: the composer (while typing),
