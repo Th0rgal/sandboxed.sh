@@ -318,20 +318,39 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
   background: color-mix(in srgb, var(--fg) 6%, transparent);
 }
 .group.has > .row.project:hover { background: var(--bg-hover); }
-/* Rail from the project icon so nested folders/missions read as children. */
-.group.has::before {
+/* Per-child tree stem + rounded elbow, like `tree`, under the project icon. */
+.group.has > :not(.row.project) {
+  position: relative;
+  padding-left: 20px;
+}
+.group.has > .row.depth { padding-left: calc(20px + (var(--depth, 1) - 1) * 12px); }
+.group.has > :not(.row.project)::before,
+.group.has > :not(.row.project)::after {
   content: "";
   position: absolute;
   left: 13px;
-  top: 30px;
-  bottom: 4px;
-  width: 1px;
-  background: color-mix(in srgb, var(--fg) 11%, transparent);
   pointer-events: none;
-  border-radius: 1px;
+  border-color: color-mix(in srgb, var(--fg) 7%, transparent);
 }
-.group.has > :not(.row.project) { padding-left: 18px; }
-.group.has > .row.depth { padding-left: calc(18px + (var(--depth, 1) - 1) * 12px); }
+.group.has > :not(.row.project)::before {
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+}
+.group.has > :not(.row.project)::after {
+  top: 50%;
+  width: calc(7px + (var(--depth, 1) - 1) * 12px);
+  height: 7px;
+  margin-top: -7px;
+  border-left: 1px solid;
+  border-bottom: 1px solid;
+  border-bottom-left-radius: 5px;
+  background: none;
+}
+.group.has > :not(.row.project):last-child::before {
+  bottom: 50%;
+}
 .sb-foot {
   flex: none;
   display: flex;
