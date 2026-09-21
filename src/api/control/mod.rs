@@ -4874,60 +4874,6 @@ pub async fn post_message(
     if content.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "content is required".to_string()));
     }
-    if let (Some(mid), Some(attachments)) = (
-        req.mission_id,
-        req.attachments.as_ref().filter(|rows| !rows.is_empty()),
-    ) {
-        let control = control_for_user(&state, &user).await;
-        if let Ok(Some(mission)) = control.mission_store.get_mission(mid).await {
-            let mut payload = crate::api::mission_payload::MissionPayload {
-                attachments: attachments.clone(),
-                project: mission.project.project.clone(),
-                controller_md: None,
-            };
-            if attachments
-                .iter()
-                .any(|row| row.kind == crate::api::mission_payload::AttachmentKind::Controller)
-            {
-                if let Some(project) = mission.project.project.as_deref() {
-                    payload.controller_md = Some(
-                        super::projects_overview::controller_snapshot_markdown(&state, project)
-                            .await,
-                    );
-                }
-            }
-            let _ = crate::api::mission_payload::write_sidecar(
-                &state.config.working_dir,
-                mid,
-                &payload,
-            );
-            let cwd = mission
-                .working_directory
-                .as_deref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    crate::workspace::mission_workspace_dir_for_root(&state.config.working_dir, mid)
-                });
-            let files_root = payload
-                .project
-                .as_deref()
-                .map(|slug| {
-                    crate::api::mission_payload::project_files_root(&state.config.working_dir, slug)
-                })
-                .unwrap_or_else(|| {
-                    state
-                        .config
-                        .working_dir
-                        .join(".sandboxed-sh/project-files/_")
-                });
-            if let Err(error) =
-                crate::api::mission_payload::materialize(&cwd, &files_root, &payload)
-            {
-                tracing::warn!(mission_id = %mid, %error, "follow-up attachment materialize failed");
-            }
-        }
-    }
-
     let id = req.client_message_id.unwrap_or_else(Uuid::new_v4);
     let agent = req.agent;
     let target_mission_id = req.mission_id;
@@ -4961,6 +4907,12 @@ pub async fn post_message(
                 .await
                 .map_err(internal_error)?
         {
+            if req.attachments.as_ref().is_some_and(|a| !a.is_empty()) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "remote follow-up attachments are not supported".into(),
+                ));
+            }
             if agent.is_some()
                 || req.github_pr.is_some()
                 || req.track.is_some()
@@ -4991,6 +4943,71 @@ pub async fn post_message(
             }));
         }
     }
+    let content = if let Some(attachments) = req.attachments.as_ref().filter(|a| !a.is_empty()) {
+        let mid = target_mission_id.ok_or((
+            StatusCode::BAD_REQUEST,
+            "attachments require mission_id".into(),
+        ))?;
+        let mission = control
+            .mission_store
+            .get_mission(mid)
+            .await
+            .map_err(internal_error)?
+            .ok_or((StatusCode::NOT_FOUND, "mission not found".into()))?;
+        let mut payload = crate::api::mission_payload::MissionPayload {
+            attachments: attachments.clone(),
+            project: mission.project.project.clone(),
+            controller_md: None,
+        };
+        if attachments
+            .iter()
+            .any(|a| a.kind == crate::api::mission_payload::AttachmentKind::Controller)
+        {
+            if let Some(project) = payload.project.as_deref() {
+                payload.controller_md = Some(
+                    super::projects_overview::controller_snapshot_markdown(&state, project).await,
+                );
+            }
+        }
+        let workspace = workspace::resolve_workspace(
+            &state.workspaces,
+            &state.config,
+            Some(mission.workspace_id),
+        )
+        .await;
+        let cwd = match mission.working_directory.as_deref() {
+            Some(requested) => super::mission_runner::resolve_mission_working_directory(
+                &workspace.path,
+                workspace.workspace_type,
+                requested,
+            )
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?,
+            None => workspace::mission_workspace_dir_for_workspace(&workspace, mid),
+        };
+        let project = payload.project.as_deref().ok_or((
+            StatusCode::BAD_REQUEST,
+            "attachments require a project".into(),
+        ))?;
+        crate::api::mission_payload::validate(&payload)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        let files =
+            crate::api::mission_payload::project_files_root(&state.config.working_dir, project);
+        // The durable queue already persists content. A unique immutable overlay
+        // makes that content reference the exact snapshot for this send, including
+        // native live steering; no mission-wide sidecar is overwritten.
+        let relative = format!(".paloma/messages/{}", Uuid::new_v4());
+        let report =
+            crate::api::mission_payload::materialize(&cwd.join(&relative), &files, &payload)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("attachments: {e}")))?;
+        if !report.skipped.is_empty() || report.truncated {
+            warnings.push(format!(
+                "Some attachments were skipped or capped; see {relative}/.paloma/attach.md"
+            ));
+        }
+        format!("{content}\n\nAttached context: read `{relative}/.paloma/attach.md` (paths in that manifest are relative to `{relative}`).")
+    } else {
+        content
+    };
     let (queued_tx, queued_rx) = oneshot::channel();
     tracing::info!(
         user_id = %user.id,
@@ -9960,6 +9977,27 @@ pub async fn create_mission(
         extra: Default::default(),
     });
 
+    if let Some(attachments) = req.attachments.as_ref().filter(|a| !a.is_empty()) {
+        if req.remote_node_id.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "remote launch attachments are not supported".into(),
+            ));
+        }
+        if req.project.as_deref().is_none_or(|p| p.trim().is_empty()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "attachments require a project".into(),
+            ));
+        }
+        crate::api::mission_payload::validate(&crate::api::mission_payload::MissionPayload {
+            attachments: attachments.clone(),
+            project: req.project.clone(),
+            controller_md: None,
+        })
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
+
     // Persist the roster slug, not a nickname. An inverted alias
     // (`coldcard-rng-cracker` → `ec-defensive-research`) made Coldcard
     // missions and STATE_SIGNATURE trailers unroutable.
@@ -11141,13 +11179,13 @@ pub async fn create_mission(
                 );
             }
         }
-        if let Err(error) = crate::api::mission_payload::write_sidecar(
-            &state.config.working_dir,
-            mission.id,
-            &payload,
-        ) {
-            tracing::warn!(mission_id = %mission.id, %error, "failed to persist mission attachments");
-        }
+        crate::api::mission_payload::write_sidecar(&state.config.working_dir, mission.id, &payload)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("persist attachments: {e}"),
+                )
+            })?;
     }
 
     if let (Some(remote_node_id), Some(remote_plan)) =

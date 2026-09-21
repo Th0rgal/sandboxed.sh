@@ -88,6 +88,8 @@ struct ProjectSlugParams {
 
 #[derive(Debug, Deserialize)]
 struct UpdateProjectStatusParams {
+    #[serde(default)]
+    consumed_steer_ids: Vec<String>,
     slug: String,
     mode: String,
     #[serde(default)]
@@ -1789,7 +1791,8 @@ impl AssistantMcp {
                         "slug": {"type": "string"},
                         "mode": {"type": "string", "enum": ["active", "blocked", "paused"]},
                         "next_action": {"type": "string", "description": "The next concrete step, or the resume/unblock condition."},
-                        "blocker": {"type": "string", "description": "What you are blocked on. Set only when mode=blocked."}
+                        "blocker": {"type": "string", "description": "What you are blocked on. Set only when mode=blocked."},
+                        "consumed_steer_ids": {"type": "array", "items": {"type": "string"}, "description": "IDs from steers.pending that this tick actually read and handled. Omit to leave all pending."}
                     }
                 }),
             },
@@ -1891,7 +1894,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "add_project_steer".to_string(),
-                description: "Queue a one-off operator order for the project's next controller tick. Pending steers appear on get_situation / get_project and outrank “nothing to do”; they are consumed when the tick records status. This is not a grant — standing authority still uses set_project_grant.".to_string(),
+                description: "Queue a one-off operator order for the project's next controller tick. Pending steers appear on get_situation / get_project and outrank “nothing to do”; acknowledge only handled IDs using update_project_status.consumed_steer_ids. This is not a grant — standing authority still uses set_project_grant.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["slug", "body"],
@@ -3027,6 +3030,7 @@ impl AssistantMcp {
             "mode": params.mode,
             "next_action": params.next_action,
             "blocker": params.blocker,
+            "consumed_steer_ids": params.consumed_steer_ids,
         });
         let response = self
             .api_post(&format!("/api/projects/{slug}/status"), body)
@@ -4462,7 +4466,7 @@ fn compact_steers(raw: Option<&Value>) -> Value {
     let compact_row = |row: &Value| {
         json!({
             "id": row.get("id").cloned().unwrap_or(Value::Null),
-            "body": compact_opt_text(row.get("body"), MCP_PROJECT_TEXT_CAP),
+            "body": row.get("body").cloned().unwrap_or(Value::Null),
             "created_at": row.get("created_at").cloned().unwrap_or(Value::Null),
             "consumed_at": row.get("consumed_at").cloned().unwrap_or(Value::Null),
             "origin": row.get("origin").cloned().unwrap_or(Value::Null),
@@ -6558,8 +6562,11 @@ mod tests {
         assert!(desired.ends_with('…'));
         assert_eq!(compact["steers"]["pending"][0]["id"], "steer-1");
         let body = compact["steers"]["pending"][0]["body"].as_str().unwrap();
-        assert!(body.chars().count() <= 201, "{body}");
-        assert!(body.ends_with('…'));
+        assert_eq!(
+            body,
+            format!("look at {}", "notes/".repeat(80)),
+            "operator instructions must not be truncated"
+        );
     }
 
     #[test]

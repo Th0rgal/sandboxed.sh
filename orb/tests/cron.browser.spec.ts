@@ -303,7 +303,7 @@ test("primary controller steers the next tick and Run now hits controller/action
   await page.locator(".row.cron").first().click();
   const input = page.getByPlaceholder("Steer the next tick…");
   await expect(input).toBeVisible();
-  await expect(page.getByText("Run now")).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: "Run now" })).toBeVisible();
   await input.fill("review the open PRs");
   await page.getByRole("button", { name: "Steer", exact: true }).click();
   await expect.poll(() => requests.some((r) => r.method === "POST" && r.path.endsWith("/steers"))).toBe(true);
@@ -313,4 +313,7 @@ test("primary controller steers the next tick and Run now hits controller/action
   const action = requests.find((r) => r.method === "POST" && r.path.endsWith("/controller/action"));
   expect(action?.body).toMatchObject({ action: "run" });
   await expect(page.getByText("review the open PRs")).toBeVisible();
+  await page.screenshot({path:"test-results/orb-steer-light.png", fullPage:true});
+  await page.evaluate(() => document.documentElement.dataset.theme = "dark");
+  await page.screenshot({path:"test-results/orb-steer-dark.png", fullPage:true});
 });

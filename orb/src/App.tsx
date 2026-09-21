@@ -278,7 +278,7 @@ function Composer(p: {
     }));
     const source = atItems().length ? atItems() : demo;
     const items = filterAttach(source, q.query);
-    return items.length ? { query: q.query, items } : { query: q.query, items: source.slice(0, 12) };
+    return { query: q.query, items };
   });
   createEffect(() => {
     slash();
@@ -294,8 +294,13 @@ function Composer(p: {
       setAtItems([]);
       return;
     }
-    void loadAttachItems(slug).then(setAtItems).catch(() => setAtItems([]));
+    let current = true;
+    setAtItems([]);
+    onCleanup(() => { current = false; });
+    void loadAttachItems(slug).then(items => { if (current) setAtItems(items); })
+      .catch(() => { if (current) setAtItems([]); });
   });
+  createEffect(on(() => p.projectSlug, () => p.onAttachments?.([]), { defer: true }));
   const resize = () => {
     ta.style.height = "auto";
     ta.style.height = Math.min(ta.scrollHeight, 220) + "px";
@@ -618,7 +623,7 @@ function Composer(p: {
                 <span class="attach-chip">
                   {chip.kind === "folder" ? <Ic.FolderIcon size={12} /> : chip.kind === "controller" ? <Ic.TargetIcon size={12} /> : <Ic.FileIcon size={12} />}
                   {chip.label}
-                  <button type="button" class="mode-chip-x" onClick={(e) => { e.preventDefault(); e.stopPropagation(); p.onAttachments?.((p.attachments ?? []).filter((c) => c.id !== chip.id)); }}>
+                  <button type="button" aria-label={`Remove ${chip.label}`} class="mode-chip-x" onClick={(e) => { e.preventDefault(); e.stopPropagation(); p.onAttachments?.((p.attachments ?? []).filter((c) => c.id !== chip.id)); }}>
                     <Ic.CloseIcon size={10} />
                   </button>
                 </span>
@@ -637,7 +642,7 @@ function Composer(p: {
             setSlashOff(false);
             setAtOff(false);
             setCaret(e.currentTarget.selectionStart ?? next.length);
-            if (!mode()) {
+            if (!mode() || mode() === "goal") {
               const absorbed = absorbGoalPrefix(next);
               if (absorbed !== null && modes().some((it) => it.id === "goal")) {
                 enterMode("goal", absorbed);
@@ -1879,7 +1884,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
             when={!awaiting()}
             fallback={
               <>
-                <Show when={receipt && ["pending", "queued", "starting", "resuming"].includes(mission()?.status ?? "") ? receipt : undefined}>
+                <Show when={receipt}>
                   {(r) => (
                     <>
                       <LaunchStatus destination={missionDestination(mission(), r())} mission={mission()} goal={missionGoal(mission(), r())} />

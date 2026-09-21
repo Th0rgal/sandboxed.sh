@@ -682,6 +682,17 @@ fn recorded_controller_id(state: &super::routes::AppState, slug: &str) -> Option
         .and_then(|p| p.controller_cron_id)
 }
 
+pub(crate) async fn snapshot_view(
+    state: &super::routes::AppState,
+    slug: &str,
+) -> Option<ControllerView> {
+    let recorded = recorded_controller_id(state, slug);
+    let slug = slug.to_string();
+    tokio::task::spawn_blocking(move || controller_view_sync(&slug, recorded, MAX_RUNS))
+        .await
+        .ok()
+}
+
 async fn get_controller(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(slug): AxumPath<String>,
@@ -843,8 +854,9 @@ pub fn claim_controller_wake(slug: &str, now: Instant) -> bool {
     let Ok(mut map) = controller_wake_guard().lock() else {
         return false;
     };
+    map.retain(|_, previous| now.saturating_duration_since(*previous) < CONTROLLER_WAKE_WINDOW);
     if let Some(prev) = map.get(slug) {
-        if now.duration_since(*prev) < CONTROLLER_WAKE_WINDOW {
+        if now.saturating_duration_since(*prev) < CONTROLLER_WAKE_WINDOW {
             return false;
         }
     }
@@ -855,7 +867,9 @@ pub fn claim_controller_wake(slug: &str, now: Instant) -> bool {
 /// Wake the project's controller cron after a terminal mission. Best-effort:
 /// missing jobs and Hermes CLI failures are logged, not fatal.
 pub async fn wake_controller_for_slug(slug: &str) {
-    if !super::projects_overview::is_plain_key(slug) {
+    if std::env::var("SANDBOXED_SH_CONTROLLER_TERMINAL_WAKE").as_deref() != Ok("1")
+        || !super::projects_overview::is_plain_key(slug)
+    {
         return;
     }
     let slug = super::projects_overview::canonicalize_project_slug(slug);

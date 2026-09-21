@@ -33,5 +33,6 @@ describe("at palette", () => {
   it("consumes the @ token after a pick", () => {
     expect(consumeAtToken("see @foo", 8)).toBe("see");
     expect(consumeAtToken("@notes", 6)).toBe("");
+    expect(consumeAtToken("Keep\n\n  code  spacing @notes", 28)).toBe("Keep\n\n  code  spacing");
   });
 });

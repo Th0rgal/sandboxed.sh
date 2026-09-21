@@ -279,16 +279,7 @@ fn ingest_deliveries_with_live(
             projects.record_state(slug, &descriptor, headline, &delivery.at, session)
         };
         let observations = match recorded {
-            Ok(observations) => {
-                // A real tick (including silent) consumes steers posted at or
-                // before this delivery. Inspect callbacks are not ticks.
-                if !inspect {
-                    if let Err(error) = projects.consume_pending_steers_at(slug, &delivery.at) {
-                        tracing::warn!("state ingest consume steers: {slug}: {error}");
-                    }
-                }
-                observations
-            }
+            Ok(observations) => observations,
             Err(error) => {
                 tracing::warn!("state ingest: {slug}: {error}");
                 1
@@ -899,6 +890,9 @@ fn write_overrides(dir: &Path, overrides: &HashMap<String, String>) -> std::io::
 
 #[derive(Debug, Deserialize)]
 pub struct SetStatusRequest {
+    /// IDs actually read and handled by this tick. Missing means no acknowledgement.
+    #[serde(default)]
+    pub consumed_steer_ids: Vec<String>,
     pub mode: String,
     pub next_action: Option<String>,
     pub blocker: Option<String>,
@@ -914,6 +908,12 @@ pub async fn set_project_status(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if !is_plain_key(&slug) {
         return Err(bad_slug());
+    }
+    if req.consumed_steer_ids.len() > super::projects_store::STEER_PENDING_CAP {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "too many steer acknowledgements".into(),
+        ));
     }
     let mut mode = req.mode.trim().to_ascii_lowercase();
     if !matches!(mode.as_str(), "active" | "blocked" | "paused") {
@@ -991,13 +991,10 @@ pub async fn set_project_status(
         .projects
         .set_mode(&slug, &mode, next_action.as_deref(), blocker.as_deref())
         .map_err(|error| (StatusCode::NOT_FOUND, error))?;
-    let consumed_at = chrono::Utc::now().to_rfc3339();
-    if let Err(error) = state
+    state
         .projects
-        .consume_pending_steers_at(&slug, &consumed_at)
-    {
-        tracing::warn!(project = %slug, %error, "status write: consume steers failed");
-    }
+        .acknowledge_steers(&slug, &req.consumed_steer_ids)
+        .map_err(store_err)?;
     let project = state.projects.get_project(&slug).map_err(store_err)?;
     Ok(Json(serde_json::json!({ "project": project })))
 }
@@ -3973,6 +3970,12 @@ pub(crate) async fn controller_snapshot_markdown(state: &Arc<AppState>, slug: &s
         if let Some(budget) = grant.budget_per_tick {
             lines.push(format!("- budget_per_tick: {budget}"));
         }
+        if let Some(parallel) = grant.parallel_missions {
+            lines.push(format!("- parallel_missions: {parallel}"));
+        }
+        if let Some(bar) = grant.material_bar {
+            lines.push(format!("- material_bar: {bar}"));
+        }
         if let Some(pause) = grant.pause_reason {
             lines.push(format!("- pause_reason: {pause}"));
         }
@@ -4030,17 +4033,18 @@ pub(crate) async fn controller_snapshot_markdown(state: &Arc<AppState>, slug: &s
         .into_iter()
         .map(|steer| steer.body)
         .collect();
-    let last = state
-        .projects
-        .recent_activity(slug, 1)
-        .ok()
-        .and_then(|rows| rows.into_iter().next())
-        .map(|row| row.question);
+    let view = super::project_controller::snapshot_view(state, slug).await;
+    let runs = view.as_ref().map(|v| v.runs.as_slice()).unwrap_or_default();
+    let ctrl = runs.iter().find_map(|run| run.ctrl.clone());
+    let last_tick = runs
+        .iter()
+        .find(|run| !run.silent && !run.report.trim().is_empty())
+        .map(|run| run.report.clone());
     super::mission_payload::render_controller_md(&super::mission_payload::ControllerSnapshot {
         slug: slug.to_string(),
         grant: grant_md,
-        ctrl: last.clone(),
-        last_tick: last,
+        ctrl,
+        last_tick,
         tracks,
         live_missions,
         pending_steers: steers,
@@ -5495,135 +5499,21 @@ mod tests {
     }
 
     #[test]
-    fn ingesting_a_ctrl_delivery_consumes_prior_steers_and_leaves_the_grant() {
-        let store = super::super::projects_store::ProjectsStore::open_in_memory().expect("store");
+    fn delivery_does_not_acknowledge_unread_steers() {
+        let store = super::super::projects_store::ProjectsStore::open_in_memory().unwrap();
         store
-            .upsert_project("verity-lido", None, None, None, None)
-            .expect("seed");
-        store
-            .set_grant(
-                "verity-lido",
-                Some("review-first"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("act_reversible"),
-            )
-            .expect("grant");
-        let grant_before = store
-            .get_grant("verity-lido")
-            .expect("read")
-            .expect("grant");
-        store
-            .insert_steer("verity-lido", "review the open PRs", "orb")
-            .expect("steer");
-        assert_eq!(
-            store
-                .list_pending_steers("verity-lido")
-                .expect("pending")
-                .len(),
-            1
-        );
-
+            .upsert_project("lido", None, None, None, None)
+            .unwrap();
+        let steer = store
+            .insert_steer("lido", "arrived during tick", "orb")
+            .unwrap();
         let delivery = parse_delivery(
             "cron_1",
             2_000_000_000.0,
-            "[Cron delivery: Lido]\nAcknowledged the steer\n\
-             [CTRL: verity-lido | mode=active | wait=0 | next=review]\n\
-             [STATE_SIGNATURE: verity-lido|pr|review]\n",
+            "[Cron delivery: Lido]\nDone\n[CTRL: lido | mode=active | wait=0 | next=review]\n",
         );
         ingest_deliveries(&store, &HashMap::new(), &HashMap::new(), vec![delivery]);
-        assert!(
-            store
-                .list_pending_steers("verity-lido")
-                .expect("pending")
-                .is_empty(),
-            "a real tick must consume steers posted before it"
-        );
-        assert_eq!(
-            store
-                .get_grant("verity-lido")
-                .expect("read")
-                .expect("grant"),
-            grant_before
-        );
-
-        store
-            .insert_steer("verity-lido", "posted after that tick", "orb")
-            .expect("late");
-        let replay = parse_delivery(
-            "cron_1",
-            1_755_360_000.0,
-            "[Cron delivery: Lido]\nAcknowledged the steer\n\
-             [CTRL: verity-lido | mode=active | wait=0 | next=review]\n\
-             [STATE_SIGNATURE: verity-lido|pr|review]\n",
-        );
-        ingest_deliveries(&store, &HashMap::new(), &HashMap::new(), vec![replay]);
-        assert_eq!(
-            store
-                .list_pending_steers("verity-lido")
-                .expect("late stays")
-                .len(),
-            1,
-            "replaying an older delivery must not swallow a later steer"
-        );
-    }
-
-    #[test]
-    fn situation_json_includes_pending_steers_and_status_consume_leaves_the_grant() {
-        let store = super::super::projects_store::ProjectsStore::open_in_memory().expect("store");
-        store
-            .upsert_project("lido", None, None, None, None)
-            .expect("seed");
-        store
-            .set_grant(
-                "lido",
-                Some("review-first"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("act_reversible"),
-            )
-            .expect("grant");
-        let grant_before = store.get_grant("lido").expect("read").expect("grant");
-        store
-            .insert_steer("lido", "look at the notes folder", "orb")
-            .expect("steer");
-
-        // Same sibling field `project_situation` / `get_project` attach.
-        let steers = store.list_steers("lido").expect("steers");
-        let mut situation = serde_json::json!({ "cursor": "plan-hash" });
-        situation["steers"] = serde_json::to_value(&steers).expect("json");
-        assert_eq!(
-            situation["steers"]["pending"][0]["body"],
-            "look at the notes folder"
-        );
-        assert!(situation["steers"]["pending"][0]["id"].is_string());
-        assert_eq!(situation["cursor"], "plan-hash");
-
-        // Same consume `set_project_status` runs after a successful write.
-        store
-            .set_mode("lido", "active", Some("review notes"), None)
-            .expect("status");
-        let consumed_at = chrono::Utc::now().to_rfc3339();
-        assert!(
-            store
-                .consume_pending_steers_at("lido", &consumed_at)
-                .expect("consume")
-                >= 1
-        );
-        assert!(store
-            .list_pending_steers("lido")
-            .expect("pending")
-            .is_empty());
-        assert_eq!(
-            store.get_grant("lido").expect("read").expect("grant"),
-            grant_before
-        );
+        assert_eq!(store.list_pending_steers("lido").unwrap()[0].id, steer.id);
     }
 
     #[test]

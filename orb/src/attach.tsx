@@ -39,7 +39,7 @@ export function chipToAttachment(chip: AttachChip): MissionAttachment {
 export function consumeAtToken(text: string, caret: number): string {
   const q = atQuery(text, caret);
   if (!q.open || q.start < 0) return text;
-  return `${text.slice(0, q.start)}${text.slice(caret)}`.replace(/\s{2,}/g, " ").trim();
+  return `${text.slice(0, q.start)}${text.slice(caret)}`.trim();
 }
 
 export async function loadAttachItems(slug: string): Promise<AttachItem[]> {
@@ -62,7 +62,7 @@ export async function loadAttachItems(slug: string): Promise<AttachItem[]> {
 }
 
 async function walkFiles(slug: string, path: string, items: AttachItem[], depth: number) {
-  if (depth > 3 || items.length > 200) return;
+  if (depth > 3 || items.length >= 200) return;
   let entries: Awaited<ReturnType<typeof listProjectFiles>> = [];
   try {
     entries = await listProjectFiles(slug, path);
@@ -70,6 +70,7 @@ async function walkFiles(slug: string, path: string, items: AttachItem[], depth:
     return;
   }
   for (const entry of entries) {
+    if (items.length >= 200) break;
     const rel = path ? `${path}/${entry.name}` : entry.name;
     if (entry.kind === "dir") {
       items.push({ id: `folder:${rel}`, kind: "folder", section: "Folders", path: rel, label: `${rel}/` });

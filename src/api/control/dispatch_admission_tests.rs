@@ -169,6 +169,7 @@ impl Harness {
             .nest("/remote-build", crate::api::remote_build::routes())
             .nest("/workspaces", crate::api::workspaces::routes())
             .route("/message", axum::routing::post(post_message))
+            .nest("/projects", crate::api::projects_overview::routes())
             .route("/missions", axum::routing::post(create_mission))
             .route("/missions/:id", axum::routing::get(get_mission))
             .route("/missions/:id/resume", axum::routing::post(resume_mission))
@@ -6822,4 +6823,200 @@ async fn native_grok_auto_track_continuation(
         .contains(remote_grok::REMOTE_JOB_STILL_RUNNING));
     assert_eq!(fixture.submissions.lock().unwrap().len(), 3);
     assert!(store.get_mission_automations(id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn http_attachment_queue_preserves_each_snapshot_and_rejects_unknown_mission() {
+    let h = Harness::new().await;
+    let m = h.writer(MissionStatus::Failed, Some("repo#244")).await;
+    let files =
+        crate::api::mission_payload::project_files_root(&h.state.config.working_dir, "lido");
+    std::fs::create_dir_all(&files).unwrap();
+    let dir = install_native_fixture(&h, m.id, "after").await;
+    let response = h
+        .request(
+            true,
+            m.id,
+            json!({"content":"/goal read files", "continue_identity":Harness::assertion(&m)}),
+        )
+        .await;
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    wait_native_file(&dir.join("started")).await;
+    let mut ids = Vec::new();
+    for version in ["first", "second"] {
+        std::fs::write(files.join("note.md"), version).unwrap();
+        let id = Uuid::new_v4();
+        ids.push(id);
+        let response = h
+            .request(
+                false,
+                m.id,
+                json!({
+                    "content": "read my attachment", "client_message_id": id,
+                    "continue_identity": Harness::assertion(&m),
+                    "attachments": [{"kind":"file", "path":"note.md"}]
+                }),
+            )
+            .await;
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+    }
+    let raw = h
+        .control
+        .mission_store
+        .load_control_queue(&h.user.id)
+        .await
+        .unwrap();
+    let queued: Vec<QueuedMessage> = serde_json::from_str(&raw).unwrap();
+    let workspace =
+        workspace::resolve_workspace(&h.state.workspaces, &h.state.config, Some(m.workspace_id))
+            .await;
+    let cwd = workspace::mission_workspace_dir_for_workspace(&workspace, m.id);
+    for (id, version) in ids.iter().zip(["first", "second"]) {
+        let message = queued
+            .iter()
+            .find(|message| message.id == *id)
+            .expect("persisted message");
+        let reference = message
+            .content
+            .split("Attached context: read `")
+            .nth(1)
+            .unwrap()
+            .split('`')
+            .next()
+            .unwrap();
+        let manifest = cwd.join(reference);
+        assert!(manifest.is_file());
+        assert_eq!(
+            std::fs::read_to_string(manifest.parent().unwrap().join("attach/note.md")).unwrap(),
+            version
+        );
+    }
+    let unknown = Uuid::new_v4();
+    let response = h
+        .request(
+            false,
+            unknown,
+            json!({"content":"unknown", "attachments":[{"kind":"file","path":"note.md"}]}),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(!workspace::mission_workspace_dir_for_workspace(&workspace, unknown).exists());
+    let response = h
+        .request(
+            false,
+            m.id,
+            json!({"content":"unsafe", "attachments":[{"kind":"file","path":"../escape"}]}),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let queue_after = h
+        .control
+        .mission_store
+        .load_control_queue(&h.user.id)
+        .await
+        .unwrap();
+    assert!(!queue_after.contains("unsafe"));
+    std::fs::write(dir.join("release"), "").unwrap();
+    let delivery = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if std::fs::read_to_string(dir.join("requests.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+                >= 3
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        delivery.is_ok(),
+        "status={:?}; requests={}; queue={}",
+        h.control
+            .mission_store
+            .get_mission(m.id)
+            .await
+            .unwrap()
+            .map(|m| (m.status, m.terminal_reason)),
+        std::fs::read_to_string(dir.join("requests.jsonl")).unwrap_or_default(),
+        h.control
+            .mission_store
+            .load_control_queue(&h.user.id)
+            .await
+            .unwrap()
+    );
+    let requests = std::fs::read_to_string(dir.join("requests.jsonl")).unwrap();
+    for message in queued.iter().filter(|message| ids.contains(&message.id)) {
+        let reference = message
+            .content
+            .split("Attached context: read `")
+            .nth(1)
+            .unwrap()
+            .split('`')
+            .next()
+            .unwrap();
+        assert!(
+            requests.contains(reference),
+            "queued attachment reference reached native driver"
+        );
+    }
+    NATIVE_FIXTURES.lock().unwrap().remove(&m.id);
+}
+
+#[tokio::test]
+async fn http_status_acknowledges_only_explicit_steers() {
+    let h = Harness::new().await;
+    let first = h
+        .state
+        .projects
+        .insert_steer("lido", "first order", "orb")
+        .unwrap();
+    let late = h
+        .state
+        .projects
+        .insert_steer("lido", "arrived after read", "orb")
+        .unwrap();
+    let url = format!("{}/projects/lido/status", h.url);
+    for body in [
+        json!({"mode":"active"}),
+        json!({"mode":"active", "consumed_steer_ids":[]}),
+    ] {
+        assert!(h
+            .state
+            .http_client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        assert_eq!(
+            h.state.projects.list_pending_steers("lido").unwrap().len(),
+            2
+        );
+    }
+    let response = h
+        .state
+        .http_client
+        .post(&url)
+        .json(&json!({"mode":"active", "consumed_steer_ids":[first.id]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(
+        h.state.projects.list_pending_steers("lido").unwrap()[0].id,
+        late.id
+    );
 }

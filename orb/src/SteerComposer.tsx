@@ -51,6 +51,8 @@ export function SteerComposer(p: {
         <div class="composer-field">
           <textarea
             ref={ta}
+            disabled={busy()}
+            aria-label="Steer the next tick"
             rows={2}
             placeholder="Steer the next tick…"
             onInput={(e) => setText(e.currentTarget.value)}

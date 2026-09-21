@@ -61,7 +61,7 @@ Un ordre ponctuel — « merge ces PRs », « regarde le dossier notes » — es
 contrôleur du projet (`c:<slug>`), écris dans *Steer the next tick…*, et
 laisse **Run now** coché. Le tick lit `steers.pending` via `get_situation` /
 `get_project` (étape 0 de `controllers-policy`) : s'il y en a, ils **battent**
-« nothing to do » / `[SILENT]`. `update_project_status` les consomme. Le
+« nothing to do » / `[SILENT]`. `update_project_status.consumed_steer_ids` acquitte uniquement les IDs lus et traités. Le
 grant reste l'autorité permanente.
 
 ## Ce qu'il fait sans demander
@@ -263,3 +263,24 @@ native).
   `references/autonomy-playbook.md`.
 - Les questions d'installation et le bloc `GRANT:` :
   `references/controller-setup-questions.md`.
+
+### Steer acknowledgement and attachment delivery
+
+A tick acknowledges only the steer IDs it actually read and handled, using
+`update_project_status.consumed_steer_ids`. Missing IDs leave the inbox pending.
+Cron deliveries and `[CTRL:]` trailers never clear it: another order may have
+arrived during the tick, or fallen outside the bounded inbox read.
+
+Orb attachments are local mission context. Follow-ups get separate snapshots
+under `.paloma/messages/<id>/.paloma/`; the durable queued message references its
+own manifest. A later send cannot replace an earlier send's files. The manifest
+records missing, secret, linked, oversized and capped files. Source symlinks and
+hard links are excluded; destination writes do not follow symlinks. Limits are
+16 attachments, 512 KiB per file, 40 files / 256 KiB per folder, and a bounded
+folder walk. Remote attachment transfer is not implemented; those requests fail
+explicitly and retain the Orb draft.
+
+Terminal mission wake is optional and disabled by default. Set
+`SANDBOXED_SH_CONTROLLER_TERMINAL_WAKE=1` to enable best-effort, 90-second-deduped
+cron wake after a successful terminal webhook delivery. It is not a durable
+wake guarantee; scheduled ticks remain the fallback.

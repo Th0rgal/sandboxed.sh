@@ -628,12 +628,14 @@ export async function sendMissionMessage(
   id: string,
   text: string,
   attachments?: MissionAttachment[],
-): Promise<{ id: string; queued: boolean }> {
-  return api("/api/control/message", {
+): Promise<{ id: string; queued: boolean; message_accepted?: boolean }> {
+  const receipt = await api<{ id: string; queued: boolean; message_accepted?: boolean }>("/api/control/message", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content: text, mission_id: id, ...(attachments?.length ? { attachments } : {}) }),
   });
+  if (receipt.message_accepted === false) throw new Error("Message was not accepted. Your draft is kept.");
+  return receipt;
 }
 
 export interface ProjectSteer {
@@ -651,7 +653,9 @@ export interface ProjectSteers {
 }
 
 export async function getProjectSteers(slug: string): Promise<ProjectSteers> {
-  return api(`/api/projects/${encodeURIComponent(slug)}/steers`);
+  const result = await api<ProjectSteers>(`/api/projects/${encodeURIComponent(slug)}/steers`);
+  if (!Array.isArray(result.pending) || !Array.isArray(result.recent)) throw new Error("Steer inbox unavailable");
+  return result;
 }
 
 export async function addProjectSteer(slug: string, body: string, origin = "orb"): Promise<ProjectSteers> {

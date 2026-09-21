@@ -251,7 +251,7 @@ any prompt rewrite — see `references/controller-setup-questions.md`.
 
 0. **Read unconsumed steers** from `get_situation` / `get_project` (`steers.pending`).
    If any exist they **outrank** “nothing to do” / `[SILENT]`: acknowledge each
-   in `[CTRL:]` and the report, then act. `update_project_status` consumes them.
+   in `[CTRL:]` and the report, then act. Pass only the IDs actually handled in `update_project_status.consumed_steer_ids`. Reports and `[CTRL:]` trailers do not consume the inbox.
    A steer is a one-off; the grant is still the standing authority. Do not scrape
    Hermes chat for operator intent. Do not invent `@` syntax in this tick.
 1. Read this policy, then `get_project_tasks` (the checklist) plus the

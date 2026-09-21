@@ -45,7 +45,7 @@ use super::library::SharedLibrary;
 /// consumed by [`WorkspaceExec`]. Container callers naturally refer to guest
 /// paths (for example `/workspace/verity/base`), while the API process must
 /// validate the corresponding path below the container rootfs.
-fn resolve_mission_working_directory(
+pub(crate) fn resolve_mission_working_directory(
     workspace_root: &Path,
     workspace_type: WorkspaceType,
     requested: &str,
@@ -3844,28 +3844,27 @@ async fn run_mission_turn(
         mission_work_dir
     };
 
-    if let Ok(Some(payload)) =
-        crate::api::mission_payload::read_sidecar(&config.working_dir, mission_id)
-    {
-        if !payload.attachments.is_empty() {
-            let files_root = payload
-                .project
-                .as_deref()
-                .map(|slug| {
-                    crate::api::mission_payload::project_files_root(&config.working_dir, slug)
-                })
-                .unwrap_or_else(|| config.working_dir.join(".sandboxed-sh/project-files/_"));
-            if let Err(error) =
-                crate::api::mission_payload::materialize(&mission_work_dir, &files_root, &payload)
-            {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    %error,
-                    "failed to materialize mission attachments"
-                );
+    let user_message =
+        match crate::api::mission_payload::read_sidecar(&config.working_dir, mission_id) {
+            Ok(Some(payload)) if !payload.attachments.is_empty() => {
+                let Some(project) = payload.project.as_deref() else {
+                    return AgentResult::failure("attachments require a project", 0);
+                };
+                let files_root =
+                    crate::api::mission_payload::project_files_root(&config.working_dir, project);
+                if let Err(error) = crate::api::mission_payload::materialize(
+                    &mission_work_dir,
+                    &files_root,
+                    &payload,
+                ) {
+                    return AgentResult::failure(format!("materialize attachments: {error}"), 0);
+                }
+                convo.push_str("\nRead attached context in `.paloma/attach.md`.\n");
+                format!("{user_message}\n\nRead attached context in `.paloma/attach.md`.")
             }
-        }
-    }
+            Ok(_) => user_message,
+            Err(e) => return AgentResult::failure(format!("read attachments: {e}"), 0),
+        };
 
     // For Telegram missions, append channel instructions and memory awareness
     // to CLAUDE.md so the backend LLM adopts the bot persona.

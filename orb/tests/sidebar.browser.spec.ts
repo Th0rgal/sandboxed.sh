@@ -57,9 +57,13 @@ test("sidebar rows stay compact with distinct hover/selected and delayed real me
   expect((await page.getByRole("button", { name: "New Agent" }).boundingBox())!.height).toBe(30);
   const liveBg = await live.evaluate((el) => getComputedStyle(el).backgroundColor);
   await live.hover();
+  await expect.poll(() => live.evaluate(el => getComputedStyle(el).backgroundColor)).not.toBe(liveBg);
+  await page.waitForTimeout(200);
   const hoverBg = await live.evaluate((el) => getComputedStyle(el).backgroundColor);
   expect(hoverBg).not.toBe(liveBg);
   await live.click();
+  await expect.poll(() => live.evaluate(el => getComputedStyle(el).backgroundColor)).not.toBe(hoverBg);
+  await page.waitForTimeout(200);
   const selectedBg = await live.evaluate((el) => getComputedStyle(el).backgroundColor);
   expect(selectedBg).not.toBe(hoverBg);
   const newAgent = page.getByRole("button", { name: "New Agent" });

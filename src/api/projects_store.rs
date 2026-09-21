@@ -383,7 +383,7 @@ CREATE TABLE IF NOT EXISTS project_roadmap_proposals (
 
 -- Operator inbox for the next controller tick. A steer is a one-off order,
 -- never a grant: the tick must read pending rows, then they are consumed
--- when status is recorded (or when a real cron delivery is ingested).
+-- only by explicit ID acknowledgement in a status report.
 CREATE TABLE IF NOT EXISTS project_steers (
     id           TEXT PRIMARY KEY NOT NULL,
     slug         TEXT NOT NULL REFERENCES projects(slug) ON DELETE CASCADE,
@@ -3951,18 +3951,23 @@ impl ProjectsStore {
             .map_err(|e| e.to_string())
     }
 
-    /// Mark pending steers consumed when a tick records status. Only rows
-    /// created at or before `at` are closed so an older delivery replay
-    /// cannot swallow a steer the operator posted afterwards.
-    pub fn consume_pending_steers_at(&self, slug: &str, at: &str) -> Result<u64, String> {
-        let connection = self.lock()?;
-        let changed = connection
-            .execute(
-                "UPDATE project_steers SET consumed_at = ?2 \
-                 WHERE slug = ?1 AND consumed_at IS NULL AND created_at <= ?2",
-                params![slug, at],
-            )
-            .map_err(|e| e.to_string())?;
+    /// Acknowledge only the IDs the controller explicitly handled. A delivery
+    /// timestamp is not evidence that a concurrent or capped-out row was read.
+    pub fn acknowledge_steers(&self, slug: &str, ids: &[String]) -> Result<u64, String> {
+        if ids.len() > STEER_PENDING_CAP {
+            return Err("too many steer acknowledgements".into());
+        }
+        let mut connection = self.lock()?;
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        let at = Utc::now().to_rfc3339();
+        let mut changed = 0;
+        for id in ids {
+            changed += tx.execute(
+                "UPDATE project_steers SET consumed_at = ?3 WHERE slug = ?1 AND id = ?2 AND consumed_at IS NULL",
+                params![slug, id, at],
+            ).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(changed as u64)
     }
 
@@ -7608,37 +7613,27 @@ mod tests {
         assert_eq!(pending.len(), STEER_PENDING_CAP);
         assert_eq!(pending[0].id, first.id, "oldest pending stays first");
 
-        let consumed = store
-            .consume_pending_steers_at("lido", "2099-01-01T00:00:00Z")
-            .expect("consume");
-        assert!(consumed >= 1);
-        let after = store.list_steers("lido").expect("list");
-        assert!(after.pending.is_empty());
-        assert!(!after.recent.is_empty());
-        assert!(after.recent.iter().all(|s| s.consumed_at.is_some()));
-
-        // A later replay of an older tick must not resurrect or re-consume.
+        let ids: Vec<_> = pending.iter().map(|s| s.id.clone()).collect();
+        assert_eq!(
+            store.acknowledge_steers("lido", &ids).unwrap(),
+            STEER_PENDING_CAP as u64
+        );
+        assert_eq!(
+            store.list_pending_steers("lido").unwrap().len(),
+            1,
+            "a row omitted by the read cap stays pending"
+        );
+        let late = store.insert_steer("lido", "after read", "mcp").unwrap();
+        assert_eq!(store.acknowledge_steers("lido", &ids).unwrap(), 0);
         assert_eq!(
             store
-                .consume_pending_steers_at("lido", "2026-09-21T11:00:00Z")
-                .expect("replay"),
+                .acknowledge_steers("other", std::slice::from_ref(&late.id))
+                .unwrap(),
             0
         );
-
-        // A steer posted after the tick stays pending.
-        let late = store
-            .insert_steer("lido", "after the tick", "mcp")
-            .expect("late");
-        assert_eq!(
-            store
-                .consume_pending_steers_at("lido", "2020-01-01T00:00:00Z")
-                .expect("old at"),
-            0
-        );
-        assert_eq!(
-            store.list_pending_steers("lido").expect("still pending")[0].id,
-            late.id
-        );
+        assert_eq!(store.acknowledge_steers("lido", &[]).unwrap(), 0);
+        assert_eq!(store.list_pending_steers("lido").unwrap().len(), 2);
+        assert!(!store.list_steers("lido").unwrap().recent.is_empty());
 
         let grant_after = store.get_grant("lido").expect("read").expect("grant");
         assert_eq!(
