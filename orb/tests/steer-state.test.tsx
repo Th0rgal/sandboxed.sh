@@ -34,11 +34,12 @@ it("does not trigger another run while a controller is already running", async (
   expect(run).not.toHaveBeenCalled();
 });
 
-it("uses pause bars for a paused cron instead of clock hands", () => {
+it("keeps the clock identity when a cron is paused", () => {
   const job = getProjectCronFromJob("test", fixtures.hourly).job!;
   const [paused, setPaused] = createSignal(true);
   const ui = render(() => <CronGlyph job={{ ...job, enabled: !paused(), state: paused() ? "paused" : "scheduled" }} />);
-  expect(ui.container.querySelector(".cron-pause-bars")).not.toBeNull();
+  expect(ui.container.querySelector(".cron-glyph.paused .cron-clock-hands")).not.toBeNull();
   setPaused(false);
-  expect(ui.container.querySelector(".cron-pause-bars")).toBeNull();
+  expect(ui.container.querySelector(".cron-clock-hands")).not.toBeNull();
+  expect(ui.container.querySelector(".cron-glyph.paused")).toBeNull();
 });

@@ -269,3 +269,7 @@ export const RunningDots = () => (
     {[0, 1, 2].flatMap((y) => [0, 1, 2].map((x) => <circle cx={3 + x * 4} cy={3 + y * 4} r="1" style={{ "animation-delay": `${(x + (2 - y)) * 0.12}s` }} />))}
   </svg>
 );
+
+export const PauseIcon = (p: P) => (
+  <I {...p} sw={1.6}><path d="M5.5 4v8M10.5 4v8" /></I>
+);

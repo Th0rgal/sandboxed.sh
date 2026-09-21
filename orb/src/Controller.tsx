@@ -51,9 +51,7 @@ export function CronGlyph(p: { job: ControllerJob | null | undefined; running?: 
           transform="rotate(-90 8 8)"
         />
       </Show>
-      <Show when={state() === "paused"} fallback={<path d="M8 5.2V8l1.8 1.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" opacity="0.9" />}>
-        <path class="cron-pause-bars" d="M6.3 5.8v4.4M9.7 5.8v4.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
-      </Show>
+      <path class="cron-clock-hands" d="M8 5.2V8l1.8 1.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" opacity="0.9" />
     </svg>
   );
 }
