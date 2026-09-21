@@ -380,6 +380,22 @@ CREATE TABLE IF NOT EXISTS project_roadmap_proposals (
     updated_at          TEXT NOT NULL,
     PRIMARY KEY (slug, task_key)
 );
+
+-- Operator inbox for the next controller tick. A steer is a one-off order,
+-- never a grant: the tick must read pending rows, then they are consumed
+-- when status is recorded (or when a real cron delivery is ingested).
+CREATE TABLE IF NOT EXISTS project_steers (
+    id           TEXT PRIMARY KEY NOT NULL,
+    slug         TEXT NOT NULL REFERENCES projects(slug) ON DELETE CASCADE,
+    body         TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    consumed_at  TEXT,
+    origin       TEXT NOT NULL CHECK (origin IN ('orb', 'mcp', 'api'))
+);
+CREATE INDEX IF NOT EXISTS idx_project_steers_pending
+    ON project_steers(slug, created_at) WHERE consumed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_project_steers_consumed
+    ON project_steers(slug, consumed_at DESC) WHERE consumed_at IS NOT NULL;
 "#;
 
 /// A project's control conversation and how we know about it.
@@ -522,6 +538,23 @@ impl ProjectsStore {
         // a revision; legacy `done`/`closed` become claim receipts. Table
         // rebuild, one transaction, idempotent.
         Self::migrate_tracks_v2(connection)?;
+        // 2026-09: operator steer inbox. CREATE TABLE IF NOT EXISTS in SCHEMA
+        // covers fresh databases; this batch is for hosts that already ran
+        // initialize() before the table existed.
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS project_steers (
+                id           TEXT PRIMARY KEY NOT NULL,
+                slug         TEXT NOT NULL REFERENCES projects(slug) ON DELETE CASCADE,
+                body         TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                consumed_at  TEXT,
+                origin       TEXT NOT NULL CHECK (origin IN ('orb', 'mcp', 'api'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_project_steers_pending
+                ON project_steers(slug, created_at) WHERE consumed_at IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_project_steers_consumed
+                ON project_steers(slug, consumed_at DESC) WHERE consumed_at IS NOT NULL;",
+        )?;
         Ok(())
     }
 
@@ -1897,6 +1930,7 @@ impl ProjectsStore {
             "project_state_events",
             "project_decisions",
             "project_roadmap_proposals",
+            "project_steers",
         ] {
             transaction
                 .execute(
@@ -3832,6 +3866,106 @@ impl ProjectsStore {
         Ok(())
     }
 
+    /// One-off operator order for the next controller tick. Never writes the
+    /// grant. `origin` is `orb` | `mcp` | `api`.
+    pub fn insert_steer(
+        &self,
+        slug: &str,
+        body: &str,
+        origin: &str,
+    ) -> Result<ProjectSteer, String> {
+        let body = body.trim();
+        if body.is_empty() {
+            return Err("steer body is required".to_string());
+        }
+        if body.chars().count() > STEER_BODY_MAX {
+            return Err(format!(
+                "steer body must be {STEER_BODY_MAX} characters or fewer"
+            ));
+        }
+        if !STEER_ORIGINS.contains(&origin) {
+            return Err(format!(
+                "origin must be one of {} (got '{origin}')",
+                STEER_ORIGINS.join(", ")
+            ));
+        }
+        if self.get_project(slug)?.is_none() {
+            return Err(format!("unknown project '{slug}'"));
+        }
+        let id = Uuid::new_v4().to_string();
+        let created_at = Utc::now().to_rfc3339();
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO project_steers (id, slug, body, created_at, origin) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, slug, body, created_at, origin],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(ProjectSteer {
+            id,
+            body: body.to_string(),
+            created_at,
+            consumed_at: None,
+            origin: origin.to_string(),
+        })
+    }
+
+    /// Pending (oldest first, capped) plus the last consumed rows (newest first).
+    pub fn list_steers(&self, slug: &str) -> Result<ProjectSteers, String> {
+        Ok(ProjectSteers {
+            pending: self.list_pending_steers(slug)?,
+            recent: self.list_consumed_steers(slug)?,
+        })
+    }
+
+    pub fn list_pending_steers(&self, slug: &str) -> Result<Vec<ProjectSteer>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, body, created_at, consumed_at, origin FROM project_steers \
+                 WHERE slug = ?1 AND consumed_at IS NULL \
+                 ORDER BY created_at ASC, id ASC LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![slug, STEER_PENDING_CAP as i64], steer_from_row)
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    fn list_consumed_steers(&self, slug: &str) -> Result<Vec<ProjectSteer>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, body, created_at, consumed_at, origin FROM project_steers \
+                 WHERE slug = ?1 AND consumed_at IS NOT NULL \
+                 ORDER BY consumed_at DESC, id DESC LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![slug, STEER_CONSUMED_RECENT as i64], steer_from_row)
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Mark pending steers consumed when a tick records status. Only rows
+    /// created at or before `at` are closed so an older delivery replay
+    /// cannot swallow a steer the operator posted afterwards.
+    pub fn consume_pending_steers_at(&self, slug: &str, at: &str) -> Result<u64, String> {
+        let connection = self.lock()?;
+        let changed = connection
+            .execute(
+                "UPDATE project_steers SET consumed_at = ?2 \
+                 WHERE slug = ?1 AND consumed_at IS NULL AND created_at <= ?2",
+                params![slug, at],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(changed as u64)
+    }
+
     /// Create-or-refresh chat-planned roadmap items. Re-proposing an existing
     /// key updates it in place and revives a cancelled one — the caller's
     /// latest intent wins; there is nothing destructive to protect here.
@@ -5050,6 +5184,39 @@ fn parse_string_list(raw: Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+pub const STEER_PENDING_CAP: usize = 20;
+pub const STEER_CONSUMED_RECENT: usize = 10;
+pub const STEER_BODY_MAX: usize = 4000;
+pub const STEER_ORIGINS: [&str; 3] = ["orb", "mcp", "api"];
+
+/// One-off operator instruction for the next controller tick.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProjectSteer {
+    pub id: String,
+    pub body: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumed_at: Option<String>,
+    pub origin: String,
+}
+
+/// Pending inbox plus the last consumed rows for the Orb cron page.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProjectSteers {
+    pub pending: Vec<ProjectSteer>,
+    pub recent: Vec<ProjectSteer>,
+}
+
+fn steer_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectSteer> {
+    Ok(ProjectSteer {
+        id: row.get(0)?,
+        body: row.get(1)?,
+        created_at: row.get(2)?,
+        consumed_at: row.get(3)?,
+        origin: row.get(4)?,
+    })
+}
+
 /// The autonomy grant, structured so it outlives a controller's prompt.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProjectGrant {
@@ -5204,6 +5371,9 @@ mod tests {
                 None,
             )
             .expect("state");
+        store
+            .insert_steer("old-name", "merge the open PRs", "orb")
+            .expect("steer");
 
         let renamed = store
             .rename_project("old-name", "new-name")
@@ -5212,6 +5382,14 @@ mod tests {
         assert_eq!(renamed.controller_cron_id.as_deref(), Some("job123"));
 
         assert!(store.get_project("old-name").expect("read").is_none());
+        assert_eq!(
+            store.list_pending_steers("new-name").expect("steers").len(),
+            1
+        );
+        assert!(store
+            .list_pending_steers("old-name")
+            .expect("old steers")
+            .is_empty());
         assert_eq!(
             store
                 .binding("new-name")
@@ -7392,5 +7570,84 @@ mod tests {
         );
         assert!(store.owns_project_cron("orbit", "abc123def456").unwrap());
         assert!(!store.owns_project_cron("other", "abc123def456").unwrap());
+    }
+
+    #[test]
+    fn steers_queue_cap_and_consume_without_touching_the_grant() {
+        let store = ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido", Some("Lido"), None, None, None)
+            .expect("create");
+        store
+            .set_grant(
+                "lido",
+                Some("review-first"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("grant");
+        let grant_before = store.get_grant("lido").expect("read").expect("grant");
+
+        let first = store
+            .insert_steer("lido", "review the open PRs", "orb")
+            .expect("steer");
+        assert!(first.consumed_at.is_none());
+        assert_eq!(first.origin, "orb");
+        assert_eq!(first.body, "review the open PRs");
+
+        for i in 0..STEER_PENDING_CAP {
+            store
+                .insert_steer("lido", &format!("extra {i}"), "api")
+                .expect("fill");
+        }
+        let pending = store.list_pending_steers("lido").expect("pending");
+        assert_eq!(pending.len(), STEER_PENDING_CAP);
+        assert_eq!(pending[0].id, first.id, "oldest pending stays first");
+
+        let consumed = store
+            .consume_pending_steers_at("lido", "2099-01-01T00:00:00Z")
+            .expect("consume");
+        assert!(consumed >= 1);
+        let after = store.list_steers("lido").expect("list");
+        assert!(after.pending.is_empty());
+        assert!(!after.recent.is_empty());
+        assert!(after.recent.iter().all(|s| s.consumed_at.is_some()));
+
+        // A later replay of an older tick must not resurrect or re-consume.
+        assert_eq!(
+            store
+                .consume_pending_steers_at("lido", "2026-09-21T11:00:00Z")
+                .expect("replay"),
+            0
+        );
+
+        // A steer posted after the tick stays pending.
+        let late = store
+            .insert_steer("lido", "after the tick", "mcp")
+            .expect("late");
+        assert_eq!(
+            store
+                .consume_pending_steers_at("lido", "2020-01-01T00:00:00Z")
+                .expect("old at"),
+            0
+        );
+        assert_eq!(
+            store.list_pending_steers("lido").expect("still pending")[0].id,
+            late.id
+        );
+
+        let grant_after = store.get_grant("lido").expect("read").expect("grant");
+        assert_eq!(
+            grant_before, grant_after,
+            "a steer must never mutate the grant"
+        );
+
+        assert!(store.insert_steer("ghost", "nope", "orb").is_err());
+        assert!(store.insert_steer("lido", "   ", "orb").is_err());
+        assert!(store.insert_steer("lido", "hi", "telegram").is_err());
     }
 }

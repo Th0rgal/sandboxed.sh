@@ -166,6 +166,7 @@ export interface Mission {
   agent?: string | null;
   backend?: string;
   model_override?: string | null;
+  project?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -187,6 +188,13 @@ export interface CreateMissionBody {
   /** Model id understood by that harness, e.g. claude-fable-5-1. */
   model_override?: string;
   model_effort?: string;
+  attachments?: MissionAttachment[];
+}
+
+export type MissionAttachmentKind = "file" | "folder" | "controller";
+export interface MissionAttachment {
+  kind: MissionAttachmentKind;
+  path?: string;
 }
 
 export interface BackendInfo {
@@ -616,11 +624,41 @@ export async function createMission(body: CreateMissionBody): Promise<Mission> {
   });
 }
 
-export async function sendMissionMessage(id: string, text: string): Promise<{ id: string; queued: boolean }> {
+export async function sendMissionMessage(
+  id: string,
+  text: string,
+  attachments?: MissionAttachment[],
+): Promise<{ id: string; queued: boolean }> {
   return api("/api/control/message", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content: text, mission_id: id }),
+    body: JSON.stringify({ content: text, mission_id: id, ...(attachments?.length ? { attachments } : {}) }),
+  });
+}
+
+export interface ProjectSteer {
+  id: string;
+  body: string;
+  created_at: string;
+  consumed_at?: string | null;
+  origin: string;
+}
+
+export interface ProjectSteers {
+  slug?: string;
+  pending: ProjectSteer[];
+  recent: ProjectSteer[];
+}
+
+export async function getProjectSteers(slug: string): Promise<ProjectSteers> {
+  return api(`/api/projects/${encodeURIComponent(slug)}/steers`);
+}
+
+export async function addProjectSteer(slug: string, body: string, origin = "orb"): Promise<ProjectSteers> {
+  return api(`/api/projects/${encodeURIComponent(slug)}/steers`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body, origin }),
   });
 }
 

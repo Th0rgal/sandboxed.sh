@@ -14,8 +14,10 @@
 //! markdown file per run under `cron/output/<job_id>/`). Actions go through
 //! the `hermes cron` CLI so Hermes stays the single writer of its own store.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
@@ -28,6 +30,7 @@ type ApiError = (StatusCode, String);
 
 const DEFAULT_RUNS: usize = 30;
 const MAX_RUNS: usize = 100;
+const CONTROLLER_WAKE_WINDOW: Duration = Duration::from_secs(90);
 /// Run outputs start with the full prompt (tens of KB of skill text); the
 /// controller's answer is the last section, so only the tail is read.
 const OUTPUT_TAIL_BYTES: u64 = 48 * 1024;
@@ -830,6 +833,49 @@ async fn controller_action(
     Ok(Json(view))
 }
 
+fn controller_wake_guard() -> &'static Mutex<HashMap<String, Instant>> {
+    static GUARD: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    GUARD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// In-window dedupe so a burst of terminal webhooks collapses to one run.
+pub fn claim_controller_wake(slug: &str, now: Instant) -> bool {
+    let Ok(mut map) = controller_wake_guard().lock() else {
+        return false;
+    };
+    if let Some(prev) = map.get(slug) {
+        if now.duration_since(*prev) < CONTROLLER_WAKE_WINDOW {
+            return false;
+        }
+    }
+    map.insert(slug.to_string(), now);
+    true
+}
+
+/// Wake the project's controller cron after a terminal mission. Best-effort:
+/// missing jobs and Hermes CLI failures are logged, not fatal.
+pub async fn wake_controller_for_slug(slug: &str) {
+    if !super::projects_overview::is_plain_key(slug) {
+        return;
+    }
+    let slug = super::projects_overview::canonicalize_project_slug(slug);
+    if !claim_controller_wake(&slug, Instant::now()) {
+        return;
+    }
+    match resolve_controller(slug.clone(), None).await {
+        Ok((home, job_id)) => {
+            if let Err((_, error)) =
+                run_hermes_cron(&home, &["run".into(), job_id, "--accept-hooks".into()]).await
+            {
+                tracing::warn!(project = %slug, %error, "controller wake after mission terminal failed");
+            }
+        }
+        Err((_, error)) => {
+            tracing::debug!(project = %slug, %error, "controller wake skipped");
+        }
+    }
+}
+
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
     Router::new()
         .route(
@@ -842,6 +888,18 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_wake_dedupes_inside_the_window() {
+        let slug = format!("wake-{}", uuid::Uuid::new_v4());
+        let t0 = Instant::now();
+        assert!(claim_controller_wake(&slug, t0));
+        assert!(!claim_controller_wake(&slug, t0 + Duration::from_secs(10)));
+        assert!(claim_controller_wake(
+            &slug,
+            t0 + CONTROLLER_WAKE_WINDOW + Duration::from_secs(1)
+        ));
+    }
 
     #[test]
     fn response_is_the_last_section_without_trailers() {

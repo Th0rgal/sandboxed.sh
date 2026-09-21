@@ -1,5 +1,6 @@
 import { LaunchStatus, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, missionSettingsIdle, dockModelLabel, type LaunchReceipt, type RemoteSupport } from "./missionLaunch";
 import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, GoalTag, EMPTY_GOAL_ERROR, absorbGoalPrefix, composerModes, filterSlash, slashQuery, modePrompt, ModeChip, type ComposerMode } from "./goal";
+import { atQuery, chipToAttachment, consumeAtToken, filterAttach, loadAttachItems, type AttachChip, type AttachItem } from "./attach";
 import { ProjectPicker, ProjectCreation } from "./ProjectPicker";
 import { hasFocusScope } from "./focusScope";
 import { For, Show, Switch, Match, createMemo, createSignal, createEffect, on, onCleanup, onMount, batch } from "solid-js";
@@ -233,6 +234,9 @@ function Composer(p: {
   /** Follow-up: the mission's harness. New agent uses the picker. */
   backend?: string;
   onDraft?: (text: string) => void;
+  projectSlug?: string;
+  attachments?: AttachChip[];
+  onAttachments?: (next: AttachChip[]) => void;
 }) {
   const [text, setText] = createSignal("");
   // Local voice input (macOS): dictated text lands at the caret, never sends.
@@ -246,6 +250,10 @@ function Composer(p: {
   const [ctx, setCtx] = createSignal(false);
   const [which, setWhich] = createSignal<"harness" | "model" | null>(null);
   const [slashOff, setSlashOff] = createSignal(false);
+  const [atOff, setAtOff] = createSignal(false);
+  const [atHi, setAtHi] = createSignal(0);
+  const [atItems, setAtItems] = createSignal<AttachItem[]>([]);
+  const [caret, setCaret] = createSignal(0);
   let ta!: HTMLTextAreaElement;
   const pick = () => effectivePick();
   const backend = () => p.backend ?? pick()?.backend ?? null;
@@ -257,9 +265,36 @@ function Composer(p: {
     const items = filterSlash(modes(), q.query);
     return items.length ? { query: q.query, items } : null;
   });
+  const at = createMemo(() => {
+    if (voiceActive() || atOff() || slash()) return null;
+    const q = atQuery(text(), caret());
+    if (!q.open) return null;
+    const demo = (p.files ?? []).map((f) => ({
+      id: f.id,
+      kind: "file" as const,
+      section: "Files" as const,
+      path: f.name,
+      label: f.name,
+    }));
+    const source = atItems().length ? atItems() : demo;
+    const items = filterAttach(source, q.query);
+    return items.length ? { query: q.query, items } : { query: q.query, items: source.slice(0, 12) };
+  });
   createEffect(() => {
     slash();
     setSlashHi(0);
+  });
+  createEffect(() => {
+    at();
+    setAtHi(0);
+  });
+  createEffect(() => {
+    const slug = p.projectSlug;
+    if (!slug || !isConnected()) {
+      setAtItems([]);
+      return;
+    }
+    void loadAttachItems(slug).then(setAtItems).catch(() => setAtItems([]));
   });
   const resize = () => {
     ta.style.height = "auto";
@@ -283,6 +318,16 @@ function Composer(p: {
     ta.focus();
   };
   const pickSlash = (item: { id: ComposerMode }) => enterMode(item.id, "");
+  const toggleChip = (item: AttachItem) => {
+    const chip: AttachChip = { id: item.id, kind: item.kind, path: item.path, label: item.label };
+    const cur = p.attachments ?? [];
+    const next = cur.some((c) => c.id === chip.id) ? cur.filter((c) => c.id !== chip.id) : [...cur, chip];
+    p.onAttachments?.(next);
+    const consumed = consumeAtToken(text(), caret());
+    write(consumed);
+    setAtOff(true);
+    ta.focus();
+  };
   const [sending, setSending] = createSignal(false);
   const send = async () => {
     const payload = draftOf(text());
@@ -311,6 +356,7 @@ function Composer(p: {
     setCtx(false);
     setWhich(null);
     if (slash()) setSlashOff(true);
+    if (at()) setAtOff(true);
   };
   const onEsc = (e: KeyboardEvent) => {
     if (e.defaultPrevented || hasFocusScope()) return;
@@ -332,20 +378,46 @@ function Composer(p: {
       <button class="plus" title="Add context" onClick={() => setCtx(!ctx())}>
         <Ic.PlusIcon size={14} />
       </button>
-      <Show when={ctx() && (p.files?.length ?? 0) > 0}>
-        <div class="menu plus-menu">
-          <For each={p.files}>
-            {(f) => (
-              <button
-                class={`menu-item ${p.attached?.includes(f.id) ? "on" : ""}`}
-                onClick={() => p.onToggleFile?.(f.id)}
-              >
-                <span class="menu-ico">
-                  <Ic.FileIcon size={14} />
-                </span>{" "}
-                {f.name}
-              </button>
-            )}
+      <Show when={ctx() && ((p.files?.length ?? 0) > 0 || atItems().length > 0)}>
+        <div class="menu plus-menu slash-menu">
+          <Show when={atItems().some((i) => i.section === "Controller")}>
+            <div class="slash-head">Controller</div>
+            <For each={atItems().filter((i) => i.section === "Controller")}>
+              {(it) => (
+                <button class={`menu-item ${(p.attachments ?? []).some((c) => c.id === it.id) ? "on" : ""}`} onClick={() => toggleChip(it)}>
+                  <span class="menu-ico"><Ic.TargetIcon size={14} /></span> {it.label}
+                </button>
+              )}
+            </For>
+          </Show>
+          <Show when={atItems().some((i) => i.section === "Folders") || (p.files?.length ?? 0) > 0}>
+            <div class="slash-head">Folders</div>
+            <For each={atItems().filter((i) => i.section === "Folders")}>
+              {(it) => (
+                <button class={`menu-item ${(p.attachments ?? []).some((c) => c.id === it.id) ? "on" : ""}`} onClick={() => toggleChip(it)}>
+                  <span class="menu-ico"><Ic.FolderIcon size={14} /></span> {it.label}
+                </button>
+              )}
+            </For>
+          </Show>
+          <div class="slash-head">Files</div>
+          <For each={atItems().length ? atItems().filter((i) => i.section === "Files") : p.files}>
+            {(f) => {
+              const id = "id" in f ? f.id : (f as { id: string }).id;
+              const label = "label" in f ? (f as AttachItem).label : (f as { name: string }).name;
+              const item: AttachItem = "section" in f ? (f as AttachItem) : { id, kind: "file", section: "Files", path: label, label };
+              return (
+                <button
+                  class={`menu-item ${(p.attachments ?? []).some((c) => c.id === item.id) || p.attached?.includes(item.id) ? "on" : ""}`}
+                  onClick={() => {
+                    if (p.onAttachments) toggleChip(item);
+                    else p.onToggleFile?.(item.id);
+                  }}
+                >
+                  <span class="menu-ico"><Ic.FileIcon size={14} /></span> {label}
+                </button>
+              );
+            }}
           </For>
         </div>
       </Show>
@@ -472,6 +544,42 @@ function Composer(p: {
       </div>
     </Show>
   );
+  const atMenu = (
+    <Show when={at()}>
+      {(s) => (
+        <div class="menu slash-menu" role="listbox" aria-label="Context" onPointerDown={(e) => e.stopPropagation()}>
+          <For each={["Controller", "Folders", "Files"] as const}>
+            {(section) => {
+              const rows = () => s().items.filter((it) => it.section === section);
+              return (
+                <Show when={rows().length}>
+                  <div class="slash-head">{section}</div>
+                  <For each={rows()}>
+                    {(it) => {
+                      const idx = () => s().items.indexOf(it);
+                      return (
+                        <button
+                          type="button"
+                          role="option"
+                          aria-selected={atHi() === idx()}
+                          class={`menu-item ${atHi() === idx() ? "on" : ""}`}
+                          onMouseEnter={() => setAtHi(idx())}
+                          onClick={() => toggleChip(it)}
+                        >
+                          <span class="menu-ico">{it.kind === "folder" ? <Ic.FolderIcon size={14} /> : it.kind === "controller" ? <Ic.TargetIcon size={14} /> : <Ic.FileIcon size={14} />}</span>
+                          {it.label}
+                        </button>
+                      );
+                    }}
+                  </For>
+                </Show>
+              );
+            }}
+          </For>
+        </div>
+      )}
+    </Show>
+  );
   const slashMenu = (
     <Show when={slash()}>
       {(s) => (
@@ -501,7 +609,23 @@ function Composer(p: {
     <div class={`composer ${p.tall ? "tall" : ""} ${voiceActive() ? "voice-on" : ""} ${mode() ? "has-mode" : ""}`} data-mode={mode() ?? ""} onClick={() => !voiceActive() && ta.focus()}>
       {plus}
       {slashMenu}
+      {atMenu}
       <div class="composer-field">
+        <Show when={(p.attachments ?? []).length}>
+          <span class="attach-pills" style={{ display: "inline-flex", margin: "0 6px 0 0" }}>
+            <For each={p.attachments}>
+              {(chip) => (
+                <span class="attach-chip">
+                  {chip.kind === "folder" ? <Ic.FolderIcon size={12} /> : chip.kind === "controller" ? <Ic.TargetIcon size={12} /> : <Ic.FileIcon size={12} />}
+                  {chip.label}
+                  <button type="button" class="mode-chip-x" onClick={(e) => { e.preventDefault(); e.stopPropagation(); p.onAttachments?.((p.attachments ?? []).filter((c) => c.id !== chip.id)); }}>
+                    <Ic.CloseIcon size={10} />
+                  </button>
+                </span>
+              )}
+            </For>
+          </span>
+        </Show>
         <Show when={mode() === "goal"}><ModeChip mode="goal" onClear={clearMode} /></Show>
         <Show when={mode()}><span class="mode-sep" aria-hidden="true" /></Show>
         <textarea
@@ -511,6 +635,8 @@ function Composer(p: {
           onInput={(e) => {
             const next = e.currentTarget.value;
             setSlashOff(false);
+            setAtOff(false);
+            setCaret(e.currentTarget.selectionStart ?? next.length);
             if (!mode()) {
               const absorbed = absorbGoalPrefix(next);
               if (absorbed !== null && modes().some((it) => it.id === "goal")) {
@@ -520,7 +646,23 @@ function Composer(p: {
             }
             write(next);
           }}
+          onClick={() => setCaret(ta.selectionStart ?? text().length)}
+          onKeyUp={() => setCaret(ta.selectionStart ?? text().length)}
           onKeyDown={(e) => {
+            const atItemsOpen = at()?.items;
+            if (atItemsOpen && atItemsOpen.length) {
+              if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                e.preventDefault();
+                const n = atItemsOpen.length;
+                setAtHi((i) => (e.key === "ArrowDown" ? (i + 1) % n : (i - 1 + n) % n));
+                return;
+              }
+              if ((e.key === "Enter" || e.key === "Tab") && !e.shiftKey && !e.isComposing) {
+                e.preventDefault();
+                toggleChip(atItemsOpen[Math.min(atHi(), atItemsOpen.length - 1)]);
+                return;
+              }
+            }
             const items = slash()?.items;
             if (items) {
               if (e.key === "ArrowDown" || e.key === "ArrowUp") {
@@ -593,6 +735,7 @@ export default function App() {
   const [plusFor, setPlusFor] = createSignal<string | null>(null);
   const [nameDlg, setNameDlg] = createSignal<null | { kind: "folder" | "file" | "rename-project" | "rename-folder" | "rename-file" | "rename-agent"; pid: string; fid?: string; fileId?: string; agentId?: string; value: string }>(null);
   const [attached, setAttached] = createSignal<string[]>([]);
+  const [attachChips, setAttachChips] = createSignal<AttachChip[]>([]);
   const [ctx, setCtx] = createSignal<{ x: number; y: number; items: MenuEntry[] } | null>(null);
   const [mdSrc, setMdSrc] = createSignal(false);
   let scroller: HTMLDivElement | undefined;
@@ -862,11 +1005,13 @@ export default function App() {
           const refusal = remoteLaunchPreflight(fleet, machine, pick, harnessName);
           if (refusal) throw new Error(refusal);
         }
-        const body = {title,prompt,project:projectSlug,backend:pick.backend,model_override:pick.model,...(machine === "core" ? {} : {remote_node_id:machine})};
+        const attachments = attachChips().map(chipToAttachment);
+        const body = {title,prompt,project:projectSlug,backend:pick.backend,model_override:pick.model,...(machine === "core" ? {} : {remote_node_id:machine}),...(attachments.length ? {attachments} : {})};
         const signature = JSON.stringify(body);
         if (launchAttempt?.signature !== signature) launchAttempt = {signature,key:crypto.randomUUID()};
         const m = await createMission({...body,idempotency_key:launchAttempt.key});
         launchAttempt = undefined;
+        setAttachChips([]);
         rememberLaunch(m.id, receipt);
         setMissions(prev => [m, ...prev.filter(old => old.id !== m.id)]);
         open(`m:${m.id}`);
@@ -1375,6 +1520,9 @@ export default function App() {
                   onToggleFile={(id) =>
                     setAttached(attached().includes(id) ? attached().filter((x) => x !== id) : [...attached(), id])
                   }
+                  projectSlug={newProject() || liveProjects()[0]?.slug}
+                  attachments={attachChips()}
+                  onAttachments={setAttachChips}
                 />
                 </div>
               </div>
@@ -1602,6 +1750,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
   const [items, setItems] = createSignal<StreamItem[]>(cached?.items ?? []);
   const [awaiting, setAwaiting] = createSignal(!cached);
   const [error, setError] = createSignal<string | null>(null);
+  const [followAttach, setFollowAttach] = createSignal<AttachChip[]>([]);
   let scroller: HTMLDivElement | undefined;
   let nearBottom = true;
   cacheRemember(`m:${p.id}`);
@@ -1701,7 +1850,12 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
   };
 
   const sendMsg = async (text: string) => {
-    try { await sendMissionMessage(p.id, text); void refresh(); return true; }
+    try {
+      await sendMissionMessage(p.id, text, followAttach().map(chipToAttachment));
+      setFollowAttach([]);
+      void refresh();
+      return true;
+    }
     catch (e) { setError(launchError(e)); return false; }
   };
 
@@ -1747,7 +1901,18 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
       </div>
       <div class="dock">
         <div class="col">
-          <Composer placeholder="Send follow-up" picker={false} busy={busy()} onSend={sendMsg} onStop={stopM} scope={`m:${p.id}`} backend={mission()?.backend} />
+          <Composer
+            placeholder="Send follow-up"
+            picker={false}
+            busy={busy()}
+            onSend={sendMsg}
+            onStop={stopM}
+            scope={`m:${p.id}`}
+            backend={mission()?.backend}
+            projectSlug={mission()?.project ?? undefined}
+            attachments={followAttach()}
+            onAttachments={setFollowAttach}
+          />
           <MissionDock mission={mission()} items={viewItems()} destination={missionDestination(mission(), receipt)} onMission={setMission} onError={setError} />
         </div>
       </div>

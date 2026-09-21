@@ -41,17 +41,28 @@ hermes cron create --name "<nom>" --every 30m \
   --skill controllers-policy --deliver project:<slug> --prompt "$(cat prompt.txt)"
 ```
 
-`--deliver project:<slug>` est important : la livraison suit le projet, pas une
-session qui peut être compactée ou abandonnée. `--deliver origin` gèle la cible
-sur la session de création — à éviter pour tout ce qui doit durer. Un job en
-`deliver: origin` sans `origin` capturé ne livre nulle part : refuse-le et
-recréé-le en `project:<slug>`.
+`--deliver project:<slug>` est du **plomberie** : ça route encore la copie
+Hermes du tick (v1). Ce n'est pas un chat à ouvrir pour piloter. Le chemin
+opérateur est la page cron Orb : **Steer the next tick…** puis **Run now**.
+`--deliver origin` gèle la cible sur la session de création — à éviter pour
+tout ce qui doit durer. Un job en `deliver: origin` sans `origin` capturé ne
+livre nulle part : refuse-le et recréé-le en `project:<slug>`.
 
 **3. Répondre une fois à ses cinq questions.** Au premier tick, le contrôleur te
 demande : périmètre, autorité de merge, plafond de budget, ce qui doit le mettre
-en pause, et ce qui mérite une livraison. Tes réponses sont écrites dans son
-tracker sous un bloc `GRANT:` — elles survivent ainsi à toute réécriture de
-prompt. Il ne les redemandera pas.
+en pause, et ce qui mérite une livraison. Tes réponses sont le **grant**
+(`set_project_grant`) — elles survivent ainsi à toute réécriture de prompt.
+Il ne les redemandera pas.
+
+## Piloter le prochain tick
+
+Un ordre ponctuel — « merge ces PRs », « regarde le dossier notes » — est un
+**steer**, pas un grant et pas un message dans Hermes. Depuis Orb, ouvre le
+contrôleur du projet (`c:<slug>`), écris dans *Steer the next tick…*, et
+laisse **Run now** coché. Le tick lit `steers.pending` via `get_situation` /
+`get_project` (étape 0 de `controllers-policy`) : s'il y en a, ils **battent**
+« nothing to do » / `[SILENT]`. `update_project_status` les consomme. Le
+grant reste l'autorité permanente.
 
 ## Ce qu'il fait sans demander
 
@@ -136,9 +147,11 @@ Si le dispatch est refusé (disque, auth, capacité), le projet **garde son
 objectif** avec un blocker infra nommé (`blocked:disk`, …). Le travail
 plateforme s'ouvre sous `sandboxed-sh`. On ne retitre pas, on ne réutilise
 pas la session de campagne (Lido « Corriger et merger les PRs » devenue un
-P0 disque). Un ordre explicite dans le chat (« merge these PRs ») met à jour
-`merge_authority` — `material_bar` seulement si l'ordre change aussi ce qui
-mérite une livraison. Un « never merge to main » périmé ne le surclasse pas.
+P0 disque). Un ordre ponctuel (« merge these PRs ») est un **steer** sur la page cron,
+pas un message dans le chat Hermes. Un changement d'autorité permanente
+passe par `set_project_grant`. `material_bar` seulement si l'ordre change
+aussi ce qui mérite une livraison. Un « never merge to main » périmé ne
+le surclasse pas.
 
 ## Le board
 
@@ -168,11 +181,11 @@ hermes cron resume <id>              # réarmer
 # état de tous les contrôleurs
 hermes cron list
 
-# forcer un tick et voir ce qu'il fait
+# forcer un tick (Orb : Run now sur la page cron)
 hermes cron run <id>
 
-# le dernier rapport d'un projet, trailer compris
-grep -o '\[CTRL:[^]]*\]' <(hermes chat --resume <session> --last)
+# le dernier rapport : page cron Orb (`RunCard`), pas Hermes chat
+# (le trailer [CTRL:] reste sur la run ; la session liée n'est pas à ouvrir)
 ```
 
 Si un contrôleur ticque `ok` mais que rien ne bouge, la question à poser est
@@ -182,9 +195,8 @@ le contournement a échoué et que l'escalade arrive.
 
 Un système agent-native ne doit finalement plus consommer un tick pour constater
 qu'une attente n'a pas changé. Toute attente doit devenir un prédicat durable
-(mission terminale, check GitHub, job fini, date atteinte) qui réveille la
-conversation ; le cron n'est plus qu'un filet de sécurité pour les échéances et
-la réconciliation.
+(mission terminale, check GitHub, job fini, date atteinte) qui réveille le
+**contrôleur** ; le cron d'intervalle n'est plus qu'un filet de sécurité.
 
 ## Coordination between controllers
 

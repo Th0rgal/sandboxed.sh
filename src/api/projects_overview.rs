@@ -279,7 +279,16 @@ fn ingest_deliveries_with_live(
             projects.record_state(slug, &descriptor, headline, &delivery.at, session)
         };
         let observations = match recorded {
-            Ok(observations) => observations,
+            Ok(observations) => {
+                // A real tick (including silent) consumes steers posted at or
+                // before this delivery. Inspect callbacks are not ticks.
+                if !inspect {
+                    if let Err(error) = projects.consume_pending_steers_at(slug, &delivery.at) {
+                        tracing::warn!("state ingest consume steers: {slug}: {error}");
+                    }
+                }
+                observations
+            }
             Err(error) => {
                 tracing::warn!("state ingest: {slug}: {error}");
                 1
@@ -697,6 +706,7 @@ pub async fn get_project(
         &waiting_user_waits,
         decisions.len() as u32,
     );
+    let steers = state.projects.list_steers(&slug).map_err(store_err)?;
     Ok(Json(serde_json::json!({
         "project": project,
         "grant": grant,
@@ -707,6 +717,7 @@ pub async fn get_project(
         "open_decisions": decisions,
         "recent_decisions": recent,
         "conversation": conversation,
+        "steers": steers,
     })))
 }
 
@@ -980,6 +991,13 @@ pub async fn set_project_status(
         .projects
         .set_mode(&slug, &mode, next_action.as_deref(), blocker.as_deref())
         .map_err(|error| (StatusCode::NOT_FOUND, error))?;
+    let consumed_at = chrono::Utc::now().to_rfc3339();
+    if let Err(error) = state
+        .projects
+        .consume_pending_steers_at(&slug, &consumed_at)
+    {
+        tracing::warn!(project = %slug, %error, "status write: consume steers failed");
+    }
     let project = state.projects.get_project(&slug).map_err(store_err)?;
     Ok(Json(serde_json::json!({ "project": project })))
 }
@@ -1203,6 +1221,66 @@ pub async fn set_project_grant(
         .map_err(store_err)?;
     let grant = state.projects.get_grant(&slug).map_err(store_err)?;
     Ok(Json(serde_json::json!({ "slug": slug, "grant": grant })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddSteerRequest {
+    pub body: String,
+    #[serde(default)]
+    pub origin: Option<String>,
+}
+
+/// `GET /api/projects/:slug/steers` — pending inbox plus last consumed.
+pub async fn get_project_steers(
+    State(state): State<Arc<AppState>>,
+    AxumPath(requested): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&requested) {
+        return Err(bad_slug());
+    }
+    let slug = resolve_roster_slug(&state.projects, &requested)
+        .map_err(store_err)?
+        .unwrap_or(requested);
+    let steers = state.projects.list_steers(&slug).map_err(store_err)?;
+    Ok(Json(serde_json::json!({
+        "slug": slug,
+        "pending": steers.pending,
+        "recent": steers.recent,
+    })))
+}
+
+/// `POST /api/projects/:slug/steers` — queue a one-off order for the next tick.
+/// Does not write the grant.
+pub async fn add_project_steer(
+    State(state): State<Arc<AppState>>,
+    AxumPath(requested): AxumPath<String>,
+    Json(req): Json<AddSteerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&requested) {
+        return Err(bad_slug());
+    }
+    let slug = resolve_roster_slug(&state.projects, &requested)
+        .map_err(store_err)?
+        .unwrap_or(requested);
+    let origin = req
+        .origin
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let origin = origin.unwrap_or("api");
+    match state.projects.insert_steer(&slug, &req.body, origin) {
+        Ok(steer) => {
+            let steers = state.projects.list_steers(&slug).map_err(store_err)?;
+            Ok(Json(serde_json::json!({
+                "slug": slug,
+                "steer": steer,
+                "pending": steers.pending,
+                "recent": steers.recent,
+            })))
+        }
+        Err(error) if error.starts_with("unknown project") => Err((StatusCode::NOT_FOUND, error)),
+        Err(error) => Err((StatusCode::BAD_REQUEST, error)),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1943,6 +2021,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/:slug/grant",
             get(get_project_grant).post(set_project_grant),
+        )
+        .route(
+            "/:slug/steers",
+            get(get_project_steers).post(add_project_steer),
         )
         .route(
             "/:slug/decision",
@@ -3877,6 +3959,94 @@ pub(crate) async fn load_project_situation(
     situation
 }
 
+/// Snapshot the controller state as markdown for `.paloma/controller.md`.
+pub(crate) async fn controller_snapshot_markdown(state: &Arc<AppState>, slug: &str) -> String {
+    let grant = state.projects.get_grant(slug).ok().flatten();
+    let grant_md = grant.map(|grant| {
+        let mut lines = Vec::new();
+        if let Some(level) = grant.autonomy_level {
+            lines.push(format!("- autonomy_level: {level}"));
+        }
+        if let Some(merge) = grant.merge_authority {
+            lines.push(format!("- merge_authority: {merge}"));
+        }
+        if let Some(budget) = grant.budget_per_tick {
+            lines.push(format!("- budget_per_tick: {budget}"));
+        }
+        if let Some(pause) = grant.pause_reason {
+            lines.push(format!("- pause_reason: {pause}"));
+        }
+        if let Some(resume) = grant.resume_condition {
+            lines.push(format!("- resume_condition: {resume}"));
+        }
+        if lines.is_empty() {
+            "_(empty)_".to_string()
+        } else {
+            lines.join("\n")
+        }
+    });
+    let situation = load_project_situation(state, slug).await;
+    let tracks = situation
+        .items
+        .iter()
+        .filter(|item| item.open)
+        .take(24)
+        .map(|item| {
+            format!(
+                "`{}` — {} ({})",
+                item.key,
+                if item.title.is_empty() {
+                    item.key.as_str()
+                } else {
+                    item.title.as_str()
+                },
+                item.derived_state.as_str()
+            )
+        })
+        .collect();
+    let live_missions = situation
+        .items
+        .iter()
+        .flat_map(|item| item.attempts.iter())
+        .filter(|attempt| {
+            matches!(
+                attempt.status.as_str(),
+                "active" | "pending" | "running" | "starting" | "queued" | "waiting_background"
+            )
+        })
+        .take(16)
+        .map(|attempt| {
+            format!(
+                "{} — {}",
+                attempt.id,
+                attempt.title.as_deref().unwrap_or("untitled")
+            )
+        })
+        .collect();
+    let steers = state
+        .projects
+        .list_pending_steers(slug)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|steer| steer.body)
+        .collect();
+    let last = state
+        .projects
+        .recent_activity(slug, 1)
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .map(|row| row.question);
+    super::mission_payload::render_controller_md(&super::mission_payload::ControllerSnapshot {
+        slug: slug.to_string(),
+        grant: grant_md,
+        ctrl: last.clone(),
+        last_tick: last,
+        tracks,
+        live_missions,
+        pending_steers: steers,
+    })
+}
+
 fn accept_err(error: super::projects_store::AcceptError) -> (StatusCode, String) {
     use super::projects_store::AcceptError;
     match &error {
@@ -4062,18 +4232,31 @@ pub fn markdown_roster_enabled() -> bool {
 
 /// `GET /api/projects/:slug/situation` — the canonical bounded read.
 /// `get_project`, `/tasks`, the roster row and MCP `get_situation` are all
-/// projections of this.
+/// projections of this. `steers` rides alongside the situation builder
+/// output so the cursor hash stays a plan hash, not an inbox hash.
 pub async fn project_situation(
     State(state): State<Arc<AppState>>,
     AxumPath(requested): AxumPath<String>,
-) -> Result<Json<super::situation::ProjectSituation>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if !is_plain_key(&requested) {
         return Err(bad_slug());
     }
     let slug = resolve_roster_slug(&state.projects, &requested)
         .map_err(store_err)?
         .unwrap_or(requested);
-    Ok(Json(load_project_situation(&state, &slug).await))
+    let situation = load_project_situation(&state, &slug).await;
+    let steers = state.projects.list_steers(&slug).map_err(store_err)?;
+    let mut value = serde_json::to_value(situation).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize situation: {error}"),
+        )
+    })?;
+    value["steers"] = serde_json::to_value(steers).unwrap_or(serde_json::json!({
+        "pending": [],
+        "recent": []
+    }));
+    Ok(Json(value))
 }
 
 /// Map a canonical item onto the `/tasks` row shape the desktop still
@@ -5309,6 +5492,138 @@ mod tests {
         assert!(recent
             .iter()
             .any(|d| d.question == "Merged #2" && d.status.as_deref() == Some("decided")));
+    }
+
+    #[test]
+    fn ingesting_a_ctrl_delivery_consumes_prior_steers_and_leaves_the_grant() {
+        let store = super::super::projects_store::ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("verity-lido", None, None, None, None)
+            .expect("seed");
+        store
+            .set_grant(
+                "verity-lido",
+                Some("review-first"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("act_reversible"),
+            )
+            .expect("grant");
+        let grant_before = store
+            .get_grant("verity-lido")
+            .expect("read")
+            .expect("grant");
+        store
+            .insert_steer("verity-lido", "review the open PRs", "orb")
+            .expect("steer");
+        assert_eq!(
+            store
+                .list_pending_steers("verity-lido")
+                .expect("pending")
+                .len(),
+            1
+        );
+
+        let delivery = parse_delivery(
+            "cron_1",
+            2_000_000_000.0,
+            "[Cron delivery: Lido]\nAcknowledged the steer\n\
+             [CTRL: verity-lido | mode=active | wait=0 | next=review]\n\
+             [STATE_SIGNATURE: verity-lido|pr|review]\n",
+        );
+        ingest_deliveries(&store, &HashMap::new(), &HashMap::new(), vec![delivery]);
+        assert!(
+            store
+                .list_pending_steers("verity-lido")
+                .expect("pending")
+                .is_empty(),
+            "a real tick must consume steers posted before it"
+        );
+        assert_eq!(
+            store
+                .get_grant("verity-lido")
+                .expect("read")
+                .expect("grant"),
+            grant_before
+        );
+
+        store
+            .insert_steer("verity-lido", "posted after that tick", "orb")
+            .expect("late");
+        let replay = parse_delivery(
+            "cron_1",
+            1_755_360_000.0,
+            "[Cron delivery: Lido]\nAcknowledged the steer\n\
+             [CTRL: verity-lido | mode=active | wait=0 | next=review]\n\
+             [STATE_SIGNATURE: verity-lido|pr|review]\n",
+        );
+        ingest_deliveries(&store, &HashMap::new(), &HashMap::new(), vec![replay]);
+        assert_eq!(
+            store
+                .list_pending_steers("verity-lido")
+                .expect("late stays")
+                .len(),
+            1,
+            "replaying an older delivery must not swallow a later steer"
+        );
+    }
+
+    #[test]
+    fn situation_json_includes_pending_steers_and_status_consume_leaves_the_grant() {
+        let store = super::super::projects_store::ProjectsStore::open_in_memory().expect("store");
+        store
+            .upsert_project("lido", None, None, None, None)
+            .expect("seed");
+        store
+            .set_grant(
+                "lido",
+                Some("review-first"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("act_reversible"),
+            )
+            .expect("grant");
+        let grant_before = store.get_grant("lido").expect("read").expect("grant");
+        store
+            .insert_steer("lido", "look at the notes folder", "orb")
+            .expect("steer");
+
+        // Same sibling field `project_situation` / `get_project` attach.
+        let steers = store.list_steers("lido").expect("steers");
+        let mut situation = serde_json::json!({ "cursor": "plan-hash" });
+        situation["steers"] = serde_json::to_value(&steers).expect("json");
+        assert_eq!(
+            situation["steers"]["pending"][0]["body"],
+            "look at the notes folder"
+        );
+        assert!(situation["steers"]["pending"][0]["id"].is_string());
+        assert_eq!(situation["cursor"], "plan-hash");
+
+        // Same consume `set_project_status` runs after a successful write.
+        store
+            .set_mode("lido", "active", Some("review notes"), None)
+            .expect("status");
+        let consumed_at = chrono::Utc::now().to_rfc3339();
+        assert!(
+            store
+                .consume_pending_steers_at("lido", &consumed_at)
+                .expect("consume")
+                >= 1
+        );
+        assert!(store
+            .list_pending_steers("lido")
+            .expect("pending")
+            .is_empty());
+        assert_eq!(
+            store.get_grant("lido").expect("read").expect("grant"),
+            grant_before
+        );
     }
 
     #[test]

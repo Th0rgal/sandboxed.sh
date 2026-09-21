@@ -3601,6 +3601,9 @@ pub struct ControlMessageRequest {
     pub track: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+    /// Follow-up `@` chips: written into the live workspace before this message.
+    #[serde(default)]
+    pub attachments: Option<Vec<crate::api::mission_payload::MissionAttachment>>,
     /// Catch-all for unrecognized request fields — surfaced as `warnings` in
     /// the response instead of being silently dropped (a mistyped targeting
     /// field once silently rerouted a message to the wrong mission).
@@ -4870,6 +4873,59 @@ pub async fn post_message(
     let content = req.content.trim().to_string();
     if content.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "content is required".to_string()));
+    }
+    if let (Some(mid), Some(attachments)) = (
+        req.mission_id,
+        req.attachments.as_ref().filter(|rows| !rows.is_empty()),
+    ) {
+        let control = control_for_user(&state, &user).await;
+        if let Ok(Some(mission)) = control.mission_store.get_mission(mid).await {
+            let mut payload = crate::api::mission_payload::MissionPayload {
+                attachments: attachments.clone(),
+                project: mission.project.project.clone(),
+                controller_md: None,
+            };
+            if attachments
+                .iter()
+                .any(|row| row.kind == crate::api::mission_payload::AttachmentKind::Controller)
+            {
+                if let Some(project) = mission.project.project.as_deref() {
+                    payload.controller_md = Some(
+                        super::projects_overview::controller_snapshot_markdown(&state, project)
+                            .await,
+                    );
+                }
+            }
+            let _ = crate::api::mission_payload::write_sidecar(
+                &state.config.working_dir,
+                mid,
+                &payload,
+            );
+            let cwd = mission
+                .working_directory
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    crate::workspace::mission_workspace_dir_for_root(&state.config.working_dir, mid)
+                });
+            let files_root = payload
+                .project
+                .as_deref()
+                .map(|slug| {
+                    crate::api::mission_payload::project_files_root(&state.config.working_dir, slug)
+                })
+                .unwrap_or_else(|| {
+                    state
+                        .config
+                        .working_dir
+                        .join(".sandboxed-sh/project-files/_")
+                });
+            if let Err(error) =
+                crate::api::mission_payload::materialize(&cwd, &files_root, &payload)
+            {
+                tracing::warn!(mission_id = %mid, %error, "follow-up attachment materialize failed");
+            }
+        }
     }
 
     let id = req.client_message_id.unwrap_or_else(Uuid::new_v4);
@@ -7822,6 +7878,9 @@ pub struct CreateMissionRequest {
     /// External conversation that spawned this mission — the Hermes session id
     /// when `origin` is "hermes". Only stored when `origin` is set.
     pub origin_session_id: Option<String>,
+    /// Orb `@` chips: materialized into `.paloma/` before the harness starts.
+    #[serde(default)]
+    pub attachments: Option<Vec<crate::api::mission_payload::MissionAttachment>>,
     /// Catch-all for unrecognized request fields. Serde ignores unknown fields
     /// by default, which has repeatedly hidden client bugs (a `prompt` sent
     /// before the field existed, a mistyped `target_mission_id`). Captured
@@ -9897,6 +9956,7 @@ pub async fn create_mission(
         estimated_disk_gib: None,
         origin: None,
         origin_session_id: None,
+        attachments: None,
         extra: Default::default(),
     });
 
@@ -11063,6 +11123,31 @@ pub async fn create_mission(
             source: Some(format!("api:{}", user.id)),
         });
         initial_prompt = Some((prompt_event_id, prompt));
+    }
+
+    if let Some(attachments) = req.attachments.as_ref().filter(|rows| !rows.is_empty()) {
+        let mut payload = crate::api::mission_payload::MissionPayload {
+            attachments: attachments.clone(),
+            project: mission.project.project.clone(),
+            controller_md: None,
+        };
+        if attachments
+            .iter()
+            .any(|row| row.kind == crate::api::mission_payload::AttachmentKind::Controller)
+        {
+            if let Some(project) = mission.project.project.as_deref() {
+                payload.controller_md = Some(
+                    super::projects_overview::controller_snapshot_markdown(&state, project).await,
+                );
+            }
+        }
+        if let Err(error) = crate::api::mission_payload::write_sidecar(
+            &state.config.working_dir,
+            mission.id,
+            &payload,
+        ) {
+            tracing::warn!(mission_id = %mission.id, %error, "failed to persist mission attachments");
+        }
     }
 
     if let (Some(remote_node_id), Some(remote_plan)) =
@@ -15994,6 +16079,7 @@ pub async fn clone_mission(
         // vanished from the worker strip of the session that asked for it.
         origin: source.origin.clone(),
         origin_session_id: source.origin_session_id.clone(),
+        attachments: None,
         extra: Default::default(),
     };
 
@@ -17688,6 +17774,18 @@ async fn paloma_webhook_forwarder_loop(
                         // exhausted retry leaves it unset, so the 60s sweep
                         // re-sends until the consumer is reachable again.
                         markers.lock().await.set(mission_id, status);
+                        if webhook_forwardable_status(status) {
+                            if let Some(slug) = mission
+                                .as_ref()
+                                .and_then(|m| m.project.project.clone())
+                                .filter(|slug| !slug.is_empty())
+                            {
+                                tokio::spawn(async move {
+                                    super::project_controller::wake_controller_for_slug(&slug)
+                                        .await;
+                                });
+                            }
+                        }
                         break;
                     }
                     Ok(resp) => {

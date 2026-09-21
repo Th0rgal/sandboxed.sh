@@ -8,7 +8,7 @@ const node={id:"dgx-spark",status:"online",cordoned:false};
 // backend that supports native Grok remote launches says so.
 type Capability={typed?:boolean;harnesses?:string[];raw_command?:boolean;proxy_url_configured?:boolean;requires_proxy_harnesses?:string[]};
 const typedCapability:Capability={typed:true,harnesses:["claudecode","opencode"],raw_command:true,proxy_url_configured:true};
-async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteSuccess?:boolean;missing?:boolean;failed?:boolean;remoteJob?:{phase:string;node_state?:string};emptyStatus?:string;capability?:Capability|null;fleetFailAfterFirst?:boolean}={}){
+async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteSuccess?:boolean;missing?:boolean;failed?:boolean;remoteJob?:{phase:string;node_state?:string};emptyStatus?:string;capability?:Capability|null;fleetFailAfterFirst?:boolean;files?:{name:string;kind:string}[]}={}){
  let posts:any[]=[], releasePost!:()=>void,releaseHistory!:()=>void;
  const postGate=new Promise<void>(resolve=>releasePost=resolve),historyGate=new Promise<void>(resolve=>releaseHistory=resolve);
  let fail=!!options.reject;let fleetReads=0;let listReads=0;
@@ -46,7 +46,7 @@ async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteS
    if(options.fleetFailAfterFirst&&fleetReads>1)return route.fulfill({status:503,body:"fleet monitor unavailable"});
    return route.fulfill({json:{enabled:true,nodes:options.missing&&fleetReads>1?[]:[node],...(capability?{remote_launch:capability}:{})}});
   }
-  const json=path==="/api/projects"?{projects:[{slug:"test",title:"Test"}]}:path==="/api/backends"?[{id:"grok",name:"Grok"},{id:"codex",name:"Codex"},{id:"opencode",name:"OpenCode"},{id:"claudecode",name:"Claude Code"}]:path==="/api/providers/backend-models"?{backends:{grok:[{value:"grok-4.6",label:"Grok 4.6"}],codex:[{value:"codex-model",label:"Codex model"}],opencode:[{value:"xai/grok-4.6",label:"Grok 4.6"}],claudecode:[{value:"claude-sonnet-4-6",label:"Claude Sonnet 4.6"}]}}:path==="/api/control/missions"?options.failed?[m]:[]:path.endsWith("/files")?{entries:[]}:path.endsWith("/crons")?{jobs:[]}:{job:null,runs:[]};
+  const json=path==="/api/projects"?{projects:[{slug:"test",title:"Test"}]}:path==="/api/backends"?[{id:"grok",name:"Grok"},{id:"codex",name:"Codex"},{id:"opencode",name:"OpenCode"},{id:"claudecode",name:"Claude Code"}]:path==="/api/providers/backend-models"?{backends:{grok:[{value:"grok-4.6",label:"Grok 4.6"}],codex:[{value:"codex-model",label:"Codex model"}],opencode:[{value:"xai/grok-4.6",label:"Grok 4.6"}],claudecode:[{value:"claude-sonnet-4-6",label:"Claude Sonnet 4.6"}]}}:path==="/api/control/missions"?options.failed?[m]:[]:path.endsWith("/files")?{entries:options.files??[]}:path.endsWith("/crons")?{jobs:[]}:{job:path.includes("/controller")?{id:"ctrl-1",name:"Test controller",enabled:true,state:"scheduled"}:null,runs:[]};
   return route.fulfill({json});
  });
  await page.goto("/");
@@ -309,4 +309,26 @@ test("typed-capable server that still answers remote_command required is explain
  await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(1);
  expect(state.posts[0]).toMatchObject({backend:"claudecode",model_override:"claude-sonnet-4-6",remote_node_id:"dgx-spark"});
  expect(state.posts[0]).not.toHaveProperty("remote_command");
+});
+
+test("@ file and controller chips are sent as structured attachments",async({page})=>{
+ const state=await setup(page,{files:[{name:"notes",kind:"dir"},{name:"foo.md",kind:"file"}]});
+ state.releasePost();state.releaseHistory();
+ const input=composerInput(page);
+ await input.fill("@");
+ await expect(page.getByRole("listbox",{name:"Context"})).toBeVisible();
+ await page.getByRole("option",{name:"foo.md"}).click();
+ await expect(page.locator(".attach-chip")).toContainText("foo.md");
+ await input.fill("@ctrl");
+ const controller=page.getByRole("option",{name:/controller/i});
+ if(await controller.count()) await controller.first().click();
+ else await page.getByRole("option",{name:"Test controller"}).click();
+ await input.fill("Read the notes");
+ await input.press("Enter");
+ await expect.poll(()=>state.posts.length).toBe(1);
+ expect(state.posts[0].attachments).toEqual(expect.arrayContaining([
+  {kind:"file",path:"foo.md"},
+ ]));
+ expect(state.posts[0].prompt).toBe("Read the notes");
+ expect(JSON.stringify(state.posts[0])).not.toContain("hello notes");
 });

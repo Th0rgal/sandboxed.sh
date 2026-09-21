@@ -3844,6 +3844,29 @@ async fn run_mission_turn(
         mission_work_dir
     };
 
+    if let Ok(Some(payload)) =
+        crate::api::mission_payload::read_sidecar(&config.working_dir, mission_id)
+    {
+        if !payload.attachments.is_empty() {
+            let files_root = payload
+                .project
+                .as_deref()
+                .map(|slug| {
+                    crate::api::mission_payload::project_files_root(&config.working_dir, slug)
+                })
+                .unwrap_or_else(|| config.working_dir.join(".sandboxed-sh/project-files/_"));
+            if let Err(error) =
+                crate::api::mission_payload::materialize(&mission_work_dir, &files_root, &payload)
+            {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    %error,
+                    "failed to materialize mission attachments"
+                );
+            }
+        }
+    }
+
     // For Telegram missions, append channel instructions and memory awareness
     // to CLAUDE.md so the backend LLM adopts the bot persona.
     if user_message.contains("[Telegram from ") {
