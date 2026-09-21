@@ -142,6 +142,19 @@ export const FolderOpenIcon = (p: P) => (
     <path d="M2.3 12.4 4 7.9c.2-.7.8-1.1 1.500-1.100h7.700c.9 0 1.500.9 1.200 1.700l-1.200 3.600c-.2.7-.9 1.100-1.600 1.100H3.500c-.7 0-1.300-.4-1.200-.800z" />
   </I>
 );
+/** Collapsed finished-missions group: the same family as the sidebar status dot. */
+export const FinishedIcon = (p: P) => (
+  <I {...p}>
+    <circle cx="8" cy="8" r="5.2" />
+  </I>
+);
+/** Expanded finished-missions group: the ring opens onto the inner dot. */
+export const FinishedOpenIcon = (p: P) => (
+  <I {...p}>
+    <circle cx="8" cy="8" r="5.2" />
+    <circle cx="8" cy="8" r="2" fill="currentColor" stroke="none" />
+  </I>
+);
 export const LaptopIcon = (p: P) => (
   <I {...p}>
     <path d="M3.5 4.2c0-.7.5-1.200 1.200-1.200h6.600c.7 0 1.200.5 1.200 1.200V10h-9zM2 12.500 3.500 10h9l1.500 2.500z" />

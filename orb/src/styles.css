@@ -787,8 +787,7 @@ button.under-model { color: inherit; }
 .model-menu { max-height: 300px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
 .row.done-toggle { color: var(--fg-3); font-size: 12px; height: 30px; }
 .row.done-toggle:hover { color: var(--fg-2); }
-.row.done-toggle .chev { transition: transform .12s; }
-.row.done-toggle .chev.open { transform: rotate(90deg); }
+.row.done-toggle .row-ico { color: color-mix(in srgb, var(--fg) 45%, transparent); }
 .row.agent.done { color: var(--fg); }
 .p-bar-fill.warm { background: var(--amber); }
 .p-bar-fill.hot { background: var(--red); }

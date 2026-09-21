@@ -503,9 +503,14 @@ export function LiveProjectsSection(p: {
                 <Show when={doneOf(project.slug).length > 0}>
                   <button
                     class="row done-toggle d1"
+                    aria-expanded={!!showDone[project.slug]}
                     onClick={() => setShowDone(project.slug, !showDone[project.slug])}
                   >
-                    <span class="row-ico"><Ic.ChevronRight size={11} class={`chev ${showDone[project.slug] ? "open" : ""}`} /></span>
+                    <span class="row-ico">
+                      <Show when={showDone[project.slug]} fallback={<Ic.FinishedIcon />}>
+                        <Ic.FinishedOpenIcon />
+                      </Show>
+                    </span>
                     <span class="row-label">
                       {doneOf(project.slug).length} finished
                     </span>
