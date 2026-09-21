@@ -290,5 +290,8 @@ explicitly and retain the Orb draft.
 
 Terminal mission wake is optional and disabled by default. Set
 `SANDBOXED_SH_CONTROLLER_TERMINAL_WAKE=1` to enable best-effort, 90-second-deduped
-cron wake after a successful terminal webhook delivery. It is not a durable
+cron wake after a successful terminal webhook delivery. Automatic wake requires
+the project's registered controller ID, an active project, and an enabled cron
+that is neither paused nor already running. It never falls back to another
+matching cron; explicit operator Run now remains separate. It is not a durable
 wake guarantee; scheduled ticks remain the fallback.

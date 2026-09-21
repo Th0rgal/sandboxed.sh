@@ -39,7 +39,7 @@ export function chipToAttachment(chip: AttachChip): MissionAttachment {
 export function consumeAtToken(text: string, caret: number): string {
   const q = atQuery(text, caret);
   if (!q.open || q.start < 0) return text;
-  return `${text.slice(0, q.start)}${text.slice(caret)}`.trim();
+  return `${text.slice(0, q.start)}${text.slice(caret)}`;
 }
 
 export async function loadAttachItems(slug: string): Promise<AttachItem[]> {

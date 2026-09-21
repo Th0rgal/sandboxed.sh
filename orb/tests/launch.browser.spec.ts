@@ -8,7 +8,8 @@ const node={id:"dgx-spark",status:"online",cordoned:false};
 // backend that supports native Grok remote launches says so.
 type Capability={typed?:boolean;harnesses?:string[];raw_command?:boolean;proxy_url_configured?:boolean;requires_proxy_harnesses?:string[]};
 const typedCapability:Capability={typed:true,harnesses:["claudecode","opencode"],raw_command:true,proxy_url_configured:true};
-async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteSuccess?:boolean;missing?:boolean;failed?:boolean;remoteJob?:{phase:string;node_state?:string};emptyStatus?:string;capability?:Capability|null;fleetFailAfterFirst?:boolean;files?:{name:string;kind:string}[]}={}){
+async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteSuccess?:boolean;missing?:boolean;failed?:boolean;remoteJob?:{phase:string;node_state?:string};emptyStatus?:string;capability?:Capability|null;fleetFailAfterFirst?:boolean;files?:{name:string;kind:string}[];emptyContext?:boolean}={}){
+ let attachmentReads:string[]=[];
  let posts:any[]=[], releasePost!:()=>void,releaseHistory!:()=>void;
  const postGate=new Promise<void>(resolve=>releasePost=resolve),historyGate=new Promise<void>(resolve=>releaseHistory=resolve);
  let fail=!!options.reject;let fleetReads=0;let listReads=0;
@@ -46,13 +47,18 @@ async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteS
    if(options.fleetFailAfterFirst&&fleetReads>1)return route.fulfill({status:503,body:"fleet monitor unavailable"});
    return route.fulfill({json:{enabled:true,nodes:options.missing&&fleetReads>1?[]:[node],...(capability?{remote_launch:capability}:{})}});
   }
+  if(path.endsWith("/files") || path.includes("/controller")) {
+   attachmentReads.push(path);
+   if(!path.startsWith("/api/projects/test/")) return route.fulfill({status:404,body:"Unknown project"});
+   if(options.emptyContext) return route.fulfill({json:path.endsWith("/files")?{entries:[]}:{job:null,runs:[]}});
+  }
   const filePath=url.searchParams.get("path")||"";
   const json=path==="/api/projects"?{projects:[{slug:"test",title:"Test"}]}:path==="/api/backends"?[{id:"grok",name:"Grok"},{id:"codex",name:"Codex"},{id:"opencode",name:"OpenCode"},{id:"claudecode",name:"Claude Code"}]:path==="/api/providers/backend-models"?{backends:{grok:[{value:"grok-4.6",label:"Grok 4.6"}],codex:[{value:"codex-model",label:"Codex model"}],opencode:[{value:"xai/grok-4.6",label:"Grok 4.6"}],claudecode:[{value:"claude-sonnet-4-6",label:"Claude Sonnet 4.6"}]}}:path==="/api/control/missions"?options.failed?[m]:[]:path.endsWith("/files")?{entries:filePath==="notes"?[{name:"foo.md",kind:"file"}]:(options.files??[])}:path.endsWith("/crons")?{jobs:[]}:{job:path.includes("/controller")?{id:"ctrl-1",name:"Test controller",enabled:true,state:"scheduled"}:null,runs:[]};
   return route.fulfill({json});
  });
  await page.goto("/");
  await expect(page.getByRole("button",{name:"Grok",exact:true})).toBeVisible();
- return {posts,releasePost,releaseHistory,setSuccess:()=>{fail=false;},listReads:()=>listReads,fleetReads:()=>fleetReads};
+ return {posts,attachmentReads,releasePost,releaseHistory,setSuccess:()=>{fail=false;},listReads:()=>listReads,fleetReads:()=>fleetReads};
 }
 async function chooseRemote(page:Page){await page.getByRole("button",{name:/Core \(agent-core\)/}).click();await page.getByRole("button",{name:/dgx-spark online/}).click();}
 const composerInput=(page:Page)=>page.getByPlaceholder(/Plan, Build, \/ for commands, @ for context|Describe the objective/);
@@ -332,4 +338,46 @@ test("@ file and controller chips are sent as structured attachments",async({pag
  ]));
  expect(state.posts[0].prompt).toBe("Read the notes");
  expect(JSON.stringify(state.posts[0])).not.toContain("hello notes");
+});
+
+
+test("new agent uses the same real project for initial context and launch",async({page})=>{
+ const state=await setup(page,{files:[{name:"notes",kind:"dir"}]});
+ state.releasePost();state.releaseHistory();
+ await expect(page.getByRole("button",{name:"Choose project"})).toHaveText(/Test/);
+ const input=composerInput(page);await input.fill("@foo");
+ await page.getByRole("option",{name:"notes/foo.md",exact:true}).click();
+ expect(state.attachmentReads.length).toBeGreaterThan(0);
+ expect(state.attachmentReads.every(path=>path.startsWith("/api/projects/test/"))).toBe(true);
+ await input.fill("Read selected context");await input.press("Enter");
+ await expect.poll(()=>state.posts.length).toBe(1);
+ expect(state.posts[0]).toMatchObject({project:"test",attachments:[{kind:"file",path:"notes/foo.md"}]});
+});
+
+test("connected empty context never substitutes demo attachment items",async({page})=>{
+ const state=await setup(page,{emptyContext:true});state.releaseHistory();
+ const input=composerInput(page);await input.fill("@");
+ await expect.poll(()=>state.attachmentReads.filter(path=>path.endsWith("/files")).length).toBeGreaterThan(0);
+ await expect(page.getByRole("listbox",{name:"Context"}).getByRole("option")).toHaveCount(0);
+ await page.getByTitle("Add context").click();
+ await expect(page.locator(".plus-menu .menu-item")).toHaveCount(0);
+ await expect(page.locator(".attach-chip")).toHaveCount(0);
+});
+
+test("context picks preserve multiline whitespace and middle-of-prompt caret",async({page})=>{
+ const state=await setup(page,{files:[{name:"notes",kind:"dir"}]});state.releaseHistory();
+ const input=composerInput(page);
+ await input.fill("Draft:\n\n@foo");
+ await page.getByRole("option",{name:"notes/foo.md",exact:true}).click();
+ await expect(input).toHaveValue("Draft:\n\n");
+ expect(await input.evaluate(el=>(el as HTMLTextAreaElement).selectionStart)).toBe(8);
+ await page.getByRole("button",{name:"Remove notes/foo.md"}).click();
+ await input.fill("Before @foo after");
+ await input.evaluate(el=>{const ta=el as HTMLTextAreaElement;ta.focus();ta.setSelectionRange(11,11);ta.dispatchEvent(new Event("click",{bubbles:true}));});
+ await expect(page.getByRole("option",{name:"notes/foo.md",exact:true})).toBeVisible();
+ await input.press("Enter");
+ await expect(input).toHaveValue("Before  after");
+ expect(await input.evaluate(el=>(el as HTMLTextAreaElement).selectionStart)).toBe(7);
+ await input.pressSequentially("inserted");
+ await expect(input).toHaveValue("Before inserted after");
 });

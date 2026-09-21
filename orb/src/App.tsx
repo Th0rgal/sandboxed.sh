@@ -276,7 +276,7 @@ function Composer(p: {
       path: f.name,
       label: f.name,
     }));
-    const source = atItems().length ? atItems() : demo;
+    const source = isConnected() ? atItems() : demo;
     const items = filterAttach(source, q.query);
     return { query: q.query, items };
   });
@@ -300,7 +300,7 @@ function Composer(p: {
     void loadAttachItems(slug).then(items => { if (current) setAtItems(items); })
       .catch(() => { if (current) setAtItems([]); });
   });
-  createEffect(on(() => p.projectSlug, () => p.onAttachments?.([]), { defer: true }));
+  createEffect(on(() => [p.projectSlug, isConnected()] as const, () => p.onAttachments?.([]), { defer: true }));
   const resize = () => {
     ta.style.height = "auto";
     ta.style.height = Math.min(ta.scrollHeight, 220) + "px";
@@ -328,10 +328,14 @@ function Composer(p: {
     const cur = p.attachments ?? [];
     const next = cur.some((c) => c.id === chip.id) ? cur.filter((c) => c.id !== chip.id) : [...cur, chip];
     p.onAttachments?.(next);
+    const query = atQuery(text(), caret());
+    const insertion = query.open ? query.start : caret();
     const consumed = consumeAtToken(text(), caret());
     write(consumed);
     setAtOff(true);
     ta.focus();
+    ta.setSelectionRange(insertion, insertion);
+    setCaret(insertion);
   };
   const [sending, setSending] = createSignal(false);
   const send = async () => {
@@ -406,7 +410,7 @@ function Composer(p: {
             </For>
           </Show>
           <div class="slash-head">Files</div>
-          <For each={atItems().length ? atItems().filter((i) => i.section === "Files") : p.files}>
+          <For each={isConnected() ? atItems().filter((i) => i.section === "Files") : p.files}>
             {(f) => {
               const id = "id" in f ? f.id : (f as { id: string }).id;
               const label = "label" in f ? (f as AttachItem).label : (f as { name: string }).name;
@@ -728,6 +732,9 @@ export default function App() {
     setNewProjectDraft(false);
   };
   const [liveProjects, setLiveProjects] = createSignal<ProjectSummary[]>([]);
+  const effectiveNewProject = createMemo(() => isConnected()
+    ? (liveProjects().find(p => p.slug === newProject())?.slug ?? liveProjects()[0]?.slug)
+    : newProject());
   const [createError, setCreateError] = createSignal<string | null>(null);
   const [creating, setCreating] = createSignal(false);
   const [launchPreview, setLaunchPreview] = createSignal<LaunchReceipt | null>(null);
@@ -880,6 +887,7 @@ export default function App() {
     return { pid, fid, file };
   });
   const projectFiles = createMemo(() => {
+    if (isConnected()) return [];
     const id = selected();
     let pid: string | undefined;
     if (id?.startsWith("f:")) pid = id.split(":")[1];
@@ -995,7 +1003,7 @@ export default function App() {
       const title = missionTitle(text);
       const machine = newMachine();
       const receipt = {prompt,nodeId:machine,destination:nodeLabel(machine)};
-      const projectSlug = liveProjects().some((p) => p.slug === newProject()) ? newProject() : liveProjects()[0]?.slug;
+      const projectSlug = effectiveNewProject();
       const pick = effectivePick();
       setCreating(true); setCreateError(null); setLaunchPreview(receipt);
       try {
@@ -1382,13 +1390,13 @@ export default function App() {
                   <div class="na-drop" onPointerDown={(e) => e.stopPropagation()}>
                     <button class="na-drop-btn" aria-label="Choose project" aria-haspopup="dialog" aria-expanded={envOpen() === "project"} onClick={() => setEnvOpen(envOpen() === "project" ? null : "project")}>
                       {isConnected()
-                        ? (liveProjects().find((p) => p.slug === newProject())?.title ?? liveProjects()[0]?.title ?? "No project")
+                        ? (liveProjects().find((p) => p.slug === effectiveNewProject())?.title ?? effectiveNewProject() ?? "No project")
                         : projects.find((p) => p.id === newProject())?.name}
                       <Ic.ChevronDown size={12} />
                     </button>
                     <Show when={envOpen() === "project"}>
                       <ProjectPicker projects={isConnected() ? [...liveProjects()].sort((a,b) => (b.updated_at ?? "").localeCompare(a.updated_at ?? "")).map((p) => ({ id: p.slug, name: p.title ?? p.slug })) : projects.map((p) => ({ id: p.id, name: p.name }))}
-                        selected={isConnected() ? (liveProjects().find(p => p.slug === newProject())?.slug ?? liveProjects()[0]?.slug ?? "") : newProject()} canCreate={isConnected()}
+                        selected={effectiveNewProject() ?? ""} canCreate={isConnected()}
                         onSelect={(id) => { setNewProject(id); setEnvOpen(null); }}
                         onClose={() => setEnvOpen(null)}
                         onCreate={() => { setEnvOpen(null); setNewProjectDraft(true); }}
@@ -1525,7 +1533,7 @@ export default function App() {
                   onToggleFile={(id) =>
                     setAttached(attached().includes(id) ? attached().filter((x) => x !== id) : [...attached(), id])
                   }
-                  projectSlug={newProject() || liveProjects()[0]?.slug}
+                  projectSlug={effectiveNewProject()}
                   attachments={attachChips()}
                   onAttachments={setAttachChips}
                 />

@@ -7064,6 +7064,9 @@ async fn http_status_acknowledges_only_explicit_steers() {
 
 #[tokio::test]
 async fn http_create_attachment_failure_never_publishes_scheduler_ticket() {
+    if isolated_track_http_test("http_create_attachment_failure_never_publishes_scheduler_ticket") {
+        return;
+    }
     use std::os::unix::fs::symlink;
     let h = Harness::new().await;
     h.state.backend_registry.write().await.register(Arc::new(

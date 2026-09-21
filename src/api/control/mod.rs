@@ -17485,7 +17485,9 @@ async fn callback_snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn paloma_webhook_forwarder_loop(
+    app_state: Arc<std::sync::OnceLock<std::sync::Weak<AppState>>>,
     mut events_rx: broadcast::Receiver<AgentEvent>,
     mission_store: Arc<dyn MissionStore>,
     workspaces: workspace::SharedWorkspaceStore,
@@ -17565,6 +17567,7 @@ async fn paloma_webhook_forwarder_loop(
                         event_execution: Option<MissionRun>,
                         event_completion: Option<MissionCompletionSnapshot>,
                         reconcile_current: bool| {
+        let app_state = app_state.clone();
         let http = http_c.clone();
         let url = url_c.clone();
         let secret = secret_c.clone();
@@ -17843,10 +17846,16 @@ async fn paloma_webhook_forwarder_loop(
                                 .and_then(|m| m.project.project.clone())
                                 .filter(|slug| !slug.is_empty())
                             {
-                                tokio::spawn(async move {
-                                    super::project_controller::wake_controller_for_slug(&slug)
+                                if let Some(state) =
+                                    app_state.get().and_then(std::sync::Weak::upgrade)
+                                {
+                                    tokio::spawn(async move {
+                                        super::project_controller::wake_controller_for_slug(
+                                            state, &slug,
+                                        )
                                         .await;
-                                });
+                                    });
+                                }
                             }
                         }
                         break;
@@ -18064,6 +18073,7 @@ fn spawn_control_session(
         .filter(|url| !url.is_empty())
     {
         tokio::spawn(paloma_webhook_forwarder_loop(
+            control_hub.admission_state.clone(),
             events_tx.subscribe(),
             Arc::clone(&state.mission_store),
             workspaces.clone(),
@@ -36564,6 +36574,7 @@ Investigate <service/> failures.
             let workspaces =
                 Arc::new(workspace::WorkspaceStore::new(dir.path().to_path_buf()).await);
             let forwarder = tokio::spawn(paloma_webhook_forwarder_loop(
+                Arc::new(std::sync::OnceLock::new()),
                 rx,
                 store,
                 workspaces,
