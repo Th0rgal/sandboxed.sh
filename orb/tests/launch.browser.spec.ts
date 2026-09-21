@@ -54,10 +54,28 @@ async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteS
  return {posts,releasePost,releaseHistory,setSuccess:()=>{fail=false;},listReads:()=>listReads,fleetReads:()=>fleetReads};
 }
 async function chooseRemote(page:Page){await page.getByRole("button",{name:/Core \(agent-core\)/}).click();await page.getByRole("button",{name:/dgx-spark online/}).click();}
-const composerInput=(page:Page)=>page.getByPlaceholder("Plan, Build, / for commands, @ for context");
+// Anchored on the composer itself, not on its placeholder: typing a `/goal `
+// prefix puts the composer in goal mode, which swaps the placeholder to
+// "Describe the objective". A placeholder-based locator stops resolving the
+// moment `fill(prompt)` succeeds, so the following press/click/toHaveValue
+// times out even though the app behaved correctly.
+const composerInput=(page:Page)=>page.locator(".new-agent .composer textarea");
+/**
+ * The draft survived a refused launch. A `/goal ` prefix is absorbed into the
+ * Goal chip as it is typed, so the textarea legitimately holds the objective
+ * alone — asserting the raw `/goal …` string back would only ever have passed
+ * before goal mode existed. Chip plus objective is the same guarantee.
+ */
+async function expectGoalDraftKept(page:Page,input:ReturnType<typeof composerInput>,text=objective){
+ await expect(input).toHaveValue(text);
+ await expect(page.locator(".composer .mode-chip")).toBeVisible();
+}
 /** A `/goal` turn renders as a Goal tag plus the exact objective, never the raw slash command. */
 async function expectGoalTurn(page:Page,selector:string,text=objective){
- const turn=page.locator(selector);await expect(turn).toHaveCount(1);
+ // The transcript skeleton's shimmer row reuses the `.user` class (`.sk-user`)
+ // for its styling, so a bare `.user` also matches a placeholder that is not a
+ // turn at all. Count real turns only.
+ const turn=page.locator(selector).locator("css=:scope:not(.sk-user)");await expect(turn).toHaveCount(1);
  await expect(turn).toHaveClass(/goal/);await expect(turn.locator(".goal-tag")).toHaveText("Goal");await expect(turn.locator(":scope > span:last-child")).toHaveText(text);
 }
 
@@ -143,13 +161,16 @@ test("goal indicator overhead per keystroke stays negligible",async({page})=>{
 
  test("rejection preserves draft; explicit retry uses the same idempotency key",async({page})=>{
   const state=await setup(page,{reject:true});state.releasePost();const input=composerInput(page);await input.fill(prompt);await input.press("Enter");
-  await expect(page.getByRole("alert")).toContainText("Runner admission unavailable");await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(1);
-  await input.fill(`${prompt} still`);await expect(page.getByRole("alert")).toContainText("Runner admission unavailable");
-  await input.fill(prompt);state.setSuccess();await input.press("Enter");await expect(page.getByPlaceholder("Send follow-up")).toBeVisible();expect(state.posts).toHaveLength(2);expect(state.posts[1].idempotency_key).toBe(state.posts[0].idempotency_key);
+  await expect(page.getByRole("alert")).toContainText("Runner admission unavailable");await expectGoalDraftKept(page,input);expect(state.posts).toHaveLength(1);
+  // The Goal chip is up now, so the user types the objective, not the prefix:
+  // re-typing "/goal …" into an already-goal composer would nest the prefix and
+  // legitimately produce a different prompt (and so a different attempt).
+  await input.fill(`${objective} still`);await expect(page.getByRole("alert")).toContainText("Runner admission unavailable");
+  await input.fill(objective);state.setSuccess();await input.press("Enter");await expect(page.getByPlaceholder("Send follow-up")).toBeVisible();expect(state.posts).toHaveLength(2);expect(state.posts[1].idempotency_key).toBe(state.posts[0].idempotency_key);
  });
 
 test("missing selected node never silently launches on Core",async({page})=>{
- const state=await setup(page,{missing:true});await chooseRemote(page);const input=composerInput(page);await input.fill(prompt);await input.press("Enter");await expect(page.getByRole("alert")).toContainText("DGX Spark is unavailable");await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(0);
+ const state=await setup(page,{missing:true});await chooseRemote(page);const input=composerInput(page);await input.fill(prompt);await input.press("Enter");await expect(page.getByRole("alert")).toContainText("DGX Spark is unavailable");await expectGoalDraftKept(page,input);expect(state.posts).toHaveLength(0);
 });
 
 test("preflight refuses Grok on a node whose server only advertises Claude Code and OpenCode, keeping the exact selection and draft",async({page})=>{
@@ -166,7 +187,7 @@ test("preflight refuses Grok on a node whose server only advertises Claude Code 
  const input=composerInput(page);await input.fill(prompt);await input.press("Enter");
  await expect(page.getByRole("alert")).toContainText("Remote launch for grok (grok-4.6) is not supported on dgx-spark");
  await expect(page.getByRole("alert")).toContainText("Claude Code, OpenCode");
- await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(0);
+ await expectGoalDraftKept(page,input);expect(state.posts).toHaveLength(0);
  await expect(page.getByRole("button",{name:"Grok",exact:true})).toBeVisible();
  await expect(page.getByRole("button",{name:/DGX Spark/})).toBeVisible();
  await expect(page.getByPlaceholder("Send follow-up")).toHaveCount(0);
@@ -200,7 +221,7 @@ test("server without the remote_launch capability is refused before POST and sho
  await page.getByRole("button",{name:/^Claude Code/}).click();
  const input=composerInput(page);await input.fill(prompt);await input.press("Enter");
  await expect(page.getByRole("alert")).toContainText("does not support structured remote launches");
- await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(0);
+ await expectGoalDraftKept(page,input);expect(state.posts).toHaveLength(0);
  await page.getByRole("button",{name:/DGX Spark/}).click();
  await expect(page.getByRole("button",{name:/dgx-spark online/})).toContainText("no typed remote launch");
 });
@@ -210,7 +231,7 @@ test("capability read failure refuses before POST and reports support as last kn
  await page.getByRole("button",{name:"Grok",exact:true}).click();await page.getByRole("button",{name:"Claude Code 1",exact:true}).click();
  const input=composerInput(page);await input.fill(prompt);await input.press("Enter");
  await expect(page.getByRole("alert")).toContainText("Could not confirm remote launch support on DGX Spark");
- await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(0);
+ await expectGoalDraftKept(page,input);expect(state.posts).toHaveLength(0);
  await page.getByRole("button",{name:/DGX Spark/}).click();
  await expect(page.getByRole("button",{name:/dgx-spark online/})).toContainText("Claude Code, OpenCode (last known)");
 });
@@ -231,7 +252,7 @@ test("capability read failure refuses before POST and reports support as last kn
   const input=composerInput(page);await input.fill(prompt);await input.press("Enter");
   await expect(page.getByRole("alert")).toContainText("cannot reach this backend's model proxy");
   await expect(page.getByRole("alert")).not.toContainText("SANDBOXED_PUBLIC_URL");
-  await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(0);
+  await expectGoalDraftKept(page,input);expect(state.posts).toHaveLength(0);
   await page.screenshot({path:"test-results/orb-remote-proxy-missing.png"});
  });
 
@@ -246,7 +267,7 @@ test("unsupported remote harness is explicit and never changed to Claude",async(
  const state=await setup(page);state.releasePost();await chooseRemote(page);
  await page.getByRole("button",{name:"Grok",exact:true}).click();await page.getByRole("button",{name:/^Codex/}).click();
  const input=composerInput(page);await input.fill(prompt);await input.press("Enter");
- await expect(page.getByRole("alert")).toContainText("codex (codex-model) is not supported");await expect(input).toHaveValue(prompt);
+ await expect(page.getByRole("alert")).toContainText("codex (codex-model) is not supported");await expectGoalDraftKept(page,input);
  expect(state.posts).toHaveLength(0);
 });
 
@@ -306,7 +327,7 @@ test("typed-capable server that still answers remote_command required is explain
  await page.getByRole("button",{name:"Grok",exact:true}).click();await page.getByRole("button",{name:"Claude Code 1",exact:true}).click();
  const input=composerInput(page);await input.fill(prompt);await input.press("Enter");
  await expect(page.getByRole("alert")).toContainText("does not support structured remote launches");
- await expect(input).toHaveValue(prompt);expect(state.posts).toHaveLength(1);
+ await expectGoalDraftKept(page,input);expect(state.posts).toHaveLength(1);
  expect(state.posts[0]).toMatchObject({backend:"claudecode",model_override:"claude-sonnet-4-6",remote_node_id:"dgx-spark"});
  expect(state.posts[0]).not.toHaveProperty("remote_command");
 });

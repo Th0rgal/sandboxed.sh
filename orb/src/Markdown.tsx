@@ -1,5 +1,16 @@
-import { For, createMemo, type JSX } from "solid-js";
+import { For, createMemo, createSignal, type JSX } from "solid-js";
 import { openExternalUrl } from "./api";
+
+/**
+ * Source-vs-preview for Markdown file views, shared by every one of them so ⌘/
+ * works the same on a local demo file and on a core-hosted reference file. It
+ * is module-level rather than per-view because the shortcut is handled once, at
+ * the window, and the mode is a user preference that should survive switching
+ * between files.
+ */
+const [mdSource, setMdSource] = createSignal(false);
+export { mdSource, setMdSource };
+export const toggleMdSource = () => setMdSource((on) => !on);
 
 /** Only http(s)/mailto links are rendered as real links; anything else
  * (javascript:, data:, file:) is neutralised so markdown from a mission

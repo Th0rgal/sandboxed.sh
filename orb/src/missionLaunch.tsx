@@ -90,6 +90,68 @@ export function remoteLaunchUnconfirmed(nodeId: string, error: unknown): string 
   const detail = error instanceof Error ? error.message : String(error);
   return `Could not confirm remote launch support on ${nodeLabel(nodeId)}: ${detail}. Your draft and selection are kept; no mission was submitted.`;
 }
+/**
+ * A launch refusal the composer can act on, parsed from the core's structured
+ * JSON error body. `create_mission` answers with `{"error": …}` plus the
+ * relevant counters; anything it doesn't recognize stays a plain message.
+ */
+export type LaunchRefusal =
+  | { kind: "project_cap"; active: number; cap: number; message: string }
+  | { kind: "project_blocked"; status: string; message: string }
+  | { kind: "other"; message: string };
+
+/** Best-effort parse of a structured core error body. */
+function errorBody(error: unknown): Record<string, unknown> | null {
+  if (!(error instanceof ApiError)) return null;
+  const text = error.detail.trim();
+  if (!text.startsWith("{")) return null;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+const numberOr = (value: unknown, fallback: number) => (typeof value === "number" && Number.isFinite(value) ? value : fallback);
+
+/**
+ * Classify a failed launch. `parallel_missions_cap` is raised by the *project's*
+ * autonomy grant (`grant.parallel_missions` in `src/api/control/mod.rs`), which
+ * counts that project's non-terminal missions — it is not the backend-global
+ * `max_parallel_missions` setting, and raising the global one does not clear it.
+ * The message says so, because the two are easy to confuse.
+ */
+export function launchRefusal(error: unknown, project?: string | null): LaunchRefusal {
+  const body = errorBody(error);
+  const code = typeof body?.error === "string" ? body.error : null;
+  const where = project ? `"${project}"` : "this project";
+  if (code === "parallel_missions_cap") {
+    const active = numberOr(body?.active, 0);
+    const cap = numberOr(body?.cap, 0);
+    return {
+      kind: "project_cap",
+      active,
+      cap,
+      message:
+        `${where} has reached its limit of ${cap} unfinished agents (${active} in use). ` +
+        `Finish an agent or increase the limit in Project settings. Your draft is kept.`,
+    };
+  }
+  if (code === "project_paused" || code === "project_archived" || code === "project_blocked") {
+    const status = code.replace("project_", "");
+    return {
+      kind: "project_blocked",
+      status,
+      message: `${where} is ${status}, so no new agents can start in it. Resume the project first. Your draft is kept.`,
+    };
+  }
+  if (code === "campaign_exists") {
+    return { kind: "other", message: `${where} already has a campaign agent running. Finish it before starting another. Your draft is kept.` };
+  }
+  return { kind: "other", message: launchError(error) };
+}
+
 export function launchError(error: unknown): string {
   if (error instanceof ApiError && /remote_command.*required/i.test(error.detail)) return TYPED_LAUNCH_UNSUPPORTED;
   if (error instanceof ApiError) return error.detail || "The launch request was rejected. Your draft is kept.";

@@ -1,4 +1,4 @@
-import { LaunchStatus, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, missionSettingsIdle, dockModelLabel, type LaunchReceipt, type RemoteSupport } from "./missionLaunch";
+import { LaunchStatus, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, launchRefusal, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, missionSettingsIdle, dockModelLabel, type LaunchReceipt, type LaunchRefusal, type RemoteSupport } from "./missionLaunch";
 import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, GoalTag, EMPTY_GOAL_ERROR, absorbGoalPrefix, composerModes, filterSlash, slashQuery, modePrompt, ModeChip, type ComposerMode } from "./goal";
 import { ProjectPicker, ProjectCreation } from "./ProjectPicker";
 import { hasFocusScope } from "./focusScope";
@@ -12,14 +12,17 @@ import { MACHINES, Machines } from "./Machines";
 import { Providers } from "./Providers";
 import { PromptSheet } from "./Dialog";
 import { MenuList, PopupMenu, type MenuEntry } from "./Menu";
-import { MdSource, MdView, safeHref } from "./Markdown";
+import { MdSource, MdView, mdSource, safeHref, setMdSource, toggleMdSource } from "./Markdown";
 import { streamMission, heldAfterHistory, type StreamEvent } from "./stream";
 import { Transcript, UserTurn, applyStreamEvent, type StreamItem } from "./Transcript";
 import { cacheRemember, cacheRecents } from "./pageCache";
+import { DEFAULT_EFFORT_LABEL, effortLabel, harnessSupportsEffort, normalizeEffort, supportedEfforts } from "./effort";
 import { loadTranscript, peekReadyTranscript, peekTranscriptHeight, prefetchTranscript, putTranscript, putTranscriptHeight, putTranscriptItems } from "./missionCache";
 import { TranscriptSkeleton } from "./Skeleton";
 import { mergeById, pollWhileVisible } from "./poll";
 import { LiveProjectsSection, ProjectFileView } from "./ProjectFiles";
+import { ProjectSettings } from "./ProjectSettings";
+import { ExecutionSettings } from "./ExecutionSettings";
 import { VoiceButton, ensureVoiceProbe, voiceAvailable } from "./VoiceButton";
 import { insertAtCaret } from "./voice";
 import { contextPct, contextWindow, estimateTokens, formatTokens } from "./missionContext";
@@ -48,12 +51,14 @@ import {
   openExternalUrl,
 } from "./api";
 
-const PAGES = new Set(["settings", "machines", "providers"]);
+const PAGES = new Set(["settings", "machines", "providers", "execution"]);
 
 const MODELS = ["Orb Lorem 4.6 High Fast", "Ipsum 5 Max", "Dolor 4.5 Sonnet", "Auto"];
 
-/** Harness + model chosen for new agents; persisted per user. */
-export type HarnessPick = { backend: string; model: string };
+/** Harness + model chosen for new agents; persisted per user. `effort` is
+ * absent for "let the backend decide", and is dropped whenever the selected
+ * harness does not accept that level (see `effort.ts`). */
+export type HarnessPick = { backend: string; model: string; effort?: string };
 const PICK_KEY = "orb.harnessPick";
 const loadPick = (): HarnessPick | null => {
   try {
@@ -73,12 +78,17 @@ const setHarnessPick = (p: HarnessPick) => {
     /* ignore */
   }
 };
-/** Preserve an explicit selection; launch validation reports unavailable models. */
+/** Preserve an explicit selection; launch validation reports unavailable models.
+ * A stored effort is normalized against the stored harness on every read, so a
+ * level that harness never accepted can't survive into a create payload. */
 const effectivePick = (): HarnessPick | null => {
   const choices = harnessChoices();
   if (!choices.length) return null;
   const stored = harnessPick();
-  if (stored) return stored;
+  if (stored) {
+    const effort = normalizeEffort(stored.effort, stored.backend);
+    return effort ? { ...stored, effort } : { backend: stored.backend, model: stored.model };
+  }
   const first = choices.find((c) => c.backend.id === "claudecode") ?? choices[0];
   return { backend: first.backend.id, model: first.models[0].value };
 };
@@ -244,7 +254,7 @@ function Composer(p: {
   const live = () => isConnected() && harnessChoices().length > 0;
   const [menu, setMenu] = createSignal(false);
   const [ctx, setCtx] = createSignal(false);
-  const [which, setWhich] = createSignal<"harness" | "model" | null>(null);
+  const [which, setWhich] = createSignal<"harness" | "model" | "effort" | null>(null);
   const [slashOff, setSlashOff] = createSignal(false);
   let ta!: HTMLTextAreaElement;
   const pick = () => effectivePick();
@@ -399,7 +409,13 @@ function Composer(p: {
                     <button
                       class={`menu-item ${c.backend.id === pick()?.backend ? "on" : ""}`}
                       onClick={() => {
-                        if (c.backend.id !== pick()?.backend) setHarnessPick({ backend: c.backend.id, model: c.models[0].value });
+                        // Switching harness resets the model, and with it the
+                        // effort: the new harness may not accept any, or may
+                        // not accept the level that was selected.
+                        if (c.backend.id !== pick()?.backend) {
+                          const effort = normalizeEffort(pick()?.effort, c.backend.id);
+                          setHarnessPick({ backend: c.backend.id, model: c.models[0].value, ...(effort ? { effort } : {}) });
+                        }
                         setWhich(null);
                       }}
                     >
@@ -433,7 +449,9 @@ function Composer(p: {
                       class={`menu-item ${m.value === pick()?.model ? "on" : ""}`}
                       title={m.value}
                       onClick={() => {
-                        setHarnessPick({ backend: choice()!.backend.id, model: m.value });
+                        const backend = choice()!.backend.id;
+                        const effort = normalizeEffort(pick()?.effort, backend);
+                        setHarnessPick({ backend, model: m.value, ...(effort ? { effort } : {}) });
                         setWhich(null);
                       }}
                     >
@@ -445,6 +463,53 @@ function Composer(p: {
               </div>
             </Show>
           </div>
+          {/* Effort, after harness and model. Only rendered for a harness the
+              core actually accepts an effort for — everything else has
+              model_effort forced to null server-side. */}
+          <Show when={harnessSupportsEffort(pick()?.backend)}>
+            <span class="picks-sep">·</span>
+            <div class="model-wrap">
+              <button
+                class={`model ${which() === "effort" ? "on" : ""}`}
+                title="Reasoning effort"
+                aria-label={`Reasoning effort: ${effortLabel(pick()?.effort)}`}
+                onClick={() => setWhich(which() === "effort" ? null : "effort")}
+              >
+                {effortLabel(pick()?.effort)} <Ic.ChevronDown size={12} />
+              </button>
+              <Show when={which() === "effort"}>
+                <div class="menu">
+                  <button
+                    class={`menu-item ${!pick()?.effort ? "on" : ""}`}
+                    title="Let the harness choose — no model_effort is sent"
+                    onClick={() => {
+                      const cur = pick()!;
+                      setHarnessPick({ backend: cur.backend, model: cur.model });
+                      setWhich(null);
+                    }}
+                  >
+                    <span class="pick-name">{DEFAULT_EFFORT_LABEL}</span>
+                    <span class="pick-check">{!pick()?.effort ? "✓" : ""}</span>
+                  </button>
+                  <For each={supportedEfforts(pick()?.backend)}>
+                    {(e) => (
+                      <button
+                        class={`menu-item ${e === pick()?.effort ? "on" : ""}`}
+                        onClick={() => {
+                          const cur = pick()!;
+                          setHarnessPick({ backend: cur.backend, model: cur.model, effort: e });
+                          setWhich(null);
+                        }}
+                      >
+                        <span class="pick-name">{effortLabel(e)}</span>
+                        <span class="pick-check">{e === pick()?.effort ? "✓" : ""}</span>
+                      </button>
+                    )}
+                  </For>
+                </div>
+              </Show>
+            </div>
+          </Show>
         </Show>
       </div>
     </Show>
@@ -594,7 +659,11 @@ export default function App() {
   const [nameDlg, setNameDlg] = createSignal<null | { kind: "folder" | "file" | "rename-project" | "rename-folder" | "rename-file" | "rename-agent"; pid: string; fid?: string; fileId?: string; agentId?: string; value: string }>(null);
   const [attached, setAttached] = createSignal<string[]>([]);
   const [ctx, setCtx] = createSignal<{ x: number; y: number; items: MenuEntry[] } | null>(null);
-  const [mdSrc, setMdSrc] = createSignal(false);
+  /** A structured launch refusal, when the core gave one we can act on. */
+  const [createRefusal, setCreateRefusal] = createSignal<{ refusal: LaunchRefusal; project: string | null } | null>(null);
+  // Shared with ProjectFileView so ⌘/ reaches core-hosted reference files too.
+  const mdSrc = mdSource;
+  const setMdSrc = setMdSource;
   let scroller: HTMLDivElement | undefined;
   let timer: number | undefined;
   let prevStatus: Agent["status"] = "idle";
@@ -675,6 +744,11 @@ export default function App() {
     }
     return null;
   });
+  // Project settings page: `ps:<slug>`.
+  const currentProjectSettings = createMemo(() => {
+    const id = selected();
+    return id?.startsWith("ps:") ? id.slice(3) : null;
+  });
   // Hosted project file: `pf:<slug>:<path>` (path may itself contain slashes).
   const currentProjectFile = createMemo(() => {
     const id = selected();
@@ -711,13 +785,13 @@ export default function App() {
         .catch(() => setLiveProjects([]));
       // Seed agent ids only exist offline — don't land on a demo transcript.
       const sel = selected();
-      if (sel && !sel.includes(":") && !["settings", "machines", "providers"].includes(sel)) open(null);
+      if (sel && !sel.includes(":") && !PAGES.has(sel)) open(null);
       if (newMachine() === "local") setNewMachine("core");
     } else {
       // Backend views (missions, hosted files) can't render offline — e.g.
       // after a 401 cleared the token mid-session.
       const sel = selected();
-      if (sel && (sel.startsWith("m:") || sel.startsWith("pf:") || sel.startsWith("c:"))) open(null);
+      if (sel && (sel.startsWith("m:") || sel.startsWith("pf:") || sel.startsWith("c:") || sel.startsWith("pc:") || sel.startsWith("ps:") || sel === "execution")) open(null);
       // Keep an explicit machine selection across reconnects.
     }
   }));
@@ -849,7 +923,7 @@ export default function App() {
       const receipt = {prompt,nodeId:machine,destination:nodeLabel(machine)};
       const projectSlug = liveProjects().some((p) => p.slug === newProject()) ? newProject() : liveProjects()[0]?.slug;
       const pick = effectivePick();
-      setCreating(true); setCreateError(null); setLaunchPreview(receipt);
+      setCreating(true); setCreateError(null); setCreateRefusal(null); setLaunchPreview(receipt);
       try {
         if (!pick || !harnessChoices().some(c => c.backend.id === pick.backend && c.models.some(m => m.value === pick.model))) throw new Error("Choose an available harness and model before starting. Your draft is kept.");
         if (machine !== "core") {
@@ -862,7 +936,10 @@ export default function App() {
           const refusal = remoteLaunchPreflight(fleet, machine, pick, harnessName);
           if (refusal) throw new Error(refusal);
         }
-        const body = {title,prompt,project:projectSlug,backend:pick.backend,model_override:pick.model,...(machine === "core" ? {} : {remote_node_id:machine})};
+        // `effectivePick` already dropped an effort this harness can't take, so
+        // an omitted field means "backend default" rather than a stale level.
+        const effort = normalizeEffort(pick.effort, pick.backend);
+        const body = {title,prompt,project:projectSlug,backend:pick.backend,model_override:pick.model,...(effort ? {model_effort:effort} : {}),...(machine === "core" ? {} : {remote_node_id:machine})};
         const signature = JSON.stringify(body);
         if (launchAttempt?.signature !== signature) launchAttempt = {signature,key:crypto.randomUUID()};
         const m = await createMission({...body,idempotency_key:launchAttempt.key});
@@ -873,7 +950,13 @@ export default function App() {
         void refreshMissions();
         return true;
       } catch (e) {
-        setCreateError(launchError(e));
+        // The idempotency key is deliberately *not* cleared here: a retry of
+        // the same draft reuses it, so a request the server actually accepted
+        // before failing the response cannot become a second mission.
+        const refusal = launchRefusal(e, projectSlug ?? null);
+        setCreateError(refusal.message);
+        setCreateRefusal(refusal.kind === "other" ? null : { refusal, project: projectSlug ?? null });
+        // Returning false keeps the composer text exactly as typed.
         return false;
       } finally { setCreating(false); setLaunchPreview(null); }
     }
@@ -976,9 +1059,11 @@ export default function App() {
       return;
     }
     if (e.metaKey && e.key === "/") {
-      if (currentFile()) {
+      // Both kinds of Markdown file view: the local demo files and the
+      // core-hosted reference files, which render through ProjectFileView.
+      if (currentFile() || currentProjectFile()) {
         e.preventDefault();
-        setMdSrc(!mdSrc());
+        toggleMdSource();
       }
       return;
     }
@@ -1126,6 +1211,12 @@ export default function App() {
             <Match when={selected() === "providers"}>
               <span>Providers</span>
             </Match>
+            <Match when={selected() === "execution"}>
+              <span>Execution</span>
+            </Match>
+            <Match when={currentProjectSettings()}>
+              {(slug) => <span>{liveProjects().find((x) => x.slug === slug())?.title ?? slug()} · Settings</span>}
+            </Match>
             <Match when={currentMissionId()}>
               {(id) => (
                 <>
@@ -1140,6 +1231,7 @@ export default function App() {
                 <>
                   <span>{pf().path.split("/").pop()}</span>
                   <Ic.CloudIcon class="dim" />
+                  <kbd class="tb-kbd">{mdSrc() ? "Preview" : "Source"} ⌘/</kbd>
                 </>
               )}
             </Match>
@@ -1171,7 +1263,7 @@ export default function App() {
       <main class="main">
         <Switch>
           <Match when={selected() === "settings"}>
-            <Settings />
+            <Settings onOpenPage={open} />
           </Match>
           <Match when={selected() === "machines"}>
             <Machines />
@@ -1186,10 +1278,20 @@ export default function App() {
               </Show>
             )}
           </Match>
+          <Match when={selected() === "execution"}>
+            <ExecutionSettings />
+          </Match>
           <Match when={currentController()}>
             {(slug) => (
               <Show when={slug()} keyed>
                 {(s) => <ControllerView slug={s.slug} id={s.id} />}
+              </Show>
+            )}
+          </Match>
+          <Match when={currentProjectSettings()}>
+            {(slug) => (
+              <Show when={slug()} keyed>
+                {(s) => <ProjectSettings slug={s} onOpenPage={open} onOpenMission={(id) => open(`m:${id}`)} />}
               </Show>
             )}
           </Match>
@@ -1255,6 +1357,7 @@ export default function App() {
                     </button>
                     <Show when={envOpen() === "machine"}>
                       <div class="menu na-menu">
+                        <div class="na-menu-list">
                         <Show
                           when={isConnected()}
                           fallback={
@@ -1289,7 +1392,7 @@ export default function App() {
                                       <Ic.MachinesIcon />
                                     </span>
                                     <span class="menu-col">
-                                      {m.name}
+                                      <span class="menu-title">{m.name}</span>
                                       <span class="menu-sub">{m.user}@{m.host}</span>
                                     </span>
                                   </button>
@@ -1309,7 +1412,7 @@ export default function App() {
                               <Ic.MachinesIcon />
                             </span>
                             <span class="menu-col">
-                              Core (agent-core)
+                              <span class="menu-title">Core (agent-core)</span>
                               <span class="menu-sub">Backend host workspace</span>
                             </span>
                           </button>
@@ -1327,7 +1430,7 @@ export default function App() {
                                   <Ic.MachinesIcon />
                                 </span>
                                 <span class="menu-col">
-                                  {n.id}
+                                  <span class="menu-title">{n.id}</span>
                                   <span class="menu-sub">
                                     {n.status}
                                     {n.cordoned ? " · cordoned" : ""}
@@ -1338,25 +1441,49 @@ export default function App() {
                             )}
                           </For>
                         </Show>
-                        <div class="menu-sep" />
-                        <button
-                          class="menu-item"
-                          onClick={() => {
-                            setEnvOpen(null);
-                            open("machines");
-                          }}
-                        >
-                          <span class="menu-ico">
-                            <Ic.GearIcon />
-                          </span>
-                          Manage machines
-                        </button>
+                        </div>
+                        <div class="na-menu-foot">
+                          <div class="menu-sep" />
+                          <button
+                            class="menu-item"
+                            onClick={() => {
+                              setEnvOpen(null);
+                              open("machines");
+                            }}
+                          >
+                            <span class="menu-ico">
+                              <Ic.GearIcon />
+                            </span>
+                            Manage machines
+                          </button>
+                        </div>
                       </div>
                     </Show>
                   </div>
                 </div>
                 <Show when={createError()}>
-                  <p class="st-error" role="alert">{createError()}</p>
+                  <div class="launch-refusal" role="alert">
+                    <p class="st-error">{createError()}</p>
+                    <Show when={createRefusal()}>
+                      {(r) => (
+                        <div class="launch-refusal-actions">
+                          <Show when={r().refusal.kind === "project_cap" && r().project}>
+                            <span class="launch-refusal-meta">
+                              {(r().refusal as Extract<LaunchRefusal, { kind: "project_cap" }>).active} of{" "}
+                              {(r().refusal as Extract<LaunchRefusal, { kind: "project_cap" }>).cap} unfinished
+                            </span>
+                          </Show>
+                          <Show when={r().project}>
+                            {(slug) => (
+                              <button class="s-btn sm" onClick={() => open(`ps:${slug()}`)}>
+                                Open project settings
+                              </button>
+                            )}
+                          </Show>
+                        </div>
+                      )}
+                    </Show>
+                  </div>
                 </Show>
                 <Show when={launchPreview()}>{(receipt) => <div class="launch-preview"><UserTurn text={receipt().prompt} /><LaunchStatus submitting destination={receipt().destination} goal={goalObjective(receipt().prompt)} /></div>}</Show>
                 <div hidden={creating()}>
@@ -1491,6 +1618,7 @@ function MissionDock(p: {
   const pct = () => contextPct(used(), windowSize());
   const [open, setOpen] = createSignal(false);
   const [modelOpen, setModelOpen] = createSignal(false);
+  const [effortOpen, setEffortOpen] = createSignal(false);
   const [saving, setSaving] = createSignal(false);
   const choice = () => harnessChoices().find((c) => c.backend.id === p.mission?.backend);
   const harnessName = () => choice()?.backend.name ?? p.mission?.backend ?? "";
@@ -1504,11 +1632,17 @@ function MissionDock(p: {
   const idle = () => missionSettingsIdle(p.mission?.status);
   const models = () => choice()?.models ?? [];
   const canChangeModel = () => idle() && models().length > 1 && !saving();
+  // The mission's own stored effort, normalized against its harness: a mission
+  // created before an effort was offered simply has none.
+  const effort = () => normalizeEffort(p.mission?.model_effort, p.mission?.backend);
+  const efforts = () => supportedEfforts(p.mission?.backend);
+  const canChangeEffort = () => idle() && efforts().length > 0 && !saving();
   const close = (e: PointerEvent) => {
     if (!(e.target instanceof Node)) return;
     const el = e.target as HTMLElement;
     if (!el.closest?.(".ctx-wrap")) setOpen(false);
     if (!el.closest?.(".under-model-wrap")) setModelOpen(false);
+    if (!el.closest?.(".under-effort-wrap")) setEffortOpen(false);
   };
   const pickModel = async (value: string) => {
     const m = p.mission;
@@ -1519,6 +1653,19 @@ function MissionDock(p: {
       p.onMission?.(await updateMissionSettings(m.id, { model_override: value }));
     } catch (e) {
       p.onError?.(e instanceof Error && e.message.includes("409") ? "Stop the current turn before switching models." : launchError(e));
+    } finally { setSaving(false); }
+  };
+  /** Next-turn effort. "" is the core's documented clear back to the backend
+   * default (`normalize_string_patch` trims it to a null). */
+  const pickEffort = async (value: string) => {
+    const m = p.mission;
+    if (!m || value === (effort() ?? "") || saving()) { setEffortOpen(false); return; }
+    setSaving(true);
+    setEffortOpen(false);
+    try {
+      p.onMission?.(await updateMissionSettings(m.id, { model_effort: value }));
+    } catch (e) {
+      p.onError?.(e instanceof Error && e.message.includes("409") ? "Stop the current turn before switching effort." : launchError(e));
     } finally { setSaving(false); }
   };
   onMount(() => window.addEventListener("pointerdown", close));
@@ -1568,6 +1715,44 @@ function MissionDock(p: {
             </Show>
           </Show>
         </div>
+        <Show when={efforts().length > 0}>
+          <span class="under-sep" aria-hidden="true">·</span>
+          <div class="under-effort-wrap under-model-wrap">
+            <Show
+              when={canChangeEffort()}
+              fallback={
+                <span class="under-model" title={idle() ? `Effort: ${effortLabel(effort())}` : "Stop the current turn to switch effort"}>
+                  {effortLabel(effort())}
+                </span>
+              }
+            >
+              <button
+                class={`under-model ${effortOpen() ? "on" : ""}`}
+                title="Reasoning effort for the next turn"
+                aria-label={`Reasoning effort: ${effortLabel(effort())}`}
+                onClick={() => setEffortOpen(!effortOpen())}
+              >
+                {effortLabel(effort())} <Ic.ChevronDown size={10} />
+              </button>
+              <Show when={effortOpen()}>
+                <div class="menu under-model-menu">
+                  <button class={`menu-item ${!effort() ? "on" : ""}`} onClick={() => void pickEffort("")}>
+                    <span class="pick-name">{DEFAULT_EFFORT_LABEL}</span>
+                    <span class="pick-check">{!effort() ? "✓" : ""}</span>
+                  </button>
+                  <For each={efforts()}>
+                    {(e) => (
+                      <button class={`menu-item ${e === effort() ? "on" : ""}`} onClick={() => void pickEffort(e)}>
+                        <span class="pick-name">{effortLabel(e)}</span>
+                        <span class="pick-check">{e === effort() ? "✓" : ""}</span>
+                      </button>
+                    )}
+                  </For>
+                </div>
+              </Show>
+            </Show>
+          </div>
+        </Show>
       </Show>
       <div class="ctx-wrap">
         <button class="ctx" title="Context used" onClick={() => setOpen(!open())}>
@@ -1725,7 +1910,13 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
             when={!awaiting()}
             fallback={
               <>
-                <Show when={receipt && ["pending", "queued", "starting", "resuming"].includes(mission()?.status ?? "") ? receipt : undefined}>
+                {/* While the transcript is still loading, the launch status is
+                    the only thing telling the user where their mission went.
+                    A remote mission reaches "active" as soon as the node
+                    accepts the job — long before any output — so gate on
+                    "accepted but nothing to show yet", not on the early
+                    statuses alone. */}
+                <Show when={receipt && (["pending", "queued", "starting", "resuming"].includes(mission()?.status ?? "") || !!mission()?.remote_job) ? receipt : undefined}>
                   {(r) => (
                     <>
                       <LaunchStatus destination={missionDestination(mission(), r())} mission={mission()} goal={missionGoal(mission(), r())} />

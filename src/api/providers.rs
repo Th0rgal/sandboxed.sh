@@ -786,6 +786,13 @@ fn default_providers_config() -> ProvidersConfig {
                 models: vec![
                     // Check Anthropic's current model IDs here:
                     // https://platform.claude.com/docs/en/about-claude/models/overview
+                    //
+                    // Only the current Opus and Fable are listed: those two
+                    // lines are superseded in place, so an older alias is never
+                    // the right choice for a new mission. `model_policy` is the
+                    // rule, and `retire_superseded_claude_models` below drops
+                    // any that the dynamic catalog or a live provider re-adds.
+                    // Sonnet/Haiku entries are untouched.
                     ProviderModel {
                         id: "claude-opus-5".to_string(),
                         name: "Claude Opus 5".to_string(),
@@ -803,36 +810,6 @@ fn default_providers_config() -> ProvidersConfig {
                         ),
                     },
                     ProviderModel {
-                        id: "claude-fable-5".to_string(),
-                        name: "Claude Fable 5".to_string(),
-                        description: Some(
-                            "Previous-generation Fable model retained for explicit compatibility"
-                                .to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "claude-opus-4-8".to_string(),
-                        name: "Claude Opus 4.8".to_string(),
-                        description: Some(
-                            "Previous-generation Opus model retained for explicit compatibility"
-                                .to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "claude-opus-4-7".to_string(),
-                        name: "Claude Opus 4.7".to_string(),
-                        description: Some(
-                            "Most capable, recommended for complex tasks".to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "claude-opus-4-6".to_string(),
-                        name: "Claude Opus 4.6".to_string(),
-                        description: Some(
-                            "Most capable, recommended for complex tasks".to_string(),
-                        ),
-                    },
-                    ProviderModel {
                         id: "claude-sonnet-4-6".to_string(),
                         name: "Claude Sonnet 4.6".to_string(),
                         description: Some(
@@ -843,13 +820,6 @@ fn default_providers_config() -> ProvidersConfig {
                         id: "claude-sonnet-4-5-20250929".to_string(),
                         name: "Claude Sonnet 4.5".to_string(),
                         description: Some("Balanced speed and capability".to_string()),
-                    },
-                    ProviderModel {
-                        id: "claude-opus-4-5-20251101".to_string(),
-                        name: "Claude Opus 4.5".to_string(),
-                        description: Some(
-                            "Most capable, recommended for complex tasks".to_string(),
-                        ),
                     },
                     ProviderModel {
                         id: "claude-sonnet-5".to_string(),
@@ -2560,6 +2530,7 @@ pub async fn list_providers(
         query.include_unverified,
     );
     drop(cached);
+    retire_superseded_claude_models(&mut providers);
 
     Json(ProvidersResponse {
         providers,
@@ -2726,6 +2697,36 @@ pub async fn list_backend_model_options(
     Json(BackendModelOptionsResponse { backends })
 }
 
+/// Drop Claude models this deployment has retired.
+///
+/// The hardcoded list above is only one source: `merge_cached_provider_models`,
+/// `merge_store_provider_models` and `apply_live_authoritative_provider_models`
+/// all add whatever Anthropic currently exposes to the account, which still
+/// includes the older Opus and Fable aliases. Filtering after the merge is what
+/// keeps them out of the pickers, not just out of the defaults.
+///
+/// A provider whose every model is retired is left empty on purpose: an empty
+/// picker says "nothing current is available here", which is true, whereas
+/// offering a retired model because it is the only one left would hand the user
+/// exactly the selection this policy exists to prevent.
+fn retire_superseded_claude_models(providers: &mut [Provider]) {
+    for provider in providers.iter_mut() {
+        let before = provider.models.len();
+        provider
+            .models
+            .retain(|model| !crate::model_policy::is_retired_claude_model(&model.id));
+        let dropped = before - provider.models.len();
+        if dropped > 0 {
+            tracing::debug!(
+                provider = %provider.id,
+                dropped,
+                remaining = provider.models.len(),
+                "filtered retired Claude models"
+            );
+        }
+    }
+}
+
 /// Validate a model override for a specific backend.
 /// Returns Ok(()) if valid, Err with user-friendly error message if invalid.
 /// Allows custom/unknown models (escape hatch) but validates known providers.
@@ -2747,6 +2748,7 @@ pub async fn validate_model_override(
     merge_store_provider_models(&mut providers, &store_providers, true);
     apply_live_authoritative_provider_models(&mut providers, &store_providers, &cached, true);
     drop(cached);
+    retire_superseded_claude_models(&mut providers);
 
     match backend {
         "opencode" => {
@@ -2783,6 +2785,17 @@ pub async fn validate_model_override(
             }
         }
         "claudecode" => {
+            // The `claude-*` escape hatch below exists so a model Anthropic
+            // ships tomorrow works today, without a release. It also accepted
+            // every model Anthropic shipped *yesterday*: production mission
+            // f77ee08c stored `claude-opus-4-1` through exactly this path,
+            // which is why the retirement check has to come first.
+            if let Some(replacement) = crate::model_policy::retired_claude_model(model_override) {
+                return Err(crate::model_policy::retired_model_message(
+                    model_override,
+                    replacement,
+                ));
+            }
             // Claude Code expects raw model IDs from Anthropic
             let anthropic = providers.iter().find(|p| p.id == "anthropic");
             if let Some(provider) = anthropic {
@@ -3144,22 +3157,105 @@ mod tests {
     }
 
     #[test]
-    fn default_anthropic_catalog_leads_with_opus_5() {
+    fn default_anthropic_catalog_offers_the_current_opus_and_fable_only() {
         let defaults = default_providers_config();
         let anthropic = defaults
             .providers
             .iter()
             .find(|provider| provider.id == "anthropic")
             .expect("anthropic provider");
-        assert_eq!(anthropic.models[0].id, "claude-opus-5");
+        assert_eq!(
+            anthropic.models[0].id,
+            crate::model_policy::CURRENT_CLAUDE_OPUS
+        );
         assert!(anthropic
             .models
             .iter()
-            .any(|model| model.id == "claude-opus-4-8"));
+            .any(|model| model.id == crate::model_policy::CURRENT_CLAUDE_FABLE));
+        // The older Opus/Fable aliases this deployment has moved off are not
+        // offered — previously `claude-opus-4-8` and friends were listed here.
+        for retired in [
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-opus-4-5-20251101",
+            "claude-fable-5",
+        ] {
+            assert!(
+                !anthropic.models.iter().any(|model| model.id == retired),
+                "{retired} must not be selectable"
+            );
+        }
+        // Other families are untouched by the policy.
         assert!(anthropic
             .models
             .iter()
-            .any(|model| model.id == "claude-fable-5-1"));
+            .any(|model| model.id == "claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn retirement_filter_drops_legacy_ids_and_never_falls_back_to_offering_them() {
+        let mut providers = vec![
+            Provider {
+                id: "anthropic".to_string(),
+                name: "Claude".to_string(),
+                billing: "subscription".to_string(),
+                description: String::new(),
+                models: vec![
+                    ProviderModel {
+                        id: "claude-opus-4-8".to_string(),
+                        name: "Opus 4.8".to_string(),
+                        description: None,
+                    },
+                    ProviderModel {
+                        id: crate::model_policy::CURRENT_CLAUDE_OPUS.to_string(),
+                        name: "Opus 5".to_string(),
+                        description: None,
+                    },
+                    ProviderModel {
+                        id: "claude-sonnet-4-6".to_string(),
+                        name: "Sonnet 4.6".to_string(),
+                        description: None,
+                    },
+                ],
+            },
+            Provider {
+                id: "legacy-only".to_string(),
+                name: "Legacy".to_string(),
+                billing: "subscription".to_string(),
+                description: String::new(),
+                models: vec![
+                    ProviderModel {
+                        id: "claude-opus-4-1".to_string(),
+                        name: "Opus 4.1".to_string(),
+                        description: None,
+                    },
+                    ProviderModel {
+                        id: "claude-fable-5".to_string(),
+                        name: "Fable 5".to_string(),
+                        description: None,
+                    },
+                ],
+            },
+        ];
+        retire_superseded_claude_models(&mut providers);
+
+        let anthropic: Vec<&str> = providers[0].models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            anthropic,
+            vec![
+                crate::model_policy::CURRENT_CLAUDE_OPUS,
+                "claude-sonnet-4-6"
+            ]
+        );
+
+        // A provider whose every model is retired is left empty on purpose:
+        // "nothing current here" is true, and offering the legacy id because it
+        // is the only one left would defeat the policy entirely.
+        assert!(
+            providers[1].models.is_empty(),
+            "a legacy-only provider must not fall back to offering legacy models"
+        );
     }
 
     #[test]

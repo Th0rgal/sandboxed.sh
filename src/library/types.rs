@@ -485,21 +485,26 @@ pub struct ClaudeCodeAttribution {
 /// Controls default model, agent preferences, and visibility for Claude Code backend.
 pub const CLAUDE_CODE_DEFAULT_MODEL: &str = "claude-opus-5";
 
+/// A config profile's stored `default_model` is whatever was written when the
+/// profile was created, which can be several model releases ago. An empty or
+/// retired value resolves to the current model of its line;
+/// [`crate::model_policy`] owns which ids those are, so this agrees with
+/// `DEFAULT_MODEL`, the provider catalog and mission creation.
+///
+/// The replacement is written bare, without a provider prefix: this value is
+/// handed to the Claude Code CLI, which takes raw Anthropic model ids. (The
+/// `DEFAULT_MODEL` environment variable is the provider-qualified surface and
+/// keeps its prefix — see `config::upgrade_legacy_anthropic_default_model`.)
 pub fn normalize_claude_code_default_model(model: Option<String>) -> String {
     let configured = model.unwrap_or_default();
     let trimmed = configured.trim();
-    if trimmed.is_empty()
-        || matches!(
-            trimmed,
-            "claude-opus-4-8"
-                | "claude-opus-4.8"
-                | "anthropic/claude-opus-4-8"
-                | "anthropic/claude-opus-4.8"
-        )
-    {
+    if trimmed.is_empty() {
         return CLAUDE_CODE_DEFAULT_MODEL.to_string();
     }
-    trimmed.to_string()
+    match crate::model_policy::retired_claude_model(trimmed) {
+        Some(replacement) => replacement.to_string(),
+        None => trimmed.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
