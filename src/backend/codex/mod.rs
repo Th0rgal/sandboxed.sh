@@ -1123,6 +1123,9 @@ struct AppServerEventTranslator {
     pending_tool_calls: std::collections::HashMap<String, PendingToolCall>,
     emitted_tool_call_ids: std::collections::HashSet<String>,
     emitted_tool_result_ids: std::collections::HashSet<String>,
+    /// Checklist notifications have no native item ID. Suppress exact replay of
+    /// the current snapshot while retaining later changes (including reversals).
+    last_plan_update: Option<serde_json::Value>,
 }
 
 struct TranslateOutcome {
@@ -1316,6 +1319,64 @@ impl AppServerEventTranslator {
                         content: entry.clone(),
                         item_id: Some(key),
                     });
+                }
+            }
+
+            // Native app-server update_plan calls surface as this notification,
+            // not a generic toolCall. Normalize the protocol's camel-case status
+            // into the same checklist shape used by the other harnesses.
+            "turn/plan/updated" => {
+                let plan = params.get("plan").and_then(serde_json::Value::as_array);
+                let valid_scope = params
+                    .get("threadId")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+                    && params
+                        .get("turnId")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some();
+                if let Some(plan) = plan.filter(|plan| plan.len() <= 500 && valid_scope) {
+                    let normalized: Option<Vec<serde_json::Value>> = plan
+                        .iter()
+                        .map(|entry| {
+                            let step = entry.get("step")?.as_str()?;
+                            if step.trim().is_empty() {
+                                return None;
+                            }
+                            let status = match entry.get("status")?.as_str()? {
+                                "pending" => "pending",
+                                "inProgress" => "in_progress",
+                                "completed" => "completed",
+                                _ => return None,
+                            };
+                            Some(serde_json::json!({ "step": step, "status": status }))
+                        })
+                        .collect();
+                    if let Some(plan) =
+                        normalized.filter(|_| self.last_plan_update.as_ref() != Some(params))
+                    {
+                        self.last_plan_update = Some(params.clone());
+                        let id = format!("plan-update-{}", uuid::Uuid::new_v4());
+                        let mut args = serde_json::json!({ "plan": plan });
+                        if let Some(explanation) = params
+                            .get("explanation")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            args["explanation"] = explanation.into();
+                        }
+                        events.push(ExecutionEvent::ToolCall {
+                            id: id.clone(),
+                            name: "update_plan".into(),
+                            args,
+                        });
+                        // Keep the actual source notification in expandable raw
+                        // details; this is a completed update, not a running tool.
+                        events.push(ExecutionEvent::ToolResult {
+                            id,
+                            name: "update_plan".into(),
+                            result: params.clone(),
+                        });
+                    }
                 }
             }
 
@@ -2207,6 +2268,57 @@ mod tests {
             true,
         );
         assert!(turn_completed.terminal);
+    }
+
+    #[test]
+    fn native_plan_notifications_normalize_without_inventing_tasks() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../orb/tests/fixtures/codex-plan-notification.json"
+        ))
+        .unwrap();
+        let params = &fixture["params"];
+        let mut translator = AppServerEventTranslator::default();
+        let result = translator.handle_notification("turn/plan/updated", params, false);
+        assert!(!result.terminal);
+        assert!(
+            matches!(&result.events[0], ExecutionEvent::ToolCall { name, args, .. } if name == "update_plan" && args == &fixture["normalized"])
+        );
+        assert!(
+            matches!(&result.events[1], ExecutionEvent::ToolResult { result, .. } if result == params)
+        );
+        assert!(translator
+            .handle_notification("turn/plan/updated", params, false)
+            .events
+            .is_empty());
+        let mut changed = params.clone();
+        changed["plan"][0]["status"] = "completed".into();
+        assert_eq!(
+            translator
+                .handle_notification("turn/plan/updated", &changed, false)
+                .events
+                .len(),
+            2
+        );
+        assert_eq!(
+            translator
+                .handle_notification("turn/plan/updated", params, false)
+                .events
+                .len(),
+            2
+        );
+        for malformed in [
+            serde_json::json!({"plan": []}),
+            serde_json::json!({"threadId":"thread","turnId":"turn","plan":[{"step":"unknown","status":"maybe"}]}),
+        ] {
+            assert!(translator
+                .handle_notification("turn/plan/updated", &malformed, false)
+                .events
+                .is_empty());
+        }
+        let empty = serde_json::json!({"threadId":"thread","turnId":"turn","plan":[]});
+        assert!(
+            matches!(&translator.handle_notification("turn/plan/updated", &empty, false).events[0], ExecutionEvent::ToolCall { args, .. } if args["plan"] == serde_json::json!([]))
+        );
     }
 
     #[test]

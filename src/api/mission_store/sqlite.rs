@@ -5576,7 +5576,11 @@ impl MissionStore for SqliteMissionStore {
                 Some(id.to_string()),
                 None,
                 None,
-                content.clone(),
+                if source.as_deref() == Some("scheduler") {
+                    crate::api::control::deferred_messages::strip(content)
+                } else {
+                    content.clone()
+                },
                 {
                     // Always record `queued`; record `source` only when present so
                     // the persisted metadata is the forensic record of who/what
@@ -5585,6 +5589,13 @@ impl MissionStore for SqliteMissionStore {
                     meta.insert("queued".to_string(), serde_json::json!(queued));
                     if let Some(src) = source {
                         meta.insert("source".to_string(), serde_json::json!(src));
+                        if src == "scheduler" {
+                            let messages =
+                                crate::api::control::deferred_messages::decode(content).1;
+                            if !messages.is_empty() {
+                                meta.insert("messages".into(), serde_json::json!(messages));
+                            }
+                        }
                     }
                     serde_json::Value::Object(meta)
                 },

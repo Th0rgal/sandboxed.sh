@@ -1,7 +1,8 @@
+import { deferredMessages } from "./deferredMessages";
 import type { StreamEvent } from "./stream";
 
 export type StreamItem =
-  | { kind: "user"; key: string; text: string }
+  | { kind: "user"; key: string; text: string; messageId?: string; queued?: boolean; attached?: boolean; receipt?: boolean }
   | { kind: "think"; key: string; text: string; done: boolean }
   | { kind: "text"; key: string; text: string; live: boolean }
   | { kind: "error"; key: string; text: string }
@@ -24,6 +25,7 @@ const states = new WeakMap<StreamItem[], TranscriptReducer>();
  * Offsets are Rust Unicode scalar indices, not JavaScript UTF-16 offsets. */
 export class TranscriptReducer {
   items: StreamItem[] = [];
+  private users = new Map<string, number>();
   private tools = new Map<string, number>();
   private bubbles = new Map<string, number>();
   private seen = new Set<string>();
@@ -41,6 +43,45 @@ export class TranscriptReducer {
   }
   apply(ev: StreamEvent) {
     const d = ev.data;
+    // A message has one identity and a monotonic queued -> delivered lifecycle.
+    // Process it before event dedupe and channel sequence checks: receipt, queue
+    // snapshot, stored history and SSE may arrive in any order.
+    if (ev.type === "user_message") {
+      const parts = deferredMessages(str(d.content), d.source, d.messages);
+      if (parts) {
+        for (const part of parts) this.apply({ type: "user_message", data: { ...part, queued: d.queued === true } });
+        return;
+      }
+      const messageId = typeof d.id === "string" ? d.id : ev.eventId;
+      const queued = d.queued === true;
+      if (!messageId && ev.sequence != null) {
+        const legacyIdentity = `user:${ev.sequence}:${queued}`;
+        if (this.seen.has(legacyIdentity)) return;
+        this.seen.add(legacyIdentity);
+      }
+      const index = messageId ? this.users.get(messageId) : undefined;
+      const previous = index == null ? undefined : this.items[index];
+      if (previous?.kind === "user" && index != null) {
+        if (!previous.queued || queued) {
+          if (previous.receipt && d.receipt !== true) this.put(index, { ...previous, text: str(d.content) || previous.text, receipt: false });
+          return;
+        }
+        this.close(); this.lastFinal = undefined;
+        // A queued row may precede text that arrived while it was waiting.
+        // Delivery places it after that response without changing its identity.
+        this.items.splice(index, 1);
+        for (const map of [this.users, this.tools, this.bubbles]) {
+          for (const [key, position] of map) if (position > index) map.set(key, position - 1);
+        }
+        this.users.set(messageId!, this.items.length);
+        this.items.push({ ...previous, text: str(d.content) || previous.text, queued: false, receipt: d.receipt === true });
+        return;
+      }
+      if (!queued) { this.close(); this.lastFinal = undefined; }
+      if (messageId) this.users.set(messageId, this.items.length);
+      this.items.push({ kind: "user", key: messageId ? `user:${messageId}` : this.key("user"), text: str(d.content), messageId, queued, attached: d.attached === true, receipt: d.receipt === true });
+      return;
+    }
     const id = ev.eventId ?? (typeof d.id === "string" ? d.id : undefined);
     const identity = d.canonical === true && ev.sequence != null ? `canonical:${ev.sequence}` : id ? `${ev.type}:${id}` : ev.sequence != null ? `stored:${ev.sequence}:${ev.type}` : undefined;
     if (identity && this.seen.has(identity)) return;
@@ -53,9 +94,6 @@ export class TranscriptReducer {
     }
     const last = this.items.at(-1);
     switch (ev.type) {
-      case "user_message":
-        this.close(); this.lastFinal = undefined;
-        this.items.push({kind:"user",key:this.key("user"),text:str(d.content)}); return;
       case "text_delta":
       case "text_op": {
         let index = this.bubbles.get(bubble);
@@ -135,6 +173,7 @@ export class TranscriptReducer {
         if(index!=null){
           const old=this.items[index];
           if(old.kind==="tool"&&ev.type==="tool_result")this.put(index,{...old,result:d.result,done:true});
+          else if(old.kind==="tool"&&ev.type==="tool_call")this.put(index,{...old,name:str(d.name)||old.name,args:d.args??old.args});
           return;
         }
         this.tools.set(callId,this.items.length);

@@ -39,6 +39,7 @@ async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteS
   if(path==="/api/control/missions"&&!url.searchParams.has("project")){
    listReads++;if(posts.length)await new Promise(r=>setTimeout(r,3000));return route.fulfill({json:options.failed?[m]:[]});
   }
+  if(path==="/api/control/queue")return route.fulfill({json:[]});
   if(path.endsWith("/events")) {if(!options.failed)await historyGate;return route.fulfill({json:options.failed?[]:[{id:1,event_id:"initial",sequence:1,event_type:"user_message",content:prompt,timestamp:""}]});}
   if(path==="/api/control/stream"){await historyGate;if(options.failed)return route.fulfill({contentType:"text/event-stream",body:""});return route.fulfill({contentType:"text/event-stream",body:`event: user_message\ndata: ${JSON.stringify({id:"initial",content:prompt})}\n\n`});}
   if(path==="/api/control/missions/accepted")return route.fulfill({json:m});
@@ -61,7 +62,7 @@ async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteS
  return {posts,attachmentReads,releasePost,releaseHistory,setSuccess:()=>{fail=false;},listReads:()=>listReads,fleetReads:()=>fleetReads};
 }
 async function chooseRemote(page:Page){await page.getByRole("button",{name:/Core \(agent-core\)/}).click();await page.getByRole("button",{name:/dgx-spark online/}).click();}
-const composerInput=(page:Page)=>page.getByPlaceholder(/Plan, Build, \/ for commands, @ for context|Describe the objective/);
+const composerInput=(page:Page)=>page.getByPlaceholder(/Describe a task, \/ for commands, @ for context|Describe the objective/);
 /** A `/goal` turn renders as a Goal tag plus the exact objective, never the raw slash command. */
 async function expectGoalTurn(page:Page,selector:string,text=objective){
  const turn=page.locator(`${selector}:not(.sk-user)`);await expect(turn).toHaveCount(1);

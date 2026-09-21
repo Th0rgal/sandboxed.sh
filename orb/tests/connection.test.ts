@@ -77,6 +77,6 @@ it("a rejected receipt preserves the follow-up draft and attachments", async () 
   vi.stubGlobal("fetch", fetcher);
   const attachments = [{kind: "file" as const, path: "notes/test.md"}];
   await expect(sendMissionMessage("mission", "same text", attachments)).rejects.toThrow("not accepted");
-  expect(JSON.parse(fetcher.mock.calls[0][1]!.body as string)).toEqual({mission_id: "mission", content: "same text", attachments});
+  expect(JSON.parse(fetcher.mock.calls[0][1]!.body as string)).toEqual({mission_id: "mission", content: "same text", attachments, client_message_id: expect.any(String)});
   expect(attachments).toHaveLength(1);
 });
