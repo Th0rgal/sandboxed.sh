@@ -1,4 +1,5 @@
 import { For, Show, createSignal } from "solid-js";
+import { ArrowUpIcon, Spinner } from "./icons";
 import { addProjectSteer, controllerAction, type ProjectSteer, type ProjectSteers } from "./api";
 
 export function SteerComposer(p: {
@@ -14,6 +15,11 @@ export function SteerComposer(p: {
   const [error, setError] = createSignal<string | null>(null);
   let ta!: HTMLTextAreaElement;
 
+  const resize = () => {
+    ta.style.height = "auto";
+    ta.style.height = Math.min(ta.scrollHeight, 220) + "px";
+  };
+
   const send = async () => {
     const body = text().trim();
     if (!body || busy()) return;
@@ -24,6 +30,7 @@ export function SteerComposer(p: {
       p.onSteers(next);
       setText("");
       ta.value = "";
+      resize();
       if (runNow() && !p.running) {
         await controllerAction(p.slug, "run");
         p.onRan?.();
@@ -47,15 +54,15 @@ export function SteerComposer(p: {
           </For>
         </div>
       </Show>
-      <div class="composer tall steer-composer">
+      <div class="composer steer-composer">
         <div class="composer-field">
           <textarea
             ref={ta}
             disabled={busy()}
             aria-label="Steer the next tick"
-            rows={2}
+            rows={1}
             placeholder="Steer the next tick…"
-            onInput={(e) => setText(e.currentTarget.value)}
+            onInput={(e) => { setText(e.currentTarget.value); resize(); }}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
                 e.preventDefault();
@@ -64,15 +71,17 @@ export function SteerComposer(p: {
             }}
           />
         </div>
-        <label class="steer-run">
-          <input type="checkbox" checked={runNow()} onChange={(e) => setRunNow(e.currentTarget.checked)} />
-          Run now
-        </label>
         <div class="send-slot">
-          <button class="s-btn sm" disabled={busy() || !text().trim()} onClick={() => void send()}>
-            {busy() ? "Sending…" : "Steer"}
+          <button class="send" aria-label="Steer" title="Send steer" disabled={busy() || !text().trim()} onClick={() => void send()}>
+            <Show when={busy()} fallback={<ArrowUpIcon size={14} />}><Spinner size={14} /></Show>
           </button>
         </div>
+      </div>
+      <div class="steer-options">
+        <label class="steer-run">
+          <input type="checkbox" checked={runNow()} disabled={busy()} onChange={(e) => setRunNow(e.currentTarget.checked)} />
+          Run now
+        </label>
       </div>
       <Show when={error()}>
         <p class="st-error cr-error">{error()}</p>

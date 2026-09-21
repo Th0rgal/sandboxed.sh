@@ -170,10 +170,10 @@ export function missionPhase(mission: Mission | null, activity: boolean) {
   const job = mission?.remote_job;
   if (job || mission?.execution?.state === "waiting_remote_job") {
     // Active means durable acceptance, not that the selected harness is running.
-    if (job?.phase === "submit_ambiguous") return {label:"Checking submission",moving:true,detail:"The backend is checking whether the remote node accepted the job."};
-    if (job?.phase === "unobserved" || job?.phase === "lease_only") return {label:"Checking remote job",moving:true,detail:"Waiting for a current remote job status. Execution is not confirmed."};
     if (["failed", "lost", "cancelled", "canceled"].includes(job?.node_state ?? "") || (job?.exit_code != null && job.exit_code !== 0)) return {label:"Remote job stopped",moving:false,failed:true,detail:job?.error ?? job?.terminal_reason ?? `Remote job ${job?.node_state ?? "exited"}${job?.exit_code != null ? ` (exit ${job.exit_code})` : ""}.`};
     if (job?.phase === "finished" || job?.finished_at) return {label:"Remote job finished",moving:false,detail:"Waiting for the backend to finalize the mission."};
+    if (job?.phase === "submit_ambiguous") return {label:"Checking submission",moving:true,detail:"The backend is checking whether the remote node accepted the job."};
+    if (job?.phase === "unobserved" || job?.phase === "lease_only") return {label:"Checking remote job",moving:true,detail:"Waiting for a current remote job status. Execution is not confirmed."};
     if (job?.node_state === "running") return {label:"Running",moving:true,detail:"The remote node reports the job is running."};
     if (job?.node_state === "queued") return {label:"Queued",moving:true,detail:"The remote node is waiting for a runner slot."};
     return {label:"Remote job accepted",moving:true,detail:"Waiting for the remote node to confirm execution."};
@@ -190,8 +190,12 @@ export function missionGoal(mission: Mission | null | undefined, receipt?: Launc
 }
 export function LaunchStatus(p: { destination: string; mission?: Mission | null; activity?: boolean; submitting?: boolean; goal?: string | null }) {
   const phase = () => p.submitting ? {label:"Starting",moving:true,detail:"Submitting your request…",failed:false} : missionPhase(p.mission ?? null, !!p.activity);
-  return <div class={`launch-status ${phase().failed ? "failed" : ""}`} role="status" aria-live="polite">
+  // Transcript activity can be from an earlier run, so it must not promote an
+  // unconfirmed remote job to Running. It does make routine startup feedback
+  // redundant. Keep explicit queue, reconciliation and terminal states visible.
+  const visible = () => p.submitting || !p.activity || !["Running", "Remote job accepted"].includes(phase().label);
+  return <Show when={visible()}><div class={`launch-status ${phase().failed ? "failed" : ""}`} role="status" aria-live="polite">
     <div><Show when={phase().moving}><span class="launch-pulse" aria-hidden="true" /></Show><Show when={p.goal}><GoalTag class="small" /></Show><span>{phase().label} on {p.destination}</span></div>
     <Show when={phase().detail}><p>{phase().detail}</p></Show>
-  </div>;
+  </div></Show>;
 }

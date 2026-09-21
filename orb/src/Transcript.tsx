@@ -2,7 +2,7 @@ import { For, Show, createSignal, createEffect, createMemo } from "solid-js";
 import * as Ic from "./icons";
 import { MdView } from "./Markdown";
 import { createStore, reconcile } from "solid-js/store";
-import { goalDraft, GoalTag } from "./goal";
+import { goalDraft } from "./goal";
 
 import { messagePresentation } from "./messagePresentation";
 import { latestChecklist, toolArgs, toolName, workSummary } from "./workModel";
@@ -72,7 +72,6 @@ export function UserTurn(p: { text: string; attached?: boolean }) {
   const goal = createMemo(() => goalDraft(presentation().text));
   return (
     <div class={`user ${goal().kind === "goal" ? "goal" : ""}`}>
-      <Show when={goal().kind === "goal"}><GoalTag /></Show>
       <span>{goal().kind === "goal" ? (goal() as { objective: string }).objective : presentation().text}</span>
       <Show when={p.attached || presentation().attached}><small class="user-context">Attached context</small></Show>
     </div>

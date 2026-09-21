@@ -63,10 +63,10 @@ async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteS
 }
 async function chooseRemote(page:Page){await page.getByRole("button",{name:/Core \(agent-core\)/}).click();await page.getByRole("button",{name:/dgx-spark online/}).click();}
 const composerInput=(page:Page)=>page.getByPlaceholder(/Describe a task, \/ for commands, @ for context|Describe the objective/);
-/** A `/goal` turn renders as a Goal tag plus the exact objective, never the raw slash command. */
+/** A `/goal` turn renders the exact objective without duplicating the title badge. */
 async function expectGoalTurn(page:Page,selector:string,text=objective){
  const turn=page.locator(`${selector}:not(.sk-user)`);await expect(turn).toHaveCount(1);
- await expect(turn).toHaveClass(/goal/);await expect(turn.locator(".goal-tag")).toHaveText("Goal");await expect(turn.locator(":scope > span:last-child")).toHaveText(text);
+ await expect(turn).toHaveClass(/goal/);await expect(turn.locator(".goal-tag")).toHaveCount(0);await expect(turn.locator(":scope > span:last-child")).toHaveText(text);
 }
 
 test("slow local POST shows prompt immediately; accepted mission opens before slow list refresh and reconciles history",async({page})=>{

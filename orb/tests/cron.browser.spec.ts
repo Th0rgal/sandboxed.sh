@@ -306,6 +306,8 @@ test("primary controller steers the next tick and Run now hits controller/action
   const input = page.getByPlaceholder("Steer the next tick…");
   await expect(input).toBeVisible();
   await expect(page.getByRole("checkbox", { name: "Run now" })).toBeVisible();
+  expect((await page.locator(".steer-composer").boundingBox())!.height).toBeLessThan(65);
+  await expect(page.locator(".steer-composer .send svg")).toBeVisible();
   await input.fill("review the open PRs");
   await page.getByRole("button", { name: "Steer", exact: true }).click();
   await expect.poll(() => requests.some((r) => r.method === "POST" && r.path.endsWith("/steers"))).toBe(true);
