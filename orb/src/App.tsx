@@ -15,6 +15,7 @@ import { PromptSheet } from "./Dialog";
 import { MenuList, PopupMenu, type MenuEntry } from "./Menu";
 import { MdSource, MdView, safeHref } from "./Markdown";
 import { streamMission, heldAfterHistory, type StreamEvent } from "./stream";
+import { latestChecklist } from "./workModel";
 import { Transcript, UserTurn, applyStreamEvent, type StreamItem } from "./Transcript";
 import { cacheRemember, cacheRecents } from "./pageCache";
 import { loadTranscript, peekReadyTranscript, peekTranscriptHeight, prefetchTranscript, putTranscript, putTranscriptHeight, putTranscriptItems } from "./missionCache";
@@ -40,6 +41,9 @@ import {
   type HarnessChoice,
   cancelMission,
   sendMissionMessage,
+  ApiError,
+  MessageRejectedError,
+  connectionVersion,
   updateMissionSettings,
   type Mission,
   type ProjectSummary,
@@ -929,7 +933,7 @@ export default function App() {
         setHIdx(h.length - 1);
       }
     });
-    if (id?.startsWith("m:")) void loadTranscript(id.slice(2));
+    if (id?.startsWith("m:")) void loadTranscript(id.slice(2)).catch(() => {});
     toBottom();
   };
   const nav = (d: number) => {
@@ -1519,7 +1523,7 @@ export default function App() {
                 <Show when={launchPreview()}>{(receipt) => <div class="launch-preview"><UserTurn text={receipt().prompt} /><LaunchStatus submitting destination={receipt().destination} goal={goalObjective(receipt().prompt)} /></div>}</Show>
                 <div hidden={creating()}>
                 <Composer
-                  placeholder="Plan, Build, / for commands, @ for context"
+                  placeholder="Describe a task, / for commands, @ for context"
                   busy={creating()}
                   onSend={create}
                   onStop={stop}
@@ -1763,6 +1767,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
   const [items, setItems] = createSignal<StreamItem[]>(cached?.items ?? []);
   const [awaiting, setAwaiting] = createSignal(!cached);
   const [error, setError] = createSignal<string | null>(null);
+  const [queueError, setQueueError] = createSignal<string | null>(cached?.queueError ?? null);
   const [followAttach, setFollowAttach] = createSignal<AttachChip[]>([]);
   let scroller: HTMLDivElement | undefined;
   let nearBottom = true;
@@ -1806,8 +1811,16 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
     try {
       const snap = await loadTranscript(p.id);
       history = snap.stream;
-      setItems(snap.items);
-      putTranscript(p.id, snap);
+      // Absence from a queue snapshot is not proof of delivery: the event
+      // logger can lag dequeue. Keep known pending entries until their ID is
+      // explicitly delivered, including while a reconnect replay is in flight.
+      let next = snap.items;
+      for (const item of items()) if (item.kind === "user" && item.queued && item.messageId) {
+        next = applyStreamEvent(next, { type: "user_message", data: { id: item.messageId, content: item.text, queued: true, receipt: item.receipt, attached: item.attached } });
+      }
+      setItems(next);
+      putTranscript(p.id, { ...snap, items: next });
+      setQueueError(snap.queueError ?? null);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1862,14 +1875,27 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
     return list.map((i) => (i.kind === "text" && i.live ? { ...i, live: false } : i));
   };
 
+  // Retrying an uncertain network result reuses the original message identity.
+  // A different draft/selection, or a definitive rejection, starts a new attempt.
+  let retryMessage: { key: string; id: string } | null = null;
   const sendMsg = async (text: string) => {
+    const attachments = followAttach().map(chipToAttachment);
+    const key = JSON.stringify([connectionVersion(), text, attachments]);
+    if (retryMessage?.key !== key) retryMessage = { key, id: crypto.randomUUID() };
     try {
-      await sendMissionMessage(p.id, text, followAttach().map(chipToAttachment));
+      const result = await sendMissionMessage(p.id, text, attachments, retryMessage.id);
+      retryMessage = null;
+      const event: StreamEvent = { type: "user_message", eventId: result.id, data: { id: result.id, content: text, queued: result.queued, receipt: true, attached: followAttach().length > 0 } };
+      if (replaying) held.push(event);
+      else applyLive(event);
       setFollowAttach([]);
       void refresh();
       return true;
     }
-    catch (e) { setError(launchError(e)); return false; }
+    catch (e) {
+      if (e instanceof MessageRejectedError || (e instanceof ApiError && e.status < 500 && e.status !== 408)) retryMessage = null;
+      setError(launchError(e)); return false;
+    }
   };
 
   const stopM = () => {
@@ -1905,15 +1931,21 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
             }
           >
             <LaunchStatus destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={viewItems().some(i => ["text","tool","think"].includes(i.kind))} />
-            <Transcript items={viewItems()} />
+            <Transcript items={viewItems().filter(i => i.kind !== "user" || !i.queued)} />
           </Show>
-          <Show when={error()}>
-            <p class="s-lead" role="alert">{error()}</p>
+          <Show when={error() || queueError()}>
+            <p class="s-lead" role="alert">{error() || queueError()}</p>
           </Show>
         </div>
       </div>
       <div class="dock">
         <div class="col">
+          <Show when={items().some(i => i.kind === "user" && i.queued)}>
+            <section class="queued-messages" aria-label="Queued messages" aria-live="polite">
+              <div class="queued-label">Queued messages</div>
+              <ol><For each={items().filter((i): i is Extract<StreamItem, { kind: "user" }> => i.kind === "user" && i.queued === true)}>{item => <li data-message-id={item.messageId}><UserTurn text={item.text} attached={item.attached} /></li>}</For></ol>
+            </section>
+          </Show>
           <Composer
             placeholder="Send follow-up"
             picker={false}
@@ -1926,6 +1958,9 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
             attachments={followAttach()}
             onAttachments={setFollowAttach}
           />
+          <Show when={latestChecklist(items())?.tasks.length}>
+            <button class="tasks-jump" onClick={() => { const tasks = scroller?.querySelector<HTMLElement>(".mission-tasks"); tasks?.scrollIntoView({ behavior: "smooth", block: "center" }); tasks?.focus({ preventScroll: true }); }}>Tasks</button>
+          </Show>
           <MissionDock mission={mission()} items={viewItems()} destination={missionDestination(mission(), receipt)} onMission={setMission} onError={setError} />
         </div>
       </div>

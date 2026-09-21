@@ -31,3 +31,20 @@ describe("thinking fold", () => {
     expect(container.querySelector(".st-tool-name")?.textContent).toBe("read");
   });
 });
+
+it("latest checklist is visible outside folded raw work, with real progress and no Plan/Build control",()=>{
+  const items=buildTranscript([
+    ev("tool_call",{tool_call_id:"old",name:"TodoWrite",args:{todos:[{content:"Old task",status:"pending",activeForm:"Working"}]}}),
+    ev("tool_call",{tool_call_id:"new",name:"update_plan",args:{plan:[{step:"Plan a build",status:"completed"},{step:"Check result",status:"in_progress"}]}}),
+    ev("tool_call",{tool_call_id:"bad",name:"todowrite",args:{todos:[{content:"Invented",status:"maybe"}]}}),
+  ]);
+  const {container}=render(()=><Transcript items={items}/>);
+  expect(container.querySelectorAll('.st-work-body')).toHaveLength(0);
+  expect(container.querySelector('.mission-tasks')?.textContent).toContain('1/2 completed');
+  expect(container.querySelector('.mission-tasks')?.textContent).not.toContain('Old task');
+  expect(container.querySelector('.mission-tasks')?.textContent).not.toContain('Invented');
+  expect(container.querySelector('progress')?.value).toBe(1);
+  container.querySelector<HTMLButtonElement>('.st-work-head')!.click();
+  expect(container.querySelectorAll('.st-tool')).toHaveLength(3);
+  expect([...container.querySelectorAll('button')].some(button=>['Plan','Build'].includes(button.textContent??''))).toBe(false);
+});

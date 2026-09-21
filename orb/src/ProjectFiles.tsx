@@ -35,6 +35,8 @@ import { CronForm } from "./ControllerSettings";
 import { getProjectCronFromJob } from "./cronSchema";
 import { loadTranscript, prefetchTranscript } from "./missionCache";
 import { cacheCanPrefetch, cacheLoad, cachePeek, cachePrefetch, cachePut, cacheRemember, prefetchProjectLimit } from "./pageCache";
+import { SidebarTree } from "./Tree";
+import type { TreeNode, TreeRow } from "./tree";
 import { FileSkeleton } from "./Skeleton";
 
 /** Sidebar section listing the core backend's projects with their missions
@@ -163,11 +165,12 @@ export function LiveProjectsSection(p: {
   const [expanded, setExpanded] = createStore<Record<string, boolean>>({});
   /** Per project: whether finished missions are unfolded (default folded). */
   const [showDone, setShowDone] = createStore<Record<string, boolean>>({});
-  const LIVE = new Set(["active", "pending", "queued", "awaiting_user", "resuming"]);
+  const LIVE = new Set(["active", "pending", "queued", "awaiting_user", "resuming", "running", "starting"]);
   const liveOf = (slug: string) => (missions[slug] ?? []).filter((m) => LIVE.has(m.status));
   const doneOf = (slug: string) => (missions[slug] ?? []).filter((m) => !LIVE.has(m.status));
   // Missions per project slug; file listings per `${slug}:${dirPath}`.
   const [missions, setMissions] = createStore<Record<string, Mission[]>>({});
+  const [dirErrors, setDirErrors] = createStore<Record<string, string | null>>({});
   const [dirs, setDirs] = createStore<Record<string, ProjectFileEntry[]>>({});
   // The project's controller (Hermes cron), shown as the folder's first row.
   const [controllers, setControllers] = createStore<Record<string, ControllerData>>({});
@@ -310,9 +313,10 @@ export function LiveProjectsSection(p: {
     const version = connectionVersion();
     const key = `${slug}:${path}`;
     if (dirs[key] && !force) return Promise.resolve();
+    setDirErrors(key, null);
     return listProjectFiles(slug, path)
       .then((entries) => { if (currentConnection(version)) setDirs(key, entries); })
-      .catch(() => { if (currentConnection(version)) setDirs(key, []); });
+      .catch((e) => { if (currentConnection(version)) setDirErrors(key, e instanceof Error ? e.message : String(e)); });
   };
 
   const warmupOne = async (slug: string) => {
@@ -441,61 +445,82 @@ export function LiveProjectsSection(p: {
     if (next) loadDir(slug, path);
   };
 
-  const DirRows = (dp: { slug: string; path: string; depth: number }) => {
-    const entries = () => dirs[`${dp.slug}:${dp.path}`] ?? [];
-    return (
-      <For each={entries()}>
-        {(entry) => {
-          const childPath = () => (dp.path ? `${dp.path}/${entry.name}` : entry.name);
-          if (entry.kind === "dir") {
-            const key = () => `${dp.slug}:${childPath()}`;
-            return (
-              <>
-                <button
-                  class="row folder depth"
-                  style={{ "--depth": dp.depth + 1 }}
-                  {...rowTip.bind(rowDetail(entry.name))}
-                  onClick={() => toggleDir(dp.slug, childPath())}
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    setActionFocus(false);
-                    setActionMenu({ x: e.clientX, y: e.clientY, slug: dp.slug, path: childPath() });
-                  }}
-                >
-                  <span class="row-ico"><Show when={expanded[key()]} fallback={<Ic.FolderIcon />}>
-                    <Ic.FolderOpenIcon />
-                  </Show></span>
-                  <span class="row-label">{entry.name}</span>
-                </button>
-                <Show when={expanded[key()]}>
-                  <div class="tree-kids">
-                    <DirRows slug={dp.slug} path={childPath()} depth={dp.depth + 1} />
-                  </div>
-                </Show>
-              </>
-            );
-          }
-          const id = () => `pf:${dp.slug}:${childPath()}`;
-          const tip = rowTip.bind(rowDetail(entry.name));
-          return (
-            <button
-              class={`row file depth ${p.selected() === id() ? "active" : ""}`}
-              style={{ "--depth": dp.depth + 1 }}
-              {...tip}
-              onPointerEnter={(e) => {
-                tip.onPointerEnter(e);
-                const path = childPath();
-                cachePrefetch(`pf:${dp.slug}:${path}`, () => readProjectFile(dp.slug, path).then((text) => cachePut(`pf:${dp.slug}:${path}`, text)));
-              }}
-              onClick={() => p.open(id())}
-            >
-              <span class="row-ico"><Ic.FileIcon /></span>
-              <span class="row-label">{entry.name}</span>
-            </button>
-          );
-        }}
-      </For>
-    );
+  type RowData = {
+    kind: "project" | "folder" | "file" | "mission" | "finished" | "cron" | "cron-error" | "note";
+    slug: string; label: string; path?: string; mission?: Mission;
+    job?: import("./api").ControllerJob; controller?: boolean;
+  };
+  type Node = TreeNode<RowData>;
+  const fileNodes = (slug: string, path: string): Node[] => {
+    const key = `${slug}:${path}`;
+    if (dirErrors[key]) return [{ id: `error:${key}`, data: { kind: "note", slug, path, label: `Files unavailable: ${dirErrors[key]}` } }];
+    if (!dirs[key]) return [{ id: `loading:${key}`, data: { kind: "note", slug, label: "Loading files…" } }];
+    if (!dirs[key].length) return path ? [{ id: `empty:${key}`, data: { kind: "note", slug, label: "Empty folder" } }] : [];
+    return dirs[key].map(entry => {
+      const childPath = path ? `${path}/${entry.name}` : entry.name;
+      const open = !!expanded[`${slug}:${childPath}`];
+      return { id: `pf:${slug}:${childPath}`, data: { kind: entry.kind === "dir" ? "folder" : "file", slug, path: childPath, label: entry.name },
+        ...(entry.kind === "dir" ? { expanded: open, children: open ? fileNodes(slug, childPath) : [] } : {}) };
+    });
+  };
+  const missionNode = (slug: string, mission: Mission): Node => ({ id: `m:${mission.id}`, data: { kind: "mission", slug, mission, label: displayTitle(mission.title) || mission.id } });
+  const tree = (): Node[] => projects().map(project => {
+    const slug = project.slug, open = !!expanded[slug];
+    const children: Node[] = [];
+    if (open) {
+      const job = controllers[slug]?.job;
+      if (job) children.push({ id: `c:${slug}`, data: { kind: "cron", slug, label: job.name, job, controller: true } });
+      if (cronUnsupported() || cronErrors[slug]) children.push({ id: `crons-error:${slug}`, data: { kind: "cron-error", slug, label: "Crons unavailable" } });
+      children.push(...(crons[slug] ?? []).map(job => ({ id: `pc:${slug}:${job.id}`, data: { kind: "cron" as const, slug, label: job.name, job } })));
+      if (missions[slug] === undefined) children.push({ id: `loading-missions:${slug}`, data: { kind: "note", slug, label: "Loading missions…" } });
+      children.push(...liveOf(slug).map(m => missionNode(slug, m)));
+      const done = doneOf(slug);
+      if (done.length) children.push({ id: `finished:${slug}`, data: { kind: "finished", slug, label: `${done.length} finished` }, expanded: !!showDone[slug], children: done.map(m => missionNode(slug, m)) });
+      children.push(...fileNodes(slug, ""));
+      if (!children.length) children.push({ id: `empty:${slug}`, data: { kind: "note", slug, label: "No missions or files yet." } });
+    }
+    return { id: `project:${slug}`, data: { kind: "project", slug, label: project.title || slug }, expanded: open, children };
+  });
+  const renderRow = (row: TreeRow<RowData>) => {
+    const d = row.data;
+    const contextMenu = (e: MouseEvent) => {
+      e.preventDefault(); setActionFocus(false);
+      setActionMenu({ x: e.clientX, y: e.clientY, slug: d.slug, path: d.path ?? "" });
+    };
+    if (d.kind === "project") return <div class={`row project ${row.expanded ? "expanded" : ""}`} onContextMenu={contextMenu}>
+      <button class="row-main" aria-expanded={row.expanded} onClick={() => toggleProject(d.slug)}>
+        <span class="row-ico"><Show when={row.expanded} fallback={<Ic.FolderIcon />}><Ic.FolderOpenIcon /></Show></span>
+        <span class="row-label">{d.label}</span>
+      </button>
+      <button class="row-action" aria-label={`Project actions for ${d.label}`} title="Project actions"
+        onPointerDown={e => setActionFocus(e.pointerType !== "mouse")}
+        onKeyDown={e => { if (e.key === "Enter" || e.key === " ") setActionFocus(true); }}
+        onClick={e => { e.stopPropagation(); const box = e.currentTarget.getBoundingClientRect(); setActionMenu({ x: Math.max(8, box.right - 176), y: box.bottom + 4, slug: d.slug, path: "" }); }}><Ic.PlusIcon size={13} /></button>
+    </div>;
+    if (d.kind === "note") return <div class="row note" role="status">{d.label}<Show when={d.path !== undefined}><button onClick={() => void loadDir(d.slug, d.path!, true)}>Retry</button></Show></div>;
+    if (d.kind === "cron-error") return <div class="cron-unavailable row" role="status" title={cronUnsupported() ? "This backend does not support project crons yet. Update the backend, then check again. Existing project content is unchanged." : `Crons could not refresh. Cached jobs are retained. ${cronErrors[d.slug]}`}>
+      <Ic.BellIcon size={12} /><button class="cron-status-label" onClick={() => setCronInfo(d.slug)}>{cronUnsupported() ? "Crons need backend update" : cronRetryable[d.slug] ? "Crons temporarily unavailable" : "Crons unavailable"}</button>
+      <Show when={!cronUnsupported() && cronRetryable[d.slug]}><button class="cron-retry" aria-label="Retry crons" title="Retry crons" onClick={() => void loadCrons(d.slug, true)}>↻</button></Show>
+    </div>;
+    if (d.kind === "finished") return <button class="row done-toggle" aria-expanded={row.expanded} onClick={() => setShowDone(d.slug, !showDone[d.slug])}>
+      <span class="row-ico"><Show when={row.expanded} fallback={<Ic.FinishedIcon />}><Ic.FinishedOpenIcon /></Show></span><span class="row-label">{d.label}</span>
+    </button>;
+    if (d.kind === "folder") return <button class="row folder" aria-expanded={row.expanded} {...rowTip.bind(rowDetail(d.label))} onClick={() => toggleDir(d.slug, d.path!)} onContextMenu={contextMenu}>
+      <span class="row-ico"><Show when={row.expanded} fallback={<Ic.FolderIcon />}><Ic.FolderOpenIcon /></Show></span><span class="row-label">{d.label}</span>
+    </button>;
+    if (d.kind === "cron") {
+      const ticking = () => d.controller && (controllers[d.slug]?.runs ?? []).some(r => r.status === "running" || r.status === "claimed");
+      return <button class={`row agent cron ${p.selected() === row.id ? "active" : ""}`} {...rowTip.bind(rowDetail(d.label, [d.controller ? "Controller" : "Cron"]))} onClick={() => p.open(row.id)}>
+        <span class="row-ico glyph"><CronGlyph job={d.job!} running={!!ticking()} /></span><span class="row-label">{d.label}</span>
+        <span class="row-machine"><span class="row-machine-name cron-next">{ticking() ? "ticking" : !d.job!.enabled || d.job!.state === "paused" ? "paused" : untilLabel(d.job!.next_run_at, Date.now())}</span></span>
+      </button>;
+    }
+    const tip = rowTip.bind(rowDetail(d.label, [d.mission ? missionMachine(d.mission) : undefined]));
+    return <button class={`row ${d.kind === "mission" ? "agent" : "file"} ${d.mission && !LIVE.has(d.mission.status) ? "done" : ""} ${p.selected() === row.id ? "active" : ""}`} {...tip}
+      onPointerEnter={e => { tip.onPointerEnter(e); if (d.mission) void loadTranscript(d.mission.id).catch(() => {}); else cachePrefetch(row.id, () => readProjectFile(d.slug, d.path!).then(text => cachePut(row.id, text))); }} onClick={() => p.open(row.id)}>
+      <span class="row-ico glyph"><Show when={d.mission} fallback={<Ic.FileIcon />}>{m => <p.StatusGlyph agent={{ status: p.missionGlyph(m().status) }} busy={false} />}</Show></span>
+      <span class="row-label">{d.label}</span><MachineBadge name={d.mission ? missionMachine(d.mission) : undefined} />
+    </button>;
   };
 
   return (
@@ -511,150 +536,7 @@ export function LiveProjectsSection(p: {
       </Show>
       <Show when={cronWarning()}><p class="st-error" role="alert">{cronWarning()}</p></Show>
       <Show when={actionError()}><p class="st-error" role="alert">{actionError()}</p></Show>
-      <For each={projects()}>
-        {(project) => {
-          const isOpen = () => !!expanded[project.slug];
-          return (
-            <div class={`group ${isOpen() ? "has" : ""}`}>
-              <div class="row project" onContextMenu={(e) => {
-                e.preventDefault();
-                setActionFocus(false);
-                setActionMenu({ x: e.clientX, y: e.clientY, slug: project.slug, path: "" });
-              }}>
-                <button class="row-main" aria-expanded={isOpen()} onClick={() => toggleProject(project.slug)}>
-                  <span class="row-ico"><Show when={isOpen()} fallback={<Ic.FolderIcon />}>
-                    <Ic.FolderOpenIcon />
-                  </Show></span>
-                  <span class="row-label">{project.title || project.slug}</span>
-                </button>
-                <button
-                  class="row-action"
-                  aria-label={`Project actions for ${project.title || project.slug}`}
-                  title="Project actions"
-                  onPointerDown={(e) => setActionFocus(e.pointerType !== "mouse")}
-                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setActionFocus(true); }}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    const box = e.currentTarget.getBoundingClientRect();
-                    setActionMenu({ x: Math.max(8, box.right - 176), y: box.bottom + 4, slug: project.slug, path: "" });
-                  }}
-                >
-                  <Ic.PlusIcon size={13} />
-                </button>
-              </div>
-              <Show when={isOpen()}>
-                <Show when={controllers[project.slug]?.job}>
-                  {(job) => {
-                    const ticking = () =>
-                      (controllers[project.slug]?.runs ?? []).some((r) => r.status === "running" || r.status === "claimed");
-                    return (
-                      <button
-                        class={`row agent d1 cron ${p.selected() === `c:${project.slug}` ? "active" : ""}`}
-                        {...rowTip.bind(rowDetail(job().name, ["Controller"]))}
-                        onClick={() => p.open(`c:${project.slug}`)}
-                      >
-                        <span class="row-ico glyph">
-                          <CronGlyph job={job()} running={ticking()} />
-                        </span>
-                        <span class="row-label">{job().name}</span>
-                        <span class="row-machine">
-                          <span class="row-machine-name cron-next">
-                            {ticking() ? "ticking" : !job().enabled || job().state === "paused" ? "paused" : untilLabel(job().next_run_at, Date.now())}
-                          </span>
-                        </span>
-                      </button>
-                    );
-                  }}
-                </Show>
-                <Show when={cronUnsupported() || cronErrors[project.slug]}>
-                  <div class="cron-unavailable row d1" role="status" title={cronUnsupported() ? "This backend does not support project crons yet. Update the backend, then check again. Existing project content is unchanged." : `Crons could not refresh. Cached jobs are retained. ${cronErrors[project.slug]}`}>
-                    <Ic.BellIcon size={12} />
-                    <button class="cron-status-label" onClick={() => setCronInfo(project.slug)}>{cronUnsupported() ? "Crons need backend update" : cronRetryable[project.slug] ? "Crons temporarily unavailable" : "Crons unavailable"}</button>
-                    <Show when={!cronUnsupported() && cronRetryable[project.slug]}><button class="cron-retry" aria-label="Retry crons" title="Retry crons" onClick={() => void loadCrons(project.slug, true)}>↻</button></Show>
-                  </div>
-                </Show>
-                <For each={crons[project.slug] ?? []}>
-                  {(job) => (
-                    <button
-                      class={`row agent d1 cron ${p.selected() === `pc:${project.slug}:${job.id}` ? "active" : ""}`}
-                      {...rowTip.bind(rowDetail(job.name, ["Cron"]))}
-                      onClick={() => p.open(`pc:${project.slug}:${job.id}`)}
-                    >
-                      <span class="row-ico glyph"><CronGlyph job={job} /></span>
-                      <span class="row-label">{job.name}</span>
-                      <span class="row-machine"><span class="row-machine-name cron-next">{!job.enabled || job.state === "paused" ? "paused" : untilLabel(job.next_run_at, Date.now())}</span></span>
-                    </button>
-                  )}
-                </For>
-                <For each={liveOf(project.slug)}>
-                  {(m) => {
-                    const tip = rowTip.bind(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]));
-                    return (
-                    <button
-                      class={`row agent d1 ${p.selected() === `m:${m.id}` ? "active" : ""}`}
-                      {...tip}
-                      onPointerEnter={(e) => { tip.onPointerEnter(e); void loadTranscript(m.id); }}
-                      onClick={() => p.open(`m:${m.id}`)}
-                    >
-                      <span class="row-ico glyph">
-                        <p.StatusGlyph agent={{ status: p.missionGlyph(m.status) }} busy={false} />
-                      </span>
-                      <span class="row-label">{displayTitle(m.title) || m.id}</span>
-                      <MachineBadge name={missionMachine(m)} />
-                    </button>
-                    );
-                  }}
-                </For>
-                <Show when={doneOf(project.slug).length > 0}>
-                  <button
-                    class="row done-toggle d1"
-                    aria-expanded={!!showDone[project.slug]}
-                    onClick={() => setShowDone(project.slug, !showDone[project.slug])}
-                  >
-                    <span class="row-ico">
-                      <Show when={showDone[project.slug]} fallback={<Ic.FinishedIcon />}>
-                        <Ic.FinishedOpenIcon />
-                      </Show>
-                    </span>
-                    <span class="row-label">
-                      {doneOf(project.slug).length} finished
-                    </span>
-                  </button>
-                  <Show when={showDone[project.slug]}>
-                    <div class="tree-kids">
-                    <For each={doneOf(project.slug)}>
-                      {(m) => {
-                        const tip = rowTip.bind(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]));
-                        return (
-                        <button
-                          class={`row agent done d2 ${p.selected() === `m:${m.id}` ? "active" : ""}`}
-                          {...tip}
-                          onPointerEnter={(e) => { tip.onPointerEnter(e); void loadTranscript(m.id); }}
-                          onClick={() => p.open(`m:${m.id}`)}
-                        >
-                          <span class="row-ico glyph">
-                            <p.StatusGlyph agent={{ status: p.missionGlyph(m.status) }} busy={false} />
-                          </span>
-                          <span class="row-label">{displayTitle(m.title) || m.id}</span>
-                          <MachineBadge name={missionMachine(m)} />
-                        </button>
-                        );
-                      }}
-                    </For>
-                    </div>
-                  </Show>
-                </Show>
-                <DirRows slug={project.slug} path="" depth={0} />
-                <Show when={(missions[project.slug]?.length ?? 0) === 0 && (dirs[`${project.slug}:`]?.length ?? 0) === 0}>
-                  <div class="row note d1">
-                    No missions or files yet.
-                  </div>
-                </Show>
-              </Show>
-            </div>
-          );
-        }}
-      </For>
+      <SidebarTree nodes={tree()} label="Projects" selected={p.selected()} render={renderRow} />
       <Show when={projects().length === 0 && !error()}>
         <div class="row note">No projects on the core backend.</div>
       </Show>

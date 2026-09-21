@@ -1,0 +1,50 @@
+[
+  {
+    "harness": "claude",
+    "name": "TodoWrite",
+    "args": {
+      "todos": [
+        {
+          "content": "Inspect implementation",
+          "activeForm": "Inspecting implementation",
+          "status": "in_progress"
+        },
+        {
+          "content": "Run tests",
+          "activeForm": "Running tests",
+          "status": "pending"
+        }
+      ]
+    }
+  },
+  {
+    "harness": "codex",
+    "name": "update_plan",
+    "args": {
+      "explanation": "Check the implementation before testing.",
+      "plan": [
+        {
+          "step": "Inspect implementation",
+          "status": "completed"
+        },
+        {
+          "step": "Run tests",
+          "status": "in_progress"
+        }
+      ]
+    }
+  },
+  {
+    "harness": "opencode",
+    "name": "todowrite",
+    "args": {
+      "todos": [
+        {
+          "content": "Implement slice",
+          "status": "in_progress",
+          "priority": "high"
+        }
+      ]
+    }
+  }
+]

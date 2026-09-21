@@ -3133,6 +3133,11 @@ impl MissionRunner {
 
         // Emit user message event with mission context, preserving the original
         // attribution (api:/telegram/…) stored on the queued message.
+        let harness_message = if msg_source.as_deref() == Some("scheduler") {
+            super::control::deferred_messages::strip(&user_message)
+        } else {
+            user_message.clone()
+        };
         let _ = events_tx.send(AgentEvent::UserMessage {
             id: msg_id,
             content: user_message.clone(),
@@ -3162,7 +3167,7 @@ impl MissionRunner {
                         status,
                         cancel,
                         hist_snapshot,
-                        user_message.clone(),
+                        harness_message,
                         Some(mission_ctrl),
                         tree_ref,
                         progress_ref,
