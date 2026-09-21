@@ -108,9 +108,21 @@ describe("goal indicators", () => {
     expect(missionGoal(mission({ goal_mode: false, goal_objective: "ignored" }))).toBeNull();
     expect(missionGoal(null)).toBeNull();
   });
-  it("marks the launch status as a goal without changing the phase text", () => {
+  it("shows no launch banner for a healthy start — the goal rides on the prompt", () => {
+    // A starting mission is quiet now: the banner that used to say "Starting on
+    // DGX Spark" is gone, and the Goal tag it carried lives on the user turn,
+    // which is where the objective already is.
     const { container } = render(() => <LaunchStatus destination="DGX Spark" submitting goal="Stored" />);
+    expect(container.querySelector(".launch-status")).toBeNull();
+    const turn = render(() => <UserTurn text="/goal Stored" pending />);
+    expect(turn.container.querySelector(".goal-tag")?.textContent).toBe("Goal");
+    expect(turn.container.querySelector(".user")?.classList.contains("pending")).toBe(true);
+  });
+
+  it("still marks a goal on a banner the user has to act on", () => {
+    const blocked = mission({ status: "awaiting_user" });
+    const { container } = render(() => <LaunchStatus destination="DGX Spark" mission={blocked} goal="Stored" />);
     expect(container.querySelector(".goal-tag")?.textContent).toBe("Goal");
-    expect(container.querySelector("[role=status]")?.textContent).toContain("Starting on DGX Spark");
+    expect(container.querySelector("[role=status]")?.textContent).toContain("Waiting for input on DGX Spark");
   });
 });

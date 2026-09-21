@@ -21,7 +21,7 @@ async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteS
   const timing:any={};(window as any).launchTiming=timing;
   document.addEventListener("keydown",event=>{if(event.key==="Enter"&&event.target instanceof HTMLTextAreaElement&&!timing.start)timing.start=performance.now();},true);
   new MutationObserver(()=>{
-   const status=document.querySelector(".launch-status"),user=document.querySelector(".launch-preview .user");
+   const status=document.querySelector(".launch-preview .user.pending"),user=document.querySelector(".launch-preview .user");
    if(timing.start&&user&&status&&!timing.optimistic)timing.optimistic=performance.now()-timing.start;
    if(timing.response&&document.querySelector('textarea[placeholder="Send follow-up"]')&&!timing.acceptedView)timing.acceptedView=performance.now()-timing.response;
   }).observe(document,{subtree:true,childList:true});
@@ -62,6 +62,13 @@ async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteS
 }
 async function chooseRemote(page:Page){await page.getByRole("button",{name:/Core \(agent-core\)/}).click();await page.getByRole("button",{name:/dgx-spark online/}).click();}
 const composerInput=(page:Page)=>page.getByPlaceholder(/Plan, Build, \/ for commands, @ for context|Describe the objective/);
+/**
+ * Where a phase is reported. A healthy in-flight mission no longer draws a
+ * banner — the prompt animates and the phase is announced in a visually hidden
+ * live region — so assert against both, and use `.launch-status` directly only
+ * where the test is specifically about the visible banner.
+ */
+const phaseStatus=(page:Page)=>page.locator(".launch-status, .sr-only[role=status]");
 /** A `/goal` turn renders as a Goal tag plus the exact objective, never the raw slash command. */
 async function expectGoalTurn(page:Page,selector:string,text=objective){
  const turn=page.locator(`${selector}:not(.sk-user)`);await expect(turn).toHaveCount(1);
@@ -71,10 +78,12 @@ async function expectGoalTurn(page:Page,selector:string,text=objective){
 test("slow local POST shows prompt immediately; accepted mission opens before slow list refresh and reconciles history",async({page})=>{
  const state=await setup(page);
  const input=composerInput(page);await input.fill(prompt);await input.press("Enter");
- await expectGoalTurn(page,".launch-preview .user");await expect(page.locator(".launch-status")).toContainText("Starting on Core");
+ await expectGoalTurn(page,".launch-preview .user");await expect(phaseStatus(page)).toContainText("Starting on Core");
  await input.dispatchEvent("keydown",{key:"Enter"});await expect.poll(()=>state.posts.length).toBe(1);
  await page.screenshot({path:"test-results/orb-launch-starting.png"});
- await page.emulateMedia({reducedMotion:"reduce"});await expect(page.locator(".launch-pulse")).toHaveCSS("animation-name","none");
+ // The working indicator is the prompt itself now, and it must not move when
+ // the user has asked for reduced motion.
+ await page.emulateMedia({reducedMotion:"reduce"});await expect(page.locator(".user.pending")).toHaveCSS("animation-name","none");
  await page.waitForTimeout(1000);state.releasePost();await expect(page.getByPlaceholder("Send follow-up")).toBeVisible({timeout:1500});
  await expect(page.locator(".launch-status")).toContainText("Queued on Core");await expectGoalTurn(page,".user");
  expect(state.posts[0]).toMatchObject({backend:"grok",model_override:"grok-4.6",prompt,title:"Check remote startup without losing this…"});expect(state.posts[0]).not.toHaveProperty("remote_node_id");expect(state.posts[0]).not.toHaveProperty("remote_command");expect(state.posts[0].idempotency_key).toBeTruthy();
@@ -187,7 +196,7 @@ test("Grok remote launch is sent unchanged once the server advertises grok",asyn
  const menu=page.locator(".picks .menu");await expect(menu.getByRole("button",{name:/^Grok 1/})).toBeVisible();await expect(menu.getByRole("button",{name:/^Codex/})).toContainText("not on DGX Spark");
  await page.keyboard.press("Escape");
  const input=composerInput(page);await input.fill(prompt);await input.press("Enter");
- await expectGoalTurn(page,".launch-preview .user");await expect(page.locator(".launch-status")).toContainText("Starting on DGX Spark");
+ await expectGoalTurn(page,".launch-preview .user");await expect(phaseStatus(page)).toContainText("Starting on DGX Spark");
  await expect.poll(()=>state.posts.length).toBe(1);
  expect(state.posts[0]).toMatchObject({backend:"grok",model_override:"grok-4.6",remote_node_id:"dgx-spark",prompt,title:"Check remote startup without losing this…"});
  expect(state.posts[0]).not.toHaveProperty("remote_command");
@@ -195,7 +204,10 @@ test("Grok remote launch is sent unchanged once the server advertises grok",asyn
  await expect(page.locator(".under-loc")).toContainText("DGX Spark");
  await expect(page.locator(".under-harness")).toHaveText("Grok");
  await expect(page.locator(".under-model")).toHaveText("4.6");
- await expect(page.locator(".launch-status")).toContainText("Remote job accepted on DGX Spark");await expect(page.locator(".launch-status .goal-tag")).toHaveText("Goal");
+ await expect(phaseStatus(page)).toContainText("Remote job accepted on DGX Spark");
+ // An accepted remote job is healthy, so it draws no banner; the Goal tag is
+ // on the prompt itself, asserted by expectGoalTurn on the next line.
+ await expect(page.locator(".launch-status")).toHaveCount(0);
  await expectGoalTurn(page,".user");state.releaseHistory();await expectGoalTurn(page,".user");
  await page.screenshot({path:"test-results/orb-remote-grok-accepted.png"});
 });
@@ -277,16 +289,16 @@ for(const status of ["failed","resuming"])test(`empty ${status} mission retains 
  await setup(page,{failed:true,emptyStatus:status});await page.getByRole("button",{name:"Test",exact:true}).click();
  if(status==="failed")await page.getByRole("button",{name:/1 finished/}).click();
  await page.getByRole("button",{name:/Remote task/}).click();
- await expect(page.locator(".launch-status")).toContainText(status==="failed"?"Failed on DGX Spark":"Resuming on DGX Spark");
+ await expect(phaseStatus(page)).toContainText(status==="failed"?"Failed on DGX Spark":"Resuming on DGX Spark");
  await expectGoalTurn(page,".user","Original saved objective");
- await expect(page.locator(".launch-pulse")).toHaveCount(status==="failed"?0:1);
+ await expect(page.locator(status==="failed"?".launch-pulse":".user.pending")).toHaveCount(status==="failed"?0:1);
 });
 
 for(const [phase,node_state,label] of [["observed",undefined,"Remote job accepted"],["observed","queued","Queued"],["observed","running","Running"],["unobserved",undefined,"Checking remote job"],["submit_ambiguous",undefined,"Checking submission"]] as const)test(`Active remote mission shows ${label} from durable job evidence`,async({page})=>{
  await setup(page,{failed:true,emptyStatus:"active",remoteJob:{phase,node_state}});
  await page.getByRole("button",{name:"Test",exact:true}).click();
  await page.getByRole("button",{name:/Remote task/}).click();
- await expect(page.locator(".launch-status")).toContainText(`${label} on DGX Spark`);
+ await expect(phaseStatus(page)).toContainText(`${label} on DGX Spark`);
  await expectGoalTurn(page,".user","Original saved objective");
 });
 
@@ -295,7 +307,7 @@ for(const harness of ["claudecode", "opencode"] as const)test(`supported remote 
  await page.getByRole("button",{name:"Grok",exact:true}).click();await page.getByRole("button",{name:harness === "claudecode" ? "Claude Code 1" : "OpenCode 1",exact:true}).click();
  const input=composerInput(page);await input.fill(prompt);await input.press("Enter");
  await expectGoalTurn(page,".launch-preview .user");
- await expect(page.locator(".launch-status")).toContainText("Starting on DGX Spark");
+ await expect(phaseStatus(page)).toContainText("Starting on DGX Spark");
  await expect.poll(()=>state.posts.length).toBe(1);
  expect(state.posts[0]).toMatchObject({backend:harness,model_override:harness === "claudecode" ? "claude-sonnet-4-6" : "xai/grok-4.6",remote_node_id:"dgx-spark",prompt});
  expect(state.posts[0]).not.toHaveProperty("remote_command");expect(state.posts[0]).not.toHaveProperty("remote_async");
@@ -303,7 +315,7 @@ for(const harness of ["claudecode", "opencode"] as const)test(`supported remote 
  await page.waitForTimeout(1000);expect(state.posts).toHaveLength(1);
  await expectGoalTurn(page,".launch-preview .user");
  state.releasePost();await expect(page.getByPlaceholder("Send follow-up")).toBeVisible({timeout:1500});
- await expect(page.locator(".launch-status")).toContainText("Remote job accepted on DGX Spark");
+ await expect(phaseStatus(page)).toContainText("Remote job accepted on DGX Spark");
  await expectGoalTurn(page,".user");state.releaseHistory();await expectGoalTurn(page,".user");
  await page.screenshot({path:`test-results/orb-remote-${harness}-accepted.png`});
 });
@@ -318,25 +330,28 @@ test("typed-capable server that still answers remote_command required is explain
  expect(state.posts[0]).not.toHaveProperty("remote_command");
 });
 
-test("@ file and controller chips are sent as structured attachments",async({page})=>{
+test("@ file and controller mentions are sent as structured attachments",async({page})=>{
  const state=await setup(page,{files:[{name:"notes",kind:"dir"}]});
  state.releasePost();state.releaseHistory();
  const input=composerInput(page);
- await input.fill("@");
+ // Mentions are written into the sentence, so the draft is built up rather
+ // than replaced: each reference stays where the user put it, and the agent
+ // reads the same words the user wrote.
+ await input.pressSequentially("Read ");
+ await input.pressSequentially("@notes/foo");
  await expect(page.getByRole("listbox",{name:"Context"})).toBeVisible();
  await page.getByRole("option",{name:"notes/foo.md",exact:true}).click();
- await expect(page.locator(".attach-chip")).toContainText("notes/foo.md");
- await input.fill("@controller");
+ await input.pressSequentially("and check @controller");
  await page.getByRole("option",{name:"Test controller",exact:true}).click();
- await input.fill("Read the notes");
- await page.screenshot({path:"test-results/orb-attachments.png", fullPage:true});
+ await expect(input).toHaveValue("Read @notes/foo.md and check @controller ");
+ await page.screenshot({path:"artifacts/orb-attachments.png", fullPage:true});
  await input.press("Enter");
  await expect.poll(()=>state.posts.length).toBe(1);
  expect(state.posts[0].attachments).toEqual(expect.arrayContaining([
   {kind:"file",path:"notes/foo.md"},
   {kind:"controller"},
  ]));
- expect(state.posts[0].prompt).toBe("Read the notes");
+ expect(state.posts[0].prompt).toBe("Read @notes/foo.md and check @controller");
  expect(JSON.stringify(state.posts[0])).not.toContain("hello notes");
 });
 
@@ -345,11 +360,13 @@ test("new agent uses the same real project for initial context and launch",async
  const state=await setup(page,{files:[{name:"notes",kind:"dir"}]});
  state.releasePost();state.releaseHistory();
  await expect(page.getByRole("button",{name:"Choose project"})).toHaveText(/Test/);
- const input=composerInput(page);await input.fill("@foo");
+ const input=composerInput(page);
+ await input.pressSequentially("Read ");await input.pressSequentially("@foo");
  await page.getByRole("option",{name:"notes/foo.md",exact:true}).click();
  expect(state.attachmentReads.length).toBeGreaterThan(0);
  expect(state.attachmentReads.every(path=>path.startsWith("/api/projects/test/"))).toBe(true);
- await input.fill("Read selected context");await input.press("Enter");
+ // The mention stays in the sentence; the draft is extended, not replaced.
+ await input.pressSequentially("for context");await input.press("Enter");
  await expect.poll(()=>state.posts.length).toBe(1);
  expect(state.posts[0]).toMatchObject({project:"test",attachments:[{kind:"file",path:"notes/foo.md"}]});
 });
@@ -361,23 +378,27 @@ test("connected empty context never substitutes demo attachment items",async({pa
  await expect(page.getByRole("listbox",{name:"Context"}).getByRole("option")).toHaveCount(0);
  await page.getByTitle("Add context").click();
  await expect(page.locator(".plus-menu .menu-item")).toHaveCount(0);
- await expect(page.locator(".attach-chip")).toHaveCount(0);
+ // Nothing was offered, so nothing was written into the draft either.
+ await expect(input).toHaveValue("@");
 });
 
-test("context picks preserve multiline whitespace and middle-of-prompt caret",async({page})=>{
+test("context picks preserve multiline whitespace and land at the caret",async({page})=>{
  const state=await setup(page,{files:[{name:"notes",kind:"dir"}]});state.releaseHistory();
  const input=composerInput(page);
  await input.fill("Draft:\n\n@foo");
  await page.getByRole("option",{name:"notes/foo.md",exact:true}).click();
- await expect(input).toHaveValue("Draft:\n\n");
- expect(await input.evaluate(el=>(el as HTMLTextAreaElement).selectionStart)).toBe(8);
- await page.getByRole("button",{name:"Remove notes/foo.md"}).click();
+ // The blank lines above survive, and the reference replaces exactly the
+ // "@foo" that was typed — the caret is left after it, ready to keep writing.
+ await expect(input).toHaveValue("Draft:\n\n@notes/foo.md ");
+ expect(await input.evaluate(el=>(el as HTMLTextAreaElement).selectionStart)).toBe("Draft:\n\n@notes/foo.md ".length);
+
+ // Mid-sentence: everything to the right of the caret stays to the right.
  await input.fill("Before @foo after");
  await input.evaluate(el=>{const ta=el as HTMLTextAreaElement;ta.focus();ta.setSelectionRange(11,11);ta.dispatchEvent(new Event("click",{bubbles:true}));});
  await expect(page.getByRole("option",{name:"notes/foo.md",exact:true})).toBeVisible();
  await input.press("Enter");
- await expect(input).toHaveValue("Before  after");
- expect(await input.evaluate(el=>(el as HTMLTextAreaElement).selectionStart)).toBe(7);
+ await expect(input).toHaveValue("Before @notes/foo.md  after");
+ expect(await input.evaluate(el=>(el as HTMLTextAreaElement).selectionStart)).toBe("Before @notes/foo.md ".length);
  await input.pressSequentially("inserted");
- await expect(input).toHaveValue("Before inserted after");
+ await expect(input).toHaveValue("Before @notes/foo.md inserted after");
 });

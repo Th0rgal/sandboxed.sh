@@ -4,7 +4,7 @@ import { MdView } from "./Markdown";
 import { createStore, reconcile } from "solid-js/store";
 import { goalDraft, GoalTag } from "./goal";
 
-import type { StreamItem } from "./transcriptModel";
+import { withoutFiller, type StreamItem } from "./transcriptModel";
 export { buildTranscript, applyStreamEvent } from "./transcriptModel";
 export type { StreamItem } from "./transcriptModel";
 
@@ -59,10 +59,16 @@ function resultText(result: unknown): string {
 
 /** A user turn. A `/goal <objective>` message is shown as a Goal turn with the
  * exact objective, not the raw slash command; the text itself is untouched. */
-export function UserTurn(p: { text: string }) {
+/**
+ * `pending` marks the prompt whose answer is still coming. It is the only
+ * signal that a healthy mission is working: a slow shimmer along the turn, no
+ * text and no extra height, replacing the banner that used to sit above the
+ * transcript announcing what the footer already says.
+ */
+export function UserTurn(p: { text: string; pending?: boolean }) {
   const goal = createMemo(() => goalDraft(p.text));
   return (
-    <div class={`user ${goal().kind === "goal" ? "goal" : ""}`}>
+    <div class={`user ${goal().kind === "goal" ? "goal" : ""} ${p.pending ? "pending" : ""}`}>
       <Show when={goal().kind === "goal"}><GoalTag /></Show>
       <span>{goal().kind === "goal" ? (goal() as { objective: string }).objective : p.text}</span>
     </div>
@@ -124,9 +130,12 @@ function ThinkBlock(p: { item: Extract<StreamItem, { kind: "think" }> }) {
 type WorkItem = Extract<StreamItem, { kind: "tool" | "think" }>;
 type Grouped = StreamItem | { kind: "work"; key: string; items: WorkItem[] };
 
-function groupWork(items: StreamItem[], previous: Grouped[] = []): Grouped[] {
+function groupWork(input: StreamItem[], previous: Grouped[] = []): Grouped[] {
   const cached = new Map(previous.filter(x => x.kind === "work").map(x => [x.key, x]));
   const out: Grouped[] = [];
+  // Dropping a filler bubble also rejoins the work around it, so one stretch of
+  // tool calls reads as one fold instead of being split in two by a stray ".".
+  const items = withoutFiller(input);
   for (const it of items) {
     const last = out[out.length - 1];
     if (it.kind === "tool" || it.kind === "think") {
@@ -178,11 +187,18 @@ function WorkFold(p: { items: WorkItem[] }) {
   );
 }
 
-export function Transcript(p: { items: StreamItem[] }) {
+export function Transcript(p: { items: StreamItem[]; pending?: boolean }) {
   // Reconcile by stable keys: existing WorkFold/ToolRow instances and parsed
   // historical Markdown survive token updates and history resynchronization.
   const [grouped, setGrouped] = createStore<Grouped[]>([]);
   const groups = createMemo<Grouped[]>((previous) => groupWork(p.items, previous), []);
+  /** Key of the last user turn, when nothing follows it yet. Compared by key
+   * rather than identity: `reconcile` hands the loop store proxies, not the
+   * original objects. */
+  const lastUserKey = createMemo(() => {
+    const last = p.items[p.items.length - 1];
+    return last?.kind === "user" ? last.key : null;
+  });
   createEffect(() => setGrouped(reconcile(groups(), { key: "key" })));
   return (
     <>
@@ -199,7 +215,9 @@ export function Transcript(p: { items: StreamItem[] }) {
               }
               return <WorkFold items={item.items} />;
             case "user":
-              return <UserTurn text={item.text} />;
+              // Only the turn still waiting for a reply animates: once anything
+              // has been said or done after it, the work is visible on its own.
+              return <UserTurn text={item.text} pending={p.pending && item.key === lastUserKey()} />;
             case "think":
               return <ThinkBlock item={item} />;
             case "text":
