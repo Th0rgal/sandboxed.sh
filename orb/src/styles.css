@@ -1422,5 +1422,7 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 
 button.fork-trigger { color: inherit; cursor: pointer; }
 button.fork-trigger:hover { color: var(--fg); }
-
-
+.fork-feedback { position: absolute; bottom: calc(100% + 6px); left: 0; width: 100%; }
+.fork-feedback:has([role]) { background: var(--menu-bg); border: 1px solid var(--stroke); border-radius: 8px; padding: 8px; }
+.fork-feedback .st-error { max-width: none; margin: 0; }
+.fork-cascade .menu-item:disabled { opacity: .4; cursor: default; }

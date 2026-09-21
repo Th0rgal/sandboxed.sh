@@ -1,4 +1,4 @@
-import { For, Show, createSignal, onMount, onCleanup } from "solid-js";
+import { For, Show, createSignal, createEffect, onMount, onCleanup } from "solid-js";
 import { forkMission, shortModelLabel, type HarnessChoice, type Mission } from "./api";
 import { effortLabel, supportedEfforts } from "./effort";
 
@@ -6,6 +6,8 @@ export function ForkMission(p: { mission: Mission; choices: HarnessChoice[]; des
   const [backend, setBackend] = createSignal(p.mission.backend ?? p.choices[0]?.backend.id ?? "");
   const choices = () => p.choices.find(c => c.backend.id === backend())?.models ?? [];
   const [model, setModel] = createSignal(choices().find(m => m.value === p.mission.model_override)?.value ?? choices()[0]?.value ?? "");
+  const [effortOpen, setEffortOpen] = createSignal(false);
+  const unavailable = (id: string) => !!p.mission.remote_node_id && !["grok", "claudecode", "opencode"].includes(id);
   const [effort, setEffort] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
@@ -20,6 +22,15 @@ export function ForkMission(p: { mission: Mission; choices: HarnessChoice[]; des
     } finally { setBusy(false); }
   };
   let root!: HTMLDivElement;
+  createEffect(() => {
+    effortOpen(); backend();
+    queueMicrotask(() => {
+      if (!root?.isConnected) return;
+      root.style.transform = "";
+      const rect = root.getBoundingClientRect();
+      if (rect.right > window.innerWidth - 12) root.style.transform = `translateX(${Math.min(0, window.innerWidth - 12 - rect.right)}px)`;
+    });
+  });
   onMount(() => {
     const outside = (e: PointerEvent) => { if (!busy() && !root.parentElement?.contains(e.target as Node)) p.onClose(); };
     const escape = (e: KeyboardEvent) => { if (e.key === "Escape" && !busy()) { e.preventDefault(); p.onClose(); } };
@@ -35,33 +46,37 @@ export function ForkMission(p: { mission: Mission; choices: HarnessChoice[]; des
     if (["ArrowDown", "ArrowUp"].includes(e.key) && items.length) {
       e.preventDefault(); items[(index + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length]?.focus();
     }
-    if (e.key === "ArrowRight") { e.preventDefault(); root.querySelector<HTMLButtonElement>('.fork-models > button')?.focus(); }
-    if (e.key === "ArrowLeft") { e.preventDefault(); root.querySelector<HTMLButtonElement>('.fork-harnesses > button[aria-expanded="true"]')?.focus(); }
+    if (e.key === "ArrowRight") { e.preventDefault(); root.querySelector<HTMLButtonElement>(menu?.classList.contains('fork-models') ? '.fork-effort-menu > button' : '.fork-models > button')?.focus(); }
+    if (e.key === "ArrowLeft") { e.preventDefault(); root.querySelector<HTMLButtonElement>(menu?.classList.contains('fork-effort-menu') ? '.fork-models > button' : '.fork-harnesses > button[aria-expanded="true"]')?.focus(); }
   };
   return <div ref={root} class="fork-cascade" onKeyDown={move}>
     <div class="menu fork-harnesses" role="menu" aria-label="Fork conversation">
       <div class="menu-group">Fork conversation</div>
       <For each={p.choices}>{c => <button class="menu-item" role="menuitem" aria-haspopup="menu"
-        aria-expanded={backend() === c.backend.id} disabled={busy()}
-        onMouseEnter={() => { if (!busy() && backend() !== c.backend.id) { setBackend(c.backend.id); setEffort(""); } }}
-        onClick={() => { setBackend(c.backend.id); setEffort(""); }}>
+        aria-expanded={backend() === c.backend.id} disabled={busy() || unavailable(c.backend.id)} title={unavailable(c.backend.id) ? "Not supported on this remote workspace" : c.backend.name}
+        onMouseEnter={() => { if (!busy() && !unavailable(c.backend.id) && backend() !== c.backend.id) { setBackend(c.backend.id); setEffort(""); setEffortOpen(false); } }}
+        onClick={() => { setBackend(c.backend.id); setEffort(""); setEffortOpen(false); }}>
         <span>{c.backend.name}</span><span class="fork-chevron" aria-hidden="true">›</span>
       </button>}</For>
     </div>
     <div class="menu fork-models" role="menu" aria-label="Choose a model">
       <For each={choices()}>{m => <button class="menu-item" role="menuitem" disabled={busy()}
         title={`Fork into ${shortModelLabel(m.label)} · same workspace on ${p.destination}`}
-        onClick={() => { setModel(m.value); void fork(); }}>
-        <span>{shortModelLabel(m.label)}</span>
+        aria-haspopup={supportedEfforts(backend()).length ? "menu" : undefined}
+        onMouseEnter={() => { if (!busy()) { setModel(m.value); setEffortOpen(!!supportedEfforts(backend()).length); } }}
+        onClick={() => { setModel(m.value); if (supportedEfforts(backend()).length) setEffortOpen(true); else void fork(); }}>
+        <span>{shortModelLabel(m.label)}</span><Show when={supportedEfforts(backend()).length}><span aria-hidden="true">›</span></Show>
         <Show when={backend() === p.mission.backend && m.value === p.mission.model_override}><span aria-hidden="true">✓</span></Show>
       </button>}</For>
       <Show when={!choices().length}><div class="menu-group">No models available</div></Show>
-      <Show when={supportedEfforts(backend()).length}>
-        <div class="fork-efforts" role="group" aria-label="Reasoning effort"><span>Effort</span>
-          <For each={["", ...supportedEfforts(backend())]}>{e => <button type="button" disabled={busy()}
-            aria-pressed={effort() === e} onClick={() => setEffort(e)}>{e ? effortLabel(e) : "Default"}</button>}</For>
-        </div>
-      </Show>
+    </div>
+    <Show when={effortOpen() && supportedEfforts(backend()).length}>
+      <div class="menu fork-effort-menu" role="menu" aria-label="Choose effort">
+        <For each={["", ...supportedEfforts(backend())]}>{e => <button class="menu-item" role="menuitem" disabled={busy()}
+          onClick={() => { setEffort(e); void fork(); }}>{e ? effortLabel(e) : "Default"}</button>}</For>
+      </div>
+    </Show>
+    <div class="fork-feedback">
       <Show when={busy()}><div class="menu-group" role="status">Forking…</div></Show>
       <Show when={error()}><p class="st-error" role="alert">{error()}</p></Show>
     </div>

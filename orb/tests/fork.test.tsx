@@ -18,6 +18,8 @@ it("forks into a new mission without changing or stopping the running source", a
   const ui = render(() => <ForkMission mission={mission} choices={choices} destination="DGX Spark" onClose={() => {}} onFork={opened} />);
   fireEvent.click(ui.getByRole("menuitem", { name: "Codex" }));
   fireEvent.click(ui.getByRole("menuitem", { name: /GPT-6 Astra/ }));
+  expect(fork).not.toHaveBeenCalled();
+  fireEvent.click(ui.getByRole("menuitem", { name: "Default" }));
   await waitFor(() => expect(opened).toHaveBeenCalledWith(expect.objectContaining({ id: "fork" })));
   expect(fork).toHaveBeenCalledWith("source", expect.objectContaining({ backend: "codex", model_override: "gpt-6-astra" }));
   expect(update).not.toHaveBeenCalled(); expect(stop).not.toHaveBeenCalled();
