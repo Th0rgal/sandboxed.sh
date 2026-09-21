@@ -804,3 +804,15 @@ export const CAP_SLOT_STATUSES = new Set([
 export function holdsCapSlot(status: string | null | undefined): boolean {
   return CAP_SLOT_STATUSES.has((status ?? "").toLowerCase());
 }
+
+/** A conversation fork preserves the source workspace and never switches the source harness. */
+export async function forkMission(id: string, body: { backend: string; model_override: string; model_effort: string; idempotency_key: string }): Promise<Mission> {
+  try {
+    return await api<Mission>(`/api/control/missions/${encodeURIComponent(id)}/fork`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+  } catch (e) {
+    if (e instanceof ApiError && [404, 405].includes(e.status)) throw new Error("This backend needs the conversation-fork update. The original mission has not been changed.");
+    throw e;
+  }
+}

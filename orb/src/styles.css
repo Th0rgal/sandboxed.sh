@@ -1398,3 +1398,15 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 .cron-paused-indicator { display: flex; align-items: center; color: var(--fg-3); }
 
 .cr-steer-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 0; }
+
+.fork-summary { margin: 0 0 18px; color: var(--fg-2); line-height: 1.5; }
+.fork-fields { display: grid; gap: 14px; }
+.fork-fields label { display: grid; gap: 6px; color: var(--fg-2); font-size: 12px; }
+.fork-fields select { width: 100%; }
+.fork-note { margin: 18px 0 0; font-size: 12px; line-height: 1.5; color: var(--fg-3); }
+
+.fork-context { width: 100%; }
+.fork-context summary { cursor: pointer; color: var(--fg-2); }
+.fork-context-message { margin-top: 14px; border-top: 1px solid var(--stroke-soft); padding-top: 10px; }
+.fork-context-message small { color: var(--fg-3); }
+.fork-context-message p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 5px 0 0; }

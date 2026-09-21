@@ -12,6 +12,7 @@ pub(crate) mod dispatch_admission;
 #[cfg(test)]
 pub(crate) mod dispatch_admission_tests;
 pub(crate) mod execution_ownership;
+pub mod fork;
 mod remote_grok;
 #[cfg(test)]
 use dispatch_admission::admit_dispatch;
@@ -13118,6 +13119,8 @@ async fn submit_leased_remote_job(
     job_id: Uuid,
     plan: &RemoteHarnessPlan,
 ) -> Result<Mission, String> {
+    let workspace_prefix =
+        fork::workspace_prefix(control, mission, &node.id, &state.config.working_dir).await?;
     if let RemoteHarnessPlan::Grok {
         new_session_id: Some(session_id),
         resume_session_id: None,
@@ -13184,7 +13187,7 @@ async fn submit_leased_remote_job(
         mission_id: mission.id,
         lease_token,
         payload: crate::remote_node::JobPayload::RawCommand {
-            command: execution.command.clone(),
+            command: format!("{workspace_prefix}{}", execution.command),
             timeout_secs: None,
             env: execution.env.clone(),
             managed_auth: execution.managed_auth.clone(),

@@ -1,3 +1,4 @@
+import { forkContext } from "./forkContext";
 import { For, Show, createSignal, createEffect, createMemo } from "solid-js";
 import * as Ic from "./icons";
 import { MdView } from "./Markdown";
@@ -74,11 +75,16 @@ function resultText(result: unknown): string {
  * transcript announcing what the footer already says.
  */
 export function UserTurn(p: { text: string; attached?: boolean; pending?: boolean }) {
+  const fork = createMemo(() => forkContext(p.text));
   const presentation = createMemo(() => messagePresentation(p.text));
   const goal = createMemo(() => goalDraft(presentation().text));
   return (
     <div class={`user ${goal().kind === "goal" ? "goal" : ""} ${p.pending ? "pending" : ""}`}>
-      <span>{goal().kind === "goal" ? (goal() as { objective: string }).objective : presentation().text}</span>
+      <Show when={fork()} fallback={<span>{goal().kind === "goal" ? (goal() as { objective: string }).objective : presentation().text}</span>}>
+        {context => <details class="fork-context"><summary>Forked from {context().source_title || "conversation"} · {context().messages.length} messages</summary>
+          <For each={context().messages}>{m => <div class="fork-context-message"><small>{m.role === "user" ? "You" : "Assistant"}</small><p>{m.content}</p></div>}</For>
+        </details>}
+      </Show>
       <Show when={p.attached || presentation().attached}><small class="user-context">Attached context</small></Show>
     </div>
   );

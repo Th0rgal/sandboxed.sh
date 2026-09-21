@@ -898,6 +898,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(control::resume_mission),
         )
         .route(
+            "/api/control/missions/:id/fork",
+            post(control::fork::fork_mission),
+        )
+        .route(
             "/api/control/missions/:id/clone",
             post(control::clone_mission),
         )

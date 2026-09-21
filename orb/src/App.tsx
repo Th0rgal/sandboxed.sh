@@ -8,6 +8,7 @@ import { createStore, produce } from "solid-js/store";
 import type { JSX } from "solid-js";
 import { projects as seed, LOREM_REPLY, type Agent, type Block, type Turn } from "./data";
 import * as Ic from "./icons";
+import { ForkMission } from "./ForkMission";
 import { Settings } from "./Settings";
 import { MACHINES, Machines } from "./Machines";
 import { Providers } from "./Providers";
@@ -1433,7 +1434,7 @@ export default function App() {
           <Match when={currentMissionId()}>
             {(id) => (
               <Show when={id()} keyed>
-                {(mid) => <MissionView id={mid} initial={missions().find(m => m.id === mid)} onMission={setOpenMission} />}
+                {(mid) => <MissionView id={mid} initial={missions().find(m => m.id === mid)} onMission={setOpenMission} onFork={m => { setMissions(ms => [m, ...ms.filter(x => x.id !== m.id)]); bumpProjects(); open(`m:${m.id}`); }} />}
               </Show>
             )}
           </Match>
@@ -1776,7 +1777,9 @@ function MissionDock(p: {
   destination: string;
   onMission?: (mission: Mission) => void;
   onError?: (message: string) => void;
+  onFork?: (mission: Mission) => void;
 }) {
+  const [forkOpen, setForkOpen] = createSignal(false);
   const used = () => estimateTokens(p.items);
   const windowSize = () => contextWindow(p.mission?.backend);
   const pct = () => contextPct(used(), windowSize());
@@ -1844,7 +1847,8 @@ function MissionDock(p: {
       </span>
       <Show when={harnessName()}>
         <span class="under-sep" aria-hidden="true">·</span>
-        <span class="under-harness" title="Harness is fixed for this mission">{harnessName()}</span>
+        <button class="under-harness under-model" title="Fork with another harness or model" aria-label="Fork conversation" onClick={() => setForkOpen(true)}>{harnessName()} <Ic.ChevronDown size={10} /></button>
+        <Show when={forkOpen() && p.mission}>{m => <ForkMission mission={m()} choices={harnessChoices()} destination={p.destination} onClose={() => setForkOpen(false)} onFork={forked => { setForkOpen(false); p.onFork?.(forked); }} />}</Show>
         <span class="under-sep" aria-hidden="true">·</span>
         <div class="under-model-wrap">
           <Show
@@ -1942,7 +1946,7 @@ function MissionDock(p: {
   );
 }
 
-function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: Mission | null) => void }) {
+function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: Mission | null) => void; onFork?: (mission: Mission) => void }) {
   const receipt = recalledLaunch(p.id);
   const cached = peekReadyTranscript(p.id);
   const [mission, setMission] = createSignal<Mission | null>(p.initial ?? null);
@@ -2166,7 +2170,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
           <Show when={latestChecklist(items())?.tasks.length}>
             <button class="tasks-jump" onClick={() => { const tasks = scroller?.querySelector<HTMLElement>(".mission-tasks"); tasks?.scrollIntoView({ behavior: "smooth", block: "center" }); tasks?.focus({ preventScroll: true }); }}>Tasks</button>
           </Show>
-          <MissionDock mission={mission()} items={viewItems()} destination={missionDestination(mission(), receipt)} onMission={setMission} onError={setError} />
+          <MissionDock mission={mission()} items={viewItems()} destination={missionDestination(mission(), receipt)} onMission={setMission} onError={setError} onFork={p.onFork} />
         </div>
       </div>
     </>
