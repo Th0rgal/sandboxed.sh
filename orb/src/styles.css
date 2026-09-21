@@ -528,7 +528,7 @@ code {
 .composer .composer-field { grid-column: 2; }
 .composer .picks { grid-column: 3; }
 .composer .voice-slot { grid-column: 4; }
-.composer .send { grid-column: 5; }
+.composer .send-slot { grid-column: 5; }
 .composer.tall {
   grid-template-columns: auto 1fr auto auto;
   grid-template-rows: 1fr auto;
@@ -544,7 +544,7 @@ code {
 .composer.tall .plus-wrap { grid-column: 1; grid-row: 2; align-self: center; }
 .composer.tall .picks { grid-column: 2; grid-row: 2; justify-self: start; align-self: center; }
 .composer.tall .voice-slot { grid-column: 3; grid-row: 2; align-self: center; }
-.composer.tall .send { grid-column: 4; grid-row: 2; align-self: center; }
+.composer.tall .send-slot { grid-column: 4; grid-row: 2; align-self: center; }
 .composer.voice-on {
   grid-template-columns: auto 1fr;
   grid-template-rows: auto;
@@ -557,7 +557,7 @@ code {
 .composer.voice-on.tall { min-height: 42px; padding: 7px 10px 7px 11px; }
 .composer.voice-on .composer-field,
 .composer.voice-on .picks,
-.composer.voice-on .send { display: none; }
+.composer.voice-on .send-slot { display: none; }
 .composer.voice-on .plus-wrap { grid-column: 1; grid-row: 1; }
 .composer.voice-on .voice-slot {
   grid-column: 2; grid-row: 1;
@@ -582,6 +582,7 @@ textarea::placeholder { color: var(--placeholder); }
 .model { padding: 0 4px; border-radius: 5px; max-width: 200px; }
 .model > :first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model:hover, .model.on { background: var(--bg-active); }
+.send-slot { display: flex; align-items: center; gap: 6px; }
 .send { width: 24px; height: 24px; border-radius: 50%; background: var(--send-bg); color: var(--send-fg); display: grid; place-items: center; }
 .send.stop { border-radius: 7px; }
 .send:hover { background: var(--send-bg-hover); }

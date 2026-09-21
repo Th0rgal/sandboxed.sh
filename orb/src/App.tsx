@@ -286,7 +286,7 @@ function Composer(p: {
   const [sending, setSending] = createSignal(false);
   const send = async () => {
     const payload = draftOf(text());
-    if (!payload || p.busy || sending()) return;
+    if (!payload || sending()) return;
     setSending(true);
     try {
       const accepted = await p.onSend(payload);
@@ -450,22 +450,20 @@ function Composer(p: {
     </Show>
   );
   // Cursor keeps the microphone mounted while a turn is streaming; Stop sits
-  // beside it. A recording also keeps the mic even once text is typed.
+  // beside it. A draft still sends — the backend queues it for the next turn.
   const sendBtn = (
-    <Show
-      when={p.busy}
-      fallback={
-        <Show when={text().trim() && !slash() && !voiceActive()}>
-          <button class="send" onClick={send} title="Send">
-            <Ic.ArrowUpIcon size={14} />
-          </button>
-        </Show>
-      }
-    >
-      <button class="send stop" onClick={p.onStop} title="Stop">
-        <Ic.StopIcon size={14} />
-      </button>
-    </Show>
+    <div class="send-slot">
+      <Show when={text().trim() && !slash() && !voiceActive()}>
+        <button class="send" onClick={send} title={p.busy ? "Queue for next turn" : "Send"}>
+          <Ic.ArrowUpIcon size={14} />
+        </button>
+      </Show>
+      <Show when={p.busy}>
+        <button class="send stop" onClick={p.onStop} title="Stop">
+          <Ic.StopIcon size={14} />
+        </button>
+      </Show>
+    </div>
   );
   const voice = (
     <Show when={voiceAvailable()}>
