@@ -1399,11 +1399,19 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 
 .cr-steer-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 0; }
 
-.fork-summary { margin: 0 0 18px; color: var(--fg-2); line-height: 1.5; }
-.fork-fields { display: grid; gap: 14px; }
-.fork-fields label { display: grid; gap: 6px; color: var(--fg-2); font-size: 12px; }
-.fork-fields select { width: 100%; }
-.fork-note { margin: 18px 0 0; font-size: 12px; line-height: 1.5; color: var(--fg-3); }
+/* Fork uses the same searchable sheet and quiet menu rows as the composer. */
+.fork-picker { max-height: min(340px, 45vh); overflow-y: auto; margin: 14px -8px 0; padding: 0 4px; }
+.fork-group-title { padding: 12px 10px 5px; color: var(--fg-3); font-size: 11px; }
+.fork-group:first-child .fork-group-title { padding-top: 0; }
+.fork-option { display: flex; align-items: center; gap: 12px; width: 100%; padding: 9px 10px; text-align: left; border-radius: 6px; color: var(--fg-2); }
+.fork-option:hover, .fork-option:focus-visible, .fork-option[aria-pressed="true"] { background: var(--bg-active); color: var(--fg); }
+.fork-option span:first-child { flex: 1; }
+.fork-check { color: var(--fg-2); }
+.fork-empty { padding: 20px 10px; color: var(--fg-3); }
+.fork-efforts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding-top: 14px; color: var(--fg-3); font-size: 11px; }
+.fork-efforts > span { margin-right: 8px; }
+.fork-efforts button { padding: 4px 7px; border-radius: 5px; color: var(--fg-2); }
+.fork-efforts button:hover, .fork-efforts button[aria-pressed="true"] { color: var(--fg); background: var(--bg-active); }
 
 .fork-context { width: 100%; }
 .fork-context summary { cursor: pointer; color: var(--fg-2); }
@@ -1413,3 +1421,5 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 
 button.fork-trigger { color: inherit; cursor: pointer; }
 button.fork-trigger:hover { color: var(--fg); }
+
+.prompt-sheet:has(.fork-picker) { width: min(520px, calc(100vw - 36px)); background: var(--menu-bg); }

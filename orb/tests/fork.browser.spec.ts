@@ -5,7 +5,7 @@ test("fork dialog opens a new page without mutating the source", async ({ page }
   const fork = { ...source, id: "forked", title: "Original work · fork", backend: "opencode", model_override: "qwen" };
   let created = false;
   const mutations: { path: string; body: any }[] = [];
-  await page.addInitScript(() => { localStorage.setItem("orb.apiUrl", location.origin); localStorage.setItem("orb.jwt", "test"); });
+  await page.addInitScript(() => { localStorage.setItem("orb.apiUrl", location.origin); localStorage.setItem("orb.jwt", "test"); localStorage.setItem("orb-theme", "dark"); });
   await page.route("**/api/**", async route => {
     const req = route.request(), path = new URL(req.url()).pathname;
     if (req.method() !== "GET") {
@@ -34,8 +34,10 @@ test("fork dialog opens a new page without mutating the source", async ({ page }
   const dialog = page.getByRole("dialog", { name: "Fork conversation" });
   await expect(dialog).toBeVisible();
   await expect(dialog).toContainText("Files are shared");
-  await dialog.getByLabel("Harness", { exact: true }).selectOption("opencode");
-  await expect(dialog.getByLabel("Model", { exact: true })).toHaveValue("qwen");
+  await dialog.getByLabel("Search models").fill("qwen");
+  await dialog.getByRole("button", { name: "Qwen" }).click();
+  await expect(dialog.getByRole("button", { name: "Qwen" })).toHaveAttribute("aria-pressed", "true");
+  await dialog.getByLabel("Search models").fill("");
   await page.screenshot({ path: "test-results/fork-dialog.png" });
   await dialog.getByRole("button", { name: "Fork and continue" }).click();
   await expect(dialog).toHaveCount(0);
