@@ -16,7 +16,7 @@ import { MdSource, MdView, safeHref } from "./Markdown";
 import { streamMission, heldAfterHistory, type StreamEvent } from "./stream";
 import { Transcript, UserTurn, applyStreamEvent, type StreamItem } from "./Transcript";
 import { cacheRemember, cacheRecents } from "./pageCache";
-import { loadTranscript, peekTranscript, peekTranscriptHeight, prefetchTranscript, putTranscript, putTranscriptHeight, putTranscriptItems } from "./missionCache";
+import { loadTranscript, peekReadyTranscript, peekTranscriptHeight, prefetchTranscript, putTranscript, putTranscriptHeight, putTranscriptItems } from "./missionCache";
 import { TranscriptSkeleton } from "./Skeleton";
 import { mergeById, pollWhileVisible } from "./poll";
 import { LiveProjectsSection, ProjectFileView } from "./ProjectFiles";
@@ -1614,7 +1614,7 @@ function MissionDock(p: {
 
 function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: Mission | null) => void }) {
   const receipt = recalledLaunch(p.id);
-  const cached = peekTranscript(p.id);
+  const cached = peekReadyTranscript(p.id);
   const [mission, setMission] = createSignal<Mission | null>(p.initial ?? null);
   createEffect(() => p.onMission?.(mission()));
   onCleanup(() => p.onMission?.(null));
@@ -1740,10 +1740,24 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
         }}
       >
         <div class="col" style={peekTranscriptHeight(p.id) && awaiting() ? { "min-height": `${peekTranscriptHeight(p.id)}px` } : undefined}>
-          <LaunchStatus destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={viewItems().some(i => ["text","tool","think"].includes(i.kind))} />
-          <Transcript items={viewItems()} />
-          <Show when={awaiting() && !cached}>
-            <TranscriptSkeleton />
+          <Show
+            when={!awaiting()}
+            fallback={
+              <>
+                <Show when={receipt && ["pending", "queued", "starting", "resuming"].includes(mission()?.status ?? "") ? receipt : undefined}>
+                  {(r) => (
+                    <>
+                      <LaunchStatus destination={missionDestination(mission(), r())} mission={mission()} goal={missionGoal(mission(), r())} />
+                      <UserTurn text={r().prompt} />
+                    </>
+                  )}
+                </Show>
+                <TranscriptSkeleton />
+              </>
+            }
+          >
+            <LaunchStatus destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={viewItems().some(i => ["text","tool","think"].includes(i.kind))} />
+            <Transcript items={viewItems()} />
           </Show>
           <Show when={error()}>
             <p class="s-lead" role="alert">{error()}</p>
