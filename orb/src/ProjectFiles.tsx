@@ -53,7 +53,7 @@ export function rowDetail(title: string, extra: Array<string | undefined | null>
   return { title, meta: extra.map((part) => part?.trim()).filter((part): part is string => !!part) };
 }
 
-/** Prefer the right of the row; otherwise below. Clamp to the viewport. */
+/** Prefer overlapping the row's trailing edge (Cursor); otherwise below. Clamp to the viewport. */
 export function placeRowTip(
   row: { top: number; left: number; right: number; bottom: number },
   size: { width: number; height: number },
@@ -61,8 +61,10 @@ export function placeRowTip(
   gap = 8,
 ) {
   const pad = 8;
-  const beside = view.width - row.right - gap - pad >= Math.min(size.width, 120);
-  const x = beside ? row.right + gap : row.left;
+  const overlap = Math.min(32, Math.max(12, row.right - row.left - 40));
+  const start = row.right - overlap;
+  const beside = view.width - start - pad >= Math.min(size.width, 120);
+  const x = beside ? start : row.left;
   const y = beside ? row.top : row.bottom + gap;
   return {
     x: Math.max(pad, Math.min(x, view.width - size.width - pad)),

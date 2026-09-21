@@ -93,7 +93,8 @@ test("sidebar rows stay compact with distinct hover/selected and delayed real me
   await expect(live).toHaveAccessibleName(/Orb DGX launch without losing this draft/);
   const liveBox = (await live.boundingBox())!;
   const tipBox = (await tip.boundingBox())!;
-  expect(tipBox.x).toBeGreaterThanOrEqual(liveBox.x + liveBox.width);
+  expect(tipBox.x).toBeGreaterThan(liveBox.x);
+  expect(tipBox.x).toBeLessThan(liveBox.x + liveBox.width);
   await page.screenshot({ path: "test-results/orb-sidebar-tooltip.png" });
   await page.keyboard.press("Escape");
   await expect(tip).toBeHidden();
