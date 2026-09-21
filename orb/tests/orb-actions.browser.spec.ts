@@ -116,7 +116,7 @@ test("right-click an agent row: Copy mission ID copies the raw UUID and changes 
   // The right-click must not open or select the agent.
   await expect(row).not.toHaveClass(/active/);
   await expect(page.locator(".tb-title")).toHaveText("New Agent");
-  await expect(page.getByPlaceholder("Plan, Build, / for commands, @ for context")).toBeVisible();
+  await expect(page.getByPlaceholder("Describe a task, / for commands, @ for context")).toBeVisible();
 });
 
 test("finished agent rows offer the same copy, and it is never an execution id", async ({ page }) => {
@@ -266,7 +266,7 @@ test("composer effort: shown after harness and model for Codex, and sent on crea
   await menu.getByRole("button", { name: /High/ }).first().click();
   await expect(picks.nth(2)).toHaveText(/High/);
 
-  await page.getByPlaceholder("Plan, Build, / for commands, @ for context").fill("ship it");
+  await page.getByPlaceholder("Describe a task, / for commands, @ for context").fill("ship it");
   await page.keyboard.press("Enter");
   await expect.poll(() => posts.length).toBe(1);
   expect(posts[0].backend).toBe("codex");
@@ -296,7 +296,7 @@ test("composer effort: absent for a harness the core ignores effort for, and res
   // ...and a launch on the effort-less harness omits the field entirely.
   await page.locator(".picks .model").nth(0).click();
   await page.locator(".picks .menu").getByRole("button", { name: "OpenCode" }).click();
-  await page.getByPlaceholder("Plan, Build, / for commands, @ for context").fill("ship it");
+  await page.getByPlaceholder("Describe a task, / for commands, @ for context").fill("ship it");
   await page.keyboard.press("Enter");
   await expect.poll(() => posts.length).toBe(1);
   expect(posts[0].backend).toBe("opencode");
@@ -330,7 +330,7 @@ test("right-click a project: Project settings opens a page in the main panel", a
 
 test("a project cap refusal explains itself and links to that project's settings", async ({ page }) => {
   const { posts } = await setup(page, { capAt: { active: 2, cap: 2 } });
-  const composer = page.getByPlaceholder("Plan, Build, / for commands, @ for context");
+  const composer = page.getByPlaceholder("Describe a task, / for commands, @ for context");
   await composer.fill("start the SRv3 report");
   await page.keyboard.press("Enter");
 
@@ -359,7 +359,7 @@ test("a project cap refusal explains itself and links to that project's settings
 
 test("retrying a refused launch reuses the idempotency key, so no second mission is created", async ({ page }) => {
   const { posts } = await setup(page, { capAt: { active: 2, cap: 2 } });
-  const composer = page.getByPlaceholder("Plan, Build, / for commands, @ for context");
+  const composer = page.getByPlaceholder("Describe a task, / for commands, @ for context");
   await composer.fill("start the SRv3 report");
   await page.keyboard.press("Enter");
   await expect(page.getByRole("alert")).toBeVisible();

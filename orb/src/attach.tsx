@@ -94,7 +94,7 @@ function trimBare(value: string): string {
 export function mentionedChips(text: string, items: AttachItem[]): AttachChip[] {
   const byPath = new Map<string, AttachItem>();
   for (const item of items) {
-    if (item.path) byPath.set(item.path.replace(/\/$/, "").toLowerCase(), item);
+    if (item.path) byPath.set(item.path.replace(/\/$/, ""), item);
   }
   const controller = items.find((it) => it.kind === "controller");
   const chips: AttachChip[] = [];
@@ -104,7 +104,7 @@ export function mentionedChips(text: string, items: AttachItem[]): AttachChip[] 
     const item =
       bare.toLowerCase() === CONTROLLER_MENTION && controller
         ? controller
-        : byPath.get(bare.toLowerCase()) ?? byPath.get(trimBare(bare).replace(/\/$/, "").toLowerCase());
+        : byPath.get(bare) ?? byPath.get(trimBare(bare).replace(/\/$/, ""));
     // An unknown `@word` is ordinary prose, not a silent attachment.
     if (!item || seen.has(item.id)) continue;
     seen.add(item.id);

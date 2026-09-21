@@ -88,11 +88,11 @@ describe("slash palette and in-input mode", () => {
 });
 
 describe("goal indicators", () => {
-  it("renders a /goal user turn as a Goal turn with the exact objective", () => {
+  it("renders a /goal user turn with the exact objective and no redundant pill", () => {
     const { container } = render(() => <UserTurn text="/goal Check the guard" />);
     const turn = container.querySelector(".user")!;
     expect(turn.classList.contains("goal")).toBe(true);
-    expect(turn.querySelector(".goal-tag")?.textContent).toBe("Goal");
+    expect(turn.querySelector(".goal-tag")).toBeNull();
     expect(turn.querySelector(":scope > span:last-child")?.textContent).toBe("Check the guard");
   });
   it("leaves ordinary turns untouched", () => {
@@ -115,7 +115,7 @@ describe("goal indicators", () => {
     const { container } = render(() => <LaunchStatus destination="DGX Spark" submitting goal="Stored" />);
     expect(container.querySelector(".launch-status")).toBeNull();
     const turn = render(() => <UserTurn text="/goal Stored" pending />);
-    expect(turn.container.querySelector(".goal-tag")?.textContent).toBe("Goal");
+    expect(turn.container.querySelector(".goal-tag")).toBeNull();
     expect(turn.container.querySelector(".user")?.classList.contains("pending")).toBe(true);
   });
 

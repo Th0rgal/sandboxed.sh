@@ -39,6 +39,7 @@ async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteS
   if(path==="/api/control/missions"&&!url.searchParams.has("project")){
    listReads++;if(posts.length)await new Promise(r=>setTimeout(r,3000));return route.fulfill({json:options.failed?[m]:[]});
   }
+  if(path==="/api/control/queue")return route.fulfill({json:[]});
   if(path.endsWith("/events")) {if(!options.failed)await historyGate;return route.fulfill({json:options.failed?[]:[{id:1,event_id:"initial",sequence:1,event_type:"user_message",content:prompt,timestamp:""}]});}
   if(path==="/api/control/stream"){await historyGate;if(options.failed)return route.fulfill({contentType:"text/event-stream",body:""});return route.fulfill({contentType:"text/event-stream",body:`event: user_message\ndata: ${JSON.stringify({id:"initial",content:prompt})}\n\n`});}
   if(path==="/api/control/missions/accepted")return route.fulfill({json:m});
@@ -61,7 +62,7 @@ async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteS
  return {posts,attachmentReads,releasePost,releaseHistory,setSuccess:()=>{fail=false;},listReads:()=>listReads,fleetReads:()=>fleetReads};
 }
 async function chooseRemote(page:Page){await page.getByRole("button",{name:/Core \(agent-core\)/}).click();await page.getByRole("button",{name:/dgx-spark online/}).click();}
-const composerInput=(page:Page)=>page.getByPlaceholder(/Plan, Build, \/ for commands, @ for context|Describe the objective/);
+const composerInput=(page:Page)=>page.getByPlaceholder(/Describe a task, \/ for commands, @ for context|Describe the objective/);
 /**
  * Where a phase is reported. A healthy in-flight mission no longer draws a
  * banner — the prompt animates and the phase is announced in a visually hidden
@@ -72,7 +73,7 @@ const phaseStatus=(page:Page)=>page.locator(".launch-status, .sr-only[role=statu
 /** A `/goal` turn renders as a Goal tag plus the exact objective, never the raw slash command. */
 async function expectGoalTurn(page:Page,selector:string,text=objective){
  const turn=page.locator(`${selector}:not(.sk-user)`);await expect(turn).toHaveCount(1);
- await expect(turn).toHaveClass(/goal/);await expect(turn.locator(".goal-tag")).toHaveText("Goal");await expect(turn.locator(":scope > span:last-child")).toHaveText(text);
+ await expect(turn).toHaveClass(/goal/);await expect(turn.locator(".goal-tag")).toHaveCount(0);await expect(turn.locator(":scope > span:last-child")).toHaveText(text);
 }
 
 test("slow local POST shows prompt immediately; accepted mission opens before slow list refresh and reconciles history",async({page})=>{
@@ -205,9 +206,8 @@ test("Grok remote launch is sent unchanged once the server advertises grok",asyn
  await expect(page.locator(".under-harness")).toHaveText("Grok");
  await expect(page.locator(".under-model")).toHaveText("4.6");
  await expect(phaseStatus(page)).toContainText("Remote job accepted on DGX Spark");
- // An accepted remote job is healthy, so it draws no banner; the Goal tag is
- // on the prompt itself, asserted by expectGoalTurn on the next line.
- await expect(page.locator(".launch-status")).toHaveCount(0);
+ // Without transcript output or running evidence, acceptance stays explicit.
+ await expect(page.locator(".launch-status")).toContainText("Remote job accepted");
  await expectGoalTurn(page,".user");state.releaseHistory();await expectGoalTurn(page,".user");
  await page.screenshot({path:"test-results/orb-remote-grok-accepted.png"});
 });

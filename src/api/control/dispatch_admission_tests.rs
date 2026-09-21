@@ -169,6 +169,7 @@ impl Harness {
             .nest("/remote-build", crate::api::remote_build::routes())
             .nest("/workspaces", crate::api::workspaces::routes())
             .route("/message", axum::routing::post(post_message))
+            .route("/queue", axum::routing::get(get_queue))
             .nest("/projects", crate::api::projects_overview::routes())
             .route("/missions", axum::routing::post(create_mission))
             .route("/missions/:id", axum::routing::get(get_mission))
@@ -7171,6 +7172,7 @@ async fn http_create_attachment_failure_never_publishes_scheduler_ticket() {
             .get_deferred_goal(stored.id)
             .await
             .unwrap()
+            .map(|goal| deferred_messages::strip(&goal))
             .as_deref(),
         Some("review the attachment")
     );
@@ -7200,4 +7202,466 @@ async fn http_create_attachment_failure_never_publishes_scheduler_ticket() {
         StatusCode::CONFLICT,
         "coalescing cannot silently discard new selections"
     );
+}
+
+// Drop the entire runtime between phases: no old actor, scheduler or event
+// logger may survive to influence the reopened store.
+fn control_restart_phase<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
+}
+
+#[test]
+fn http_deferred_queue_preserves_ids_order_attachments_and_restart() {
+    let (m, ids, files, path, cleanup) = control_restart_phase(async {
+        let mut h = Harness::new().await;
+        let m = h.writer(MissionStatus::Pending, None).await;
+        h.control
+            .mission_store
+            .set_mission_scheduling(
+                m.id,
+                &crate::api::mission_store::MissionScheduling {
+                    not_before: Some(
+                        (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let files =
+            crate::api::mission_payload::project_files_root(&h.state.config.working_dir, "lido");
+        std::fs::create_dir_all(&files).unwrap();
+        let ids = [Uuid::new_v4(), Uuid::new_v4()];
+        for (index, id) in ids.iter().enumerate() {
+            std::fs::write(files.join("note.md"), format!("version-{index}")).unwrap();
+            let response = h.request(false, m.id, json!({"content":"same text 🦀", "client_message_id":id,
+            "continue_identity":Harness::assertion(&m), "attachments":[{"kind":"file","path":"note.md"}]})).await;
+            assert!(
+                response.status().is_success(),
+                "{}",
+                response.text().await.unwrap()
+            );
+            let receipt: Value = response.json().await.unwrap();
+            assert_eq!(receipt["id"], id.to_string());
+            assert_eq!(receipt["queued"], true);
+        }
+        let fetch_queue = |h: &Harness| {
+            h.state
+                .http_client
+                .get(format!("{}/queue?mission_id={}", h.url, m.id))
+                .send()
+        };
+        let rows: Vec<QueuedMessage> = fetch_queue(&h).await.unwrap().json().await.unwrap();
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), ids);
+        assert!(rows
+            .iter()
+            .all(|r| r.content.contains("paloma:attachment:")));
+        // A new store/actor restores pending messages from the durable deferred
+        // value even though queued events are absent from transcript history.
+        let path = h._dir.path().to_path_buf();
+        let cleanup = h._dir._cleanup.take();
+        drop(h);
+        (m, ids, files, path, cleanup)
+    });
+    let (fixture, request_count, final_status, path, cleanup) = control_restart_phase(async {
+        let fetch_queue = |h: &Harness| {
+            h.state
+                .http_client
+                .get(format!("{}/queue?mission_id={}", h.url, m.id))
+                .send()
+        };
+        let mut h = Harness::with_directory(
+            FixtureDir {
+                path,
+                _cleanup: cleanup,
+            },
+            vec![],
+        )
+        .await;
+        let restored: Vec<QueuedMessage> = fetch_queue(&h).await.unwrap().json().await.unwrap();
+        assert_eq!(restored.iter().map(|r| r.id).collect::<Vec<_>>(), ids);
+        std::fs::remove_file(files.join("note.md")).unwrap();
+        let retry = h.request(false, m.id, json!({"content":"same text 🦀", "client_message_id":ids[0],
+        "continue_identity":Harness::assertion(&m), "attachments":[{"kind":"file","path":"note.md"}]})).await;
+        assert!(retry.status().is_success());
+        assert_eq!(retry.json::<Value>().await.unwrap()["queued"], true);
+        let after: Vec<QueuedMessage> = fetch_queue(&h).await.unwrap().json().await.unwrap();
+        assert_eq!(after.iter().map(|r| r.id).collect::<Vec<_>>(), ids);
+        let missing = h
+            .state
+            .http_client
+            .get(format!("{}/queue?mission_id={}", h.url, Uuid::new_v4()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let prompt = h
+            .control
+            .mission_store
+            .get_deferred_goal(m.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, parts) = deferred_messages::decode(&prompt);
+        assert_eq!(parts.iter().map(|(id, _)| *id).collect::<Vec<_>>(), ids);
+        // Let the real scheduler/actor dispatch the restored batch into the native
+        // fixture. Its delivered history retains original IDs; harness input has
+        // no transport envelope and both immutable attachment snapshots are copied.
+        let fixture = install_native_fixture(&h, m.id, "after").await;
+        h.control
+            .mission_store
+            .set_mission_scheduling(m.id, &Default::default())
+            .await
+            .unwrap();
+        wait_native_file(&fixture.join("requests.jsonl")).await;
+        let requests = std::fs::read_to_string(fixture.join("requests.jsonl")).unwrap();
+        assert!(!requests.contains("sandboxed:messages"));
+        let workspace = workspace::resolve_workspace(
+            &h.state.workspaces,
+            &h.state.config,
+            Some(m.workspace_id),
+        )
+        .await;
+        let cwd = workspace::mission_workspace_dir_for_workspace(&workspace, m.id);
+        for (index, id) in ids.iter().enumerate() {
+            assert_eq!(
+                std::fs::read_to_string(
+                    cwd.join(format!(".paloma/messages/{id}/.paloma/attach/note.md"))
+                )
+                .unwrap(),
+                format!("version-{index}")
+            );
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let events = h
+                    .control
+                    .mission_store
+                    .get_events(m.id, Some(&["user_message"]), None, None)
+                    .await
+                    .unwrap();
+                if let Some(event) = events
+                    .iter()
+                    .find(|event| event.metadata.get("messages").is_some())
+                {
+                    let messages: Vec<(Uuid, String)> =
+                        serde_json::from_value(event.metadata["messages"].clone()).unwrap();
+                    assert_eq!(messages.iter().map(|(id, _)| *id).collect::<Vec<_>>(), ids);
+                    assert!(!event.content.contains("sandboxed:messages"));
+                    let replay = stored_event_to_agent_event(event).unwrap();
+                    let wire: Value =
+                        serde_json::from_str(&deferred_messages::stream_payload(&replay).unwrap())
+                            .unwrap();
+                    assert_eq!(wire["messages"], event.metadata["messages"]);
+                    assert!(!wire["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("sandboxed:messages"));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let delivered: Vec<QueuedMessage> = fetch_queue(&h).await.unwrap().json().await.unwrap();
+        assert!(
+            delivered.iter().all(|entry| entry.inflight),
+            "no pending messages remain after dispatch"
+        );
+        // Completion removes the inflight snapshot and clears the scheduler goal.
+        // A new actor must still recognize each original receipt from stored history.
+        // This fixture only ACKs; the real consumer correctly refuses to
+        // call a requested attachment read complete without a tool event.
+        // A failed-but-consumed turn still owns its receipt IDs: retrying that
+        // receipt is not an explicit new attempt or resume.
+        let settled = wait_native_status(&h, m.id, MissionStatus::Failed).await;
+        assert_eq!(settled.terminal_reason.as_deref(), Some("stalled"));
+        let final_status = settled.status;
+        assert!(h
+            .control
+            .mission_store
+            .get_deferred_goal(m.id)
+            .await
+            .unwrap()
+            .is_none());
+        let request_count = std::fs::read_to_string(fixture.join("requests.jsonl"))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(request_count, 1);
+        let path = h._dir.path().to_path_buf();
+        let cleanup = h._dir._cleanup.take();
+        drop(h);
+        (fixture, request_count, final_status, path, cleanup)
+    });
+    control_restart_phase(async {
+        let restarted = Harness::with_directory(
+            FixtureDir {
+                path,
+                _cleanup: cleanup,
+            },
+            vec![],
+        )
+        .await;
+        for id in ids {
+            let retry = restarted.request(false, m.id, json!({"content":"same text 🦀", "client_message_id":id,
+            "continue_identity":Harness::assertion(&m), "attachments":[{"kind":"file","path":"note.md"}]})).await;
+            assert!(
+                retry.status().is_success(),
+                "{}",
+                retry.text().await.unwrap()
+            );
+            assert_eq!(retry.json::<Value>().await.unwrap()["queued"], false);
+        }
+        assert_eq!(
+            restarted
+                .control
+                .mission_store
+                .get_mission(m.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            final_status
+        );
+        assert!(restarted
+            .control
+            .mission_store
+            .get_active_mission_run(m.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            std::fs::read_to_string(fixture.join("requests.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            request_count
+        );
+        let events = restarted
+            .control
+            .mission_store
+            .get_events(m.id, Some(&["user_message"]), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "retry cannot publish a second delivered user event"
+        );
+        NATIVE_FIXTURES.lock().unwrap().remove(&m.id);
+    });
+}
+
+#[tokio::test]
+async fn http_reserved_attachment_prose_is_rejected_before_acceptance() {
+    let h = Harness::new().await;
+    let before = h
+        .control
+        .mission_store
+        .list_missions(100, 0)
+        .await
+        .unwrap()
+        .len();
+    let target = Uuid::new_v4();
+    for reference in ["malformed".to_string(), format!("{} -->", Uuid::new_v4())] {
+        let content = format!("Quoted prose: <!-- paloma:attachment:{reference}");
+        for attached in [false, true] {
+            let attachments = if attached {
+                json!([{"kind":"controller"}])
+            } else {
+                json!([])
+            };
+            for (path, body) in [
+                (
+                    "/missions".to_string(),
+                    json!({"prompt":content,"project":"lido","attachments":attachments}),
+                ),
+                (
+                    "/message".to_string(),
+                    json!({"content":content,"mission_id":target,"attachments":attachments}),
+                ),
+                (
+                    format!("/missions/{target}/resume"),
+                    json!({"content":content}),
+                ),
+            ] {
+                let response = h
+                    .state
+                    .http_client
+                    .post(format!("{}{path}", h.url))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert!(response
+                    .text()
+                    .await
+                    .unwrap()
+                    .contains("reserved attachment reference"));
+            }
+        }
+    }
+    assert_eq!(
+        h.control
+            .mission_store
+            .list_missions(100, 0)
+            .await
+            .unwrap()
+            .len(),
+        before
+    );
+    let queue: Value = h
+        .state
+        .http_client
+        .get(format!("{}/queue", h.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queue, json!([]));
+    assert!(!h
+        .state
+        .config
+        .working_dir
+        .join(".sandboxed-sh/message-payloads")
+        .exists());
+}
+
+#[test]
+fn http_restored_scheduler_batch_retry_preserves_pending_and_consumed_state() {
+    for inflight in [false, true] {
+        let (m, fixture, outer, ids, path, cleanup) = control_restart_phase(async {
+            let mut first = Harness::new().await;
+            let m = first.writer(MissionStatus::Pending, None).await;
+            let fixture = install_native_fixture(&first, m.id, "after").await;
+            let outer = Uuid::new_v4();
+            let ids = [Uuid::new_v4(), Uuid::new_v4()];
+            let content = deferred_messages::join(
+                &deferred_messages::encode(ids[0], "same"),
+                &deferred_messages::encode(ids[1], "same"),
+            );
+            let batch = QueuedMessage {
+                id: outer,
+                content,
+                agent: None,
+                mission_id: Some(m.id),
+                source: Some("scheduler".into()),
+                inflight,
+            };
+            let mut snapshot = Vec::new();
+            if !inflight {
+                // This restored first turn stays held in the native fixture while
+                // the scheduler batch is restored behind it in the runner queue.
+                snapshot.push(QueuedMessage {
+                    id: Uuid::new_v4(),
+                    content: "/goal hold the first turn".into(),
+                    agent: None,
+                    mission_id: Some(m.id),
+                    source: Some("api:test".into()),
+                    inflight: false,
+                });
+            }
+            snapshot.push(batch);
+            // An actor command barrier completes its initial queue load before
+            // writing the on-disk crash fixture.
+            assert!(first
+                .state
+                .http_client
+                .get(format!("{}/queue", first.url))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .is_success());
+            first
+                .control
+                .mission_store
+                .save_control_queue(&first.user.id, &serde_json::to_string(&snapshot).unwrap())
+                .await
+                .unwrap();
+            let path = first._dir.path().to_path_buf();
+            let cleanup = first._dir._cleanup.take();
+            drop(first);
+            (m, fixture, outer, ids, path, cleanup)
+        });
+        control_restart_phase(async {
+            let h = Harness::with_directory(
+                FixtureDir {
+                    path,
+                    _cleanup: cleanup,
+                },
+                vec![],
+            )
+            .await;
+            if !inflight {
+                wait_native_file(&fixture.join("started")).await;
+            }
+            for id in ids {
+                let response = h.request(false, m.id, json!({"content":"same", "client_message_id":id,"continue_identity":Harness::assertion(&m)})).await;
+                assert!(
+                    response.status().is_success(),
+                    "{}",
+                    response.text().await.unwrap()
+                );
+                assert_eq!(response.json::<Value>().await.unwrap()["queued"], !inflight);
+            }
+            let queue: Vec<QueuedMessage> = h
+                .state
+                .http_client
+                .get(format!("{}/queue", h.url))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(
+                queue.len(),
+                usize::from(!inflight),
+                "no aliases or repeated original messages in the queue"
+            );
+            if !inflight {
+                assert_eq!(queue[0].id, outer);
+            }
+            let stored: Vec<QueuedMessage> = serde_json::from_str(
+                &h.control
+                    .mission_store
+                    .load_control_queue(&h.user.id)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(stored.iter().filter(|entry| entry.id == outer).count(), 1);
+            assert!(
+                !stored.iter().any(|entry| ids.contains(&entry.id)),
+                "constituent aliases are never serialized"
+            );
+            if !inflight {
+                std::fs::write(fixture.join("release"), "").unwrap();
+                wait_native_status(&h, m.id, MissionStatus::AwaitingUser).await;
+                assert_eq!(
+                    std::fs::read_to_string(fixture.join("requests.jsonl"))
+                        .unwrap()
+                        .lines()
+                        .count(),
+                    2
+                );
+            } else {
+                assert!(
+                    !fixture.join("requests.jsonl").exists(),
+                    "consumed batch never replays"
+                );
+            }
+            NATIVE_FIXTURES.lock().unwrap().remove(&m.id);
+        });
+    }
 }

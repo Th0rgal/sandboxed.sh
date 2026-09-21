@@ -7,6 +7,7 @@
 //! - supports frontend/interactive tools by accepting tool results
 //! - supports persistent missions (goal-oriented sessions)
 
+pub(crate) mod deferred_messages;
 pub(crate) mod dispatch_admission;
 #[cfg(test)]
 pub(crate) mod dispatch_admission_tests;
@@ -306,7 +307,7 @@ pub(crate) fn deferred_goal_for_incoming_message(
 ) -> String {
     if status == MissionStatus::Pending {
         match previous_goal {
-            Some(prev) if !prev.is_empty() => format!("{prev}\n{content}"),
+            Some(prev) if !prev.is_empty() => deferred_messages::join(prev, content),
             _ => content.to_string(),
         }
     } else {
@@ -3839,6 +3840,23 @@ pub struct QueuedMessage {
     pub inflight: bool,
 }
 
+/// A scheduler batch keeps one transport entry, but every original receipt ID
+/// remains an admission identity. Never insert aliases into the persisted queue:
+/// that would replay/display the same batch more than once.
+fn control_message_contains_id(
+    outer_id: Uuid,
+    content: &str,
+    source: Option<&str>,
+    candidate: Uuid,
+) -> bool {
+    outer_id == candidate
+        || (source == Some("scheduler")
+            && deferred_messages::decode(content)
+                .1
+                .iter()
+                .any(|(id, _)| *id == candidate))
+}
+
 fn partition_restored_control_messages(
     items: Vec<QueuedMessage>,
 ) -> (Vec<QueuedMessage>, Vec<QueuedMessage>) {
@@ -5065,6 +5083,8 @@ pub async fn post_message(
     if content.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "content is required".to_string()));
     }
+    crate::api::mission_payload::validate_user_content(&content)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let id = req.client_message_id.unwrap_or_else(Uuid::new_v4);
     let agent = req.agent;
     let target_mission_id = req.mission_id;
@@ -5683,10 +5703,17 @@ pub async fn post_cancel(
 
 // ==================== Queue Management Endpoints ====================
 
-/// Get the current message queue.
+#[derive(Deserialize, Default)]
+pub struct QueueQuery {
+    pub mission_id: Option<Uuid>,
+}
+
+/// Get the current message queue, including durable scheduled/capacity deferrals
+/// when requesting a mission. The control store is scoped to the authenticated user.
 pub async fn get_queue(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
+    Query(query): Query<QueueQuery>,
 ) -> Result<Json<Vec<QueuedMessage>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let (tx, rx) = oneshot::channel();
@@ -5695,12 +5722,92 @@ pub async fn get_queue(
         .send(ControlCommand::GetQueue { respond: tx })
         .await
         .map_err(session_unavailable)?;
-    let queue = rx.await.map_err(|_| {
+    let mut queue = rx.await.map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to get queue".to_string(),
         )
     })?;
+    if let Some(mid) = query.mission_id {
+        let mission = control
+            .mission_store
+            .get_mission(mid)
+            .await
+            .map_err(internal_error)?
+            .ok_or((StatusCode::NOT_FOUND, "mission not found".into()))?;
+        queue.retain(|entry| entry.mission_id == Some(mid));
+        // The asynchronous transcript logger can lag dispatch. The durable
+        // snapshot retains `inflight=true` only after a run lease was acquired,
+        // so a fresh reader can reconcile that ID even before history catches up.
+        // Keep the unscoped queue's existing pending-only contract unchanged.
+        let durable = control
+            .mission_store
+            .load_control_queue(&user.id)
+            .await
+            .map_err(internal_error)?;
+        if !durable.is_empty() {
+            let persisted: Vec<QueuedMessage> =
+                serde_json::from_str(&durable).map_err(internal_error)?;
+            let mut snapshot = Vec::new();
+            for entry in persisted
+                .into_iter()
+                .filter(|entry| entry.mission_id == Some(mid))
+            {
+                let parts = if entry.source.as_deref() == Some("scheduler") {
+                    deferred_messages::decode(&entry.content).1
+                } else {
+                    Vec::new()
+                };
+                if parts.is_empty() {
+                    snapshot.push(entry);
+                } else {
+                    for (id, content) in parts {
+                        snapshot.push(QueuedMessage {
+                            id,
+                            content,
+                            agent: entry.agent.clone(),
+                            mission_id: entry.mission_id,
+                            source: entry.source.clone(),
+                            inflight: entry.inflight,
+                        });
+                    }
+                }
+            }
+            let ids: HashSet<Uuid> = snapshot.iter().map(|entry| entry.id).collect();
+            snapshot.extend(queue.into_iter().filter(|entry| !ids.contains(&entry.id)));
+            queue = snapshot;
+        }
+        if mission.status == MissionStatus::Pending {
+            if let Some(goal) = control
+                .mission_store
+                .get_deferred_goal(mid)
+                .await
+                .map_err(internal_error)?
+            {
+                let mut deferred: Vec<QueuedMessage> = deferred_messages::decode(&goal)
+                    .1
+                    .into_iter()
+                    .map(|(id, content)| QueuedMessage {
+                        id,
+                        content,
+                        agent: None,
+                        mission_id: Some(mid),
+                        source: Some("scheduler".into()),
+                        inflight: false,
+                    })
+                    .collect();
+                let delivered: HashSet<Uuid> = queue
+                    .iter()
+                    .filter(|entry| entry.inflight)
+                    .map(|entry| entry.id)
+                    .collect();
+                deferred.retain(|entry| !delivered.contains(&entry.id));
+                let ids: HashSet<Uuid> = deferred.iter().map(|entry| entry.id).collect();
+                deferred.extend(queue.into_iter().filter(|entry| !ids.contains(&entry.id)));
+                queue = deferred;
+            }
+        }
+    }
     Ok(Json(queue))
 }
 
@@ -10235,6 +10342,11 @@ pub async fn create_mission(
         extra: Default::default(),
     });
 
+    if let Some(prompt) = req.prompt.as_deref() {
+        crate::api::mission_payload::validate_user_content(prompt)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    }
+
     if let Some(attachments) = req.attachments.as_ref().filter(|a| !a.is_empty()) {
         if req.remote_node_id.is_some() {
             return Err((
@@ -11445,10 +11557,14 @@ pub async fn create_mission(
         // deferred goal is later re-injected verbatim, and the backend goal
         // drivers only recognise `/goal <objective>` with a space.
         let prompt = canonical_goal_message(&prompt).unwrap_or(prompt);
+        let prompt_event_id = Uuid::new_v4();
         if !remote_launch {
             control
                 .mission_store
-                .set_deferred_goal(mission.id, Some(prompt.clone()))
+                .set_deferred_goal(
+                    mission.id,
+                    Some(deferred_messages::encode(prompt_event_id, &prompt)),
+                )
                 .await
                 .map_err(internal_error)?;
         }
@@ -11467,7 +11583,6 @@ pub async fn create_mission(
             mission.goal_objective = Some(objective);
         }
         // Surface the queued goal so UIs show it as pending until dispatch.
-        let prompt_event_id = Uuid::new_v4();
         let _ = control.events_tx.send(AgentEvent::UserMessage {
             id: prompt_event_id,
             content: prompt.clone(),
@@ -16498,6 +16613,10 @@ pub async fn resume_mission(
     body: Option<Json<ResumeMissionRequest>>,
 ) -> Result<Json<Mission>, (StatusCode, String)> {
     let request = body.map(|b| b.0).unwrap_or_default();
+    if let Some(content) = request.content.as_deref() {
+        crate::api::mission_payload::validate_user_content(content)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    }
     let clean_workspace = request.clean_workspace;
     let skip_message = request.skip_message;
     let actor = resolve_actor(request.actor.clone(), &user);
@@ -16955,7 +17074,22 @@ fn stored_event_to_agent_event(event: &mission_store::StoredEvent) -> Option<Age
                 .as_deref()
                 .and_then(|id| Uuid::parse_str(id).ok())
                 .unwrap_or_else(Uuid::new_v4),
-            content: event.content.clone(),
+            content: if event
+                .metadata
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                == Some("scheduler")
+            {
+                let messages = event
+                    .metadata
+                    .get("messages")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default();
+                deferred_messages::wrap(&event.content, messages)
+            } else {
+                event.content.clone()
+            },
             queued: false,
             mission_id,
             source: event
@@ -17475,7 +17609,7 @@ pub async fn stream(
                             }
                             let outbound = text_op_events_for_stream(ev, &mut text_op_buffers);
                             for ev in outbound {
-                                match serde_json::to_string(&ev) {
+                                match deferred_messages::stream_payload(&ev) {
                                     Ok(payload) => {
                                         metrics.record_sse_chunk(payload.len());
                                         metrics.record_broadcast(ev.mission_id());
@@ -17557,7 +17691,7 @@ pub async fn stream(
                             // length closely enough for p50/p99 use.
                             let outbound = text_op_events_for_stream(ev, &mut text_op_buffers);
                             for ev in outbound {
-                                match serde_json::to_string(&ev) {
+                                match deferred_messages::stream_payload(&ev) {
                                     Ok(payload) => {
                                         metrics.record_sse_chunk(payload.len());
                                         metrics.record_broadcast(ev.mission_id());
@@ -20900,6 +21034,9 @@ async fn control_actor_loop(
     // messages (re-injected as commands above) rely on this same guard: the
     // first occurrence runs, any later duplicate is dropped.
     let mut accepted_user_message_ids: HashSet<Uuid> = HashSet::new();
+    // Alias membership follows the outer acceptance bit. Rejection/release
+    // removes that bit, so constituent IDs cannot suppress a legitimate retry.
+    let mut accepted_user_message_batches: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
     // One bounded same-mission retry for structured transport failures. Auth,
     // quota/capacity, source failures, stalls, and loops are deliberately not
     // eligible. Writer leases are re-acquired by the normal start path.
@@ -21490,10 +21627,47 @@ async fn control_actor_loop(
                     ControlCommand::AdmitDispatch { admission, command } => {
                         // Deduplication is an admission decision too: a retry
                         // cannot smuggle a new assignment into an accepted id.
-                        if let ControlCommand::UserMessage { id, .. } = command.as_ref() {
-                            if recovered_consumed_user_messages.contains_key(id) || accepted_user_message_ids.contains(id) {
+                        if let ControlCommand::UserMessage { id, target_mission_id, .. } = command.as_ref() {
+                            let pending_in_queue = queue.iter().any(|entry| control_message_contains_id(entry.0, &entry.1, entry.4.as_deref(), *id))
+                                || parallel_runners.values().any(|runner| runner.queue.iter().any(|entry| control_message_contains_id(entry.id, &entry.content, entry.source.as_deref(), *id)));
+                            let consumed = recovered_consumed_user_messages.values().any(|entry| control_message_contains_id(entry.id, &entry.content, entry.source.as_deref(), *id))
+                                || parallel_runners.values().any(|runner| runner.inflight_message().is_some_and(|entry| control_message_contains_id(entry.id, &entry.content, entry.source.as_deref(), *id)));
+                            let pending_deferred = if let Some(mid) = target_mission_id {
+                                match mission_store.get_mission(*mid).await {
+                                    Ok(Some(mission)) if mission.status == MissionStatus::Pending => {
+                                        mission_store.get_deferred_goal(*mid).await.ok().flatten()
+                                            .is_some_and(|goal| deferred_messages::decode(&goal).1.iter().any(|(message_id, _)| message_id == id))
+                                    }
+                                    _ => false,
+                                }
+                            } else { false };
+                            let pending = pending_in_queue || pending_deferred;
+                            let accepted = accepted_user_message_ids.contains(id)
+                                || accepted_user_message_batches.iter().any(|(outer, ids)| accepted_user_message_ids.contains(outer) && ids.contains(id));
+                            // Completed runners leave the live snapshot. Their durable
+                            // transcript still owns both the outer ID and constituent
+                            // scheduler IDs across later control-session restarts.
+                            let delivered_history = if !pending && !consumed && !accepted {
+                                if let Some(mid) = target_mission_id {
+                                    match mission_store.get_events(*mid, Some(&["user_message"]), None, None).await {
+                                        Ok(events) => events.iter().filter(|event| event.metadata.get("queued").and_then(|value| value.as_bool()) != Some(true)).any(|event| {
+                                            event.event_id.as_deref().and_then(|value| Uuid::parse_str(value).ok()) == Some(*id)
+                                                || (event.metadata.get("source").and_then(|value| value.as_str()) == Some("scheduler")
+                                                    && event.metadata.get("messages").and_then(|value| serde_json::from_value::<Vec<(Uuid, String)>>(value.clone()).ok())
+                                                        .is_some_and(|messages| messages.iter().any(|(message_id, _)| message_id == id)))
+                                        }),
+                                        Err(error) => {
+                                            if let ControlCommand::UserMessage { respond, .. } = *command {
+                                                let _ = respond.send(UserMessageAck::Rejected(format!("failed to check prior message receipts: {error}")));
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                } else { false }
+                            } else { false };
+                            if pending || consumed || delivered_history || accepted {
                                 if let ControlCommand::UserMessage { respond, .. } = *command {
-                                    let _ = respond.send(UserMessageAck::Delivered);
+                                    let _ = respond.send(if pending { UserMessageAck::Queued } else { UserMessageAck::Delivered });
                                 }
                                 continue;
                             }
@@ -21548,7 +21722,7 @@ async fn control_actor_loop(
                             }
                         }
 
-                        if recovered_consumed_user_messages.contains_key(&id) {
+                        if recovered_consumed_user_messages.values().any(|entry| control_message_contains_id(entry.id, &entry.content, entry.source.as_deref(), id)) {
                             // The previous actor had already started this exact
                             // deterministic delivery. Its run was interrupted
                             // during startup recovery, so acknowledge the retry
@@ -21565,6 +21739,10 @@ async fn control_actor_loop(
                                 UserMessageAck::Delivered
                             });
                             continue;
+                        }
+
+                        if source.as_deref() == Some("scheduler") {
+                            accepted_user_message_batches.insert(id, deferred_messages::decode(&content).1.into_iter().map(|(id, _)| id).collect());
                         }
 
                         // Smart routing: decide where to send this message based on target_mission_id
@@ -21638,7 +21816,11 @@ async fn control_actor_loop(
                             }
                         }
 
-                        let mut content = content;
+                        // Only scheduler-owned envelopes are transport metadata.
+                        // Direct operator text that resembles one stays literal.
+                        let (mut content, deferred_parts) = if source.as_deref() == Some("scheduler") {
+                            deferred_messages::decode(&content)
+                        } else { (content, Vec::new()) };
                         // Canonicalise `/goal\n…` to the space form at the single
                         // entry point, so every downstream space-only parser (the
                         // grok kickoff below, the mission_runner dispatch paths,
@@ -21676,6 +21858,7 @@ async fn control_actor_loop(
                                 }
                             }
                         }
+                        let content = deferred_messages::wrap(&content, deferred_parts);
 
                         // Reject paused targets before writer capability is
                         // acquired. Retagging a paused read-only audit for a
@@ -21745,7 +21928,7 @@ async fn control_actor_loop(
                                             let combined = deferred_goal_for_incoming_message(
                                                 m.status,
                                                 previous_goal.as_deref(),
-                                                &content,
+                                                &if source.as_deref() == Some("scheduler") { content.clone() } else { deferred_messages::encode(id, &content) },
                                             );
                                             if let Err(e) = mission_store
                                                 .set_deferred_goal(tid, Some(combined))
@@ -22039,7 +22222,7 @@ async fn control_actor_loop(
                                     let combined = deferred_goal_for_incoming_message(
                                         mission.status,
                                         previous_goal.as_deref(),
-                                        &content,
+                                        &if source.as_deref() == Some("scheduler") { content.clone() } else { deferred_messages::encode(id, &content) },
                                     );
                                     match mission_store.set_deferred_goal(tid, Some(combined)).await
                                     {
@@ -22743,7 +22926,7 @@ async fn control_actor_loop(
                                         status_ref,
                                         cancel,
                                         hist_snapshot,
-                                        msg.clone(),
+                                        if msg_source.as_deref() == Some("scheduler") { deferred_messages::strip(&msg) } else { msg.clone() },
                                         Some(mission_ctrl),
                                         tree_ref,
                                         progress_ref,
@@ -24223,7 +24406,7 @@ async fn control_actor_loop(
                                                 status_ref,
                                                 cancel,
                                                 hist_snapshot,
-                                                msg.clone(),
+                                                if msg_source.as_deref() == Some("scheduler") { deferred_messages::strip(&msg) } else { msg.clone() },
                                                 Some(mission_ctrl),
                                                 tree_ref,
                                                 progress_ref,
@@ -25341,7 +25524,7 @@ async fn control_actor_loop(
                             status_ref,
                             cancel,
                             hist_snapshot,
-                            msg.clone(),
+                            if msg_source.as_deref() == Some("scheduler") { deferred_messages::strip(&msg) } else { msg.clone() },
                             Some(mission_ctrl),
                             tree_ref,
                             progress_ref,
@@ -26736,10 +26919,12 @@ async fn control_actor_loop(
                     if let AgentEvent::UserMessage {
                         content,
                         mission_id: Some(mid),
+                        source,
                         ..
                     } = &event
                     {
-                        if let Some(objective) = parse_goal_objective(content) {
+                        let prompt = if source.as_deref() == Some("scheduler") { deferred_messages::strip(content) } else { content.clone() };
+                        if let Some(objective) = parse_goal_objective(&prompt) {
                             if let Err(err) = mission_store
                                 .update_mission_goal(*mid, true, Some(&objective))
                                 .await
@@ -35848,6 +36033,65 @@ Investigate <service/> failures.
         assert!(replayed_again.is_empty());
         assert_eq!(consumed_again.len(), 1);
         assert_eq!(consumed_again[0].id, inflight_id);
+    }
+
+    #[test]
+    fn scheduler_batch_recovery_retains_all_ids_without_serializing_aliases() {
+        let outer = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let content = deferred_messages::join(
+            &deferred_messages::encode(a, "same"),
+            &deferred_messages::encode(b, "same"),
+        );
+        for inflight in [false, true] {
+            let entry = QueuedMessage {
+                id: outer,
+                content: content.clone(),
+                agent: None,
+                mission_id: Some(Uuid::new_v4()),
+                source: Some("scheduler".into()),
+                inflight,
+            };
+            let (pending, consumed) = partition_restored_control_messages(vec![entry]);
+            let restored = pending.first().or_else(|| consumed.first()).unwrap();
+            for id in [outer, a, b] {
+                assert!(control_message_contains_id(
+                    restored.id,
+                    &restored.content,
+                    restored.source.as_deref(),
+                    id
+                ));
+            }
+            // User prose resembling an internal envelope never owns another ID.
+            assert!(!control_message_contains_id(
+                outer,
+                &content,
+                Some("api:test"),
+                a
+            ));
+            let queue = pending
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.id,
+                        entry.content,
+                        entry.agent,
+                        entry.mission_id,
+                        entry.source,
+                    )
+                })
+                .collect();
+            let recovered = consumed
+                .into_iter()
+                .map(|entry| (entry.id, entry))
+                .collect();
+            let serialized = serialize_queue_snapshot(&queue, &HashMap::new(), &recovered);
+            let rows: Vec<QueuedMessage> = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, outer);
+            assert_eq!(rows[0].inflight, inflight);
+        }
     }
 
     #[test]
