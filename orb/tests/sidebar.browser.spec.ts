@@ -72,7 +72,7 @@ test("sidebar rows stay compact with distinct hover/selected and delayed real me
   await expect(done).toBeVisible();
   const livePad = await live.evaluate((el) => getComputedStyle(el).paddingLeft);
   const donePad = await done.evaluate((el) => getComputedStyle(el).paddingLeft);
-  expect(donePad).toBe(livePad);
+  expect(parseFloat(donePad)).toBeGreaterThan(parseFloat(livePad));
   const otherLive = page.getByRole("button", { name: "Live mission 1" });
   const doneColor = await done.evaluate((el) => getComputedStyle(el).color);
   const liveColor = await otherLive.evaluate((el) => getComputedStyle(el).color);

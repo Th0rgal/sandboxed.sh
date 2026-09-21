@@ -318,35 +318,60 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
   background: color-mix(in srgb, var(--fg) 6%, transparent);
 }
 .group.has > .row.project:hover { background: var(--bg-hover); }
-/* Per-child tree stem + rounded elbow, like `tree`, under the project icon. */
-.group.has > :not(.row.project) {
-  position: relative;
-  padding-left: 20px;
+.group.has {
+  --rail: 13px;
+  --indent: 12px;
+  --tree: color-mix(in srgb, var(--fg) 4%, transparent);
 }
-.group.has > .row.depth { padding-left: calc(20px + (var(--depth, 1) - 1) * 12px); }
-.group.has > :not(.row.project)::before,
-.group.has > :not(.row.project)::after {
+.row.d2 { --depth: 2; }
+/* Per-row stem + rounded elbow. --depth shifts the rail inward for nested groups. */
+.group.has .row:not(.project) {
+  position: relative;
+  padding-left: calc(20px + (var(--depth, 1) - 1) * var(--indent));
+}
+.group.has .row:not(.project)::before,
+.group.has .row:not(.project)::after {
   content: "";
   position: absolute;
-  left: 13px;
+  left: calc(var(--rail) + (var(--depth, 1) - 1) * var(--indent));
   pointer-events: none;
-  background: color-mix(in srgb, var(--fg) 4%, transparent);
+  background: var(--tree);
 }
-.group.has > :not(.row.project)::before {
+.group.has .row:not(.project)::before {
   top: 0;
   bottom: 0;
   width: 1px;
 }
-.group.has > :not(.row.project)::after {
+.group.has .row:not(.project)::after {
   top: calc(50% - 3px);
-  width: calc(5px + (var(--depth, 1) - 1) * 12px);
+  width: 5px;
   height: 4px;
   border-bottom-left-radius: 3px;
-  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--fg) 4%, transparent);
+  box-shadow: inset 0 -1px 0 var(--tree);
   background: none;
 }
-.group.has > :not(.row.project):last-child::before {
+.group.has > .row:not(.project):last-child::before,
+.tree-kids > .row:last-child::before {
   bottom: 50%;
+}
+/* Nested group (finished, expanded folder): keep the parent rail and inset the children. */
+.tree-kids {
+  position: relative;
+}
+.tree-kids::before {
+  content: "";
+  position: absolute;
+  left: calc(var(--rail) + (var(--depth, 2) - 2) * var(--indent));
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--tree);
+  pointer-events: none;
+}
+.tree-kids { --depth: 2; }
+.tree-kids .tree-kids { --depth: 3; }
+.group.has > .tree-kids:last-child::before {
+  bottom: 15px;
 }
 .sb-foot {
   flex: none;

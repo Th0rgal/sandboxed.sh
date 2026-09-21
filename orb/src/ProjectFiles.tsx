@@ -459,7 +459,9 @@ export function LiveProjectsSection(p: {
                   <span class="row-label">{entry.name}</span>
                 </button>
                 <Show when={expanded[key()]}>
-                  <DirRows slug={dp.slug} path={childPath()} depth={dp.depth + 1} />
+                  <div class="tree-kids">
+                    <DirRows slug={dp.slug} path={childPath()} depth={dp.depth + 1} />
+                  </div>
                 </Show>
               </>
             );
@@ -610,12 +612,13 @@ export function LiveProjectsSection(p: {
                     </span>
                   </button>
                   <Show when={showDone[project.slug]}>
+                    <div class="tree-kids">
                     <For each={doneOf(project.slug)}>
                       {(m) => {
                         const tip = rowTip.bind(rowDetail(displayTitle(m.title) || m.id, [missionMachine(m)]));
                         return (
                         <button
-                          class={`row agent done d1 ${p.selected() === `m:${m.id}` ? "active" : ""}`}
+                          class={`row agent done d2 ${p.selected() === `m:${m.id}` ? "active" : ""}`}
                           {...tip}
                           onPointerEnter={(e) => { tip.onPointerEnter(e); void loadTranscript(m.id); }}
                           onClick={() => p.open(`m:${m.id}`)}
@@ -629,6 +632,7 @@ export function LiveProjectsSection(p: {
                         );
                       }}
                     </For>
+                    </div>
                   </Show>
                 </Show>
                 <DirRows slug={project.slug} path="" depth={0} />
