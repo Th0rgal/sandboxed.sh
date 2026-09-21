@@ -12,7 +12,7 @@
 //! The data is read straight from the Hermes cron store that lives on the
 //! same host (`<hermes home>/cron/jobs.json`, `executions.db`, and one
 //! markdown file per run under `cron/output/<job_id>/`). Actions go through
-//! the `hermes cron` CLI so Hermes stays the single writer of its own store.
+//! the Hermes scheduler API (settings use its CLI), keeping Hermes the single writer.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -829,13 +829,25 @@ async fn controller_action(
     };
     let slug = super::projects_overview::canonicalize_project_slug(&slug);
     let recorded = recorded_controller_id(&state, &slug);
-    let (home, job_id) = resolve_controller(slug.clone(), recorded.clone()).await?;
+    let (_, job_id) = resolve_controller(slug.clone(), recorded.clone()).await?;
 
-    let mut args = vec![verb.to_string(), job_id];
-    if verb == "run" {
-        args.push("--accept-hooks".to_string());
+    // The CLI's `run` executes synchronously and can return exit 0 after
+    // skipping a paused job. The gateway queues the explicit wake atomically,
+    // resumes paused jobs, and owns execution independently of this request.
+    if let Err(response) = super::project_crons::hermes(
+        &state,
+        reqwest::Method::POST,
+        &format!("/api/jobs/{job_id}/{verb}"),
+        None,
+    )
+    .await
+    {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .map_err(internal)?;
+        return Err((status, String::from_utf8_lossy(&body).into_owned()));
     }
-    run_hermes_cron(&home, &args).await?;
 
     let view =
         tokio::task::spawn_blocking(move || controller_view_sync(&slug, recorded, DEFAULT_RUNS))

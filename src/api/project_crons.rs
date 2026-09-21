@@ -29,7 +29,7 @@ fn valid_slug(slug: &str) -> Result<(), Response> {
     }
 }
 
-async fn hermes(
+pub(super) async fn hermes(
     state: &AppState,
     method: reqwest::Method,
     suffix: &str,

@@ -501,11 +501,15 @@ export async function getProjectController(slug: string, limit = 40): Promise<Co
 }
 
 export async function controllerAction(slug: string, action: "pause" | "resume" | "run"): Promise<ControllerView> {
-  return normalizeControllerView(await api<HermesControllerView>(`/api/projects/${encodeURIComponent(slug)}/controller/action`, {
+  const view = normalizeControllerView(await api<HermesControllerView>(`/api/projects/${encodeURIComponent(slug)}/controller/action`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action }),
   }));
+  if (action === "run" && (!view.job || !view.job.enabled || view.job.state === "paused")) {
+    throw new Error("The scheduler did not wake the paused controller. Your steer is still saved.");
+  }
+  return view;
 }
 
 /** Additional Hermes jobs explicitly bound to this project by the core. */
