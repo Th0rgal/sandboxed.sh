@@ -81,7 +81,7 @@ describe("shared cron form", () => {
     render(() => <CronForm creating draftKey="route" view={{ slug: "notes", job: view().job, runs: [] }} deliveryRoute={{ ready: false, loading: false, error: null }} save={save} onSaved={() => {}} />);
     expect((screen.getByLabelText("Delivery") as HTMLInputElement).value).toBe("project:notes");
     expect((screen.getByText("Create") as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByText(/No canonical conversation is bound/)).toBeTruthy();
+    expect(screen.getByText(/No delivery route is bound yet/)).toBeTruthy();
     fireEvent.input(screen.getByLabelText("Delivery"), { target: { value: "local" } });
     fireEvent.input(screen.getByLabelText("Instruction"), { target: { value: "Read local notes" } });
     fireEvent.click(screen.getByText("Create"));

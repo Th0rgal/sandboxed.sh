@@ -697,6 +697,7 @@ pub async fn get_project(
         &waiting_user_waits,
         decisions.len() as u32,
     );
+    let steers = state.projects.list_steers(&slug).map_err(store_err)?;
     Ok(Json(serde_json::json!({
         "project": project,
         "grant": grant,
@@ -707,6 +708,7 @@ pub async fn get_project(
         "open_decisions": decisions,
         "recent_decisions": recent,
         "conversation": conversation,
+        "steers": steers,
     })))
 }
 
@@ -888,6 +890,9 @@ fn write_overrides(dir: &Path, overrides: &HashMap<String, String>) -> std::io::
 
 #[derive(Debug, Deserialize)]
 pub struct SetStatusRequest {
+    /// IDs actually read and handled by this tick. Missing means no acknowledgement.
+    #[serde(default)]
+    pub consumed_steer_ids: Vec<String>,
     pub mode: String,
     pub next_action: Option<String>,
     pub blocker: Option<String>,
@@ -903,6 +908,12 @@ pub async fn set_project_status(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if !is_plain_key(&slug) {
         return Err(bad_slug());
+    }
+    if req.consumed_steer_ids.len() > super::projects_store::STEER_PENDING_CAP {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "too many steer acknowledgements".into(),
+        ));
     }
     let mut mode = req.mode.trim().to_ascii_lowercase();
     if !matches!(mode.as_str(), "active" | "blocked" | "paused") {
@@ -980,6 +991,10 @@ pub async fn set_project_status(
         .projects
         .set_mode(&slug, &mode, next_action.as_deref(), blocker.as_deref())
         .map_err(|error| (StatusCode::NOT_FOUND, error))?;
+    state
+        .projects
+        .acknowledge_steers(&slug, &req.consumed_steer_ids)
+        .map_err(store_err)?;
     let project = state.projects.get_project(&slug).map_err(store_err)?;
     Ok(Json(serde_json::json!({ "project": project })))
 }
@@ -1203,6 +1218,66 @@ pub async fn set_project_grant(
         .map_err(store_err)?;
     let grant = state.projects.get_grant(&slug).map_err(store_err)?;
     Ok(Json(serde_json::json!({ "slug": slug, "grant": grant })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddSteerRequest {
+    pub body: String,
+    #[serde(default)]
+    pub origin: Option<String>,
+}
+
+/// `GET /api/projects/:slug/steers` — pending inbox plus last consumed.
+pub async fn get_project_steers(
+    State(state): State<Arc<AppState>>,
+    AxumPath(requested): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&requested) {
+        return Err(bad_slug());
+    }
+    let slug = resolve_roster_slug(&state.projects, &requested)
+        .map_err(store_err)?
+        .unwrap_or(requested);
+    let steers = state.projects.list_steers(&slug).map_err(store_err)?;
+    Ok(Json(serde_json::json!({
+        "slug": slug,
+        "pending": steers.pending,
+        "recent": steers.recent,
+    })))
+}
+
+/// `POST /api/projects/:slug/steers` — queue a one-off order for the next tick.
+/// Does not write the grant.
+pub async fn add_project_steer(
+    State(state): State<Arc<AppState>>,
+    AxumPath(requested): AxumPath<String>,
+    Json(req): Json<AddSteerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_plain_key(&requested) {
+        return Err(bad_slug());
+    }
+    let slug = resolve_roster_slug(&state.projects, &requested)
+        .map_err(store_err)?
+        .unwrap_or(requested);
+    let origin = req
+        .origin
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let origin = origin.unwrap_or("api");
+    match state.projects.insert_steer(&slug, &req.body, origin) {
+        Ok(steer) => {
+            let steers = state.projects.list_steers(&slug).map_err(store_err)?;
+            Ok(Json(serde_json::json!({
+                "slug": slug,
+                "steer": steer,
+                "pending": steers.pending,
+                "recent": steers.recent,
+            })))
+        }
+        Err(error) if error.starts_with("unknown project") => Err((StatusCode::NOT_FOUND, error)),
+        Err(error) => Err((StatusCode::BAD_REQUEST, error)),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1943,6 +2018,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/:slug/grant",
             get(get_project_grant).post(set_project_grant),
+        )
+        .route(
+            "/:slug/steers",
+            get(get_project_steers).post(add_project_steer),
         )
         .route(
             "/:slug/decision",
@@ -3877,6 +3956,101 @@ pub(crate) async fn load_project_situation(
     situation
 }
 
+/// Snapshot the controller state as markdown for `.paloma/controller.md`.
+pub(crate) async fn controller_snapshot_markdown(state: &Arc<AppState>, slug: &str) -> String {
+    let grant = state.projects.get_grant(slug).ok().flatten();
+    let grant_md = grant.map(|grant| {
+        let mut lines = Vec::new();
+        if let Some(level) = grant.autonomy_level {
+            lines.push(format!("- autonomy_level: {level}"));
+        }
+        if let Some(merge) = grant.merge_authority {
+            lines.push(format!("- merge_authority: {merge}"));
+        }
+        if let Some(budget) = grant.budget_per_tick {
+            lines.push(format!("- budget_per_tick: {budget}"));
+        }
+        if let Some(parallel) = grant.parallel_missions {
+            lines.push(format!("- parallel_missions: {parallel}"));
+        }
+        if let Some(bar) = grant.material_bar {
+            lines.push(format!("- material_bar: {bar}"));
+        }
+        if let Some(pause) = grant.pause_reason {
+            lines.push(format!("- pause_reason: {pause}"));
+        }
+        if let Some(resume) = grant.resume_condition {
+            lines.push(format!("- resume_condition: {resume}"));
+        }
+        if lines.is_empty() {
+            "_(empty)_".to_string()
+        } else {
+            lines.join("\n")
+        }
+    });
+    let situation = load_project_situation(state, slug).await;
+    let tracks = situation
+        .items
+        .iter()
+        .filter(|item| item.open)
+        .take(24)
+        .map(|item| {
+            format!(
+                "`{}` — {} ({})",
+                item.key,
+                if item.title.is_empty() {
+                    item.key.as_str()
+                } else {
+                    item.title.as_str()
+                },
+                item.derived_state.as_str()
+            )
+        })
+        .collect();
+    let live_missions = situation
+        .items
+        .iter()
+        .flat_map(|item| item.attempts.iter())
+        .filter(|attempt| {
+            matches!(
+                attempt.status.as_str(),
+                "active" | "pending" | "running" | "starting" | "queued" | "waiting_background"
+            )
+        })
+        .take(16)
+        .map(|attempt| {
+            format!(
+                "{} — {}",
+                attempt.id,
+                attempt.title.as_deref().unwrap_or("untitled")
+            )
+        })
+        .collect();
+    let steers = state
+        .projects
+        .list_pending_steers(slug)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|steer| steer.body)
+        .collect();
+    let view = super::project_controller::snapshot_view(state, slug).await;
+    let runs = view.as_ref().map(|v| v.runs.as_slice()).unwrap_or_default();
+    let ctrl = runs.iter().find_map(|run| run.ctrl.clone());
+    let last_tick = runs
+        .iter()
+        .find(|run| !run.silent && !run.report.trim().is_empty())
+        .map(|run| run.report.clone());
+    super::mission_payload::render_controller_md(&super::mission_payload::ControllerSnapshot {
+        slug: slug.to_string(),
+        grant: grant_md,
+        ctrl,
+        last_tick,
+        tracks,
+        live_missions,
+        pending_steers: steers,
+    })
+}
+
 fn accept_err(error: super::projects_store::AcceptError) -> (StatusCode, String) {
     use super::projects_store::AcceptError;
     match &error {
@@ -4062,18 +4236,31 @@ pub fn markdown_roster_enabled() -> bool {
 
 /// `GET /api/projects/:slug/situation` — the canonical bounded read.
 /// `get_project`, `/tasks`, the roster row and MCP `get_situation` are all
-/// projections of this.
+/// projections of this. `steers` rides alongside the situation builder
+/// output so the cursor hash stays a plan hash, not an inbox hash.
 pub async fn project_situation(
     State(state): State<Arc<AppState>>,
     AxumPath(requested): AxumPath<String>,
-) -> Result<Json<super::situation::ProjectSituation>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if !is_plain_key(&requested) {
         return Err(bad_slug());
     }
     let slug = resolve_roster_slug(&state.projects, &requested)
         .map_err(store_err)?
         .unwrap_or(requested);
-    Ok(Json(load_project_situation(&state, &slug).await))
+    let situation = load_project_situation(&state, &slug).await;
+    let steers = state.projects.list_steers(&slug).map_err(store_err)?;
+    let mut value = serde_json::to_value(situation).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize situation: {error}"),
+        )
+    })?;
+    value["steers"] = serde_json::to_value(steers).unwrap_or(serde_json::json!({
+        "pending": [],
+        "recent": []
+    }));
+    Ok(Json(value))
 }
 
 /// Map a canonical item onto the `/tasks` row shape the desktop still
@@ -5309,6 +5496,24 @@ mod tests {
         assert!(recent
             .iter()
             .any(|d| d.question == "Merged #2" && d.status.as_deref() == Some("decided")));
+    }
+
+    #[test]
+    fn delivery_does_not_acknowledge_unread_steers() {
+        let store = super::super::projects_store::ProjectsStore::open_in_memory().unwrap();
+        store
+            .upsert_project("lido", None, None, None, None)
+            .unwrap();
+        let steer = store
+            .insert_steer("lido", "arrived during tick", "orb")
+            .unwrap();
+        let delivery = parse_delivery(
+            "cron_1",
+            2_000_000_000.0,
+            "[Cron delivery: Lido]\nDone\n[CTRL: lido | mode=active | wait=0 | next=review]\n",
+        );
+        ingest_deliveries(&store, &HashMap::new(), &HashMap::new(), vec![delivery]);
+        assert_eq!(store.list_pending_steers("lido").unwrap()[0].id, steer.id);
     }
 
     #[test]

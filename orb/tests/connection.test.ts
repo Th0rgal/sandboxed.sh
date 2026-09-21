@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { createMission, api, clearConnection, connectionVersion, getJwt, isConnected, setConnection } from "../src/api";
+import { sendMissionMessage, createMission, api, clearConnection, connectionVersion, getJwt, isConnected, setConnection } from "../src/api";
 
 afterEach(() => { clearConnection(); vi.unstubAllGlobals(); });
 
@@ -69,4 +69,14 @@ it("preserves the selected local harness and model in the supported create contr
   const body = {backend:"grok",model_override:"grok-4.6",prompt:"Keep my draft"};
   await createMission(body);
   expect(JSON.parse((fetcher.mock.calls[0] as unknown as [string, RequestInit])[1].body as string)).toEqual(body);
+});
+
+
+it("a rejected receipt preserves the follow-up draft and attachments", async () => {
+  const fetcher = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ id: "m1", queued: false, message_accepted: false })));
+  vi.stubGlobal("fetch", fetcher);
+  const attachments = [{kind: "file" as const, path: "notes/test.md"}];
+  await expect(sendMissionMessage("mission", "same text", attachments)).rejects.toThrow("not accepted");
+  expect(JSON.parse(fetcher.mock.calls[0][1]!.body as string)).toEqual({mission_id: "mission", content: "same text", attachments});
+  expect(attachments).toHaveLength(1);
 });

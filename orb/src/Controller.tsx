@@ -2,7 +2,8 @@ import { For, Show, createMemo, createSignal, onCleanup } from "solid-js";
 import { MdView } from "./Markdown";
 import { pollWhileVisible } from "./poll";
 import { ControllerSettingsPanel } from "./ControllerSettings";
-import { controllerAction, getProjectController, getProjectCron, isConnected, projectCronAction, updateProjectCron, type ControllerJob, type ControllerRun, type ControllerView as View } from "./api";
+import { controllerAction, getProjectController, getProjectCron, getProjectSteers, isConnected, projectCronAction, updateProjectCron, type ControllerJob, type ControllerRun, type ControllerView as View, type ProjectSteers } from "./api";
+import { SteerComposer } from "./SteerComposer";
 import { cacheLoad, cachePeek, cachePut, cacheRemember } from "./pageCache";
 import { ControllerSkeleton } from "./Skeleton";
 
@@ -214,6 +215,7 @@ export function ControllerView(p: { slug: string; id?: string }) {
   const [busy, setBusy] = createSignal<string | null>(null);
   const [now, setNow] = createSignal(Date.now());
   const [tab, setTab] = createSignal<"runs" | "settings">("runs");
+  const [steers, setSteers] = createSignal<ProjectSteers | null>(null);
   cacheRemember(viewKey());
 
   const load = async () => {
@@ -224,6 +226,11 @@ export function ControllerView(p: { slug: string; id?: string }) {
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+    try {
+      setSteers(await getProjectSteers(p.slug));
+    } catch {
+      /* steers are optional on older backends */
     }
   };
   void load();
@@ -252,6 +259,7 @@ export function ControllerView(p: { slug: string; id?: string }) {
   };
 
   return (
+    <div class="col" style={{ flex: 1, "min-height": 0, display: "flex", "flex-direction": "column" }}>
     <div class="scroll">
       <div class="col cr-page">
         <Show when={view()} fallback={error() ? <p class="s-lead">{error()}</p> : <ControllerSkeleton />}>
@@ -340,6 +348,27 @@ export function ControllerView(p: { slug: string; id?: string }) {
           </Show>
         </Show>
       </div>
+    </div>
+    <Show when={!p.id}>
+      <div class="dock">
+        <div class="col">
+          <SteerComposer
+            slug={p.slug}
+            steers={steers()}
+            running={running()}
+            onSteers={setSteers}
+            onRan={() => void load()}
+          />
+        </div>
+      </div>
+    </Show>
+    <Show when={!!p.id && ((steers()?.pending.length ?? 0) > 0 || (steers()?.recent.length ?? 0) > 0)}>
+      <div class="dock">
+        <div class="col">
+          <p class="s-lead">Steers land on the project controller, not this extra cron.</p>
+        </div>
+      </div>
+    </Show>
     </div>
   );
 }

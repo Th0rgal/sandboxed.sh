@@ -1231,3 +1231,26 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 }
 .picks .menu-item .pick-meta.unsupported { color: var(--amber); }
 .picks .menu-item .pick-meta.unknown:not(:empty) { color: var(--fg-3); }
+
+.steer-box { display: flex; flex-direction: column; gap: 8px; }
+.steer-list { display: flex; flex-direction: column; gap: 4px; }
+.steer-chip {
+  display: flex; gap: 8px; align-items: baseline;
+  padding: 4px 8px; border-radius: 8px; background: var(--bg-inset);
+  font-size: 12px; line-height: 18px;
+}
+.steer-chip.pending { border: 1px solid var(--stroke-strong); }
+.steer-chip-kind { flex: none; color: var(--fg-4); font-size: 11px; }
+.steer-chip-body { color: var(--fg-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.steer-composer { grid-template-columns: 1fr auto auto; }
+.steer-composer .composer-field { grid-column: 1 / -1; }
+.steer-run {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--fg-3); padding: 0 4px 2px;
+}
+.attach-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  height: 22px; padding: 0 6px 0 8px; border-radius: 11px;
+  background: var(--bg-active); color: var(--fg-2); font-size: 12px;
+}
+.attach-chip button { color: var(--fg-4); }

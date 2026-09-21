@@ -215,6 +215,10 @@ Gotchas:
   GPU nodes for inference while ordinary CPU/Lean nodes have immediate slots,
   then balances by normalized utilization. Only terminal node/job/head receipts
   prove that work was actually distributed.
+- **Controllers are piloted from Orb**, not a bound Hermes chat. One-off
+  orders are project steers (`add_project_steer` / cron composer). Standing
+  authority is still `set_project_grant`. `deliver: project:<slug>` is
+  delivery plumbing. See `docs/CONTROLLERS.md`.
 - **Dev/prod companion binaries are isolated**: production uses unsuffixed MCP
   and palomactl paths; non-production services use a service suffix (for
   example `assistant-mcp-dev`). A dev deploy must never replace Hermes's

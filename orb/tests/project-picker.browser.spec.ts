@@ -41,6 +41,6 @@ test("actual App project chooser searches, selects and creates with keyboard and
  await page.screenshot({path:"test-results/orb-project-create.png"});
  fail=false;await page.getByRole("button",{name:"Create project",exact:true}).click();await expect(dialog).toHaveCount(0);await expect(trigger).toContainText("Fresh notes");await expect(trigger).toBeFocused();
  expect(writes.at(-1)).toEqual({slug:"fresh-notes",title:"Fresh notes"});
- await trigger.click();await page.getByRole("button",{name:"New project…",exact:true}).click();await page.getByRole("button",{name:"Cancel",exact:true}).click();await expect(trigger).toBeFocused();
+ await trigger.click();await page.getByRole("button",{name:"New project…",exact:true}).click();await page.getByRole("button",{name:"Close",exact:true}).click();await expect(trigger).toBeFocused();
  expect(errors).toEqual([]);
 });

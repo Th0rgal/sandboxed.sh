@@ -3601,6 +3601,9 @@ pub struct ControlMessageRequest {
     pub track: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+    /// Follow-up `@` chips: written into the live workspace before this message.
+    #[serde(default)]
+    pub attachments: Option<Vec<crate::api::mission_payload::MissionAttachment>>,
     /// Catch-all for unrecognized request fields — surfaced as `warnings` in
     /// the response instead of being silently dropped (a mistyped targeting
     /// field once silently rerouted a message to the wrong mission).
@@ -4871,7 +4874,6 @@ pub async fn post_message(
     if content.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "content is required".to_string()));
     }
-
     let id = req.client_message_id.unwrap_or_else(Uuid::new_v4);
     let agent = req.agent;
     let target_mission_id = req.mission_id;
@@ -4905,6 +4907,12 @@ pub async fn post_message(
                 .await
                 .map_err(internal_error)?
         {
+            if req.attachments.as_ref().is_some_and(|a| !a.is_empty()) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "remote follow-up attachments are not supported".into(),
+                ));
+            }
             if agent.is_some()
                 || req.github_pr.is_some()
                 || req.track.is_some()
@@ -4935,6 +4943,47 @@ pub async fn post_message(
             }));
         }
     }
+    let content = if let Some(attachments) = req.attachments.as_ref().filter(|a| !a.is_empty()) {
+        let mid = target_mission_id.ok_or((
+            StatusCode::BAD_REQUEST,
+            "attachments require mission_id".into(),
+        ))?;
+        let mission = control
+            .mission_store
+            .get_mission(mid)
+            .await
+            .map_err(internal_error)?
+            .ok_or((StatusCode::NOT_FOUND, "mission not found".into()))?;
+        let mut payload = crate::api::mission_payload::MissionPayload {
+            attachments: attachments.clone(),
+            project: mission.project.project.clone(),
+            controller_md: None,
+        };
+        if attachments
+            .iter()
+            .any(|a| a.kind == crate::api::mission_payload::AttachmentKind::Controller)
+        {
+            if let Some(project) = payload.project.as_deref() {
+                payload.controller_md = Some(
+                    super::projects_overview::controller_snapshot_markdown(&state, project).await,
+                );
+            }
+        }
+        let (content, report) = crate::api::mission_payload::stage_message(
+            &state.config.working_dir,
+            mid,
+            id,
+            &content,
+            &payload,
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("attachments: {e}")))?;
+        if !report.skipped.is_empty() || report.truncated {
+            warnings.push(format!("Some attachments were skipped or capped; see .paloma/messages/{id}/.paloma/attach.md"));
+        }
+        content
+    } else {
+        content
+    };
     let (queued_tx, queued_rx) = oneshot::channel();
     tracing::info!(
         user_id = %user.id,
@@ -7822,6 +7871,9 @@ pub struct CreateMissionRequest {
     /// External conversation that spawned this mission — the Hermes session id
     /// when `origin` is "hermes". Only stored when `origin` is set.
     pub origin_session_id: Option<String>,
+    /// Orb `@` chips: materialized into `.paloma/` before the harness starts.
+    #[serde(default)]
+    pub attachments: Option<Vec<crate::api::mission_payload::MissionAttachment>>,
     /// Catch-all for unrecognized request fields. Serde ignores unknown fields
     /// by default, which has repeatedly hidden client bugs (a `prompt` sent
     /// before the field existed, a mistyped `target_mission_id`). Captured
@@ -9857,6 +9909,23 @@ async fn interrupt_new_mission(control: &ControlState, mission_id: Uuid, reason:
     });
 }
 
+// Coalescing a create must not acknowledge attachment selections that were
+// never saved on the existing mission. New context belongs in a follow-up.
+fn verify_coalesced_attachments(
+    config: &Config,
+    req: &CreateMissionRequest,
+    existing: &Mission,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(attachments) = req.attachments.as_ref().filter(|a| !a.is_empty()) {
+        let saved = crate::api::mission_payload::read_sidecar(&config.working_dir, existing.id)
+            .map_err(internal_error)?;
+        if !saved.is_some_and(|p| p.attachments == *attachments && p.project == req.project) {
+            return Err((StatusCode::CONFLICT, format!("mission {} already exists with different or unavailable attachments; send the attachments as a follow-up or use a distinct title", existing.id)));
+        }
+    }
+    Ok(())
+}
+
 pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -9897,8 +9966,30 @@ pub async fn create_mission(
         estimated_disk_gib: None,
         origin: None,
         origin_session_id: None,
+        attachments: None,
         extra: Default::default(),
     });
+
+    if let Some(attachments) = req.attachments.as_ref().filter(|a| !a.is_empty()) {
+        if req.remote_node_id.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "remote launch attachments are not supported".into(),
+            ));
+        }
+        if req.project.as_deref().is_none_or(|p| p.trim().is_empty()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "attachments require a project".into(),
+            ));
+        }
+        crate::api::mission_payload::validate(&crate::api::mission_payload::MissionPayload {
+            attachments: attachments.clone(),
+            project: req.project.clone(),
+            controller_md: None,
+        })
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
 
     // Persist the roster slug, not a nickname. An inverted alias
     // (`coldcard-rng-cracker` → `ec-defensive-research`) made Coldcard
@@ -9957,6 +10048,7 @@ pub async fn create_mission(
                     // rejected remote submission) is not the work the retry
                     // asks for; only live or finished attempts coalesce.
                     if existing.status != MissionStatus::Failed {
+                        verify_coalesced_attachments(&state.config, &req, &existing)?;
                         tracing::info!(
                             mission_id = %existing.id,
                             idempotency_key = key,
@@ -9990,6 +10082,7 @@ pub async fn create_mission(
         )
         .await
         {
+            verify_coalesced_attachments(&state.config, &req, &existing)?;
             tracing::info!(
                 mission_id = %existing.id,
                 title = %title,
@@ -11007,6 +11100,61 @@ pub async fn create_mission(
             .map_err(internal_error)?;
         mission.origin = Some(origin.to_string());
         mission.origin_session_id = origin_session_id.map(str::to_string);
+    }
+
+    // Persist attachments before publishing the deferred-goal dispatch ticket.
+    // The scheduler can run at every await after set_deferred_goal.
+    if let Some(attachments) = req.attachments.as_ref().filter(|rows| !rows.is_empty()) {
+        let mut payload = crate::api::mission_payload::MissionPayload {
+            attachments: attachments.clone(),
+            project: mission.project.project.clone(),
+            controller_md: None,
+        };
+        if attachments
+            .iter()
+            .any(|row| row.kind == crate::api::mission_payload::AttachmentKind::Controller)
+        {
+            if let Some(project) = mission.project.project.as_deref() {
+                payload.controller_md = Some(
+                    super::projects_overview::controller_snapshot_markdown(&state, project).await,
+                );
+            }
+        }
+        if let Err(error) = crate::api::mission_payload::write_sidecar(
+            &state.config.working_dir,
+            mission.id,
+            &payload,
+        ) {
+            // A retry must not coalesce onto a half-created mission and report
+            // success while discarding both its prompt and attachments.
+            control
+                .mission_store
+                .update_mission_status_with_reason(
+                    mission.id,
+                    MissionStatus::Failed,
+                    Some("attachment_persistence_failed"),
+                )
+                .await
+                .map_err(internal_error)?;
+            state
+                .projects
+                .release_leases_for_attempt(&mission.id.to_string())
+                .map_err(internal_error)?;
+            release_local_mission_disk(&state.config, mission.id)
+                .await
+                .map_err(internal_error)?;
+            let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                completion: None,
+                execution: None,
+                mission_id: mission.id,
+                status: MissionStatus::Failed,
+                summary: Some("attachment_persistence_failed".into()),
+            });
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persist attachments: {error}"),
+            ));
+        }
     }
 
     // Atomic create+start: stash the initial prompt as the deferred goal. The
@@ -15994,6 +16142,7 @@ pub async fn clone_mission(
         // vanished from the worker strip of the session that asked for it.
         origin: source.origin.clone(),
         origin_session_id: source.origin_session_id.clone(),
+        attachments: None,
         extra: Default::default(),
     };
 
@@ -17336,7 +17485,9 @@ async fn callback_snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn paloma_webhook_forwarder_loop(
+    app_state: Arc<std::sync::OnceLock<std::sync::Weak<AppState>>>,
     mut events_rx: broadcast::Receiver<AgentEvent>,
     mission_store: Arc<dyn MissionStore>,
     workspaces: workspace::SharedWorkspaceStore,
@@ -17416,6 +17567,7 @@ async fn paloma_webhook_forwarder_loop(
                         event_execution: Option<MissionRun>,
                         event_completion: Option<MissionCompletionSnapshot>,
                         reconcile_current: bool| {
+        let app_state = app_state.clone();
         let http = http_c.clone();
         let url = url_c.clone();
         let secret = secret_c.clone();
@@ -17688,6 +17840,24 @@ async fn paloma_webhook_forwarder_loop(
                         // exhausted retry leaves it unset, so the 60s sweep
                         // re-sends until the consumer is reachable again.
                         markers.lock().await.set(mission_id, status);
+                        if webhook_forwardable_status(status) {
+                            if let Some(slug) = mission
+                                .as_ref()
+                                .and_then(|m| m.project.project.clone())
+                                .filter(|slug| !slug.is_empty())
+                            {
+                                if let Some(state) =
+                                    app_state.get().and_then(std::sync::Weak::upgrade)
+                                {
+                                    tokio::spawn(async move {
+                                        super::project_controller::wake_controller_for_slug(
+                                            state, &slug,
+                                        )
+                                        .await;
+                                    });
+                                }
+                            }
+                        }
                         break;
                     }
                     Ok(resp) => {
@@ -17903,6 +18073,7 @@ fn spawn_control_session(
         .filter(|url| !url.is_empty())
     {
         tokio::spawn(paloma_webhook_forwarder_loop(
+            control_hub.admission_state.clone(),
             events_tx.subscribe(),
             Arc::clone(&state.mission_store),
             workspaces.clone(),
@@ -26355,6 +26526,9 @@ async fn run_single_control_turn(
     #[cfg(test)]
     if let Some(mid) = mission_id {
         if let Some(result) = dispatch_admission_tests::native_goal_fixture(
+            &config,
+            &workspaces,
+            Some(&mission_store),
             mid,
             &user_message,
             events_tx.clone(),
@@ -26456,6 +26630,25 @@ async fn run_single_control_turn(
                 config.working_dir.clone(),
             )),
         )
+    };
+
+    let user_message = if let Some(mid) = mission_id {
+        match crate::api::mission_payload::materialize_turn(
+            &config.working_dir,
+            &working_dir_path,
+            mid,
+            &user_message,
+        ) {
+            Ok(message) => message,
+            Err(error) => {
+                return crate::agents::AgentResult::failure(
+                    format!("materialize attachments: {error}"),
+                    0,
+                )
+            }
+        }
+    } else {
+        user_message
     };
 
     if let Some(ws) = runtime_workspace.as_ref() {
@@ -36381,6 +36574,7 @@ Investigate <service/> failures.
             let workspaces =
                 Arc::new(workspace::WorkspaceStore::new(dir.path().to_path_buf()).await);
             let forwarder = tokio::spawn(paloma_webhook_forwarder_loop(
+                Arc::new(std::sync::OnceLock::new()),
                 rx,
                 store,
                 workspaces,

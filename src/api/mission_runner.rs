@@ -45,7 +45,7 @@ use super::library::SharedLibrary;
 /// consumed by [`WorkspaceExec`]. Container callers naturally refer to guest
 /// paths (for example `/workspace/verity/base`), while the API process must
 /// validate the corresponding path below the container rootfs.
-fn resolve_mission_working_directory(
+pub(crate) fn resolve_mission_working_directory(
     workspace_root: &Path,
     workspace_type: WorkspaceType,
     requested: &str,
@@ -3565,6 +3565,9 @@ async fn run_mission_turn(
 ) -> AgentResult {
     #[cfg(test)]
     if let Some(result) = super::control::dispatch_admission_tests::native_goal_fixture(
+        &config,
+        &workspaces,
+        mission_store.as_ref(),
         mission_id,
         &user_message,
         events_tx.clone(),
@@ -3842,6 +3845,21 @@ async fn run_mission_turn(
         }
     } else {
         mission_work_dir
+    };
+
+    let user_message = match crate::api::mission_payload::materialize_turn(
+        &config.working_dir,
+        &mission_work_dir,
+        mission_id,
+        &user_message,
+    ) {
+        Ok(message) => {
+            if message != user_message {
+                convo.push_str("\nRead attached context in `.paloma/attach.md`.\n");
+            }
+            message
+        }
+        Err(error) => return AgentResult::failure(format!("materialize attachments: {error}"), 0),
     };
 
     // For Telegram missions, append channel instructions and memory awareness

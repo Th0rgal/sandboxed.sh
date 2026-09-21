@@ -169,6 +169,7 @@ impl Harness {
             .nest("/remote-build", crate::api::remote_build::routes())
             .nest("/workspaces", crate::api::workspaces::routes())
             .route("/message", axum::routing::post(post_message))
+            .nest("/projects", crate::api::projects_overview::routes())
             .route("/missions", axum::routing::post(create_mission))
             .route("/missions/:id", axum::routing::get(get_mission))
             .route("/missions/:id/resume", axum::routing::post(resume_mission))
@@ -2017,6 +2018,9 @@ static NATIVE_FIXTURES: std::sync::LazyLock<std::sync::Mutex<HashMap<Uuid, Nativ
     std::sync::LazyLock::new(Default::default);
 
 pub(crate) async fn native_goal_fixture(
+    config: &Config,
+    workspaces: &workspace::SharedWorkspaceStore,
+    store: Option<&Arc<dyn MissionStore>>,
     id: Uuid,
     message: &str,
     events: broadcast::Sender<AgentEvent>,
@@ -2024,6 +2028,31 @@ pub(crate) async fn native_goal_fixture(
 ) -> Option<crate::agents::AgentResult> {
     use crate::backend::{Backend, SessionConfig};
     let (dir, order) = NATIVE_FIXTURES.lock().unwrap().get(&id).cloned()?;
+    let store = store.expect("fixture mission store");
+    let mission = store.get_mission(id).await.unwrap().unwrap();
+    let workspace =
+        workspace::resolve_workspace(workspaces, config, Some(mission.workspace_id)).await;
+    let cwd = match mission.working_directory.as_deref() {
+        Some(path) => super::super::mission_runner::resolve_mission_working_directory(
+            &workspace.path,
+            workspace.workspace_type,
+            path,
+        )
+        .unwrap(),
+        None => workspace::mission_workspace_dir_for_workspace(&workspace, id),
+    };
+    let message =
+        match crate::api::mission_payload::materialize_turn(&config.working_dir, &cwd, id, message)
+        {
+            Ok(message) => message,
+            Err(error) => {
+                return Some(crate::agents::AgentResult::failure(
+                    format!("materialize attachments: {error}"),
+                    0,
+                ))
+            }
+        };
+    let message = message.as_str();
     let backend = crate::backend::codex::CodexBackend::with_config(
         crate::backend::codex::client::CodexConfig {
             cli_path: dir.join("app-server").to_string_lossy().into_owned(),
@@ -5210,9 +5239,20 @@ async fn remote_launch_is_never_scheduled_locally_while_the_node_submit_is_slow(
 
     // The remote job still finishes the mission it owns.
     fixture.set_state("succeeded");
-    wait_until("remote completion", 20, || async {
-        store.get_mission(mission_id).await.unwrap().unwrap().status == MissionStatus::Completed
-    })
+    wait_until(
+        "remote completion and durable run settlement",
+        20,
+        || async {
+            // Presentation is written before finish_remote_job_lease. Its status
+            // alone cannot certify that the observer has released execution.
+            store.get_mission(mission_id).await.unwrap().unwrap().status == MissionStatus::Completed
+                && store
+                    .get_latest_mission_run(mission_id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|run| run.execution_state.is_terminal())
+        },
+    )
     .await;
     let latest = store
         .get_latest_mission_run(mission_id)
@@ -6167,9 +6207,18 @@ async fn restart_keeps_accepted_remote_job_active_and_reattaches_its_observer() 
 
     // And the normal terminal path still finishes it.
     fixture.set_state("failed");
-    wait_until("failed finalization", 20, || async {
-        store.get_mission(mission.id).await.unwrap().unwrap().status == MissionStatus::Failed
-    })
+    wait_until(
+        "failed finalization and durable run settlement",
+        20,
+        || async {
+            store.get_mission(mission.id).await.unwrap().unwrap().status == MissionStatus::Failed
+                && store
+                    .get_latest_mission_run(mission.id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|run| run.execution_state.is_terminal())
+        },
+    )
     .await;
     let done = store.get_mission(mission.id).await.unwrap().unwrap();
     assert_eq!(done.terminal_reason.as_deref(), Some("remote_node_job"));
@@ -6822,4 +6871,333 @@ async fn native_grok_auto_track_continuation(
         .contains(remote_grok::REMOTE_JOB_STILL_RUNNING));
     assert_eq!(fixture.submissions.lock().unwrap().len(), 3);
     assert!(store.get_mission_automations(id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn http_attachment_queue_preserves_each_snapshot_and_rejects_unknown_mission() {
+    let h = Harness::new().await;
+    let m = h.writer(MissionStatus::Failed, Some("repo#244")).await;
+    let files =
+        crate::api::mission_payload::project_files_root(&h.state.config.working_dir, "lido");
+    std::fs::create_dir_all(&files).unwrap();
+    let dir = install_native_fixture(&h, m.id, "after").await;
+    let response = h
+        .request(
+            true,
+            m.id,
+            json!({"content":"/goal read files", "continue_identity":Harness::assertion(&m)}),
+        )
+        .await;
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    wait_native_file(&dir.join("started")).await;
+    let mut ids = Vec::new();
+    for version in ["first", "second"] {
+        std::fs::write(files.join("note.md"), version).unwrap();
+        let id = Uuid::new_v4();
+        ids.push(id);
+        let response = h
+            .request(
+                false,
+                m.id,
+                json!({
+                    "content": "read my attachment", "client_message_id": id,
+                    "continue_identity": Harness::assertion(&m),
+                    "attachments": [{"kind":"file", "path":"note.md"}]
+                }),
+            )
+            .await;
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+    }
+    let raw = h
+        .control
+        .mission_store
+        .load_control_queue(&h.user.id)
+        .await
+        .unwrap();
+    let queued: Vec<QueuedMessage> = serde_json::from_str(&raw).unwrap();
+    let workspace =
+        workspace::resolve_workspace(&h.state.workspaces, &h.state.config, Some(m.workspace_id))
+            .await;
+    let cwd = workspace::mission_workspace_dir_for_workspace(&workspace, m.id);
+    for id in &ids {
+        let message = queued
+            .iter()
+            .find(|message| message.id == *id)
+            .expect("persisted message");
+        assert!(message.content.contains(&format!("paloma:attachment:{id}")));
+        assert!(
+            !cwd.join(format!(".paloma/messages/{id}")).exists(),
+            "queued context must not touch running cwd"
+        );
+    }
+    // Source mutation after acceptance must not change either queued snapshot.
+    std::fs::remove_file(files.join("note.md")).unwrap();
+    // Retry with the same ID after source deletion must retain the first snapshot.
+    let response = h.request(false, m.id, json!({"content":"read my attachment", "client_message_id":ids[0], "continue_identity":Harness::assertion(&m), "attachments":[{"kind":"file","path":"note.md"}]})).await;
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let rejected_id = Uuid::new_v4();
+    let response = h.request(false, m.id, json!({"content":"unapproved identity change", "client_message_id":rejected_id, "github_pr":"different#1", "attachments":[{"kind":"file","path":"note.md"}]})).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(!cwd.join(format!(".paloma/messages/{rejected_id}")).exists());
+    let unknown = Uuid::new_v4();
+    let response = h
+        .request(
+            false,
+            unknown,
+            json!({"content":"unknown", "attachments":[{"kind":"file","path":"note.md"}]}),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(!workspace::mission_workspace_dir_for_workspace(&workspace, unknown).exists());
+    let response = h
+        .request(
+            false,
+            m.id,
+            json!({"content":"unsafe", "attachments":[{"kind":"file","path":"../escape"}]}),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let queue_after = h
+        .control
+        .mission_store
+        .load_control_queue(&h.user.id)
+        .await
+        .unwrap();
+    assert!(!queue_after.contains("unsafe"));
+    std::fs::write(dir.join("release"), "").unwrap();
+    let delivery = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if std::fs::read_to_string(dir.join("requests.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+                >= 3
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        delivery.is_ok(),
+        "status={:?}; requests={}; queue={}",
+        h.control
+            .mission_store
+            .get_mission(m.id)
+            .await
+            .unwrap()
+            .map(|m| (m.status, m.terminal_reason)),
+        std::fs::read_to_string(dir.join("requests.jsonl")).unwrap_or_default(),
+        h.control
+            .mission_store
+            .load_control_queue(&h.user.id)
+            .await
+            .unwrap()
+    );
+    for (id, version) in ids.iter().zip(["first", "second"]) {
+        assert_eq!(
+            std::fs::read_to_string(
+                cwd.join(format!(".paloma/messages/{id}/.paloma/attach/note.md"))
+            )
+            .unwrap(),
+            version
+        );
+    }
+    let requests = std::fs::read_to_string(dir.join("requests.jsonl")).unwrap();
+    for message in queued.iter().filter(|message| ids.contains(&message.id)) {
+        let reference = message
+            .content
+            .split("Attached context: read `")
+            .nth(1)
+            .unwrap()
+            .split('`')
+            .next()
+            .unwrap();
+        assert!(
+            requests.contains(reference),
+            "queued attachment reference reached native driver"
+        );
+    }
+    NATIVE_FIXTURES.lock().unwrap().remove(&m.id);
+}
+
+#[tokio::test]
+async fn http_status_acknowledges_only_explicit_steers() {
+    let h = Harness::new().await;
+    let first = h
+        .state
+        .projects
+        .insert_steer("lido", "first order", "orb")
+        .unwrap();
+    let late = h
+        .state
+        .projects
+        .insert_steer("lido", "arrived after read", "orb")
+        .unwrap();
+    let url = format!("{}/projects/lido/status", h.url);
+    for body in [
+        json!({"mode":"active"}),
+        json!({"mode":"active", "consumed_steer_ids":[]}),
+    ] {
+        assert!(h
+            .state
+            .http_client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        assert_eq!(
+            h.state.projects.list_pending_steers("lido").unwrap().len(),
+            2
+        );
+    }
+    let response = h
+        .state
+        .http_client
+        .post(&url)
+        .json(&json!({"mode":"active", "consumed_steer_ids":[first.id]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(
+        h.state.projects.list_pending_steers("lido").unwrap()[0].id,
+        late.id
+    );
+}
+
+#[tokio::test]
+async fn http_create_attachment_failure_never_publishes_scheduler_ticket() {
+    if isolated_track_http_test("http_create_attachment_failure_never_publishes_scheduler_ticket") {
+        return;
+    }
+    use std::os::unix::fs::symlink;
+    let h = Harness::new().await;
+    h.state.backend_registry.write().await.register(Arc::new(
+        crate::backend::opencode::OpenCodeBackend::new("http://127.0.0.1:9".into(), None, false),
+    ));
+    let outside = h._dir.path().join("outside-payloads");
+    std::fs::create_dir(&outside).unwrap();
+    let parent = h.state.config.working_dir.join(".sandboxed-sh");
+    std::fs::create_dir_all(&parent).unwrap();
+    symlink(&outside, parent.join("mission-payloads")).unwrap();
+    let request_body = json!({
+        "title":"attachment create race", "backend":"opencode", "project":"lido",
+        "track":"attachment-review", "writer":false, "estimated_disk_gib":1,
+        "prompt":"review the attachment", "attachments":[{"kind":"controller"}],
+        "not_before":(chrono::Utc::now()+chrono::Duration::hours(1)).to_rfc3339()
+    });
+    let response = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        response.text().await.unwrap()
+    );
+    let missions = h.control.mission_store.list_missions(100, 0).await.unwrap();
+    let failed_create = missions
+        .iter()
+        .find(|m| m.title.as_deref() == Some("attachment create race"))
+        .expect("mission created before failed sidecar write");
+    assert!(
+        h.control
+            .mission_store
+            .get_deferred_goal(failed_create.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a failed attachment write must never expose a dispatch ticket"
+    );
+    assert_eq!(failed_create.status, MissionStatus::Failed);
+    assert!(!h
+        .state
+        .projects
+        .live_leases(Some("lido"))
+        .unwrap()
+        .iter()
+        .any(|l| l.attempt_id == failed_create.id.to_string()));
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    std::fs::remove_file(parent.join("mission-payloads")).unwrap();
+    let response = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert!(status.is_success(), "{status}: {body}");
+    let created: Mission = serde_json::from_str(&body).unwrap();
+    assert!(
+        crate::api::mission_payload::read_sidecar(&h.state.config.working_dir, created.id)
+            .unwrap()
+            .is_some()
+    );
+    let stored = h
+        .control
+        .mission_store
+        .get_mission(created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        h.control
+            .mission_store
+            .get_deferred_goal(stored.id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("review the attachment")
+    );
+    let response = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let coalesced: Mission = response.json().await.unwrap();
+    assert_eq!(coalesced.id, created.id);
+    let mut changed = request_body;
+    changed["attachments"] = json!([{"kind":"file", "path":"new.md"}]);
+    let response = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&changed)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "coalescing cannot silently discard new selections"
+    );
 }

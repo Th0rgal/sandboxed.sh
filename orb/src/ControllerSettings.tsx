@@ -135,12 +135,12 @@ export function CronForm(p: {
 
   const usesProjectRoute = () => !draft.deliver.trim() || draft.deliver.split(",").some((target) => target.trim() === `project:${p.view.slug}`);
   const deliveryHint = () => {
-    if (draft.deliver.trim() === "local") return "Save output in Hermes only; no conversation message will be sent.";
+    if (draft.deliver.trim() === "local") return "Save output on the job only; no conversation copy.";
     if (!usesProjectRoute()) return "Send run output to the destination specified here.";
     if (p.deliveryRoute?.error) return `Project delivery unavailable: ${p.deliveryRoute.error}`;
-    if (p.deliveryRoute?.loading) return "Checking the project's canonical conversation route…";
-    if (p.deliveryRoute && !p.deliveryRoute.ready) return "No canonical conversation is bound. Bind one first, or explicitly choose local to save output only.";
-    return "Send each run's output to this project's canonical conversation. The canonical controller is unchanged.";
+    if (p.deliveryRoute?.loading) return "Checking the project's delivery route…";
+    if (p.deliveryRoute && !p.deliveryRoute.ready) return "No delivery route is bound yet. That route is plumbing, not a chat to open. Bind one first, or choose local to keep output on the job only.";
+    return "Run output is stored on this job. A copy may also land on the project's delivery route — look here, not in Hermes chat.";
   };
   const save = async () => {
     if (saving()) return;
@@ -154,7 +154,7 @@ export function CronForm(p: {
     }
     if ((p.creating || patch().prompt !== undefined) && draft.prompt.length > (p.view.settings?.prompt_budget ?? 5000)) { setError("Instruction exceeds the allowed character budget."); return; }
     if (p.creating && usesProjectRoute() && p.deliveryRoute && !p.deliveryRoute.ready) {
-      setError(p.deliveryRoute.error ?? (p.deliveryRoute.loading ? "Checking project delivery route…" : "No canonical conversation is bound. Bind one first, or explicitly choose local delivery to save output only.")); return;
+      setError(p.deliveryRoute.error ?? (p.deliveryRoute.loading ? "Checking project delivery route…" : "No delivery route is bound yet. Bind one first, or choose local to keep output on the job only.")); return;
     }
     if (!p.creating && dirtyCount() === 0) return;
     setSaving(true);
