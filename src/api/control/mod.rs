@@ -11896,6 +11896,7 @@ pub(crate) enum RemoteHarnessPlan {
     OpenCode {
         model: Option<String>,
         prompt: String,
+        resume_session_id: Option<String>,
     },
 }
 
@@ -11978,6 +11979,7 @@ pub(crate) fn plan_remote_harness(
                     )
                 })?;
             Ok(RemoteHarnessPlan::OpenCode {
+                resume_session_id: None,
                 model: Some(model),
                 prompt,
             })
@@ -12109,7 +12111,11 @@ pub(crate) fn remote_execution_for_plan(
                 label,
             }
         }
-        RemoteHarnessPlan::OpenCode { model, prompt } => {
+        RemoteHarnessPlan::OpenCode {
+            model,
+            prompt,
+            resume_session_id,
+        } => {
             // Inline config through OPENCODE_CONFIG_CONTENT: nothing is
             // written into the job cwd (the node's per-mission directory,
             // also its HOME), and nothing depends on the service user's home.
@@ -12124,6 +12130,10 @@ pub(crate) fn remote_execution_for_plan(
             // `plan_remote_harness` guarantees a model for OpenCode; the
             // config registers exactly that id under `builtin`.
             let model = model.as_deref().unwrap_or_default();
+            if let Some(session) = resume_session_id {
+                command.push_str(" --session ");
+                command.push_str(&shell_single_quote(session));
+            }
             command.push_str(" --model ");
             command.push_str(&shell_single_quote(&remote_opencode_model_argument(model)));
             env.insert(
@@ -36366,6 +36376,7 @@ Investigate <service/> failures.
         assert_eq!(
             plan_remote_harness(None, "opencode", Some("xai/grok-4.6"), Some("do it")).unwrap(),
             RemoteHarnessPlan::OpenCode {
+                resume_session_id: None,
                 model: Some("xai/grok-4.6".into()),
                 prompt: "do it".into()
             }
@@ -36379,6 +36390,7 @@ Investigate <service/> failures.
             )
             .unwrap(),
             RemoteHarnessPlan::OpenCode {
+                resume_session_id: None,
                 model: Some("xai/grok-4.6".into()),
                 prompt: "do it".into()
             }
@@ -36432,6 +36444,7 @@ Investigate <service/> failures.
         assert_eq!(exec.label, "claudecode/claude-opus-5");
 
         let plan = RemoteHarnessPlan::OpenCode {
+            resume_session_id: None,
             model: Some("xai/grok-4.6".into()),
             prompt: "build".into(),
         };
