@@ -312,12 +312,26 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 
 .menu-item.quiet { color: var(--fg-3); }
 .menu-item.quiet:hover { color: var(--fg); }
-.group { display: flex; flex-direction: column; gap: 2px; }
-.group.has { margin-bottom: 8px; }
+.group { display: flex; flex-direction: column; gap: 1px; }
+.group.has { margin-bottom: 12px; position: relative; }
 .group.has > .row.project {
   background: color-mix(in srgb, var(--fg) 6%, transparent);
 }
 .group.has > .row.project:hover { background: var(--bg-hover); }
+/* Rail from the project icon so nested folders/missions read as children. */
+.group.has::before {
+  content: "";
+  position: absolute;
+  left: 13px;
+  top: 30px;
+  bottom: 4px;
+  width: 1px;
+  background: color-mix(in srgb, var(--fg) 11%, transparent);
+  pointer-events: none;
+  border-radius: 1px;
+}
+.group.has > :not(.row.project) { padding-left: 18px; }
+.group.has > .row.depth { padding-left: calc(18px + (var(--depth, 1) - 1) * 12px); }
 .sb-foot {
   flex: none;
   display: flex;
@@ -888,7 +902,6 @@ button.under-model { color: inherit; }
 }
 .row.folder:hover .row-action { display: flex; }
 .row.file { color: var(--fg-2); }
-/* Nested missions sit on the same left edge as the project folder (Cursor). */
 .row.d1, .row.d2 { padding-left: 6px; }
 .row.depth { padding-left: calc(6px + (var(--depth, 1) - 1) * 12px); }
 .row-tip {
