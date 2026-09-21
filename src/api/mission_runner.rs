@@ -101,8 +101,16 @@ fn resolve_mission_working_directory(
 /// not be recorded, or a caller bypassed dispatch altogether. Both of the
 /// alternatives are worse than failing: silently upgrading here would run a
 /// model no client reports, and proceeding would run a model that has been
-/// withdrawn. Returning `Some` aborts before any harness — local or remote —
-/// is spawned, because the caller returns it in place of the turn.
+/// withdrawn. Returning `Some` aborts the turn before its harness is spawned,
+/// because the caller returns it in place of running anything.
+///
+/// Coverage, stated precisely: this guards turns that go through
+/// `run_mission_turn`. Typed remote-node creation is a separate path —
+/// `plan_remote_harness` / `dispatch_remote_job` — which does not pass through
+/// here; an explicitly requested retired model is rejected there at create time
+/// by `validate_model_override`, and `model_for_dispatch` upgrades a stored one
+/// before either path reads it. So this is the last gate for local turns, not a
+/// single choke point for every typed remote dispatch.
 pub(crate) fn refuse_retired_model(mission_id: Uuid, model: &str) -> Option<AgentResult> {
     let replacement = crate::model_policy::retired_claude_model(model)?;
     tracing::error!(
@@ -3631,9 +3639,9 @@ async fn run_mission_turn(
         // would run a model nothing reported; silently accepting a retired id
         // would run a model this deployment has withdrawn. So a retired id
         // reaching this point means the upgrade was never recorded (or the
-        // caller bypassed dispatch) — refuse the turn and say why, before any
-        // harness is spawned. Local and remote both pass through here: remote
-        // builds its command from this same resolved config.
+        // caller bypassed dispatch) — refuse the turn and say why, before the
+        // harness is spawned. See `refuse_retired_model` for what this does and
+        // does not cover: typed remote creation is guarded at create instead.
         if let Some(refusal) = refuse_retired_model(mission_id, model) {
             return refusal;
         }

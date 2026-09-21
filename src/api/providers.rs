@@ -2592,6 +2592,12 @@ pub async fn list_backend_model_options(
         query.include_unverified,
     );
     drop(cached);
+    // This endpoint is what the desktop client's harness/model pickers read
+    // (`listBackendModels` in orb/src/api.ts), and it assembles its own provider
+    // list from the dynamic catalog and the live account. Filtering only in
+    // `list_providers` and `validate_model_override` left retired models
+    // selectable here — visibly offered, then refused on submit.
+    retire_superseded_claude_models(&mut providers);
 
     let mut backends: std::collections::HashMap<String, Vec<BackendModelOption>> =
         std::collections::HashMap::new();
