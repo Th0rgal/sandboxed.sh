@@ -228,12 +228,12 @@ export async function listBackendModels(): Promise<Record<string, BackendModelOp
 }
 
 /** Harness order for the composer: the native agents first, then routers. */
-const HARNESS_ORDER = ["claudecode", "codex", "grok", "gemini", "opencode"];
+const HARNESS_ORDER = ["claudecode", "codex", "grok", "opencode"];
 
 export async function listHarnessChoices(): Promise<HarnessChoice[]> {
   const [backends, models] = await Promise.all([listBackends(), listBackendModels()]);
   return backends
-    .filter((b) => (models[b.id]?.length ?? 0) > 0)
+    .filter((b) => b.id !== "gemini" && (models[b.id]?.length ?? 0) > 0)
     .sort((a, b) => {
       const ia = HARNESS_ORDER.indexOf(a.id);
       const ib = HARNESS_ORDER.indexOf(b.id);

@@ -91,7 +91,7 @@ const effectivePick = (): HarnessPick | null => {
   const choices = harnessChoices();
   if (!choices.length) return null;
   const stored = harnessPick();
-  if (stored) {
+  if (stored && stored.backend !== "gemini") {
     const effort = normalizeEffort(stored.effort, stored.backend);
     return effort ? { ...stored, effort } : { backend: stored.backend, model: stored.model };
   }
