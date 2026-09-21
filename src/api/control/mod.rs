@@ -3840,6 +3840,23 @@ pub struct QueuedMessage {
     pub inflight: bool,
 }
 
+/// A scheduler batch keeps one transport entry, but every original receipt ID
+/// remains an admission identity. Never insert aliases into the persisted queue:
+/// that would replay/display the same batch more than once.
+fn control_message_contains_id(
+    outer_id: Uuid,
+    content: &str,
+    source: Option<&str>,
+    candidate: Uuid,
+) -> bool {
+    outer_id == candidate
+        || (source == Some("scheduler")
+            && deferred_messages::decode(content)
+                .1
+                .iter()
+                .any(|(id, _)| *id == candidate))
+}
+
 fn partition_restored_control_messages(
     items: Vec<QueuedMessage>,
 ) -> (Vec<QueuedMessage>, Vec<QueuedMessage>) {
@@ -21017,6 +21034,9 @@ async fn control_actor_loop(
     // messages (re-injected as commands above) rely on this same guard: the
     // first occurrence runs, any later duplicate is dropped.
     let mut accepted_user_message_ids: HashSet<Uuid> = HashSet::new();
+    // Alias membership follows the outer acceptance bit. Rejection/release
+    // removes that bit, so constituent IDs cannot suppress a legitimate retry.
+    let mut accepted_user_message_batches: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
     // One bounded same-mission retry for structured transport failures. Auth,
     // quota/capacity, source failures, stalls, and loops are deliberately not
     // eligible. Writer leases are re-acquired by the normal start path.
@@ -21608,8 +21628,10 @@ async fn control_actor_loop(
                         // Deduplication is an admission decision too: a retry
                         // cannot smuggle a new assignment into an accepted id.
                         if let ControlCommand::UserMessage { id, target_mission_id, .. } = command.as_ref() {
-                            let pending_in_queue = queue.iter().any(|entry| entry.0 == *id)
-                                || parallel_runners.values().any(|runner| runner.queue.iter().any(|entry| entry.id == *id));
+                            let pending_in_queue = queue.iter().any(|entry| control_message_contains_id(entry.0, &entry.1, entry.4.as_deref(), *id))
+                                || parallel_runners.values().any(|runner| runner.queue.iter().any(|entry| control_message_contains_id(entry.id, &entry.content, entry.source.as_deref(), *id)));
+                            let consumed = recovered_consumed_user_messages.values().any(|entry| control_message_contains_id(entry.id, &entry.content, entry.source.as_deref(), *id))
+                                || parallel_runners.values().any(|runner| runner.inflight_message().is_some_and(|entry| control_message_contains_id(entry.id, &entry.content, entry.source.as_deref(), *id)));
                             let pending_deferred = if let Some(mid) = target_mission_id {
                                 match mission_store.get_mission(*mid).await {
                                     Ok(Some(mission)) if mission.status == MissionStatus::Pending => {
@@ -21620,7 +21642,30 @@ async fn control_actor_loop(
                                 }
                             } else { false };
                             let pending = pending_in_queue || pending_deferred;
-                            if pending || recovered_consumed_user_messages.contains_key(id) || accepted_user_message_ids.contains(id) {
+                            let accepted = accepted_user_message_ids.contains(id)
+                                || accepted_user_message_batches.iter().any(|(outer, ids)| accepted_user_message_ids.contains(outer) && ids.contains(id));
+                            // Completed runners leave the live snapshot. Their durable
+                            // transcript still owns both the outer ID and constituent
+                            // scheduler IDs across later control-session restarts.
+                            let delivered_history = if !pending && !consumed && !accepted {
+                                if let Some(mid) = target_mission_id {
+                                    match mission_store.get_events(*mid, Some(&["user_message"]), None, None).await {
+                                        Ok(events) => events.iter().filter(|event| event.metadata.get("queued").and_then(|value| value.as_bool()) != Some(true)).any(|event| {
+                                            event.event_id.as_deref().and_then(|value| Uuid::parse_str(value).ok()) == Some(*id)
+                                                || (event.metadata.get("source").and_then(|value| value.as_str()) == Some("scheduler")
+                                                    && event.metadata.get("messages").and_then(|value| serde_json::from_value::<Vec<(Uuid, String)>>(value.clone()).ok())
+                                                        .is_some_and(|messages| messages.iter().any(|(message_id, _)| message_id == id)))
+                                        }),
+                                        Err(error) => {
+                                            if let ControlCommand::UserMessage { respond, .. } = *command {
+                                                let _ = respond.send(UserMessageAck::Rejected(format!("failed to check prior message receipts: {error}")));
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                } else { false }
+                            } else { false };
+                            if pending || consumed || delivered_history || accepted {
                                 if let ControlCommand::UserMessage { respond, .. } = *command {
                                     let _ = respond.send(if pending { UserMessageAck::Queued } else { UserMessageAck::Delivered });
                                 }
@@ -21677,7 +21722,7 @@ async fn control_actor_loop(
                             }
                         }
 
-                        if recovered_consumed_user_messages.contains_key(&id) {
+                        if recovered_consumed_user_messages.values().any(|entry| control_message_contains_id(entry.id, &entry.content, entry.source.as_deref(), id)) {
                             // The previous actor had already started this exact
                             // deterministic delivery. Its run was interrupted
                             // during startup recovery, so acknowledge the retry
@@ -21694,6 +21739,10 @@ async fn control_actor_loop(
                                 UserMessageAck::Delivered
                             });
                             continue;
+                        }
+
+                        if source.as_deref() == Some("scheduler") {
+                            accepted_user_message_batches.insert(id, deferred_messages::decode(&content).1.into_iter().map(|(id, _)| id).collect());
                         }
 
                         // Smart routing: decide where to send this message based on target_mission_id
@@ -35984,6 +36033,65 @@ Investigate <service/> failures.
         assert!(replayed_again.is_empty());
         assert_eq!(consumed_again.len(), 1);
         assert_eq!(consumed_again[0].id, inflight_id);
+    }
+
+    #[test]
+    fn scheduler_batch_recovery_retains_all_ids_without_serializing_aliases() {
+        let outer = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let content = deferred_messages::join(
+            &deferred_messages::encode(a, "same"),
+            &deferred_messages::encode(b, "same"),
+        );
+        for inflight in [false, true] {
+            let entry = QueuedMessage {
+                id: outer,
+                content: content.clone(),
+                agent: None,
+                mission_id: Some(Uuid::new_v4()),
+                source: Some("scheduler".into()),
+                inflight,
+            };
+            let (pending, consumed) = partition_restored_control_messages(vec![entry]);
+            let restored = pending.first().or_else(|| consumed.first()).unwrap();
+            for id in [outer, a, b] {
+                assert!(control_message_contains_id(
+                    restored.id,
+                    &restored.content,
+                    restored.source.as_deref(),
+                    id
+                ));
+            }
+            // User prose resembling an internal envelope never owns another ID.
+            assert!(!control_message_contains_id(
+                outer,
+                &content,
+                Some("api:test"),
+                a
+            ));
+            let queue = pending
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.id,
+                        entry.content,
+                        entry.agent,
+                        entry.mission_id,
+                        entry.source,
+                    )
+                })
+                .collect();
+            let recovered = consumed
+                .into_iter()
+                .map(|entry| (entry.id, entry))
+                .collect();
+            let serialized = serialize_queue_snapshot(&queue, &HashMap::new(), &recovered);
+            let rows: Vec<QueuedMessage> = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, outer);
+            assert_eq!(rows[0].inflight, inflight);
+        }
     }
 
     #[test]

@@ -37,6 +37,11 @@ includes durable `inflight` proof after run acquisition, closing the gap before
 the asynchronous transcript logger catches up; unscoped queue reads retain their
 pending-only contract. A duplicate
 HTTP receipt reports the actual queued state instead of claiming delivery.
+Admission recognizes constituent IDs inside restored pending and consumed
+scheduler batches while retaining one outer queue entry. Once a runner finishes
+and leaves the snapshot, stored user events retain the original receipt IDs for
+retry deduplication after a later restart. A failed receipt-history read refuses
+new dispatch rather than risking duplicate execution.
 
 No database migration is required. Existing plain deferred prompts still run, but
 pre-upgrade individual IDs cannot be recovered from text that never stored them.
@@ -49,7 +54,9 @@ The HTTP regression reopens SQLite with a new actor, retries the same accepted I
 then lets the scheduler dispatch through the native driver fixture. It checks
 ordered original IDs in replay metadata, exact immutable attachment versions in
 the actual turn cwd, and absence of transport metadata in harness input. It also
-checks unknown-mission rejection. PR #922's immutable attachment snapshots and
+checks unknown-mission rejection and retry after dispatch, goal clearing and a
+second restart. A separate restored-batch regression checks pending and consumed
+IDs without serializing aliases or adding another delivery. PR #922's immutable attachment snapshots and
 steer acknowledgments remain intact. Public create/follow-up/resume content rejects
 the reserved attachment-reference prefix before accepting work, with a clear 400
 error and retained Orb draft; server-generated references still fail closed when

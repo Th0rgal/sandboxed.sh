@@ -7252,7 +7252,7 @@ async fn http_deferred_queue_preserves_ids_order_attachments_and_restart() {
     let path = h._dir.path().to_path_buf();
     let cleanup = h._dir._cleanup.take();
     drop(h);
-    let h = Harness::with_directory(
+    let mut h = Harness::with_directory(
         FixtureDir {
             path,
             _cleanup: cleanup,
@@ -7348,6 +7348,78 @@ async fn http_deferred_queue_preserves_ids_order_attachments_and_restart() {
         delivered.iter().all(|entry| entry.inflight),
         "no pending messages remain after dispatch"
     );
+    // Completion removes the inflight snapshot and clears the scheduler goal.
+    // A new actor must still recognize each original receipt from stored history.
+    wait_native_status(&h, m.id, MissionStatus::AwaitingUser).await;
+    assert!(h
+        .control
+        .mission_store
+        .get_deferred_goal(m.id)
+        .await
+        .unwrap()
+        .is_none());
+    let request_count = std::fs::read_to_string(fixture.join("requests.jsonl"))
+        .unwrap()
+        .lines()
+        .count();
+    assert_eq!(request_count, 1);
+    let path = h._dir.path().to_path_buf();
+    let cleanup = h._dir._cleanup.take();
+    drop(h);
+    let restarted = Harness::with_directory(
+        FixtureDir {
+            path,
+            _cleanup: cleanup,
+        },
+        vec![],
+    )
+    .await;
+    for id in ids {
+        let retry = restarted.request(false, m.id, json!({"content":"same text 🦀", "client_message_id":id,
+            "continue_identity":Harness::assertion(&m), "attachments":[{"kind":"file","path":"note.md"}]})).await;
+        assert!(
+            retry.status().is_success(),
+            "{}",
+            retry.text().await.unwrap()
+        );
+        assert_eq!(retry.json::<Value>().await.unwrap()["queued"], false);
+    }
+    assert_eq!(
+        restarted
+            .control
+            .mission_store
+            .get_mission(m.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        MissionStatus::AwaitingUser
+    );
+    assert!(restarted
+        .control
+        .mission_store
+        .get_active_mission_run(m.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        std::fs::read_to_string(fixture.join("requests.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        request_count
+    );
+    let events = restarted
+        .control
+        .mission_store
+        .get_events(m.id, Some(&["user_message"]), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "retry cannot publish a second delivered user event"
+    );
     NATIVE_FIXTURES.lock().unwrap().remove(&m.id);
 }
 
@@ -7427,4 +7499,118 @@ async fn http_reserved_attachment_prose_is_rejected_before_acceptance() {
         .working_dir
         .join(".sandboxed-sh/message-payloads")
         .exists());
+}
+
+#[tokio::test]
+async fn http_restored_scheduler_batch_retry_preserves_pending_and_consumed_state() {
+    for inflight in [false, true] {
+        let mut first = Harness::new().await;
+        let m = first.writer(MissionStatus::Pending, None).await;
+        let fixture = install_native_fixture(&first, m.id, "after").await;
+        let outer = Uuid::new_v4();
+        let ids = [Uuid::new_v4(), Uuid::new_v4()];
+        let content = deferred_messages::join(
+            &deferred_messages::encode(ids[0], "same"),
+            &deferred_messages::encode(ids[1], "same"),
+        );
+        let batch = QueuedMessage {
+            id: outer,
+            content,
+            agent: None,
+            mission_id: Some(m.id),
+            source: Some("scheduler".into()),
+            inflight,
+        };
+        let mut snapshot = Vec::new();
+        if !inflight {
+            // This restored first turn stays held in the native fixture while
+            // the scheduler batch is restored behind it in the runner queue.
+            snapshot.push(QueuedMessage {
+                id: Uuid::new_v4(),
+                content: "/goal hold the first turn".into(),
+                agent: None,
+                mission_id: Some(m.id),
+                source: Some("api:test".into()),
+                inflight: false,
+            });
+        }
+        snapshot.push(batch);
+        first
+            .control
+            .mission_store
+            .save_control_queue(&first.user.id, &serde_json::to_string(&snapshot).unwrap())
+            .await
+            .unwrap();
+        let path = first._dir.path().to_path_buf();
+        let cleanup = first._dir._cleanup.take();
+        drop(first);
+        let h = Harness::with_directory(
+            FixtureDir {
+                path,
+                _cleanup: cleanup,
+            },
+            vec![],
+        )
+        .await;
+        if !inflight {
+            wait_native_file(&fixture.join("started")).await;
+        }
+        for id in ids {
+            let response = h.request(false, m.id, json!({"content":"same", "client_message_id":id,"continue_identity":Harness::assertion(&m)})).await;
+            assert!(
+                response.status().is_success(),
+                "{}",
+                response.text().await.unwrap()
+            );
+            assert_eq!(response.json::<Value>().await.unwrap()["queued"], !inflight);
+        }
+        let queue: Vec<QueuedMessage> = h
+            .state
+            .http_client
+            .get(format!("{}/queue", h.url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            queue.len(),
+            usize::from(!inflight),
+            "no aliases or repeated original messages in the queue"
+        );
+        if !inflight {
+            assert_eq!(queue[0].id, outer);
+        }
+        let stored: Vec<QueuedMessage> = serde_json::from_str(
+            &h.control
+                .mission_store
+                .load_control_queue(&h.user.id)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.iter().filter(|entry| entry.id == outer).count(), 1);
+        assert!(
+            !stored.iter().any(|entry| ids.contains(&entry.id)),
+            "constituent aliases are never serialized"
+        );
+        if !inflight {
+            std::fs::write(fixture.join("release"), "").unwrap();
+            wait_native_status(&h, m.id, MissionStatus::AwaitingUser).await;
+            assert_eq!(
+                std::fs::read_to_string(fixture.join("requests.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+        } else {
+            assert!(
+                !fixture.join("requests.jsonl").exists(),
+                "consumed batch never replays"
+            );
+        }
+        NATIVE_FIXTURES.lock().unwrap().remove(&m.id);
+    }
 }
