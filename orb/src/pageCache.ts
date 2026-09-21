@@ -87,6 +87,15 @@ export function cacheCanPrefetch(): boolean {
   return true;
 }
 
+/** How many project trees to warm on connect. 0 when the machine is tight. */
+export function prefetchProjectLimit(): number {
+  if (!cacheCanPrefetch()) return 0;
+  const mem = (navigator as { deviceMemory?: number }).deviceMemory;
+  if (mem != null && mem < 4) return 8;
+  if (mem != null && mem < 8) return 16;
+  return 25;
+}
+
 type Job = { key: string; run: () => Promise<unknown> };
 const queue: Job[] = [];
 let active = 0;

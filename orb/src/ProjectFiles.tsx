@@ -34,7 +34,7 @@ import { PopupMenu, type MenuEntry } from "./Menu";
 import { CronForm } from "./ControllerSettings";
 import { getProjectCronFromJob } from "./cronSchema";
 import { loadTranscript, prefetchTranscript } from "./missionCache";
-import { cacheLoad, cachePeek, cachePrefetch, cachePut, cacheRemember } from "./pageCache";
+import { cacheCanPrefetch, cacheLoad, cachePeek, cachePrefetch, cachePut, cacheRemember, prefetchProjectLimit } from "./pageCache";
 import { FileSkeleton } from "./Skeleton";
 
 /** Sidebar section listing the core backend's projects with their missions
@@ -195,10 +195,13 @@ export function LiveProjectsSection(p: {
   const [actionError, setActionError] = createSignal<string | null>(null);
   const rowTip = useRowTip();
   const currentConnection = (version: number) => isConnected() && connectionVersion() === version;
+  const warmed = new Set<string>();
+  const warmupQueue: string[] = [];
+  let warmupActive = 0;
   const loadController = (slug: string) => {
-    if (!isConnected()) return;
+    if (!isConnected()) return Promise.resolve();
     const version = connectionVersion();
-    getProjectController(slug, 3)
+    return getProjectController(slug, 3)
       .then((view) => { if (currentConnection(version)) setControllers(slug, view); })
       .catch(() => {});
   };
@@ -220,6 +223,8 @@ export function LiveProjectsSection(p: {
     setCronUnsupported(false);
     setCronChecking(false);
     setCronInfo(null);
+    warmed.clear();
+    warmupQueue.length = 0;
     if (!isConnected()) return;
     for (const slug of Object.keys(expanded)) if (expanded[slug] && !slug.includes(":")) void loadCrons(slug);
   }, { defer: true }));
@@ -245,6 +250,7 @@ export function LiveProjectsSection(p: {
         if (!currentConnection(version)) return;
         setProjects(list);
         setError(null);
+        warmupProjects(list);
       })
       .catch((e) => {
         if (!currentConnection(version)) return;
@@ -273,14 +279,15 @@ export function LiveProjectsSection(p: {
     onCleanup(stop);
   });
 
-  const loadMissions = (slug: string) => {
-    if (!isConnected()) return;
+  const loadMissions = (slug: string, opts?: { transcripts?: boolean }) => {
+    if (!isConnected()) return Promise.resolve();
     const version = connectionVersion();
-    listProjectMissions(slug)
+    return listProjectMissions(slug)
       .then((list) => {
         if (!currentConnection(version)) return;
         const merged = mergeById(missions[slug] ?? [], list);
         if (merged !== missions[slug]) setMissions(slug, merged);
+        if (opts?.transcripts === false) return;
         const live = new Set(["active", "pending", "queued", "awaiting_user", "resuming", "running", "starting"]);
         for (const m of merged) if (live.has(m.status)) prefetchTranscript(m.id);
       })
@@ -290,13 +297,43 @@ export function LiveProjectsSection(p: {
   };
 
   const loadDir = (slug: string, path: string, force = false) => {
-    if (!isConnected()) return;
+    if (!isConnected()) return Promise.resolve();
     const version = connectionVersion();
     const key = `${slug}:${path}`;
-    if (dirs[key] && !force) return;
-    listProjectFiles(slug, path)
+    if (dirs[key] && !force) return Promise.resolve();
+    return listProjectFiles(slug, path)
       .then((entries) => { if (currentConnection(version)) setDirs(key, entries); })
       .catch(() => { if (currentConnection(version)) setDirs(key, []); });
+  };
+
+  const warmupOne = async (slug: string) => {
+    await Promise.all([
+      loadMissions(slug, { transcripts: false }),
+      loadDir(slug, ""),
+      loadController(slug),
+      loadCrons(slug),
+    ]);
+  };
+  const pumpWarmup = () => {
+    if (!cacheCanPrefetch()) return;
+    while (warmupActive < 2 && warmupQueue.length) {
+      const slug = warmupQueue.shift()!;
+      warmupActive++;
+      void warmupOne(slug).finally(() => {
+        warmupActive--;
+        pumpWarmup();
+      });
+    }
+  };
+  const warmupProjects = (list: ProjectSummary[]) => {
+    const limit = prefetchProjectLimit();
+    if (!limit) return;
+    for (const p of list.slice(0, limit)) {
+      if (warmed.has(p.slug)) continue;
+      warmed.add(p.slug);
+      warmupQueue.push(p.slug);
+    }
+    pumpWarmup();
   };
 
   const beginFolder = (slug: string, path: string) => {
