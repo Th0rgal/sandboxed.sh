@@ -305,7 +305,12 @@ test("primary controller steers the next tick and Run now hits controller/action
   await page.locator(".row.cron").first().click();
   const input = page.getByPlaceholder("Steer the next tick…");
   await expect(input).toBeVisible();
-  await expect(page.getByRole("checkbox", { name: "Run now" })).toBeVisible();
+  const timing = page.locator(".steer-composer").getByRole("button", { name: "Run now", exact: true, pressed: true });
+  await expect(timing).toHaveText("Now");
+  await timing.click();
+  await expect(page.locator(".steer-composer").getByRole("button", { name: "Run now", exact: true, pressed: false })).toHaveText("Next tick");
+  await page.locator(".steer-composer").getByRole("button", { name: "Run now", exact: true, pressed: false }).click();
+  await expect(page.locator(".steer-options")).toHaveCount(0);
   expect((await page.locator(".steer-composer").boundingBox())!.height).toBeLessThan(65);
   await expect(page.locator(".steer-composer .send svg")).toBeVisible();
   await input.fill("review the open PRs");
@@ -316,6 +321,7 @@ test("primary controller steers the next tick and Run now hits controller/action
   await expect.poll(() => requests.some((r) => r.method === "POST" && r.path.endsWith("/controller/action"))).toBe(true);
   const action = requests.find((r) => r.method === "POST" && r.path.endsWith("/controller/action"));
   expect(action?.body).toMatchObject({ action: "run" });
+  await expect(page.locator(".steer-chip-kind")).toHaveText("Run requested");
   await expect(page.getByText("review the open PRs")).toBeVisible();
   await page.screenshot({path:"test-results/orb-steer-light.png", fullPage:true});
   await page.evaluate(() => document.documentElement.dataset.theme = "dark");

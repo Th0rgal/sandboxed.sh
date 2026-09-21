@@ -12,6 +12,7 @@ export function SteerComposer(p: {
   const [text, setText] = createSignal("");
   const [runNow, setRunNow] = createSignal(true);
   const [busy, setBusy] = createSignal(false);
+  const [requested, setRequested] = createSignal<Set<string>>(new Set());
   const [error, setError] = createSignal<string | null>(null);
   let ta!: HTMLTextAreaElement;
 
@@ -26,14 +27,20 @@ export function SteerComposer(p: {
     setBusy(true);
     setError(null);
     try {
+      const previous = new Set((p.steers?.pending ?? []).map(s => s.id));
       const next = await addProjectSteer(p.slug, body, "orb");
       p.onSteers(next);
       setText("");
       ta.value = "";
       resize();
       if (runNow() && !p.running) {
-        await controllerAction(p.slug, "run");
-        p.onRan?.();
+        try {
+          await controllerAction(p.slug, "run");
+          setRequested(ids => new Set([...ids, ...next.pending.filter(s => !previous.has(s.id)).map(s => s.id)]));
+          p.onRan?.();
+        } catch (e) {
+          setError(`Steer saved, but the controller could not start: ${e instanceof Error ? e.message : String(e)}. Use Run now to retry.`);
+        }
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -47,7 +54,7 @@ export function SteerComposer(p: {
       <Show when={(p.steers?.pending.length ?? 0) > 0 || (p.steers?.recent.length ?? 0) > 0}>
         <div class="steer-list">
           <For each={p.steers?.pending ?? []}>
-            {(s) => <SteerChip steer={s} pending />}
+            {(s) => <SteerChip steer={s} pending label={requested().has(s.id) ? "Run requested" : p.running ? "Awaiting pickup" : "Next tick"} />}
           </For>
           <For each={p.steers?.recent ?? []}>
             {(s) => <SteerChip steer={s} />}
@@ -71,17 +78,22 @@ export function SteerComposer(p: {
             }}
           />
         </div>
+        <button
+          type="button"
+          class="steer-timing"
+          aria-label="Run now"
+          aria-pressed={runNow()}
+          title={runNow() ? "Run the controller after sending (unless already running). Click to wait for the next tick." : "Wait for the next scheduled tick. Click to run after sending."}
+          disabled={busy()}
+          onClick={() => setRunNow(!runNow())}
+        >
+          {runNow() ? "Now" : "Next tick"}
+        </button>
         <div class="send-slot">
           <button class="send" aria-label="Steer" title="Send steer" disabled={busy() || !text().trim()} onClick={() => void send()}>
             <Show when={busy()} fallback={<ArrowUpIcon size={14} />}><Spinner size={14} /></Show>
           </button>
         </div>
-      </div>
-      <div class="steer-options">
-        <label class="steer-run">
-          <input type="checkbox" checked={runNow()} disabled={busy()} onChange={(e) => setRunNow(e.currentTarget.checked)} />
-          Run now
-        </label>
       </div>
       <Show when={error()}>
         <p class="st-error cr-error">{error()}</p>
@@ -90,10 +102,10 @@ export function SteerComposer(p: {
   );
 }
 
-function SteerChip(p: { steer: ProjectSteer; pending?: boolean }) {
+function SteerChip(p: { steer: ProjectSteer; pending?: boolean; label?: string }) {
   return (
     <div class={`steer-chip ${p.pending ? "pending" : "consumed"}`} title={p.steer.body}>
-      <span class="steer-chip-kind">{p.pending ? "Pending" : "Consumed"}</span>
+      <span class="steer-chip-kind">{p.pending ? p.label ?? "Next tick" : "Consumed"}</span>
       <span class="steer-chip-body">{p.steer.body}</span>
     </div>
   );
