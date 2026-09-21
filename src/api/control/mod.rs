@@ -913,6 +913,197 @@ mod campaign_guard_tests {
         mission.id
     }
 
+    /// A mission with an explicit model selection and a live native session,
+    /// as it exists on disk before any turn is dispatched.
+    async fn mk_selected(
+        store: &Arc<dyn MissionStore>,
+        backend: &str,
+        model: Option<&str>,
+    ) -> Mission {
+        let mission = store
+            .create_mission(Some("selected"), None, None, None, None, None, None)
+            .await
+            .expect("create");
+        store
+            .update_mission_run_settings(
+                mission.id,
+                Some(backend),
+                Some(Some("writer")),
+                Some(model.map(|m| m).map(Some).unwrap_or(None)),
+                Some(Some("high")),
+                Some(true),
+                Some(Some("telegram")),
+                "native-session-1",
+            )
+            .await
+            .expect("settings");
+        store
+            .get_mission(mission.id)
+            .await
+            .expect("load")
+            .expect("present")
+    }
+
+    #[tokio::test]
+    async fn dispatch_never_drops_a_model_this_deployment_still_runs() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        // The regression this guards: returning None here silently erased the
+        // user's selection and fell back to the harness default.
+        for (backend, model) in [
+            ("codex", "gpt-6-astra"),
+            ("codex", "gpt-5.6-sol"),
+            ("claudecode", crate::model_policy::CURRENT_CLAUDE_FABLE),
+            ("claudecode", crate::model_policy::CURRENT_CLAUDE_OPUS),
+            ("claudecode", "claude-sonnet-4-6"),
+            ("grok", "grok-4.6"),
+            ("opencode", "xai/grok-4.6"),
+            ("opencode", "anthropic/claude-opus-5"),
+        ] {
+            let mission = mk_selected(&store, backend, Some(model)).await;
+            assert_eq!(
+                model_for_dispatch(&store, &mission).await.as_deref(),
+                Some(model),
+                "{backend}/{model} must reach the runner unchanged"
+            );
+            let reloaded = store.get_mission(mission.id).await.unwrap().unwrap();
+            assert_eq!(reloaded.model_override.as_deref(), Some(model));
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_leaves_an_unset_model_unset() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = mk_selected(&store, "claudecode", None).await;
+        assert_eq!(mission.model_override, None);
+        assert_eq!(model_for_dispatch(&store, &mission).await, None);
+        let reloaded = store.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.model_override, None, "no override was invented");
+    }
+
+    #[tokio::test]
+    async fn dispatch_upgrades_a_retired_model_and_records_it() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = mk_selected(&store, "claudecode", Some("claude-opus-4-1")).await;
+        let before = store.get_mission(mission.id).await.unwrap().unwrap();
+
+        let effective = model_for_dispatch(&store, &mission).await;
+        assert_eq!(
+            effective.as_deref(),
+            Some(crate::model_policy::CURRENT_CLAUDE_OPUS)
+        );
+
+        // What clients read must match what the turn will run — the whole point
+        // of persisting the upgrade rather than only applying it in the runner.
+        let after = store.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(after.model_override.as_deref(), effective.as_deref());
+
+        // A model change must not cost the conversation its native session, its
+        // history, or any other run setting.
+        assert_eq!(after.session_id, before.session_id);
+        assert!(
+            after.session_id.is_some(),
+            "session was preserved, not cleared"
+        );
+        assert_eq!(after.backend, before.backend);
+        assert_eq!(after.agent, before.agent);
+        assert_eq!(after.model_effort, before.model_effort);
+        assert_eq!(after.fast_mode, before.fast_mode);
+        assert_eq!(after.config_profile, before.config_profile);
+        assert_eq!(after.history.len(), before.history.len());
+        assert_eq!(after.created_at, before.created_at);
+    }
+
+    #[tokio::test]
+    async fn dispatch_keeps_the_provider_prefix_when_upgrading() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        // OpenCode addresses models as provider/model; dropping the prefix
+        // would produce an id it cannot resolve.
+        let mission = mk_selected(&store, "opencode", Some("anthropic/claude-opus-4-8")).await;
+        assert_eq!(
+            model_for_dispatch(&store, &mission).await.as_deref(),
+            Some("anthropic/claude-opus-5")
+        );
+        let after = store.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.model_override.as_deref(),
+            Some("anthropic/claude-opus-5")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_is_refused_rather_than_run_on_a_retired_model() {
+        use crate::api::mission_runner::refuse_retired_model;
+
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = mk_selected(&store, "claudecode", Some("claude-opus-4-1")).await;
+
+        // Make the upgrade unrecordable: the write `model_for_dispatch` needs
+        // now fails, exactly as it would against an unavailable store.
+        assert!(store.delete_mission(mission.id).await.expect("delete"));
+
+        // Dispatch hands back the stored id rather than a model nothing reports.
+        let dispatched = model_for_dispatch(&store, &mission)
+            .await
+            .expect("a model is still resolved");
+        assert_eq!(dispatched, "claude-opus-4-1");
+
+        // The pre-harness guard then refuses the turn. This is the fail-closed
+        // half: no harness is spawned, locally or remotely, and the retired
+        // model never runs.
+        let refusal = refuse_retired_model(mission.id, &dispatched)
+            .expect("a retired model must not reach a harness");
+        assert!(!refusal.success);
+        assert_eq!(refusal.cost_cents, 0);
+        assert!(refusal.output.contains("claude-opus-4-1"));
+        assert!(refusal
+            .output
+            .contains(crate::model_policy::CURRENT_CLAUDE_OPUS));
+        assert!(
+            refusal.output.contains("Nothing was started"),
+            "the refusal must say no work began: {}",
+            refusal.output
+        );
+    }
+
+    #[tokio::test]
+    async fn the_guard_never_refuses_a_model_this_deployment_runs() {
+        use crate::api::mission_runner::refuse_retired_model;
+
+        let id = Uuid::new_v4();
+        for allowed in [
+            crate::model_policy::CURRENT_CLAUDE_OPUS,
+            crate::model_policy::CURRENT_CLAUDE_FABLE,
+            "claude-opus-6",
+            "claude-opus-5-20260101",
+            "claude-sonnet-4-6",
+            "gpt-6-astra",
+            "grok-4.6",
+            "anthropic/claude-opus-5",
+        ] {
+            assert!(
+                refuse_retired_model(id, allowed).is_none(),
+                "{allowed} must be allowed to run"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_does_not_downgrade_a_newer_model() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        for newer in [
+            "claude-opus-6",
+            "claude-fable-6-1",
+            "claude-opus-5-20260101",
+        ] {
+            let mission = mk_selected(&store, "claudecode", Some(newer)).await;
+            assert_eq!(
+                model_for_dispatch(&store, &mission).await.as_deref(),
+                Some(newer),
+                "{newer} must not be rewritten"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn nonterminal_missions_for_project_counts_the_live_footprint() {
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
@@ -9754,6 +9945,80 @@ async fn find_recent_identical_mission(
     })
 }
 
+/// The model a turn about to be dispatched should actually use, persisting the
+/// choice so the UI and the harness agree.
+///
+/// A mission created before this deployment retired a model still carries that
+/// model in `model_override`. That field is current configuration, not
+/// transcript — it is what every client reads to say which model the *next*
+/// turn will use — so leaving it stale would show one model while another ran.
+/// Rewriting it here, on the mission that is dispatching right now, keeps the
+/// two the same on both a new turn and a plain refresh. Recorded events and
+/// completed turns are untouched, and a mission that is not dispatching is
+/// never rewritten. Every dispatch path (new turn, queued message, resume,
+/// remote) funnels through this, so they cannot diverge.
+///
+/// When the upgrade cannot be recorded this returns the stored model unchanged,
+/// which for a retired id the pre-harness guard in `mission_runner` then refuses
+/// to run. A turn that fails loudly is the intended outcome: it is better than
+/// running a retired model, and better than running a model no client reports.
+async fn model_for_dispatch(
+    mission_store: &Arc<dyn MissionStore>,
+    mission: &Mission,
+) -> Option<String> {
+    let stored = mission.model_override.clone()?;
+    // Everything this deployment still runs — every Codex, Grok, OpenCode and
+    // current Claude selection — passes straight through. Only a retired id is
+    // touched, and only ever by replacing it with the current model of its own
+    // line, keeping any provider prefix (`anthropic/…`) the caller relies on.
+    let upgraded = crate::model_policy::current_claude_model(&stored);
+    if upgraded == stored {
+        return Some(stored);
+    }
+    let upgraded = upgraded.into_owned();
+    match mission_store
+        .update_mission_run_settings(
+            mission.id,
+            None,
+            None,
+            Some(Some(&upgraded)),
+            None,
+            None,
+            None,
+            // Settings writes also rewrite `session_id`. Passing the mission's
+            // own id back keeps the native harness session — a model upgrade
+            // must not cost the conversation its context.
+            mission.session_id.as_deref().unwrap_or(""),
+        )
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                mission_id = %mission.id,
+                from = %stored,
+                to = %upgraded,
+                "retired model upgraded for the next turn"
+            );
+            Some(upgraded)
+        }
+        Err(error) => {
+            // The upgrade could not be recorded. Hand back the stored id
+            // unchanged rather than a model no client would report: the
+            // pre-harness guard refuses to run a retired id, so this turn fails
+            // instead of quietly running either the wrong model or a retired
+            // one. The next dispatch retries the upgrade.
+            tracing::warn!(
+                mission_id = %mission.id,
+                from = %stored,
+                to = %upgraded,
+                %error,
+                "could not persist the model upgrade; this turn will be refused rather than run a retired model"
+            );
+            Some(stored)
+        }
+    }
+}
+
 /// Whether a mission in this status holds its project's single campaign slot.
 ///
 /// Campaign missions are long-running per-project drivers; two of them racing
@@ -14547,11 +14812,32 @@ pub async fn update_mission_settings(
     }
 
     let mut effective_model = match &model_override {
+        // Explicitly requested: validated below, and refused if retired.
         Some(Some(model)) => normalize_model_override_for_backend(Some(&effective_backend), model),
         Some(None) => None,
-        None => current.model_override.as_deref().and_then(|model| {
-            normalize_model_override_for_backend(Some(&effective_backend), model)
-        }),
+        // Carried forward from the mission. A mission stored before a model was
+        // retired must not be stuck — blocking an unrelated settings change
+        // (effort, agent, backend) because of an old stored model would be a
+        // worse failure than the stale model itself. Migrate it to the current
+        // model of its line for the next turn instead; the transcript and the
+        // recorded history of what already ran are untouched.
+        None => current
+            .model_override
+            .as_deref()
+            .and_then(|model| normalize_model_override_for_backend(Some(&effective_backend), model))
+            .map(|model| {
+                if let Some(replacement) = crate::model_policy::retired_claude_model(&model) {
+                    tracing::info!(
+                        mission_id = %id,
+                        from = %model,
+                        to = %replacement,
+                        "migrating retired Claude model for the next turn"
+                    );
+                    replacement.to_string()
+                } else {
+                    model
+                }
+            }),
     };
     if let Some(ref model) = effective_model {
         if model_override.as_ref().and_then(|value| value.as_ref()) != Some(model) {
@@ -21993,7 +22279,7 @@ async fn control_actor_loop(
                                                 Some(mission.backend.clone()),
                                                 mission.session_id.clone(),
                                                 mission.config_profile.clone(),
-                                                mission.model_override.clone(),
+                                                model_for_dispatch(&mission_store, &mission).await,
                                                 mission.model_effort.clone(),
                                                 mission.fast_mode,
                                             );
@@ -22478,7 +22764,7 @@ async fn control_actor_loop(
                                             }
                                             (
                                                 Some(mission.workspace_id),
-                                                mission.model_override.clone(),
+                                                model_for_dispatch(&mission_store, &mission).await,
                                                 mission.model_effort.clone(),
                                                 mission.fast_mode,
                                                 mission.agent.clone(),
@@ -23113,7 +23399,7 @@ async fn control_actor_loop(
                                 Some(mission.backend.clone()),
                                 mission.session_id.clone(),
                                 mission.config_profile.clone(),
-                                mission.model_override.clone(),
+                                model_for_dispatch(&mission_store, &mission).await,
                                 mission.model_effort.clone(),
                                 mission.fast_mode,
                             );
@@ -23761,7 +24047,7 @@ async fn control_actor_loop(
                                         Some(mission.backend.clone()),
                                         mission.session_id.clone(),
                                         mission.config_profile.clone(),
-                                        mission.model_override.clone(),
+                                        model_for_dispatch(&mission_store, &mission).await,
                                         mission.model_effort.clone(),
                                         mission.fast_mode,
                                     );
@@ -23991,7 +24277,7 @@ async fn control_actor_loop(
                                         let progress_ref = Arc::clone(&progress);
                                         let workspace_id = Some(mission.workspace_id);
                                         let backend_id = Some(mission.backend.clone());
-                                        let model_override = mission.model_override.clone();
+                                        let model_override = model_for_dispatch(&mission_store, &mission).await;
                                         let model_effort = mission.model_effort.clone();
                                         let fast_mode = mission.fast_mode;
                                         // Resume uses mission agent (no per-message override for resumes)
@@ -25124,7 +25410,7 @@ async fn control_actor_loop(
                         match mission_store.get_mission(mid).await {
                             Ok(Some(mission)) => (
                                 Some(mission.workspace_id),
-                                mission.model_override.clone(),
+                                model_for_dispatch(&mission_store, &mission).await,
                                 mission.model_effort.clone(),
                                 mission.fast_mode,
                                 mission.agent.clone(),

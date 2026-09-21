@@ -666,9 +666,12 @@ textarea::placeholder { color: var(--placeholder); }
   animation: pop .1s ease-out;
 }
 @keyframes pop { from { opacity: 0; transform: translateY(4px); } }
+/* One-line rows keep their 28px rhythm; a row carrying a second line (the
+   machine menu's host/status caption) grows instead of overlapping it, so the
+   height is a floor and the padding is symmetric. */
 .menu-item {
   display: flex; align-items: center; gap: 8px;
-  width: 100%; height: 28px; text-align: left; padding: 0 8px; border-radius: 5px;
+  width: 100%; min-height: 28px; text-align: left; padding: 4px 8px; border-radius: 5px;
   color: var(--fg); font-size: 13px; line-height: 16px;
 }
 .menu-item:hover, .menu-item.on { background: var(--bg-hover); }
@@ -741,9 +744,26 @@ button.under-model { color: inherit; }
 }
 .na-drop-btn:hover { color: var(--fg); }
 .na-drop-btn svg { color: var(--fg-3); }
-.na-menu { top: 26px; left: 0; right: auto; bottom: auto; min-width: 220px; }
-.menu-col { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
-.menu-sub { font-size: 11px; color: var(--fg-3); font-family: var(--mono); }
+.na-menu {
+  top: 26px; left: 0; right: auto; bottom: auto;
+  min-width: 220px; max-width: min(320px, calc(100vw - 24px));
+  display: flex; flex-direction: column; max-height: min(420px, 60vh);
+}
+/* The node list scrolls; "Manage machines" stays pinned as a footer. */
+.na-menu-list { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+.na-menu-foot { flex: none; }
+/* Two-line entry: the label and its caption own their own box and wrap, and the
+   trailing icon never sits on top of the text. */
+.menu-col { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.menu-title { line-height: 16px; overflow-wrap: anywhere; }
+.menu-sub {
+  font-size: 11px; line-height: 14px; color: var(--fg-3); font-family: var(--mono);
+  white-space: normal; overflow-wrap: anywhere;
+}
+/* A menu item that carries a caption is top-aligned so its icon lines up with
+   the title rather than the middle of both lines. */
+.menu-item:has(.menu-col) { align-items: flex-start; }
+.menu-item:has(.menu-col) .menu-ico { margin-top: 1px; }
 
 .rdots circle { opacity: .15; animation: rdot 1.1s ease-in-out infinite; }
 @keyframes rdot { 0%, 60%, 100% { opacity: .15; } 25% { opacity: .9; } }
@@ -988,13 +1008,33 @@ button.under-model { color: inherit; }
 .md blockquote { margin: 0 0 12px; padding-left: 12px; border-left: 3px solid var(--stroke-strong); color: var(--fg-2); }
 .md a { color: var(--blue); text-decoration: none; }
 .md-src { position: relative; flex: 1; min-height: 0; font: 13px/1.55 var(--mono); }
+/* Two stacked layers that must occupy exactly the same box and wrap text at
+   exactly the same points: a highlighted <pre> underneath, and a transparent
+   textarea on top that owns the caret and the selection. Any difference in
+   size, padding or wrapping shows up as a selection drawn over the wrong text.
+
+   Two things used to break that. The global `textarea` rule caps height at
+   220px, which is right for the composer but left this textarea scrolling
+   inside a short box while the <pre> stayed full height — so a selection near
+   the top of the text appeared over a paragraph further down. And a textarea
+   falls back to its intrinsic `cols`/`rows` size unless width and height are
+   stated outright, which WebKit in particular does not stretch away. */
 .md-hl, .md-ta {
   position: absolute; inset: 0; margin: 0; padding: 22px 36px 48px;
   border: 0; white-space: pre-wrap; word-wrap: break-word; overflow: auto;
   font: inherit; line-height: inherit; tab-size: 2;
+  width: 100%; height: 100%; box-sizing: border-box;
+  min-width: 0; min-height: 0; max-width: none; max-height: none;
 }
-.md-hl { color: var(--fg); pointer-events: none; }
+/* Driven entirely by the textarea's scroll position; never scrolled directly,
+   and never showing a scrollbar of its own. */
+.md-hl { color: var(--fg); pointer-events: none; overflow: hidden; }
 .md-ta { color: transparent; caret-color: var(--fg); background: transparent; outline: 0; resize: none; z-index: 1; }
+/* A classic scrollbar would narrow the textarea's content box relative to the
+   <pre>, so the two layers would wrap at different points. Hidden here, as the
+   sidebar already does; wheel and keyboard scrolling are unaffected. */
+.md-ta { scrollbar-width: none; }
+.md-ta::-webkit-scrollbar { display: none; }
 .md-p { color: var(--md-p); }
 .md-h { color: var(--md-h); font-weight: 650; }
 .md-code { color: var(--green); }
@@ -1289,3 +1329,34 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 .mission-tasks progress::-webkit-progress-bar { background: var(--stroke); border-radius: 2px; }
 .mission-tasks progress::-webkit-progress-value { background: var(--fg-2); border-radius: 2px; }
 .mission-tasks progress::-moz-progress-bar { background: var(--fg-2); border-radius: 2px; }
+/* ---------- project settings / execution pages ---------- */
+.ps-page { padding-top: 22px !important; }
+.ps-page > .page-head h2 { font-size: 20px; font-weight: 600; margin: 0 0 8px; letter-spacing: -.02em; }
+.ps-page .s-lead code, .ps-page .s-row-desc code {
+  font: 11.5px var(--mono); padding: 1px 4px; border-radius: 4px; background: var(--bg-inset); color: var(--fg-2);
+}
+.ps-cap-ctrl { display: flex; align-items: center; gap: 8px; }
+.ps-cap-input { width: 92px; text-align: right; font-variant-numeric: tabular-nums; }
+.ps-usage { font-size: 13px; color: var(--fg-2); font-variant-numeric: tabular-nums; }
+.ps-usage.full { color: var(--amber); }
+.ps-readonly { font-size: 12.5px; color: var(--fg-3); font-family: var(--mono); overflow-wrap: anywhere; }
+.ps-saved { color: var(--fg-3); font-size: 12px; margin: 8px 2px 0; }
+.ps-occupants { margin-top: 8px; }
+.ps-occupant {
+  display: flex; align-items: center; gap: 12px; width: 100%;
+  padding: 8px 14px; text-align: left; color: var(--fg); font-size: 13px;
+}
+.ps-occupant:hover { background: var(--bg-hover); }
+.ps-occupant + .ps-occupant { border-top: 1px solid var(--stroke-soft); }
+.ps-occupant-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ps-occupant-status { flex: none; font-size: 11.5px; color: var(--fg-3); font-family: var(--mono); }
+
+/* A refusal the user can act on: the reason, the counters, and the page that
+   owns the limit — never a bare JSON body. */
+.launch-refusal { display: flex; flex-direction: column; gap: 6px; }
+.launch-refusal .st-error { margin: 0; }
+.launch-refusal-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 0 2px; }
+.launch-refusal-meta { font-size: 12px; color: var(--fg-3); font-variant-numeric: tabular-nums; }
+
+/* Sidebar confirmation that a mission id reached the clipboard. */
+.row.note.copied-note { color: var(--fg-2); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }

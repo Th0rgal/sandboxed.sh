@@ -95,6 +95,40 @@ pub(crate) fn resolve_mission_working_directory(
     Ok(resolved)
 }
 
+/// Refuse a turn whose model this deployment no longer runs.
+///
+/// Reaching this means the dispatch-time upgrade (`model_for_dispatch`) could
+/// not be recorded, or a caller bypassed dispatch altogether. Both of the
+/// alternatives are worse than failing: silently upgrading here would run a
+/// model no client reports, and proceeding would run a model that has been
+/// withdrawn. Returning `Some` aborts the turn before its harness is spawned,
+/// because the caller returns it in place of running anything.
+///
+/// Coverage, stated precisely: this guards turns that go through
+/// `run_mission_turn`. Typed remote-node creation is a separate path —
+/// `plan_remote_harness` / `dispatch_remote_job` — which does not pass through
+/// here; an explicitly requested retired model is rejected there at create time
+/// by `validate_model_override`, and `model_for_dispatch` upgrades a stored one
+/// before either path reads it. So this is the last gate for local turns, not a
+/// single choke point for every typed remote dispatch.
+pub(crate) fn refuse_retired_model(mission_id: Uuid, model: &str) -> Option<AgentResult> {
+    let replacement = crate::model_policy::retired_claude_model(model)?;
+    tracing::error!(
+        mission_id = %mission_id,
+        requested = %model,
+        replacement = %replacement,
+        "refusing to run a retired model: the upgrade was not recorded"
+    );
+    Some(AgentResult::failure(
+        format!(
+            "This mission is set to '{model}', which this backend no longer runs, and the upgrade \
+             to '{replacement}' could not be saved. Nothing was started. Set the model to \
+             '{replacement}' in the mission's settings and run it again."
+        ),
+        0,
+    ))
+}
+
 /// Build the synthetic `AgentResult::failure` produced when a turn is
 /// cancelled. If the process has begun a graceful shutdown, return a
 /// friendlier "paused for restart" message and a `ServerShutdown` reason
@@ -3607,6 +3641,18 @@ async fn run_mission_turn(
         config.opencode_agent = Some(agent.clone());
     }
     if let Some(ref model) = model_override {
+        // Fail closed. Retirement is applied once, at dispatch
+        // (`model_for_dispatch`), which also records the upgrade so clients
+        // show the model that is about to run. Silently upgrading again here
+        // would run a model nothing reported; silently accepting a retired id
+        // would run a model this deployment has withdrawn. So a retired id
+        // reaching this point means the upgrade was never recorded (or the
+        // caller bypassed dispatch) — refuse the turn and say why, before the
+        // harness is spawned. See `refuse_retired_model` for what this does and
+        // does not cover: typed remote creation is guarded at create instead.
+        if let Some(refusal) = refuse_retired_model(mission_id, model) {
+            return refusal;
+        }
         config.default_model = Some(model.clone());
     } else if backend_id == "claudecode" {
         config.default_model = config

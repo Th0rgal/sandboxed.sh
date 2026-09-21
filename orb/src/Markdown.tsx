@@ -1,5 +1,16 @@
-import { For, createMemo, type JSX } from "solid-js";
+import { For, createMemo, createSignal, type JSX } from "solid-js";
 import { openExternalUrl } from "./api";
+
+/**
+ * Source-vs-preview for Markdown file views, shared by every one of them so ⌘/
+ * works the same on a local demo file and on a core-hosted reference file. It
+ * is module-level rather than per-view because the shortcut is handled once, at
+ * the window, and the mode is a user preference that should survive switching
+ * between files.
+ */
+const [mdSource, setMdSource] = createSignal(false);
+export { mdSource, setMdSource };
+export const toggleMdSource = () => setMdSource((on) => !on);
 
 /** Only http(s)/mailto links are rendered as real links; anything else
  * (javascript:, data:, file:) is neutralised so markdown from a mission
@@ -270,8 +281,13 @@ export function MdSource(p: { text: string; onInput: (t: string) => void }) {
   let pre!: HTMLPreElement;
   let ta!: HTMLTextAreaElement;
   const lines = createMemo(() => p.text.split("\n"));
+  // The highlighted layer has no scrollbar of its own: it follows the textarea
+  // on both axes. Horizontal matters even though both layers wrap, because a
+  // single unbreakable run (a long URL, a wide table row) still overflows.
   const sync = () => {
-    if (pre && ta) pre.scrollTop = ta.scrollTop;
+    if (!pre || !ta) return;
+    pre.scrollTop = ta.scrollTop;
+    pre.scrollLeft = ta.scrollLeft;
   };
   return (
     <div class="md-src">
@@ -291,7 +307,13 @@ export function MdSource(p: { text: string; onInput: (t: string) => void }) {
         value={p.text}
         spellcheck={false}
         onScroll={sync}
-        onInput={(e) => p.onInput(e.currentTarget.value)}
+        onInput={(e) => {
+          p.onInput(e.currentTarget.value);
+          // Typing at the bottom scrolls the textarea to keep the caret in
+          // view; re-sync so the layer beneath follows even if that happened
+          // without a scroll event.
+          sync();
+        }}
       />
     </div>
   );

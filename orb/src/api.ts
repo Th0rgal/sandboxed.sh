@@ -166,6 +166,8 @@ export interface Mission {
   agent?: string | null;
   backend?: string;
   model_override?: string | null;
+  /** Reasoning effort in force for the next turn. Absent means backend default. */
+  model_effort?: string | null;
   project?: string | null;
   created_at: string;
   updated_at: string;
@@ -688,14 +690,113 @@ export async function cancelMission(id: string): Promise<void> {
   await api<void>(`/api/control/missions/${id}/cancel`, { method: "POST" });
 }
 
-/** Next-turn settings. The mission must be idle; a running turn returns 409. */
+/** Next-turn settings. The mission must be idle; a running turn returns 409.
+ * `model_effort: ""` clears the override back to the backend default — the
+ * core's `normalize_string_patch` trims an empty string to a clear, while an
+ * omitted field leaves the stored effort untouched. */
 export async function updateMissionSettings(
   id: string,
-  body: { model_override?: string; backend?: string },
+  body: { model_override?: string; backend?: string; model_effort?: string },
 ): Promise<Mission> {
   return api(`/api/control/missions/${id}/settings`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+/**
+ * A project's autonomy grant (`GET|POST /api/projects/:slug/grant`).
+ * `parallel_missions` is the *project* concurrency limit enforced by
+ * `create_mission` in `src/api/control/mod.rs`: above 0, a launch is refused
+ * once that many of the project's own missions are unfinished. It is a
+ * different limit from the backend-global `max_parallel_missions` setting.
+ */
+export interface ProjectGrant {
+  merge_authority?: string | null;
+  budget_per_tick?: string | null;
+  parallel_missions?: number | null;
+  pause_reason?: string | null;
+  resume_condition?: string | null;
+  material_bar?: string | null;
+  answered_at?: string | null;
+  /** observe | propose | act_reversible | act_full */
+  autonomy_level?: string | null;
+}
+
+export async function getProjectGrant(slug: string): Promise<ProjectGrant | null> {
+  const data = await api<{ slug: string; grant: ProjectGrant | null }>(
+    `/api/projects/${encodeURIComponent(slug)}/grant`,
+  );
+  return data.grant ?? null;
+}
+
+/**
+ * "No limit", as the core stores it. `set_grant` upserts every column with
+ * `COALESCE(excluded.x, project_grant.x)`, so a JSON `null` *preserves* the
+ * stored value rather than clearing it. `create_mission` only enforces a cap
+ * when it is `> 0`, so 0 is the value that actually turns the limit off.
+ */
+export const NO_PROJECT_LIMIT = 0;
+
+/** A stored cap that is not actually enforced (unset, 0 or negative). */
+export function projectLimitOf(grant: ProjectGrant | null | undefined): number | null {
+  const value = grant?.parallel_missions;
+  return typeof value === "number" && value > 0 ? value : null;
+}
+
+/**
+ * Narrow update of the one field this UI owns. The core's upsert already
+ * preserves every column it is not given, atomically — so sending only
+ * `parallel_missions` cannot revert an autonomy or merge-authority change made
+ * between a read and this write, and needs no extra read to begin with.
+ */
+export async function setProjectLimit(slug: string, parallel_missions: number): Promise<ProjectGrant | null> {
+  const data = await api<{ slug: string; grant: ProjectGrant | null }>(
+    `/api/projects/${encodeURIComponent(slug)}/grant`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ parallel_missions }),
+    },
+  );
+  return data.grant ?? null;
+}
+
+/** Backend-global execution settings (`GET|PUT /api/settings`). */
+export interface GlobalSettings {
+  /** Backend-wide mission concurrency. Distinct from a project's grant cap. */
+  max_parallel_missions?: number | null;
+  max_concurrent_tasks?: number | null;
+}
+
+export async function getGlobalSettings(): Promise<GlobalSettings> {
+  return api("/api/settings");
+}
+
+/** PUT /api/settings is a patch: the core re-reads current settings and only
+ * overwrites the fields present in the body. */
+export async function updateGlobalSettings(patch: GlobalSettings): Promise<GlobalSettings> {
+  return api("/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+}
+
+/**
+ * Mission statuses that occupy a project's `parallel_missions` slot, mirroring
+ * `campaign_slot_held_by` in `src/api/control/mod.rs`. Terminal missions free
+ * their slot, so this is what a cap of N is counted against.
+ */
+export const CAP_SLOT_STATUSES = new Set([
+  "pending",
+  "active",
+  "awaiting_user",
+  "waiting_background",
+  "paused",
+]);
+
+export function holdsCapSlot(status: string | null | undefined): boolean {
+  return CAP_SLOT_STATUSES.has((status ?? "").toLowerCase());
 }

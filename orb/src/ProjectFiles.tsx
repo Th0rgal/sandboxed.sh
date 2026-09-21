@@ -2,7 +2,7 @@ import { For, Show, createSignal, onCleanup, onMount, createEffect, on } from "s
 import { mergeById, pollWhileVisible } from "./poll";
 import { createStore } from "solid-js/store";
 import * as Ic from "./icons";
-import { MdSource, MdView } from "./Markdown";
+import { MdSource, MdView, mdSource, setMdSource } from "./Markdown";
 import { displayTitle } from "./goal";
 import { nodeLabel } from "./missionLaunch";
 import {
@@ -31,6 +31,7 @@ import {
 import { CronGlyph, untilLabel } from "./Controller";
 import { Dialog, PromptSheet } from "./Dialog";
 import { PopupMenu, type MenuEntry } from "./Menu";
+import { copyText } from "./clipboard";
 import { CronForm } from "./ControllerSettings";
 import { getProjectCronFromJob } from "./cronSchema";
 import { loadTranscript, prefetchTranscript } from "./missionCache";
@@ -72,6 +73,45 @@ export function placeRowTip(
     x: Math.max(pad, Math.min(x, view.width - size.width - pad)),
     y: Math.max(pad, Math.min(y, view.height - size.height - pad)),
   };
+}
+
+/**
+ * The id to put on the clipboard for a sidebar agent row: the sandboxed mission
+ * UUID exactly as the core stores it. Never the `m:` sidebar routing prefix,
+ * never the durable remote job id (`remote_job.job_id`), and never a harness
+ * session id — those identify an execution attempt, not the mission the
+ * `/api/control/missions/:id` endpoints take.
+ */
+export function missionCopyId(mission: { id: string }): string {
+  return mission.id;
+}
+
+/** Default extension for a new reference file: these are Markdown notes. */
+export const REFERENCE_FILE_EXT = ".md";
+
+/**
+ * Validate a new file name typed into the sidebar and return the path relative
+ * to `dir`. Traversal, absolute paths and Windows separators are refused here
+ * as well as by the core's `safe_join`, so the user sees why instead of a 400.
+ * A name with no extension gets `.md`, matching the Markdown view/editor these
+ * reference files are read in.
+ */
+export function newFilePath(dir: string, raw: string): { path: string; name: string } | { error: string } {
+  const name = raw.trim();
+  if (!name) return { error: "Enter a file name." };
+  if (name.includes("\\")) return { error: "Use forward slashes, not backslashes." };
+  if (name.startsWith("/")) return { error: "Use a path relative to this folder." };
+  const parts = name.split("/");
+  if (parts.some((part) => part.trim() === "")) return { error: "Remove the empty path segment." };
+  if (parts.some((part) => part.trim() === "." || part.trim() === "..")) {
+    return { error: "Paths cannot contain '.' or '..' segments." };
+  }
+  const cleaned = parts.map((part) => part.trim());
+  const last = cleaned[cleaned.length - 1];
+  // A dotfile ("`.gitignore`") is already named; only an extensionless name
+  // gets the Markdown default.
+  cleaned[cleaned.length - 1] = last.includes(".") ? last : `${last}${REFERENCE_FILE_EXT}`;
+  return { path: dir ? `${dir}/${cleaned.join("/")}` : cleaned.join("/"), name: cleaned[cleaned.length - 1] };
 }
 
 /** Where an agent runs: the workspace/machine name behind a cloud glyph.
@@ -187,6 +227,13 @@ export function LiveProjectsSection(p: {
   const [folderName, setFolderName] = createSignal("");
   const [folderError, setFolderError] = createSignal<string | null>(null);
   const [makingFolder, setMakingFolder] = createSignal(false);
+  const [newFile, setNewFile] = createSignal<{ slug: string; path: string } | null>(null);
+  const [fileName, setFileName] = createSignal("");
+  const [fileError, setFileError] = createSignal<string | null>(null);
+  const [makingFile, setMakingFile] = createSignal(false);
+  /** Right-click menu on an agent row. Opening it never changes the selection. */
+  const [missionMenu, setMissionMenu] = createSignal<{ x: number; y: number; mission: Mission } | null>(null);
+  const [copied, setCopied] = createSignal<string | null>(null);
   const [makingCron, setMakingCron] = createSignal(false);
   const [cronWarning, setCronWarning] = createSignal<string | null>(null);
   const [newCron, setNewCron] = createSignal<string | null>(null);
@@ -376,6 +423,62 @@ export function LiveProjectsSection(p: {
       setMakingFolder(false);
     }
   };
+  const beginFile = (slug: string, path: string) => {
+    setActionMenu(null);
+    setFileName("");
+    setFileError(null);
+    setNewFile({ slug, path });
+  };
+  /**
+   * Create an empty reference file through the core's project-file API
+   * (`PUT /api/projects/:slug/file`), which stores it under the backend's own
+   * `.sandboxed-sh/project-files/<slug>` tree. No mission, workspace or
+   * execution machine is involved, and no cron API is touched.
+   */
+  const createFile = async () => {
+    const target = newFile();
+    if (!target || makingFile()) return;
+    const resolved = newFilePath(target.path, fileName());
+    if ("error" in resolved) { setFileError(resolved.error); return; }
+    setMakingFile(true);
+    setFileError(null);
+    try {
+      // Re-list the parent rather than trusting the cached rows: another client
+      // (or a mission) may have added the file since this listing was loaded,
+      // and `writeProjectFile` would overwrite it without asking.
+      const parent = resolved.path.slice(0, Math.max(0, resolved.path.lastIndexOf("/")));
+      const siblings = await listProjectFiles(target.slug, parent);
+      if (siblings.some((entry) => entry.name === resolved.name)) {
+        setFileError(`"${resolved.name}" already exists here. Choose another name.`);
+        return;
+      }
+      await writeProjectFile(target.slug, resolved.path, "");
+      // Reveal it: refresh the parent listing, unfold every folder on the way
+      // down, then open the file in the Markdown view.
+      await loadDir(target.slug, parent, true);
+      setExpanded(target.slug, true);
+      const segments = parent ? parent.split("/") : [];
+      for (let i = 1; i <= segments.length; i++) setExpanded(`${target.slug}:${segments.slice(0, i).join("/")}`, true);
+      setNewFile(null);
+      p.open(`pf:${target.slug}:${resolved.path}`);
+    } catch (e) {
+      setFileError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMakingFile(false);
+    }
+  };
+  const copyMissionId = async (mission: Mission) => {
+    setMissionMenu(null);
+    setActionError(null);
+    const id = missionCopyId(mission);
+    try {
+      await copyText(id);
+      setCopied(id);
+      window.setTimeout(() => setCopied((cur) => (cur === id ? null : cur)), 1600);
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+    }
+  };
   const beginRename = (slug: string) => {
     const project = projects().find((x) => x.slug === slug);
     const title = (project?.title || slug).trim();
@@ -412,20 +515,41 @@ export function LiveProjectsSection(p: {
       setActionError(e instanceof Error ? e.message : String(e));
     }
   };
+  /**
+   * Actions for a project row (`path` empty) or one of its folders. A folder
+   * only holds files, so it offers file/folder creation; starting an agent or a
+   * cron is a project-level act and stays on the project row.
+   */
   const menuItems = (slug: string, path: string): MenuEntry[] => {
     const items: MenuEntry[] = [
+      { kind: "item", label: "New file", icon: Ic.FileIcon, onClick: () => beginFile(slug, path) },
       { kind: "item", label: "New folder", icon: Ic.FolderIcon, onClick: () => beginFolder(slug, path) },
-      { kind: "item", label: "New agent", icon: Ic.NewAgentIcon, onClick: () => p.onNewAgent(slug) },
-      { kind: "item", label: cronChecking() ? "Checking crons…" : "New cron", icon: Ic.BellIcon, onClick: () => { if (!cronChecking()) void beginCron(slug); } },
     ];
     if (!path) {
       items.push(
         { kind: "sep" },
+        { kind: "item", label: "New agent", icon: Ic.NewAgentIcon, onClick: () => p.onNewAgent(slug) },
+        { kind: "item", label: cronChecking() ? "Checking crons…" : "New cron", icon: Ic.BellIcon, onClick: () => { if (!cronChecking()) void beginCron(slug); } },
+        { kind: "sep" },
+        { kind: "item", label: "Project settings", icon: Ic.SlidersIcon, onClick: () => { setActionMenu(null); p.open(`ps:${slug}`); } },
         { kind: "item", label: "Rename", icon: Ic.PencilIcon, onClick: () => beginRename(slug) },
         { kind: "item", label: "Archive", icon: Ic.ArchiveIcon, onClick: () => void archive(slug) },
       );
     }
     return items;
+  };
+  /** Right-click on an agent row: identity actions only, no navigation. */
+  const missionMenuItems = (mission: Mission): MenuEntry[] => [
+    { kind: "item", label: "Copy mission ID", icon: Ic.CopyIcon, onClick: () => void copyMissionId(mission) },
+  ];
+  /** Right-click handler shared by every agent row. Suppresses the native menu
+   * and the sidebar-wide one without activating the row, so the open agent and
+   * the current selection are untouched. */
+  const onMissionContext = (e: MouseEvent, mission: Mission) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setActionMenu(null);
+    setMissionMenu({ x: e.clientX, y: e.clientY, mission });
   };
   const toggleProject = (slug: string) => {
     const next = !expanded[slug];
@@ -484,7 +608,7 @@ export function LiveProjectsSection(p: {
   const renderRow = (row: TreeRow<RowData>) => {
     const d = row.data;
     const contextMenu = (e: MouseEvent) => {
-      e.preventDefault(); setActionFocus(false);
+      e.preventDefault(); e.stopPropagation(); setMissionMenu(null); setActionFocus(false);
       setActionMenu({ x: e.clientX, y: e.clientY, slug: d.slug, path: d.path ?? "" });
     };
     if (d.kind === "project") return <div class={`row project ${row.expanded ? "expanded" : ""}`} onContextMenu={contextMenu}>
@@ -505,9 +629,15 @@ export function LiveProjectsSection(p: {
     if (d.kind === "finished") return <button class="row done-toggle" aria-expanded={row.expanded} onClick={() => setShowDone(d.slug, !showDone[d.slug])}>
       <span class="row-ico"><Show when={row.expanded} fallback={<Ic.FinishedIcon />}><Ic.FinishedOpenIcon /></Show></span><span class="row-label">{d.label}</span>
     </button>;
-    if (d.kind === "folder") return <button class="row folder" aria-expanded={row.expanded} {...rowTip.bind(rowDetail(d.label))} onClick={() => toggleDir(d.slug, d.path!)} onContextMenu={contextMenu}>
-      <span class="row-ico"><Show when={row.expanded} fallback={<Ic.FolderIcon />}><Ic.FolderOpenIcon /></Show></span><span class="row-label">{d.label}</span>
-    </button>;
+    if (d.kind === "folder") return <div class="row folder" onContextMenu={contextMenu}>
+      <button class="row-main" aria-expanded={row.expanded} {...rowTip.bind(rowDetail(d.label))} onClick={() => toggleDir(d.slug, d.path!)}>
+        <span class="row-ico"><Show when={row.expanded} fallback={<Ic.FolderIcon />}><Ic.FolderOpenIcon /></Show></span><span class="row-label">{d.label}</span>
+      </button>
+      <button class="row-action" aria-label={`New file in ${d.label}`} title="New file"
+        onPointerDown={e => setActionFocus(e.pointerType !== "mouse")}
+        onKeyDown={e => { if (e.key === "Enter" || e.key === " ") setActionFocus(true); }}
+        onClick={e => { e.stopPropagation(); const box = e.currentTarget.getBoundingClientRect(); setActionMenu({ x: Math.max(8, box.right - 176), y: box.bottom + 4, slug: d.slug, path: d.path! }); }}><Ic.PlusIcon size={13} /></button>
+    </div>;
     if (d.kind === "cron") {
       const ticking = () => d.controller && (controllers[d.slug]?.runs ?? []).some(r => r.status === "running" || r.status === "claimed");
       return <button class={`row agent cron ${p.selected() === row.id ? "active" : ""}`} {...rowTip.bind(rowDetail(d.label, [d.controller ? "Controller" : "Cron"]))} onClick={() => p.open(row.id)}>
@@ -517,7 +647,7 @@ export function LiveProjectsSection(p: {
     }
     const tip = rowTip.bind(rowDetail(d.label, [d.mission ? missionMachine(d.mission) : undefined]));
     return <button class={`row ${d.kind === "mission" ? "agent" : "file"} ${d.mission && !LIVE.has(d.mission.status) ? "done" : ""} ${p.selected() === row.id ? "active" : ""}`} {...tip}
-      onPointerEnter={e => { tip.onPointerEnter(e); if (d.mission) void loadTranscript(d.mission.id).catch(() => {}); else cachePrefetch(row.id, () => readProjectFile(d.slug, d.path!).then(text => cachePut(row.id, text))); }} onClick={() => p.open(row.id)}>
+      onPointerEnter={e => { tip.onPointerEnter(e); if (d.mission) void loadTranscript(d.mission.id).catch(() => {}); else cachePrefetch(row.id, () => readProjectFile(d.slug, d.path!).then(text => cachePut(row.id, text))); }} onContextMenu={e => { if (d.mission) onMissionContext(e, d.mission); }} onClick={() => p.open(row.id)}>
       <span class="row-ico glyph"><Show when={d.mission} fallback={<Ic.FileIcon />}>{m => <p.StatusGlyph agent={{ status: p.missionGlyph(m().status) }} busy={false} />}</Show></span>
       <span class="row-label">{d.label}</span><MachineBadge name={d.mission ? missionMachine(d.mission) : undefined} />
     </button>;
@@ -542,6 +672,12 @@ export function LiveProjectsSection(p: {
       </Show>
       <Show when={actionMenu()}>
         {(menu) => <PopupMenu {...menu()} focus={actionFocus()} items={menuItems(menu().slug, menu().path)} onClose={() => setActionMenu(null)} />}
+      </Show>
+      <Show when={missionMenu()}>
+        {(menu) => <PopupMenu x={menu().x} y={menu().y} focus={false} items={missionMenuItems(menu().mission)} onClose={() => setMissionMenu(null)} />}
+      </Show>
+      <Show when={copied()}>
+        {(id) => <div class="row note copied-note" role="status">Copied mission ID {id()}</div>}
       </Show>
       <div ref={rowTip.setCard} id={rowTip.id} class="row-tip" role="tooltip" hidden={!rowTip.tip()} style={rowTip.tip() ? { left: `${rowTip.tip()!.x}px`, top: `${rowTip.tip()!.y}px` } : undefined}>
         <Show when={rowTip.tip()}>{(tip) => (
@@ -587,6 +723,25 @@ export function LiveProjectsSection(p: {
           />
         )}
       </Show>
+      <Show when={newFile()}>
+        {(target) => (
+          <PromptSheet
+            title="New file"
+            hint={`in ${target().path ? `${target().slug}/${target().path}` : target().slug}`}
+            label="File name"
+            placeholder={`notes${REFERENCE_FILE_EXT}`}
+            value={fileName()}
+            onInput={setFileName}
+            action="Create"
+            busy={makingFile()}
+            disabled={!fileName().trim()}
+            error={fileError()}
+            onAction={() => void createFile()}
+            onClose={() => !makingFile() && setNewFile(null)}
+            footer={<span>Markdown by default — a name with no extension gets {REFERENCE_FILE_EXT}.</span>}
+          />
+        )}
+      </Show>
       <Show when={cronInfo()}>{(slug) => <Dialog title="Project crons" onClose={() => setCronInfo(null)} footer={<><button class="s-btn sm" onClick={() => setCronInfo(null)}>Close</button><button class="s-btn sm" disabled={cronChecking()} onClick={async () => { if (!isConnected()) return; const version = connectionVersion(); setCronChecking(true); await loadCrons(slug(), true); if (!currentConnection(version)) return; setCronChecking(false); if (!cronUnsupported() && !cronErrors[slug()]) setCronInfo(null); }}>Check again</button></>}>
         <p>{cronUnsupported() ? "This backend does not support project crons yet. Update the connected backend, then choose Check again. Your canonical controller and existing project content remain available." : cronRetryable[slug()] ? "Project crons could not refresh. Previously loaded jobs are retained. Try again when the scheduler is available." : "The backend rejected this cron request. Check backend access and configuration, then check again. Previously loaded jobs are retained."}</p>
       </Dialog>}</Show>
@@ -616,7 +771,10 @@ export function ProjectFileView(p: { slug: string; path: string }) {
   const fileKey = () => `pf:${p.slug}:${p.path}`;
   const cached = cachePeek<string>(fileKey());
   const [text, setText] = createSignal<string | null>(cached ?? null);
-  const [editing, setEditing] = createSignal(false);
+  // Shared with the ⌘/ handler in App.tsx; the button and the shortcut drive
+  // the same state, so they can never disagree.
+  const editing = mdSource;
+  const setEditing = setMdSource;
   const [state, setState] = createSignal<"loading" | "saved" | "saving" | "error">(cached != null ? "saved" : "loading");
   const [error, setError] = createSignal<string | null>(null);
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -671,7 +829,7 @@ export function ProjectFileView(p: { slug: string; path: string }) {
         <Show when={state() === "saved"}>
           <span class="pf-state dim">Saved</span>
         </Show>
-        <button class="s-btn" onClick={() => setEditing(!editing())}>
+        <button class="s-btn" title="Toggle source and preview (⌘/)" onClick={() => setEditing(!editing())}>
           {editing() ? "Preview" : "Edit"}
         </button>
       </div>

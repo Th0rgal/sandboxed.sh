@@ -177,20 +177,21 @@ test("project action menu is compact, pointer hover has no focus ring, keyboard 
   expect(await menu.evaluate((el) => getComputedStyle(el).backdropFilter === "none" || !getComputedStyle(el).backdropFilter)).toBeTruthy();
   const box = await menu.boundingBox();
   expect(box!.width).toBeLessThanOrEqual(220);
-  const first = page.getByRole("menuitem", { name: "New folder" });
+  // "New file" leads the project menu; "New folder" follows it.
+  const first = page.getByRole("menuitem", { name: "New file" });
   await expect(page.getByRole("menuitem", { name: "Rename" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Archive" })).toBeVisible();
   await expect(first).not.toBeFocused();
   const outline = await first.evaluate((el) => getComputedStyle(el).outlineStyle);
   expect(outline === "none" || outline === "").toBeTruthy();
-  await page.screenshot({ path: "test-results/orb-project-menu.png" });
+  await page.screenshot({ path: "artifacts/orb-project-menu.png" });
   await page.keyboard.press("ArrowDown");
   await expect(first).toBeFocused();
   await page.keyboard.press("Escape");
   await expect(action).toBeFocused();
   await action.focus();
   await page.keyboard.press("Enter");
-  await expect(page.getByRole("menuitem", { name: "New folder" })).toBeFocused();
+  await expect(first).toBeFocused();
   await page.evaluate(() => { document.documentElement.dataset.theme = "light"; });
   await expect.poll(() => menu.evaluate((el) => Number(getComputedStyle(el).opacity))).toBe(1);
   expect(await menu.evaluate((el) => getComputedStyle(el).backgroundColor)).toBe("rgb(255, 255, 255)");
