@@ -46,7 +46,8 @@ async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteS
    if(options.fleetFailAfterFirst&&fleetReads>1)return route.fulfill({status:503,body:"fleet monitor unavailable"});
    return route.fulfill({json:{enabled:true,nodes:options.missing&&fleetReads>1?[]:[node],...(capability?{remote_launch:capability}:{})}});
   }
-  const json=path==="/api/projects"?{projects:[{slug:"test",title:"Test"}]}:path==="/api/backends"?[{id:"grok",name:"Grok"},{id:"codex",name:"Codex"},{id:"opencode",name:"OpenCode"},{id:"claudecode",name:"Claude Code"}]:path==="/api/providers/backend-models"?{backends:{grok:[{value:"grok-4.6",label:"Grok 4.6"}],codex:[{value:"codex-model",label:"Codex model"}],opencode:[{value:"xai/grok-4.6",label:"Grok 4.6"}],claudecode:[{value:"claude-sonnet-4-6",label:"Claude Sonnet 4.6"}]}}:path==="/api/control/missions"?options.failed?[m]:[]:path.endsWith("/files")?{entries:options.files??[]}:path.endsWith("/crons")?{jobs:[]}:{job:path.includes("/controller")?{id:"ctrl-1",name:"Test controller",enabled:true,state:"scheduled"}:null,runs:[]};
+  const filePath=url.searchParams.get("path")||"";
+  const json=path==="/api/projects"?{projects:[{slug:"test",title:"Test"}]}:path==="/api/backends"?[{id:"grok",name:"Grok"},{id:"codex",name:"Codex"},{id:"opencode",name:"OpenCode"},{id:"claudecode",name:"Claude Code"}]:path==="/api/providers/backend-models"?{backends:{grok:[{value:"grok-4.6",label:"Grok 4.6"}],codex:[{value:"codex-model",label:"Codex model"}],opencode:[{value:"xai/grok-4.6",label:"Grok 4.6"}],claudecode:[{value:"claude-sonnet-4-6",label:"Claude Sonnet 4.6"}]}}:path==="/api/control/missions"?options.failed?[m]:[]:path.endsWith("/files")?{entries:filePath==="notes"?[{name:"foo.md",kind:"file"}]:(options.files??[])}:path.endsWith("/crons")?{jobs:[]}:{job:path.includes("/controller")?{id:"ctrl-1",name:"Test controller",enabled:true,state:"scheduled"}:null,runs:[]};
   return route.fulfill({json});
  });
  await page.goto("/");
@@ -54,7 +55,7 @@ async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteS
  return {posts,releasePost,releaseHistory,setSuccess:()=>{fail=false;},listReads:()=>listReads,fleetReads:()=>fleetReads};
 }
 async function chooseRemote(page:Page){await page.getByRole("button",{name:/Core \(agent-core\)/}).click();await page.getByRole("button",{name:/dgx-spark online/}).click();}
-const composerInput=(page:Page)=>page.getByPlaceholder("Plan, Build, / for commands, @ for context");
+const composerInput=(page:Page)=>page.getByPlaceholder(/Plan, Build, \/ for commands, @ for context|Describe the objective/);
 /** A `/goal` turn renders as a Goal tag plus the exact objective, never the raw slash command. */
 async function expectGoalTurn(page:Page,selector:string,text=objective){
  const turn=page.locator(selector);await expect(turn).toHaveCount(1);
@@ -69,9 +70,9 @@ test("slow local POST shows prompt immediately; accepted mission opens before sl
  await page.screenshot({path:"test-results/orb-launch-starting.png"});
  await page.emulateMedia({reducedMotion:"reduce"});await expect(page.locator(".launch-pulse")).toHaveCSS("animation-name","none");
  await page.waitForTimeout(1000);state.releasePost();await expect(page.getByPlaceholder("Send follow-up")).toBeVisible({timeout:1500});
- await expect(page.locator(".launch-status")).toContainText("Queued on Core");await expectGoalTurn(page,".user");
+ await expect(page.locator(".launch-status")).toContainText("Queued on Core");await expectGoalTurn(page,"main .scroll .user");
  expect(state.posts[0]).toMatchObject({backend:"grok",model_override:"grok-4.6",prompt,title:"Check remote startup without losing this…"});expect(state.posts[0]).not.toHaveProperty("remote_node_id");expect(state.posts[0]).not.toHaveProperty("remote_command");expect(state.posts[0].idempotency_key).toBeTruthy();
- state.releaseHistory();await expectGoalTurn(page,".user");
+ state.releaseHistory();await expectGoalTurn(page,"main .scroll .user");
  const timings=await page.evaluate(()=>(window as any).launchTiming);console.log("LAUNCH_TIMING",JSON.stringify(timings));expect(timings.optimistic).toBeLessThan(500);expect(timings.acceptedView).toBeLessThan(500);writeFileSync("test-results/launch-timings.json",JSON.stringify(timings,null,2));
 });
 
@@ -312,22 +313,21 @@ test("typed-capable server that still answers remote_command required is explain
 });
 
 test("@ file and controller chips are sent as structured attachments",async({page})=>{
- const state=await setup(page,{files:[{name:"notes",kind:"dir"},{name:"foo.md",kind:"file"}]});
+ const state=await setup(page,{files:[{name:"notes",kind:"dir"}]});
  state.releasePost();state.releaseHistory();
  const input=composerInput(page);
  await input.fill("@");
  await expect(page.getByRole("listbox",{name:"Context"})).toBeVisible();
- await page.getByRole("option",{name:"foo.md"}).click();
- await expect(page.locator(".attach-chip")).toContainText("foo.md");
+ await page.getByRole("option",{name:"notes/foo.md",exact:true}).click();
+ await expect(page.locator(".attach-chip")).toContainText("notes/foo.md");
  await input.fill("@ctrl");
- const controller=page.getByRole("option",{name:/controller/i});
- if(await controller.count()) await controller.first().click();
- else await page.getByRole("option",{name:"Test controller"}).click();
+ await page.getByRole("option",{name:"Test controller",exact:true}).click();
  await input.fill("Read the notes");
  await input.press("Enter");
  await expect.poll(()=>state.posts.length).toBe(1);
  expect(state.posts[0].attachments).toEqual(expect.arrayContaining([
-  {kind:"file",path:"foo.md"},
+  {kind:"file",path:"notes/foo.md"},
+  {kind:"controller"},
  ]));
  expect(state.posts[0].prompt).toBe("Read the notes");
  expect(JSON.stringify(state.posts[0])).not.toContain("hello notes");

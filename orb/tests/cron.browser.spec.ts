@@ -277,6 +277,7 @@ for (const staleStatus of [200, 401, 404, 500]) test(`old connection cron ${stal
 
 test("primary controller steers the next tick and Run now hits controller/action", async ({ page }) => {
   const requests: { method: string; path: string; body: any }[] = [];
+  let pending: { id: string; body: string; created_at: string; origin: string }[] = [];
   await page.route("**/api/**", async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
@@ -286,14 +287,9 @@ test("primary controller steers the next tick and Run now hits controller/action
     if (path === "/api/projects") return route.fulfill({ json: { projects: [{ slug: "notes", title: "Project notes" }] } });
     if (path.endsWith("/steers")) {
       if (method === "POST") {
-        return route.fulfill({
-          json: {
-            pending: [{ id: "s1", body: body.body, created_at: "2026-09-21T11:00:00Z", origin: "orb" }],
-            recent: [],
-          },
-        });
+        pending = [{ id: "s1", body: body.body, created_at: "2026-09-21T11:00:00Z", origin: "orb" }];
       }
-      return route.fulfill({ json: { pending: [], recent: [] } });
+      return route.fulfill({ json: { pending, recent: [] } });
     }
     if (path.endsWith("/controller/action")) return route.fulfill({ json: { slug: "notes", job: fixtures.hourly, runs: [] } });
     if (path.endsWith("/controller")) return route.fulfill({ json: { slug: "notes", job: fixtures.hourly, runs: [] } });
