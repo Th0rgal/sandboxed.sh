@@ -10,7 +10,7 @@ import * as Ic from "./icons";
 import { Settings, SETTINGS_TABS, type SettingsTab } from "./Settings";
 import { MACHINES, Machines } from "./Machines";
 import { Providers } from "./Providers";
-import { Dialog, Field } from "./Dialog";
+import { PromptSheet } from "./Dialog";
 import { MenuList, PopupMenu, type MenuEntry } from "./Menu";
 import { MdSource, MdView, safeHref } from "./Markdown";
 import { streamMission, heldAfterHistory, type StreamEvent } from "./stream";
@@ -1471,27 +1471,17 @@ export default function App() {
       <Show when={newProjectDraft()}><ProjectCreation existingIds={liveProjects().map(p => p.slug)} onCreate={submitNewProject} onClose={() => setNewProjectDraft(false)} /></Show>
       <Show when={nameDlg()}>
         {(d) => (
-          <Dialog
+          <PromptSheet
             title={d().kind.startsWith("rename") ? "Rename" : d().kind === "folder" ? "New folder" : "New file"}
+            label="Name"
+            placeholder={d().kind === "folder" ? "notes" : "note.md"}
+            value={d().value}
+            onInput={(value) => setNameDlg({ ...d(), value })}
+            action={d().kind.startsWith("rename") ? "Save" : "Create"}
+            disabled={!d().value.trim()}
+            onAction={confirmName}
             onClose={() => setNameDlg(null)}
-            footer={
-              <>
-                <span class="dlg-spacer" />
-                <button class="s-btn sm quiet" onClick={() => setNameDlg(null)}>Cancel</button>
-                <button class="s-btn sm primary" onClick={confirmName}>{d().kind.startsWith("rename") ? "Save" : "Create"}</button>
-              </>
-            }
-          >
-            <Field label="Name">
-              <input
-                autofocus
-                placeholder={d().kind === "folder" ? "notes" : "note.md"}
-                value={d().value}
-                onInput={(e) => setNameDlg({ ...d(), value: e.currentTarget.value })}
-                onKeyDown={(e) => e.key === "Enter" && confirmName()}
-              />
-            </Field>
-          </Dialog>
+          />
         )}
       </Show>
     </div>

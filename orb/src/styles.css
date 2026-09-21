@@ -838,6 +838,31 @@ button.under-model { color: inherit; }
   box-shadow: var(--shadow-lg);
 }
 .dlg h3 { margin: 0 0 10px; font-size: 13px; font-weight: 600; color: var(--fg-strong); }
+.prompt-sheet { width: min(440px, calc(100vw - 36px)); padding: 12px 14px 12px; }
+.prompt-sheet h3 { margin: 0; }
+.prompt-head { display: flex; align-items: baseline; gap: 8px; margin: 0 0 12px; }
+.prompt-hint { color: var(--fg-4); font-size: 12px; font-weight: 400; }
+.prompt-x {
+  margin-left: auto; width: 22px; height: 22px; border-radius: 6px; flex: none;
+  display: grid; place-items: center; color: var(--fg-4); align-self: center;
+}
+.prompt-x:hover { background: var(--bg-hover); color: var(--fg); }
+.prompt-row { display: flex; gap: 8px; align-items: center; }
+.prompt-input {
+  flex: 1; min-width: 0; height: 32px; padding: 0 10px; border-radius: 7px;
+  border: 1px solid var(--stroke-strong); background: var(--bg-field); color: var(--fg);
+  font: 13px var(--sans);
+}
+.prompt-input:focus { outline: 0; border-color: var(--focus-border); }
+.prompt-go {
+  flex: none; height: 32px; padding: 0 12px; border-radius: 7px;
+  background: var(--send-bg); color: var(--send-fg); font-size: 13px; font-weight: 500;
+}
+.prompt-go:hover { background: var(--send-bg-hover); }
+.prompt-go:disabled { opacity: .45; }
+.prompt-sheet .st-error { margin: 8px 0 0; }
+.prompt-sheet .field { margin: 12px 0 0; }
+.prompt-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; font-size: 12px; color: var(--fg-4); }
 .dlg-body { display: flex; flex-direction: column; }
 .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
 .field span { font-size: 12px; color: var(--fg-2); }

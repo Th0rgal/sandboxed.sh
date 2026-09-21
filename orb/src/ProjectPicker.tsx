@@ -1,7 +1,7 @@
 import { For, Show, createMemo, createSignal, createEffect, onMount, onCleanup } from "solid-js";
 import * as Ic from "./icons";
 import { trapFocus } from "./focusScope";
-import { Dialog, Field } from "./Dialog";
+import { PromptSheet } from "./Dialog";
 import { slugify } from "./api";
 
 export function ProjectPicker(p: {
@@ -69,13 +69,8 @@ export function ProjectCreation(p:{existingIds: string[];onCreate:(title:string,
     catch(e){setError(e instanceof Error?e.message:String(e));}
     finally{setBusy(false);}
   };
-  return <Dialog title="New project" onClose={close} footer={<><button class="s-btn" disabled={busy()} onClick={close}>Cancel</button><button class="s-btn primary" disabled={busy()||!name().trim()} onClick={()=>void submit()}>{busy()?"Creating…":"Create project"}</button></>}>
-    <form class="project-create" onSubmit={e=>{e.preventDefault();void submit();}}>
-      <Field label="Project name"><input class="s-input" autofocus value={name()} disabled={busy()} onInput={e=>setName(e.currentTarget.value)} placeholder="My project"/></Field>
-      <Field label="Project ID"><input class="s-input" value={slug()} disabled={busy()} onInput={e=>setId(e.currentTarget.value)} /></Field>
-      <div class="project-location"><span>Location</span><p>Project files on the connected backend</p><small>Folders and files belong to this project. Choose where agents run with the machine picker.</small></div>
-      <Show when={error()}><p class="cs-warn" role="alert">{error()}</p></Show>
-      <button type="submit" hidden />
-    </form>
-  </Dialog>;
+  return <PromptSheet title="New project" label="Project name" placeholder="Project name" value={name()} onInput={v=>{setName(v);setError(null);}} action={busy()?"Creating…":"Create project"} busy={busy()} disabled={!name().trim()} error={error()} onAction={()=>void submit()} onClose={close}
+    footer={<span>Files live on the connected backend. Agents run on the machine you pick.</span>}>
+    <label class="field"><span>Project ID</span><input class="s-input" aria-label="Project ID" value={slug()} disabled={busy()} onInput={e=>setId(e.currentTarget.value)} /></label>
+  </PromptSheet>;
 }

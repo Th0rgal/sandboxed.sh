@@ -29,7 +29,7 @@ import {
   type ControllerView as ControllerData,
 } from "./api";
 import { CronGlyph, untilLabel } from "./Controller";
-import { Dialog, Field } from "./Dialog";
+import { Dialog, PromptSheet } from "./Dialog";
 import { PopupMenu, type MenuEntry } from "./Menu";
 import { CronForm } from "./ControllerSettings";
 import { getProjectCronFromJob } from "./cronSchema";
@@ -619,22 +619,38 @@ export function LiveProjectsSection(p: {
       </div>
       <Show when={rename()}>
         {(target) => (
-          <Dialog title="Rename" onClose={() => !renaming() && setRename(null)} footer={<><button class="s-btn" disabled={renaming()} onClick={() => setRename(null)}>Cancel</button><button class="s-btn primary" disabled={renaming()} onClick={() => void saveRename()}>{renaming() ? "Saving…" : "Save"}</button></>}>
-            <Field label={target().slug}>
-              <input autofocus class="s-input" placeholder="Project name" value={renameValue()} onInput={(e) => setRenameValue(e.currentTarget.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void saveRename(); } }} />
-            </Field>
-            <Show when={renameError()}><p class="st-error">{renameError()}</p></Show>
-          </Dialog>
+          <PromptSheet
+            title="Rename"
+            hint={target().slug}
+            label="Project name"
+            placeholder="Project name"
+            value={renameValue()}
+            onInput={setRenameValue}
+            action="Save"
+            busy={renaming()}
+            disabled={!renameValue().trim()}
+            error={renameError()}
+            onAction={() => void saveRename()}
+            onClose={() => !renaming() && setRename(null)}
+          />
         )}
       </Show>
       <Show when={newFolder()}>
         {(target) => (
-          <Dialog title="New folder" onClose={() => !makingFolder() && setNewFolder(null)} footer={<><button class="s-btn" disabled={makingFolder()} onClick={() => setNewFolder(null)}>Cancel</button><button class="s-btn primary" disabled={makingFolder()} onClick={createFolder}>{makingFolder() ? "Creating…" : "Create"}</button></>}>
-            <Field label={`In ${target().path ? `${target().slug}/${target().path}` : target().slug}`}>
-              <input autofocus class="s-input" placeholder="Folder name" value={folderName()} onInput={(e) => setFolderName(e.currentTarget.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void createFolder(); } }} />
-            </Field>
-            <Show when={folderError()}><p class="st-error">{folderError()}</p></Show>
-          </Dialog>
+          <PromptSheet
+            title="New folder"
+            hint={`in ${target().path ? `${target().slug}/${target().path}` : target().slug}`}
+            label="Folder name"
+            placeholder="Folder name"
+            value={folderName()}
+            onInput={setFolderName}
+            action="Create"
+            busy={makingFolder()}
+            disabled={!folderName().trim()}
+            error={folderError()}
+            onAction={() => void createFolder()}
+            onClose={() => !makingFolder() && setNewFolder(null)}
+          />
         )}
       </Show>
       <Show when={cronInfo()}>{(slug) => <Dialog title="Project crons" onClose={() => setCronInfo(null)} footer={<><button class="s-btn sm" onClick={() => setCronInfo(null)}>Close</button><button class="s-btn sm" disabled={cronChecking()} onClick={async () => { if (!isConnected()) return; const version = connectionVersion(); setCronChecking(true); await loadCrons(slug(), true); if (!currentConnection(version)) return; setCronChecking(false); if (!cronUnsupported() && !cronErrors[slug()]) setCronInfo(null); }}>Check again</button></>}>
