@@ -1180,7 +1180,35 @@ pub(crate) async fn continue_on_node(
     let content = content
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty());
-    let session_id = mission.session_id.as_deref().map(str::trim)
+    // Jobs launched before OpenCode streaming was enabled have a placeholder
+    // session id. Recover the native identity from that exact job's log.
+    let mut native_session = mission.session_id.clone();
+    if mission.backend == "opencode"
+        && !native_session
+            .as_deref()
+            .is_some_and(|s| s.starts_with("ses_"))
+    {
+        let token = std::env::var(&_node.token_env).map_err(internal)?;
+        let client = RemoteNodeClient::default();
+        let mut stream = GrokStream::default();
+        let mut offset = 0;
+        for _ in 0..MAX_CHUNKS_PER_TICK {
+            let chunk = client
+                .get_job_log(&_node, &token, placement.job_id, offset)
+                .await
+                .map_err(internal)?;
+            stream.feed(&chunk.data);
+            if stream.session_id.is_some() {
+                break;
+            }
+            if chunk.next_offset <= offset || chunk.next_offset >= chunk.log_len {
+                break;
+            }
+            offset = chunk.next_offset;
+        }
+        native_session = stream.session_id;
+    }
+    let session_id = native_session.as_deref().map(str::trim)
         .filter(|s| !s.is_empty()).map(str::to_string)
         .ok_or_else(|| (StatusCode::CONFLICT, format!(
             "{REMOTE_RESUME_REQUIRES_REPLACEMENT}: mission {mission_id} has no recorded native session; create a remote replacement with supersedes_mission_id={mission_id}"
