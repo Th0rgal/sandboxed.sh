@@ -112,11 +112,11 @@ test("combined queue and checklist survives failure, identical sends, reload and
   await page.getByRole("button",{name:"Tasks",exact:true}).click();await expect(page.locator('.mission-tasks')).toBeFocused();
   await expect(page.getByRole("button",{name:"Plan",exact:true})).toHaveCount(0);
   await field.fill("@README");await page.getByRole("option",{name:"README.md",exact:true}).click();
-  state.setReject(true);await field.fill("retry this");await field.press("Enter");
-  await expect(page.getByRole("alert")).toContainText("not accepted");await expect(field).toHaveValue("retry this");await expect(page.locator('.queued-messages')).toHaveCount(0);
-  await expect(page.locator('.attach-chip')).toContainText("README.md");
+  state.setReject(true);await field.fill("retry this @README.md");await field.press("Escape");await field.press("Enter");
+  await expect(page.getByRole("alert")).toContainText("not accepted");await expect(field).toHaveValue("retry this @README.md");await expect(page.locator('.queued-messages')).toHaveCount(0);
+  await expect(field).toHaveValue(/@README\.md/);
   state.setReject(false);
-  for(let i=0;i<2;i++){await field.fill("same text");await field.press("Enter");await expect(field).toHaveValue("");}
+  for(let i=0;i<2;i++){await field.fill("same text @README.md");await field.press("Escape");await field.press("Enter");await expect(field).toHaveValue("");}
   await expect(page.locator('.queued-messages li')).toHaveCount(2);
   expect(state.posts[1].attachments).toEqual([{kind:"file",path:"README.md"}]);
   await expect(page.locator('.queued-messages')).toContainText("Attached context");
@@ -155,9 +155,9 @@ test("reserved attachment reference rejection keeps the follow-up draft and atta
   const field=page.getByPlaceholder("Send follow-up");
   await field.fill("@README");await page.getByRole("option",{name:"README.md",exact:true}).click();
   state.setReject("Message contains a reserved attachment reference. Remove it and use the attachment picker to attach context.");
-  const prose="Quoted prose: "+"<!-- paloma:"+"attachment:malformed";
+  const prose="@README.md Quoted prose: "+"<!-- paloma:"+"attachment:malformed";
   await field.fill(prose);await field.press("Enter");
   await expect(page.getByRole("alert")).toContainText("reserved attachment reference");
-  await expect(field).toHaveValue(prose);await expect(page.locator('.attach-chip')).toContainText("README.md");
+  await expect(field).toHaveValue(prose);await expect(field).toHaveValue(/@README\.md/);
   await expect(page.locator('.queued-messages')).toHaveCount(0);
 });

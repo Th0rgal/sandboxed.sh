@@ -157,6 +157,17 @@ export function launchError(error: unknown): string {
   if (error instanceof ApiError) return error.detail || "The launch request was rejected. Your draft is kept.";
   return error instanceof Error ? error.message : String(error);
 }
+/**
+ * Phases that need no banner: the mission is healthy and in flight, and the
+ * only thing a line of text would add is a claim the user can already see.
+ * Where it is running is in the mission footer; that it is running is carried
+ * by the pending animation on their own prompt.
+ *
+ * Everything else stays: anything waiting on the user, anything the server is
+ * unsure about, and every failure.
+ */
+const QUIET_PHASES = new Set(["Starting", "Running", "Resuming"]);
+
 export function missionPhase(mission: Mission | null, activity: boolean) {
   const status = mission?.status;
   if (!status) return { label: "Loading mission", moving: true, detail: "Checking the accepted mission status." };
@@ -188,14 +199,40 @@ export function missionGoal(mission: Mission | null | undefined, receipt?: Launc
   if (mission?.goal_mode && mission.goal_objective) return mission.goal_objective;
   return goalObjective(receipt?.prompt) ?? goalObjective(mission?.history?.find(entry => entry.role === "user")?.content);
 }
+/**
+ * A phase not worth a banner: either healthy and in flight, or settled with
+ * nothing left to explain. A finished mission whose answer is right there needs
+ * no "Completed" line above it — but one that finished with no output keeps its
+ * banner, because that line is the only explanation of an empty transcript.
+ */
+export function phaseIsQuiet(phase: { label: string; failed?: boolean; moving?: boolean; detail?: string }): boolean {
+  if (phase.failed) return false;
+  if (QUIET_PHASES.has(phase.label)) return true;
+  return !phase.moving && !phase.detail;
+}
+
+/**
+ * The status above a transcript. Renders nothing at all while a mission is
+ * simply working — no text, no reserved space — so the prompt and the answer
+ * sit together. The state is still announced: `MissionPending` carries it to
+ * assistive technology, and anything actionable or failed still draws a
+ * compact banner here.
+ */
 export function LaunchStatus(p: { destination: string; mission?: Mission | null; activity?: boolean; submitting?: boolean; goal?: string | null }) {
   const phase = () => p.submitting ? {label:"Starting",moving:true,detail:"Submitting your request…",failed:false} : missionPhase(p.mission ?? null, !!p.activity);
-  // Transcript activity can be from an earlier run, so it must not promote an
-  // unconfirmed remote job to Running. It does make routine startup feedback
-  // redundant. Keep explicit queue, reconciliation and terminal states visible.
-  const visible = () => p.submitting || !p.activity || !["Running", "Remote job accepted"].includes(phase().label);
-  return <Show when={visible()}><div class={`launch-status ${phase().failed ? "failed" : ""}`} role="status" aria-live="polite">
-    <div><Show when={phase().moving}><span class="launch-pulse" aria-hidden="true" /></Show><Show when={p.goal}><GoalTag class="small" /></Show><span>{phase().label} on {p.destination}</span></div>
-    <Show when={phase().detail}><p>{phase().detail}</p></Show>
-  </div></Show>;
+  return <Show when={!phaseIsQuiet(phase()) && !(p.activity && phase().label === "Remote job accepted")}>
+    <div class={`launch-status ${phase().failed ? "failed" : ""}`} role="status" aria-live="polite">
+      <div><Show when={phase().moving}><span class="launch-pulse" aria-hidden="true" /></Show><Show when={p.goal}><GoalTag class="small" /></Show><span>{phase().label} on {p.destination}</span></div>
+      <Show when={phase().detail}><p>{phase().detail}</p></Show>
+    </div>
+  </Show>;
+}
+
+/**
+ * The accessible half of the quiet state: a live region with no visual box, so
+ * a screen reader hears "Starting on Core" while sighted users see only the
+ * animation on their prompt.
+ */
+export function MissionPending(p: { destination: string; label: string }) {
+  return <span class="sr-only" role="status" aria-live="polite">{p.label} on {p.destination}</span>;
 }

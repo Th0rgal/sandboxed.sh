@@ -1,6 +1,6 @@
-import { LaunchStatus, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, launchRefusal, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, missionSettingsIdle, dockModelLabel, type LaunchReceipt, type LaunchRefusal, type RemoteSupport } from "./missionLaunch";
+import { LaunchStatus, MissionPending, missionPhase, phaseIsQuiet, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, launchRefusal, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, missionSettingsIdle, dockModelLabel, type LaunchReceipt, type LaunchRefusal, type RemoteSupport } from "./missionLaunch";
 import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, GoalTag, EMPTY_GOAL_ERROR, absorbGoalPrefix, composerModes, filterSlash, slashQuery, modePrompt, ModeChip, type ComposerMode } from "./goal";
-import { atQuery, chipToAttachment, consumeAtToken, filterAttach, loadAttachItems, type AttachChip, type AttachItem } from "./attach";
+import { atQuery, chipToAttachment, filterAttach, insertMention, loadAttachItems, mentionedChips, type AttachChip, type AttachItem } from "./attach";
 import { ProjectPicker, ProjectCreation } from "./ProjectPicker";
 import { hasFocusScope } from "./focusScope";
 import { For, Show, Switch, Match, createMemo, createSignal, createEffect, on, onCleanup, onMount, batch } from "solid-js";
@@ -249,7 +249,7 @@ function Composer(p: {
   backend?: string;
   onDraft?: (text: string) => void;
   projectSlug?: string;
-  attachments?: AttachChip[];
+  /** Reports what the draft currently mentions; the draft text is the source. */
   onAttachments?: (next: AttachChip[]) => void;
 }) {
   const [text, setText] = createSignal("");
@@ -302,6 +302,7 @@ function Composer(p: {
     at();
     setAtHi(0);
   });
+  let attachmentLoad: Promise<void> = Promise.resolve();
   createEffect(() => {
     const slug = p.projectSlug;
     if (!slug || !isConnected()) {
@@ -311,10 +312,12 @@ function Composer(p: {
     let current = true;
     setAtItems([]);
     onCleanup(() => { current = false; });
-    void loadAttachItems(slug).then(items => { if (current) setAtItems(items); })
+    attachmentLoad = loadAttachItems(slug).then(items => { if (current) setAtItems(items); })
       .catch(() => { if (current) setAtItems([]); });
   });
-  createEffect(on(() => [p.projectSlug, isConnected()] as const, () => p.onAttachments?.([]), { defer: true }));
+  /** What the current draft refers to, resolved against this project's files. */
+  const mentioned = createMemo(() => mentionedChips(text(), atItems()));
+  createEffect(() => p.onAttachments?.(mentioned()));
   const resize = () => {
     ta.style.height = "auto";
     ta.style.height = Math.min(ta.scrollHeight, 220) + "px";
@@ -337,19 +340,20 @@ function Composer(p: {
     ta.focus();
   };
   const pickSlash = (item: { id: ComposerMode }) => enterMode(item.id, "");
-  const toggleChip = (item: AttachItem) => {
-    const chip: AttachChip = { id: item.id, kind: item.kind, path: item.path, label: item.label };
-    const cur = p.attachments ?? [];
-    const next = cur.some((c) => c.id === chip.id) ? cur.filter((c) => c.id !== chip.id) : [...cur, chip];
-    p.onAttachments?.(next);
-    const query = atQuery(text(), caret());
-    const insertion = query.open ? query.start : caret();
-    const consumed = consumeAtToken(text(), caret());
-    write(consumed);
+  /**
+   * Write the chosen attachment into the sentence at the point `@` was typed.
+   *
+   * The mention is the reference: there is no separate list to keep in step, so
+   * editing the text is editing the attachments, and the agent reads the same
+   * words the user wrote.
+   */
+  const pickAttach = (item: AttachItem) => {
+    const next = insertMention(text(), caret(), item);
+    write(next.text);
     setAtOff(true);
     ta.focus();
-    ta.setSelectionRange(insertion, insertion);
-    setCaret(insertion);
+    ta.setSelectionRange(next.caret, next.caret);
+    setCaret(next.caret);
   };
   const [sending, setSending] = createSignal(false);
   const send = async () => {
@@ -357,6 +361,12 @@ function Composer(p: {
     if (!payload || sending()) return;
     setSending(true);
     try {
+      // Typing can beat the initial catalog request. Resolve references before
+      // handing the draft to the parent, rather than silently omitting files.
+      const scope = p.projectSlug;
+      await attachmentLoad;
+      if (scope !== p.projectSlug || draftOf(text()) !== payload) return;
+      p.onAttachments?.(mentioned());
       const accepted = await p.onSend(payload);
       if (accepted !== false && draftOf(text()) === payload) {
         setMode(null);
@@ -383,7 +393,9 @@ function Composer(p: {
   };
   const onEsc = (e: KeyboardEvent) => {
     if (e.defaultPrevented || hasFocusScope()) return;
-    if (e.key === "Escape" && (menu() || ctx() || which() || slash())) {
+    // `close()` already dismisses the `@` picker; it was missing from this
+    // guard, so Escape did nothing while only that picker was open.
+    if (e.key === "Escape" && (menu() || ctx() || which() || slash() || at())) {
       e.stopPropagation();
       close();
     }
@@ -407,7 +419,7 @@ function Composer(p: {
             <div class="slash-head">Controller</div>
             <For each={atItems().filter((i) => i.section === "Controller")}>
               {(it) => (
-                <button class={`menu-item ${(p.attachments ?? []).some((c) => c.id === it.id) ? "on" : ""}`} onClick={() => toggleChip(it)}>
+                <button class={`menu-item ${mentioned().some((c) => c.id === it.id) ? "on" : ""}`} onClick={() => pickAttach(it)}>
                   <span class="menu-ico"><Ic.TargetIcon size={14} /></span> {it.label}
                 </button>
               )}
@@ -417,7 +429,7 @@ function Composer(p: {
             <div class="slash-head">Folders</div>
             <For each={atItems().filter((i) => i.section === "Folders")}>
               {(it) => (
-                <button class={`menu-item ${(p.attachments ?? []).some((c) => c.id === it.id) ? "on" : ""}`} onClick={() => toggleChip(it)}>
+                <button class={`menu-item ${mentioned().some((c) => c.id === it.id) ? "on" : ""}`} onClick={() => pickAttach(it)}>
                   <span class="menu-ico"><Ic.FolderIcon size={14} /></span> {it.label}
                 </button>
               )}
@@ -431,9 +443,9 @@ function Composer(p: {
               const item: AttachItem = "section" in f ? (f as AttachItem) : { id, kind: "file", section: "Files", path: label, label };
               return (
                 <button
-                  class={`menu-item ${(p.attachments ?? []).some((c) => c.id === item.id) || p.attached?.includes(item.id) ? "on" : ""}`}
+                  class={`menu-item ${mentioned().some((c) => c.id === item.id) || p.attached?.includes(item.id) ? "on" : ""}`}
                   onClick={() => {
-                    if (p.onAttachments) toggleChip(item);
+                    if (p.onAttachments) pickAttach(item);
                     else p.onToggleFile?.(item.id);
                   }}
                 >
@@ -642,7 +654,7 @@ function Composer(p: {
                           aria-selected={atHi() === idx()}
                           class={`menu-item ${atHi() === idx() ? "on" : ""}`}
                           onMouseEnter={() => setAtHi(idx())}
-                          onClick={() => toggleChip(it)}
+                          onClick={() => pickAttach(it)}
                         >
                           <span class="menu-ico">{it.kind === "folder" ? <Ic.FolderIcon size={14} /> : it.kind === "controller" ? <Ic.TargetIcon size={14} /> : <Ic.FileIcon size={14} />}</span>
                           {it.label}
@@ -689,21 +701,6 @@ function Composer(p: {
       {slashMenu}
       {atMenu}
       <div class="composer-field">
-        <Show when={(p.attachments ?? []).length}>
-          <span class="attach-pills" style={{ display: "inline-flex", margin: "0 6px 0 0" }}>
-            <For each={p.attachments}>
-              {(chip) => (
-                <span class="attach-chip">
-                  {chip.kind === "folder" ? <Ic.FolderIcon size={12} /> : chip.kind === "controller" ? <Ic.TargetIcon size={12} /> : <Ic.FileIcon size={12} />}
-                  {chip.label}
-                  <button type="button" aria-label={`Remove ${chip.label}`} class="mode-chip-x" onClick={(e) => { e.preventDefault(); e.stopPropagation(); p.onAttachments?.((p.attachments ?? []).filter((c) => c.id !== chip.id)); }}>
-                    <Ic.CloseIcon size={10} />
-                  </button>
-                </span>
-              )}
-            </For>
-          </span>
-        </Show>
         <Show when={mode() === "goal"}><ModeChip mode="goal" onClear={clearMode} /></Show>
         <Show when={mode()}><span class="mode-sep" aria-hidden="true" /></Show>
         <textarea
@@ -737,7 +734,7 @@ function Composer(p: {
               }
               if ((e.key === "Enter" || e.key === "Tab") && !e.shiftKey && !e.isComposing) {
                 e.preventDefault();
-                toggleChip(atItemsOpen[Math.min(atHi(), atItemsOpen.length - 1)]);
+                pickAttach(atItemsOpen[Math.min(atHi(), atItemsOpen.length - 1)]);
                 return;
               }
             }
@@ -1647,7 +1644,10 @@ export default function App() {
                     </Show>
                   </div>
                 </Show>
-                <Show when={launchPreview()}>{(receipt) => <div class="launch-preview"><UserTurn text={receipt().prompt} /><LaunchStatus submitting destination={receipt().destination} goal={goalObjective(receipt().prompt)} /></div>}</Show>
+                {/* The optimistic window: the prompt appears immediately and animates while
+    the request is in flight. No banner and no reserved space — LaunchStatus
+    stays silent for a healthy launch and speaks only if it is refused. */}
+                <Show when={launchPreview()}>{(receipt) => <div class="launch-preview"><UserTurn text={receipt().prompt} pending /><LaunchStatus submitting destination={receipt().destination} goal={goalObjective(receipt().prompt)} /><MissionPending destination={receipt().destination} label="Starting" /></div>}</Show>
                 <div hidden={creating()}>
                 <Composer
                   placeholder="Describe a task, / for commands, @ for context"
@@ -1665,7 +1665,6 @@ export default function App() {
                     setAttached(attached().includes(id) ? attached().filter((x) => x !== id) : [...attached(), id])
                   }
                   projectSlug={effectiveNewProject()}
-                  attachments={attachChips()}
                   onAttachments={setAttachChips}
                 />
                 </div>
@@ -1953,6 +1952,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
   const [awaiting, setAwaiting] = createSignal(!cached);
   const [error, setError] = createSignal<string | null>(null);
   const [queueError, setQueueError] = createSignal<string | null>(cached?.queueError ?? null);
+  const [sendError, setSendError] = createSignal<string | null>(null);
   const [followAttach, setFollowAttach] = createSignal<AttachChip[]>([]);
   let scroller: HTMLDivElement | undefined;
   let nearBottom = true;
@@ -2052,6 +2052,20 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
     return !!s && ["active","running","pending","queued","starting","resuming"].includes(s);
   };
 
+  /** Anything the agent has actually said or done in this turn. */
+  const activity = () => viewItems().some((i) => ["text", "tool", "think"].includes(i.kind));
+  /**
+   * The mission is working and has produced nothing yet: the window where the
+   * prompt animates instead of a banner. It stops the moment any output lands —
+   * a tool call counts, not just text — and never runs for a state the user
+   * has to act on, which keeps its own banner.
+   */
+  const pending = () => {
+    const phase = missionPhase(mission(), activity());
+    return phaseIsQuiet(phase) && phase.moving && !activity();
+  };
+  const phaseLabel = () => missionPhase(mission(), activity()).label;
+
   const viewItems = () => {
     const list = withInitialPrompt(items(), mission(), receipt);
     if (busy()) return list;
@@ -2064,6 +2078,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
   // A different draft/selection, or a definitive rejection, starts a new attempt.
   let retryMessage: { key: string; id: string } | null = null;
   const sendMsg = async (text: string) => {
+    setSendError(null);
     const attachments = followAttach().map(chipToAttachment);
     const key = JSON.stringify([connectionVersion(), text, attachments]);
     if (retryMessage?.key !== key) retryMessage = { key, id: crypto.randomUUID() };
@@ -2079,7 +2094,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
     }
     catch (e) {
       if (e instanceof MessageRejectedError || (e instanceof ApiError && e.status < 500 && e.status !== 408)) retryMessage = null;
-      setError(launchError(e)); return false;
+      setSendError(launchError(e)); return false;
     }
   };
 
@@ -2107,7 +2122,10 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
                   {(r) => (
                     <>
                       <LaunchStatus destination={missionDestination(mission(), r())} mission={mission()} goal={missionGoal(mission(), r())} />
-                      <UserTurn text={r().prompt} />
+                      <UserTurn text={r().prompt} pending={pending()} />
+                      <Show when={pending()}>
+                        <MissionPending destination={missionDestination(mission(), r())} label={phaseLabel()} />
+                      </Show>
                     </>
                   )}
                 </Show>
@@ -2115,11 +2133,14 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
               </>
             }
           >
-            <LaunchStatus destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={viewItems().some(i => ["text","tool","think"].includes(i.kind))} />
-            <Transcript items={viewItems().filter(i => i.kind !== "user" || !i.queued)} />
+            <LaunchStatus destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={activity()} />
+            <Transcript items={viewItems().filter(i => i.kind !== "user" || !i.queued)} pending={pending()} />
+            <Show when={pending()}>
+              <MissionPending destination={missionDestination(mission(), receipt)} label={phaseLabel()} />
+            </Show>
           </Show>
-          <Show when={error() || queueError()}>
-            <p class="s-lead" role="alert">{error() || queueError()}</p>
+          <Show when={sendError() || error() || queueError()}>
+            <p class="s-lead" role="alert">{sendError() || error() || queueError()}</p>
           </Show>
         </div>
       </div>
@@ -2140,7 +2161,6 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
             scope={`m:${p.id}`}
             backend={mission()?.backend}
             projectSlug={mission()?.project ?? undefined}
-            attachments={followAttach()}
             onAttachments={setFollowAttach}
           />
           <Show when={latestChecklist(items())?.tasks.length}>
