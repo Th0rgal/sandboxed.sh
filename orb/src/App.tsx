@@ -1847,7 +1847,7 @@ function MissionDock(p: {
       </span>
       <Show when={harnessName()}>
         <span class="under-sep" aria-hidden="true">·</span>
-        <button class="under-harness under-model" title="Fork with another harness or model" aria-label="Fork conversation" onClick={() => setForkOpen(true)}>{harnessName()} <Ic.ChevronDown size={10} /></button>
+        <button class="under-harness fork-trigger" title="Fork with another harness or model" aria-label="Fork conversation" onClick={() => setForkOpen(true)}>{harnessName()} <Ic.ChevronDown size={10} /></button>
         <Show when={forkOpen() && p.mission}>{m => <ForkMission mission={m()} choices={harnessChoices()} destination={p.destination} onClose={() => setForkOpen(false)} onFork={forked => { setForkOpen(false); p.onFork?.(forked); }} />}</Show>
         <span class="under-sep" aria-hidden="true">·</span>
         <div class="under-model-wrap">

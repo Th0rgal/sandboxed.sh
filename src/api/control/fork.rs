@@ -62,11 +62,37 @@ pub async fn fork_mission(
                 .and_then(|id| Uuid::parse_str(id).ok())
         })
         .unwrap_or(id);
+    let working_directory = if placement.is_none() && source.working_directory.is_none() {
+        let workspace = crate::workspace::resolve_workspace(
+            &state.workspaces,
+            &state.config,
+            Some(source.workspace_id),
+        )
+        .await;
+        crate::workspace::ensure_persisted_mission_root_is_available(&workspace, id)
+            .map_err(internal_error)?;
+        let directory = crate::workspace::mission_workspace_dir_for_workspace(&workspace, id);
+        if !directory.is_dir() {
+            return Err((
+                StatusCode::CONFLICT,
+                "Original workspace is unavailable".into(),
+            ));
+        }
+        crate::workspace::verify_or_adopt_explicit_mission_working_directory(
+            &workspace,
+            &directory,
+            &[id],
+        )
+        .map_err(internal_error)?;
+        Some(directory.to_string_lossy().into_owned())
+    } else {
+        source.working_directory.clone()
+    };
     let changed = req.backend != source.backend;
     let create: CreateMissionRequest = serde_json::from_value(serde_json::json!({
         "title": format!("{} · fork", source.title.as_deref().unwrap_or("Conversation")),
         "workspace_id": source.workspace_id,
-        "working_directory": source.working_directory,
+        "working_directory": working_directory,
         "backend": req.backend,
         "agent": if changed { None } else { source.agent },
         "config_profile": if changed { None } else { source.config_profile },
