@@ -1396,3 +1396,5 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 }
 
 .cron-paused-indicator { display: flex; align-items: center; color: var(--fg-3); }
+
+.cr-steer-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 0; }

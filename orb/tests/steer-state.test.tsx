@@ -3,7 +3,7 @@ import { render, fireEvent, waitFor } from "@solidjs/testing-library";
 import { it, expect, vi, afterEach } from "vitest";
 import * as api from "../src/api";
 import { SteerComposer } from "../src/SteerComposer";
-import { CronGlyph } from "../src/Controller";
+import { CronGlyph, cronState, buildEntries } from "../src/Controller";
 import { getProjectCronFromJob } from "../src/cronSchema";
 import fixtures from "./fixtures/hermes-jobs.json";
 
@@ -42,4 +42,20 @@ it("keeps the clock identity when a cron is paused", () => {
   setPaused(false);
   expect(ui.container.querySelector(".cron-clock-hands")).not.toBeNull();
   expect(ui.container.querySelector(".cron-glyph.paused")).toBeNull();
+});
+
+it("keeps a paused schedule visible while an already-started run finishes", () => {
+  const job = getProjectCronFromJob("test", fixtures.hourly).job!;
+  expect(cronState({ ...job, enabled: false, state: "paused" }, true)).toBe("paused");
+  expect(cronState({ ...job, enabled: false, state: "running" }, true)).toBe("paused");
+  expect(cronState({ ...job, enabled: true, state: "scheduled" }, true)).toBe("running");
+});
+
+it("moves a consumed instruction out of the composer and into the dated history", () => {
+  const steer = { ...inbox.pending[0], consumed_at: "2026-09-21T15:43:37Z" };
+  const ui = render(() => <SteerComposer slug="test" steers={{ pending: [], recent: [steer] }} running={false} onSteers={() => {}} />);
+  expect(ui.container.textContent).not.toContain(steer.body);
+  const entries = buildEntries([], [steer, inbox.pending[0]]);
+  expect(entries.map(e => e.kind)).toEqual(["day", "steer"]);
+  expect(entries[1]).toMatchObject({ kind: "steer", steer });
 });

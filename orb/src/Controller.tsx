@@ -2,7 +2,7 @@ import { For, Show, createMemo, createSignal, onCleanup } from "solid-js";
 import { MdView } from "./Markdown";
 import { pollWhileVisible } from "./poll";
 import { ControllerSettingsPanel } from "./ControllerSettings";
-import { controllerAction, getProjectController, getProjectCron, getProjectSteers, isConnected, projectCronAction, updateProjectCron, type ControllerJob, type ControllerRun, type ControllerView as View, type ProjectSteers } from "./api";
+import { controllerAction, getProjectController, getProjectCron, getProjectSteers, isConnected, projectCronAction, updateProjectCron, type ControllerJob, type ControllerRun, type ControllerView as View, type ProjectSteers, type ProjectSteer } from "./api";
 import { SteerComposer } from "./SteerComposer";
 import { cacheLoad, cachePeek, cachePut, cacheRemember } from "./pageCache";
 import { ControllerSkeleton } from "./Skeleton";
@@ -12,8 +12,8 @@ export type CronState = "running" | "paused" | "attention" | "scheduled";
 
 export function cronState(job: ControllerJob | null | undefined, running = false): CronState {
   if (!job) return "scheduled";
-  if (running || job.state === "running") return "running";
   if (!job.enabled || job.state === "paused") return "paused";
+  if (running || job.state === "running") return "running";
   if (job.failure_streak > 0 || (job.last_status && job.last_status !== "ok")) return "attention";
   return "scheduled";
 }
@@ -91,20 +91,30 @@ function durationLabel(secs?: number | null): string {
 type Entry =
   | { kind: "day"; key: string; label: string }
   | { kind: "run"; key: string; run: ControllerRun }
+  | { kind: "steer"; key: string; steer: ProjectSteer }
   | { kind: "silent"; key: string; runs: ControllerRun[] }
   | { kind: "failed"; key: string; runs: ControllerRun[]; error: string };
 
 const isFailed = (r: ControllerRun) => r.status === "failed" || !!r.error;
 
-function buildEntries(runs: ControllerRun[]): Entry[] {
+export function buildEntries(runs: ControllerRun[], steers: ProjectSteer[] = []): Entry[] {
   const out: Entry[] = [];
   let day = "";
-  for (const run of runs) {
-    const d = dayOf(run.at);
+  const events = [
+    ...runs.map(run => ({ at: run.at, run, steer: undefined as ProjectSteer | undefined })),
+    ...steers.filter(steer => steer.consumed_at).map(steer => ({ at: steer.consumed_at!, run: undefined as ControllerRun | undefined, steer })),
+  ].sort((a, b) => (Date.parse(b.at ?? "") || 0) - (Date.parse(a.at ?? "") || 0));
+  for (const event of events) {
+    const d = dayOf(event.at);
     if (d && d !== day) {
       day = d;
       out.push({ kind: "day", key: `day:${d}`, label: d });
     }
+    if (event.steer) {
+      out.push({ kind: "steer", key: `steer:${event.steer.id}`, steer: event.steer });
+      continue;
+    }
+    const run = event.run!;
     const last = out[out.length - 1];
     const running = run.status === "running" || run.status === "claimed";
     if (isFailed(run) && !running && !run.report) {
@@ -241,7 +251,7 @@ export function ControllerView(p: { slug: string; id?: string }) {
   const job = () => view()?.job ?? null;
   const running = () => (view()?.runs ?? []).some((r) => r.status === "running" || r.status === "claimed");
   const state = () => cronState(job(), running());
-  const entries = createMemo(() => buildEntries(view()?.runs ?? []));
+  const entries = createMemo(() => buildEntries(view()?.runs ?? [], p.id ? [] : steers()?.recent ?? []));
 
   const act = async (action: "pause" | "resume" | "run") => {
     if (busy()) return;
@@ -277,7 +287,7 @@ export function ControllerView(p: { slug: string; id?: string }) {
                         {state() === "running"
                           ? "ticking now"
                           : state() === "paused"
-                            ? `paused${j().paused_reason ? ` · ${j().paused_reason}` : ""}`
+                            ? `paused${running() ? " · current run finishing" : ""}${j().paused_reason ? ` · ${j().paused_reason}` : ""}`
                             : `next ${untilLabel(j().next_run_at, now())}`}
                       </span>
                       <Show when={state() === "attention"}>
@@ -330,6 +340,14 @@ export function ControllerView(p: { slug: string; id?: string }) {
                     {(e) =>
                       e.kind === "day" ? (
                         <div class="cr-day">{e.label}</div>
+                      ) : e.kind === "steer" ? (
+                        <div class="cr-run cr-steer">
+                          <div class="cr-rail"><span class="cr-time">{timeOf(e.steer.consumed_at!)}</span></div>
+                          <div class="cr-body">
+                            <div class="cr-meta"><span class="cr-chip">Your instruction</span><span class="cr-ctrl">Taken into account</span></div>
+                            <p class="cr-steer-text">{e.steer.body}</p>
+                          </div>
+                        </div>
                       ) : e.kind === "silent" ? (
                         <SilentFold runs={e.runs} />
                       ) : e.kind === "failed" ? (

@@ -51,13 +51,10 @@ export function SteerComposer(p: {
 
   return (
     <div class="steer-box">
-      <Show when={(p.steers?.pending.length ?? 0) > 0 || (p.steers?.recent.length ?? 0) > 0}>
+      <Show when={(p.steers?.pending.length ?? 0) > 0}>
         <div class="steer-list">
           <For each={p.steers?.pending ?? []}>
             {(s) => <SteerChip steer={s} pending label={requested().has(s.id) ? "Run requested" : p.running ? "Awaiting pickup" : "Next tick"} />}
-          </For>
-          <For each={p.steers?.recent ?? []}>
-            {(s) => <SteerChip steer={s} />}
           </For>
         </div>
       </Show>

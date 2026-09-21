@@ -642,8 +642,8 @@ export function LiveProjectsSection(p: {
       const ticking = () => d.controller && (controllers[d.slug]?.runs ?? []).some(r => r.status === "running" || r.status === "claimed");
       return <button class={`row agent cron ${p.selected() === row.id ? "active" : ""}`} {...rowTip.bind(rowDetail(d.label, [d.controller ? "Controller" : "Cron"]))} onClick={() => p.open(row.id)}>
         <span class="row-ico glyph"><CronGlyph job={d.job!} running={!!ticking()} /></span><span class="row-label">{d.label}</span>
-        <span class="row-machine"><Show when={!ticking() && (!d.job!.enabled || d.job!.state === "paused")} fallback={<span class="row-machine-name cron-next">{ticking() ? "ticking" : untilLabel(d.job!.next_run_at, Date.now())}</span>}>
-          <span class="cron-paused-indicator" role="img" aria-label="Paused" title="Paused"><Ic.PauseIcon size={14} /></span>
+        <span class="row-machine"><Show when={!d.job!.enabled || d.job!.state === "paused"} fallback={<span class="row-machine-name cron-next">{ticking() ? "ticking" : untilLabel(d.job!.next_run_at, Date.now())}</span>}>
+          <span class="cron-paused-indicator" role="img" aria-label="Paused" title={ticking() ? "Paused · current run finishing" : "Paused"}><Ic.PauseIcon size={14} /></span>
         </Show></span>
       </button>;
     }
