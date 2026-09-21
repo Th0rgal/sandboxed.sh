@@ -5239,9 +5239,20 @@ async fn remote_launch_is_never_scheduled_locally_while_the_node_submit_is_slow(
 
     // The remote job still finishes the mission it owns.
     fixture.set_state("succeeded");
-    wait_until("remote completion", 20, || async {
-        store.get_mission(mission_id).await.unwrap().unwrap().status == MissionStatus::Completed
-    })
+    wait_until(
+        "remote completion and durable run settlement",
+        20,
+        || async {
+            // Presentation is written before finish_remote_job_lease. Its status
+            // alone cannot certify that the observer has released execution.
+            store.get_mission(mission_id).await.unwrap().unwrap().status == MissionStatus::Completed
+                && store
+                    .get_latest_mission_run(mission_id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|run| run.execution_state.is_terminal())
+        },
+    )
     .await;
     let latest = store
         .get_latest_mission_run(mission_id)
@@ -6196,9 +6207,18 @@ async fn restart_keeps_accepted_remote_job_active_and_reattaches_its_observer() 
 
     // And the normal terminal path still finishes it.
     fixture.set_state("failed");
-    wait_until("failed finalization", 20, || async {
-        store.get_mission(mission.id).await.unwrap().unwrap().status == MissionStatus::Failed
-    })
+    wait_until(
+        "failed finalization and durable run settlement",
+        20,
+        || async {
+            store.get_mission(mission.id).await.unwrap().unwrap().status == MissionStatus::Failed
+                && store
+                    .get_latest_mission_run(mission.id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|run| run.execution_state.is_terminal())
+        },
+    )
     .await;
     let done = store.get_mission(mission.id).await.unwrap().unwrap();
     assert_eq!(done.terminal_reason.as_deref(), Some("remote_node_job"));
