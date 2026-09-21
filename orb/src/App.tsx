@@ -7,7 +7,7 @@ import { createStore, produce } from "solid-js/store";
 import type { JSX } from "solid-js";
 import { projects as seed, LOREM_REPLY, type Agent, type Block, type Turn } from "./data";
 import * as Ic from "./icons";
-import { Settings, SETTINGS_TABS, type SettingsTab } from "./Settings";
+import { Settings } from "./Settings";
 import { MACHINES, Machines } from "./Machines";
 import { Providers } from "./Providers";
 import { PromptSheet } from "./Dialog";
@@ -589,7 +589,7 @@ export default function App() {
   const [envOpen, setEnvOpen] = createSignal<"machine" | "project" | null>(null);
   const [history, setHistory] = createSignal<(string | null)[]>(["a1"]);
   const [hIdx, setHIdx] = createSignal(0);
-  const [settingsTab, setSettingsTab] = createSignal<SettingsTab>("general");
+
   const [plusFor, setPlusFor] = createSignal<string | null>(null);
   const [nameDlg, setNameDlg] = createSignal<null | { kind: "folder" | "file" | "rename-project" | "rename-folder" | "rename-file" | "rename-agent"; pid: string; fid?: string; fileId?: string; agentId?: string; value: string }>(null);
   const [attached, setAttached] = createSignal<string[]>([]);
@@ -744,8 +744,7 @@ export default function App() {
     return p.folders.flatMap((f) => f.files.map((file) => ({ id: `f:${p.id}:${f.id}:${file.id}`, name: `${f.name}/${file.name}`, text: file.text })));
   });
   const onSettings = () => selected() === "settings";
-  const openSettings = (tab: SettingsTab = "general") => {
-    setSettingsTab(tab);
+  const openSettings = () => {
     open("settings");
   };
   const leaveSettings = () => {
@@ -1055,7 +1054,7 @@ export default function App() {
                       <div class="section">Projects</div>
                       <div class="sb-empty">
                         No backend connected.
-                        <button class="sb-link" onClick={() => openSettings("backend")}>
+                        <button class="sb-link" onClick={() => openSettings()}>
                           Connect
                         </button>
                       </div>
@@ -1086,14 +1085,6 @@ export default function App() {
               <span class="row-ico"><Ic.ArrowLeft /></span>
               <span class="row-label">Back</span>
             </button>
-            <For each={SETTINGS_TABS}>
-              {(t) => (
-                <button class={`row ${settingsTab() === t.id ? "active" : ""}`} onClick={() => setSettingsTab(t.id)}>
-                  <span class="row-ico"><t.icon /></span>
-                  <span class="row-label">{t.label}</span>
-                </button>
-              )}
-            </For>
           </Show>
         </nav>
         <div class="sb-foot">
@@ -1180,7 +1171,7 @@ export default function App() {
       <main class="main">
         <Switch>
           <Match when={selected() === "settings"}>
-            <Settings tab={settingsTab()} />
+            <Settings />
           </Match>
           <Match when={selected() === "machines"}>
             <Machines />

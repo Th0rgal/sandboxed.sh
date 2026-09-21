@@ -6,26 +6,6 @@ import { getThemePref, setThemePref, type ThemePref } from "./theme";
 const THEME_LABELS: Record<ThemePref, string> = { auto: "Auto", light: "Light", dark: "Dark" };
 const THEME_PREFS: Record<string, ThemePref> = { Auto: "auto", Light: "light", Dark: "dark" };
 
-export const SETTINGS_TABS = [
-  { id: "backend", label: "Backend", icon: Ic.SlidersIcon },
-  { id: "general", label: "General", icon: Ic.GearIcon },
-  { id: "appearance", label: "Appearance", icon: Ic.AppearanceIcon },
-  { id: "agents", label: "Agents", icon: Ic.NewAgentIcon },
-  { id: "models", label: "Models", icon: Ic.CubeIcon },
-] as const;
-
-export type SettingsTab = (typeof SETTINGS_TABS)[number]["id"];
-
-const MODELS = [
-  { name: "Orb Lorem 4.6 High Fast", cap: "200k", on: true },
-  { name: "Orb Lorem 4.6", cap: "200k", on: true },
-  { name: "Ipsum 5 Max", cap: "272k", on: true },
-  { name: "Ipsum 5", cap: "128k", on: false },
-  { name: "Dolor 4.5 Sonnet", cap: "200k", on: true },
-  { name: "Dolor 4.5 Opus", cap: "200k", on: false },
-  { name: "Auto", cap: "Router", on: true },
-];
-
 export function Toggle(p: { on: boolean; onClick?: () => void }) {
   const [on, setOn] = createSignal(p.on);
   return (
@@ -119,8 +99,7 @@ function BackendTab() {
 
   return (
     <>
-      <h2>Backend</h2>
-      <Card title="Sandboxed.sh core">
+      <Card title="Backend">
         <Row title="API URL" desc="Base URL of the sandboxed.sh core backend.">
           <input
             class="s-input"
@@ -165,89 +144,21 @@ function BackendTab() {
   );
 }
 
-export function Settings(p: { tab: SettingsTab }) {
+export function Settings() {
   return (
     <div class="s-body">
       <div class="s-inner">
-        <Show when={p.tab === "backend"}>
-          <BackendTab />
-        </Show>
-
-        <Show when={p.tab === "general"}>
-          <h2>General</h2>
-          <Card title="Notifications">
-            <Row title="System Notifications" desc="Show system notifications when an agent completes or needs attention">
-              <Toggle on />
-            </Row>
-            <Row title="Warning Notifications" desc="Show warning-level in-app toasts">
-              <Toggle on={false} />
-            </Row>
-            <Row title="Menu Bar Icon" desc="Show Orb in the menu bar">
-              <Toggle on />
-            </Row>
-            <Row title="Completion Sound" desc="Play a sound when an agent finishes responding">
-              <Toggle on={false} />
-            </Row>
-          </Card>
-          <Card title="Privacy">
-            <Row title="Privacy Mode" desc="Your code data will not be trained on or used to improve the product.">
-              <Select value="Privacy Mode" options={["Privacy Mode", "Share Data"]} />
-            </Row>
-          </Card>
-        </Show>
-
-        <Show when={p.tab === "appearance"}>
-          <h2>Appearance</h2>
-          <Card>
-            <Row title="Theme" desc="Auto follows your desktop appearance.">
-              <Select
-                value={THEME_LABELS[getThemePref()]}
-                options={["Auto", "Light", "Dark"]}
-                onChange={(v) => setThemePref(THEME_PREFS[v])}
-              />
-            </Row>
-            <Row title="Text Size" desc="Size of the conversation transcript.">
-              <Select value="Default" options={["Small", "Default", "Large"]} />
-            </Row>
-          </Card>
-        </Show>
-
-        <Show when={p.tab === "agents"}>
-          <h2>Agents</h2>
-          <Card>
-            <Row title="Default Mode" desc="Mode used when you open a new agent.">
-              <Select value="Agent" options={["Agent", "Plan", "Ask", "Last used mode"]} />
-            </Row>
-            <Row title="Queue Messages" desc="What happens if you send while an agent is working.">
-              <Select value="Send after current message" options={["Send after current message", "Stop & send right away"]} />
-            </Row>
-          </Card>
-          <Card title="Auto-Run">
-            <Row title="Auto-Run Mode" desc="How freely agents may run tools without asking.">
-              <Select value="Auto-Run in Sandbox" options={["Ask Every Time", "Auto-Run in Sandbox", "Run Everything"]} />
-            </Row>
-            <Row title="File-Deletion Protection" desc="Always ask before an agent deletes files.">
-              <Toggle on />
-            </Row>
-            <Row title="Dotfile Protection" desc="Always ask before editing files like .gitignore.">
-              <Toggle on />
-            </Row>
-          </Card>
-        </Show>
-
-        <Show when={p.tab === "models"}>
-          <h2>Models</h2>
-          <p class="s-lead">When Orb is wired to sandboxed.sh, this list will come from connected providers. Until then it is local.</p>
-          <Card>
-            <For each={MODELS}>
-              {(m) => (
-                <Row title={m.name} desc={m.cap}>
-                  <Toggle on={m.on} />
-                </Row>
-              )}
-            </For>
-          </Card>
-        </Show>
+        <h2>Settings</h2>
+        <BackendTab />
+        <Card title="Appearance">
+          <Row title="Theme" desc="Auto follows your desktop appearance.">
+            <Select
+              value={THEME_LABELS[getThemePref()]}
+              options={["Auto", "Light", "Dark"]}
+              onChange={(v) => setThemePref(THEME_PREFS[v])}
+            />
+          </Row>
+        </Card>
       </div>
     </div>
   );
