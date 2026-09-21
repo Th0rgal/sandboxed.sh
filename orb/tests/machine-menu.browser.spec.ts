@@ -70,9 +70,11 @@ test("machine picker: two-line entries never overlap, and the footer stays reach
 
   await expectNoOverlap(page);
 
-  // Single-line entries keep the original 28px rhythm.
+  // Single-line entries keep the original 28px rhythm. Measured loosely: a
+  // bounding box is reported in device pixels, so a row that is exactly 28 CSS
+  // pixels can come back as 27.99993896484375 depending on the display scale.
   const manage = page.getByRole("button", { name: "Manage machines" });
-  expect((await manage.boundingBox())!.height).toBe(28);
+  expect((await manage.boundingBox())!.height).toBeCloseTo(28, 2);
 
   // Footer is outside the scroll area, so it is visible without scrolling.
   await expect(manage).toBeInViewport();

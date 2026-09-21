@@ -998,13 +998,33 @@ button.under-model { color: inherit; }
 .md blockquote { margin: 0 0 12px; padding-left: 12px; border-left: 3px solid var(--stroke-strong); color: var(--fg-2); }
 .md a { color: var(--blue); text-decoration: none; }
 .md-src { position: relative; flex: 1; min-height: 0; font: 13px/1.55 var(--mono); }
+/* Two stacked layers that must occupy exactly the same box and wrap text at
+   exactly the same points: a highlighted <pre> underneath, and a transparent
+   textarea on top that owns the caret and the selection. Any difference in
+   size, padding or wrapping shows up as a selection drawn over the wrong text.
+
+   Two things used to break that. The global `textarea` rule caps height at
+   220px, which is right for the composer but left this textarea scrolling
+   inside a short box while the <pre> stayed full height — so a selection near
+   the top of the text appeared over a paragraph further down. And a textarea
+   falls back to its intrinsic `cols`/`rows` size unless width and height are
+   stated outright, which WebKit in particular does not stretch away. */
 .md-hl, .md-ta {
   position: absolute; inset: 0; margin: 0; padding: 22px 36px 48px;
   border: 0; white-space: pre-wrap; word-wrap: break-word; overflow: auto;
   font: inherit; line-height: inherit; tab-size: 2;
+  width: 100%; height: 100%; box-sizing: border-box;
+  min-width: 0; min-height: 0; max-width: none; max-height: none;
 }
-.md-hl { color: var(--fg); pointer-events: none; }
+/* Driven entirely by the textarea's scroll position; never scrolled directly,
+   and never showing a scrollbar of its own. */
+.md-hl { color: var(--fg); pointer-events: none; overflow: hidden; }
 .md-ta { color: transparent; caret-color: var(--fg); background: transparent; outline: 0; resize: none; z-index: 1; }
+/* A classic scrollbar would narrow the textarea's content box relative to the
+   <pre>, so the two layers would wrap at different points. Hidden here, as the
+   sidebar already does; wheel and keyboard scrolling are unaffected. */
+.md-ta { scrollbar-width: none; }
+.md-ta::-webkit-scrollbar { display: none; }
 .md-p { color: var(--md-p); }
 .md-h { color: var(--md-h); font-weight: 650; }
 .md-code { color: var(--green); }
