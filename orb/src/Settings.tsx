@@ -144,12 +144,24 @@ function BackendTab() {
   );
 }
 
-export function Settings() {
+export function Settings(p: { onOpenPage?: (id: string) => void } = {}) {
   return (
     <div class="s-body">
       <div class="s-inner">
         <h2>Settings</h2>
         <BackendTab />
+        <Show when={isConnected() && p.onOpenPage}>
+          <Card title="Execution">
+            <Row
+              title="Concurrency limits"
+              desc="Backend-wide mission and task concurrency. A project's own parallel-mission cap lives on that project's settings page."
+            >
+              <button class="s-btn" onClick={() => p.onOpenPage?.("execution")}>
+                Open
+              </button>
+            </Row>
+          </Card>
+        </Show>
         <Card title="Appearance">
           <Row title="Theme" desc="Auto follows your desktop appearance.">
             <Select

@@ -45,6 +45,7 @@ pub mod github_connection;
 pub mod hermes_tools;
 pub mod library;
 pub mod mcp;
+pub mod model_policy;
 pub mod node;
 pub mod nspawn;
 pub mod opencode;

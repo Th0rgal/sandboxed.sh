@@ -730,14 +730,12 @@ fn parse_bool(value: &str) -> Result<bool, String> {
     }
 }
 
+/// `DEFAULT_MODEL` outlives the model it names — production still ships
+/// `anthropic/claude-opus-4-8` in `/etc/open_agent/open_agent.env`. Upgrade any
+/// retired Opus/Fable alias to the current model of its line rather than
+/// maintaining a second list here; [`crate::model_policy`] owns the rule.
 fn upgrade_legacy_anthropic_default_model(model: String) -> String {
-    match model.trim() {
-        "claude-opus-4-8" | "claude-opus-4.8" => "claude-opus-5".to_string(),
-        "anthropic/claude-opus-4-8" | "anthropic/claude-opus-4.8" => {
-            "anthropic/claude-opus-5".to_string()
-        }
-        _ => model,
-    }
+    crate::model_policy::current_claude_model(model.trim()).into_owned()
 }
 
 #[cfg(test)]
