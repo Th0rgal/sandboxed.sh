@@ -70,9 +70,9 @@ test("slow local POST shows prompt immediately; accepted mission opens before sl
  await page.screenshot({path:"test-results/orb-launch-starting.png"});
  await page.emulateMedia({reducedMotion:"reduce"});await expect(page.locator(".launch-pulse")).toHaveCSS("animation-name","none");
  await page.waitForTimeout(1000);state.releasePost();await expect(page.getByPlaceholder("Send follow-up")).toBeVisible({timeout:1500});
- await expect(page.locator(".launch-status")).toContainText("Queued on Core");await expectGoalTurn(page,"main .scroll .user");
+ await expect(page.locator(".launch-status")).toContainText("Queued on Core");await expectGoalTurn(page,".user");
  expect(state.posts[0]).toMatchObject({backend:"grok",model_override:"grok-4.6",prompt,title:"Check remote startup without losing this…"});expect(state.posts[0]).not.toHaveProperty("remote_node_id");expect(state.posts[0]).not.toHaveProperty("remote_command");expect(state.posts[0].idempotency_key).toBeTruthy();
- state.releaseHistory();await expectGoalTurn(page,"main .scroll .user");
+ state.releaseHistory();await expectGoalTurn(page,".user");
  const timings=await page.evaluate(()=>(window as any).launchTiming);console.log("LAUNCH_TIMING",JSON.stringify(timings));expect(timings.optimistic).toBeLessThan(500);expect(timings.acceptedView).toBeLessThan(500);writeFileSync("test-results/launch-timings.json",JSON.stringify(timings,null,2));
 });
 
