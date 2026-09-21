@@ -79,8 +79,7 @@ const fmt = (ms: number) => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 };
 
-const WAVE_BARS = 40;
-const WAVE_ENV = Array.from({ length: WAVE_BARS }, (_, i) => Math.sin((i / (WAVE_BARS - 1)) * Math.PI));
+const WAVE_BARS = 320;
 const silentWave = () => Array.from({ length: WAVE_BARS }, () => 0);
 
 export function VoiceButton(p: {
@@ -105,9 +104,8 @@ export function VoiceButton(p: {
   let rec: Recorder | null = null;
   let tick: number | undefined;
   let errTimer: number | undefined;
-  let waveRaf = 0;
+  let waveTimer: number | undefined;
   let pendingLevel = 0;
-  let wavePhase = 0;
   let token = 0; // bumps on every start/cancel; late results with an old token are dropped
   let disposed = false;
   /** Conversation the current recording was started for; fixed at start, checked at every hand-off. */
@@ -154,23 +152,7 @@ export function VoiceButton(p: {
       candidate = await record()({
         onLevel: (l) => {
           if (!live()) return;
-          pendingLevel = Math.max(l, pendingLevel * 0.9);
-          if (waveRaf) return;
-          waveRaf = requestAnimationFrame(() => {
-            waveRaf = 0;
-            if (!live()) return;
-            const level = pendingLevel;
-            pendingLevel *= 0.84;
-            wavePhase += 0.32;
-            const phase = wavePhase;
-            setBars((prev) =>
-              prev.map((v, i) => {
-                const wobble = 0.42 + 0.58 * Math.abs(Math.sin(phase + i * 0.52));
-                const target = level * WAVE_ENV[i] * wobble;
-                return v + (target - v) * 0.42;
-              }),
-            );
-          });
+          pendingLevel = Math.max(l, pendingLevel);
         },
         maxSeconds: VOICE_MAX_SECONDS,
         onAutoStop: () => {
@@ -191,6 +173,12 @@ export function VoiceButton(p: {
     }
     rec = candidate;
     setBars(silentWave());
+    pendingLevel = 0;
+    waveTimer = window.setInterval(() => {
+      const level = Math.min(1, Math.max(0, pendingLevel));
+      pendingLevel = 0;
+      setBars(prev => [...prev.slice(1), level]);
+    }, 60);
     setState("recording");
     setElapsed(0);
     const t0 = rec.startedAt;
@@ -211,7 +199,7 @@ export function VoiceButton(p: {
     const scope = activeScope;
     rec = null;
     stopTimer();
-    if (waveRaf) { cancelAnimationFrame(waveRaf); waveRaf = 0; }
+    clearInterval(waveTimer); waveTimer = undefined;
     setState("transcribing");
     try {
       const wav = await r.stop();
@@ -245,7 +233,7 @@ export function VoiceButton(p: {
     rec?.cancel();
     rec = null;
     stopTimer();
-    if (waveRaf) { cancelAnimationFrame(waveRaf); waveRaf = 0; }
+    clearInterval(waveTimer); waveTimer = undefined;
     pendingLevel = 0;
     setBars(silentWave());
     setState("idle");
@@ -313,7 +301,7 @@ export function VoiceButton(p: {
     window.removeEventListener("keydown", onKey, true);
     window.removeEventListener("pointerdown", onPointerDownOutside);
     clearTimeout(errTimer);
-    if (waveRaf) cancelAnimationFrame(waveRaf);
+    clearInterval(waveTimer);
     if (status() === "transcribing") void bridge()?.cancel().catch(() => {});
     cancelRecording();
   });

@@ -1176,7 +1176,7 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 .voice-menu .pick-meta { color: var(--fg-4); font-size: 11px; margin-left: auto; }
 .voice-wave {
   flex: 1; min-width: 0; height: 22px; width: 100%;
-  display: flex; align-items: center; justify-content: center; gap: 2px;
+  display: flex; align-items: center; justify-content: flex-end; gap: 2px; overflow: hidden;
   color: color-mix(in srgb, var(--fg) 48%, transparent);
 }
 .voice-wave span {
