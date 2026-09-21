@@ -10,7 +10,7 @@ const SUB: Record<string, Array<{ name: string; kind: string }>> = {
   audit: [{ name: "spec.md", kind: "file" }],
 };
 
-async function setup(page: Page) {
+async function setup(page: Page, filesReady: Promise<void> = Promise.resolve()) {
   const posts: any[] = [];
   await page.addInitScript(() => {
     localStorage.setItem("orb.apiUrl", location.origin);
@@ -27,6 +27,7 @@ async function setup(page: Page) {
       return route.fulfill({ status: 503, body: "Runner admission unavailable" });
     }
     if (path.endsWith("/files")) {
+      await filesReady;
       const dir = url.searchParams.get("path") ?? "";
       return route.fulfill({ json: { entries: dir ? (SUB[dir] ?? []) : ENTRIES } });
     }
@@ -150,5 +151,18 @@ test("mentions survive goal mode and reach the goal prompt", async ({ page }) =>
 
   await expect.poll(() => posts.length).toBe(1);
   expect(posts[0].prompt).toBe("/goal audit @notes.md");
+  expect(posts[0].attachments).toEqual([{ kind: "file", path: "notes.md" }]);
+});
+
+test("sending waits for the attachment catalog instead of silently dropping typed mentions", async ({ page }) => {
+  let release!: () => void;
+  const ready = new Promise<void>(resolve => { release = resolve; });
+  const { posts, input } = await setup(page, ready);
+  await input.fill("Use @notes.md please");
+  await input.press("Enter");
+  await expect(input).toHaveValue("Use @notes.md please");
+  expect(posts).toHaveLength(0);
+  release();
+  await expect.poll(() => posts.length).toBe(1);
   expect(posts[0].attachments).toEqual([{ kind: "file", path: "notes.md" }]);
 });

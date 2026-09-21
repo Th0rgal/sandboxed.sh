@@ -1,0 +1,9 @@
+These are actual upstream declarations used by the three adapters, fetched on 2026-09-21.
+
+- Claude: published `@anthropic-ai/claude-agent-sdk@0.3.278`, `sdk-tools.d.ts`, `TodoWriteInput`. Package URL is recorded in the excerpt. [Official tool types](https://code.claude.com/docs/en/agent-sdk/typescript#todowrite).
+- Codex: [plan_tool.rs at 73129716c28bd56d49a8b02544934dcc8a961dc2](https://github.com/openai/codex/blob/73129716c28bd56d49a8b02544934dcc8a961dc2/codex-rs/protocol/src/plan_tool.rs).
+- OpenCode: [session-todo.ts at 70a24697ea0028e19f22712fd63059538cb4bee7](https://github.com/anomalyco/opencode/blob/70a24697ea0028e19f22712fd63059538cb4bee7/packages/schema/src/session-todo.ts). Its `Implement slice` input is copied from the [real tool test](https://github.com/anomalyco/opencode/blob/70a24697ea0028e19f22712fd63059538cb4bee7/packages/core/test/tool-todowrite.test.ts#L90).
+
+`../task-tools.json` uses the OpenCode test input and schema-derived Claude/Codex inputs. These are compatibility fixtures, not claimed production captures. The retained declaration excerpts make the source shapes and status domains reviewable. Native tool translation retains names and arguments in `src/backend/claudecode`, `src/backend/opencode`, and `src/backend/codex/mod.rs` (generic toolCall and synthetic bash translation). `src/api/ask/mod.rs` also recognizes precisely TodoWrite/update_plan/todowrite.
+
+`codex-turn-plan-schema.json` is the actual app-server `TurnPlanUpdatedNotification` schema from the same pinned Codex revision. `../codex-plan-notification.json` is its source-shaped compatibility fixture, shared by the Rust translator and Orb parser tests. The native wire uses `inProgress`; the translator emits `update_plan` with `in_progress` and retains the raw notification in the result. Exact consecutive replay is suppressed; valid empty plans clear the checklist.

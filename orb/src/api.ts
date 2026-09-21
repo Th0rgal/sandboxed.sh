@@ -626,17 +626,35 @@ export async function createMission(body: CreateMissionBody): Promise<Mission> {
   });
 }
 
+export interface QueuedMessage {
+  id: string;
+  content: string;
+  /** Durable run-start proof, independent of mission busy/terminal status. */
+  inflight?: boolean;
+  mission_id?: string | null;
+}
+/** This endpoint reads the authenticated user's durable control queue. */
+export async function listQueuedMessages(missionId: string): Promise<QueuedMessage[]> {
+  const rows = await api<QueuedMessage[]>(`/api/control/queue?mission_id=${encodeURIComponent(missionId)}`);
+  if (!Array.isArray(rows) || rows.some(row => !row || typeof row.id !== "string" || typeof row.content !== "string")) throw new Error("Invalid queue response");
+  return rows.filter(row => row.mission_id === missionId);
+}
+
+export class MessageRejectedError extends Error {}
+
 export async function sendMissionMessage(
   id: string,
   text: string,
   attachments?: MissionAttachment[],
+  clientMessageId: string = crypto.randomUUID(),
 ): Promise<{ id: string; queued: boolean; message_accepted?: boolean }> {
   const receipt = await api<{ id: string; queued: boolean; message_accepted?: boolean }>("/api/control/message", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content: text, mission_id: id, ...(attachments?.length ? { attachments } : {}) }),
+    body: JSON.stringify({ content: text, mission_id: id, client_message_id: clientMessageId, ...(attachments?.length ? { attachments } : {}) }),
   });
-  if (receipt.message_accepted === false) throw new Error("Message was not accepted. Your draft is kept.");
+  if (receipt.message_accepted === false) throw new MessageRejectedError("Message was not accepted. Your draft is kept.");
+  if (typeof receipt.id !== "string" || !receipt.id || typeof receipt.queued !== "boolean") throw new Error("Invalid message receipt. Your draft is kept.");
   return receipt;
 }
 

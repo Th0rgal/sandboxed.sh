@@ -2,16 +2,18 @@ import { For, Show, createSignal, createEffect, createMemo } from "solid-js";
 import * as Ic from "./icons";
 import { MdView } from "./Markdown";
 import { createStore, reconcile } from "solid-js/store";
-import { goalDraft, GoalTag } from "./goal";
+import { goalDraft } from "./goal";
 
+import { messagePresentation } from "./messagePresentation";
+import { latestChecklist, toolArgs, toolName, workSummary } from "./workModel";
 import { withoutFiller, type StreamItem } from "./transcriptModel";
 export { buildTranscript, applyStreamEvent } from "./transcriptModel";
 export type { StreamItem } from "./transcriptModel";
 
 /** Short, human-readable target for a tool call row (Cursor-style). */
 function toolTarget(name: string, args: unknown): string {
-  if (!args || typeof args !== "object") return "";
-  const a = args as Record<string, unknown>;
+  const a = toolArgs(args);
+  if (!a) return "";
   const pick = (...keys: string[]): string => {
     for (const k of keys) {
       const v = a[k];
@@ -20,14 +22,20 @@ function toolTarget(name: string, args: unknown): string {
     return "";
   };
   let t = "";
-  switch (name.toLowerCase()) {
+  switch (toolName(name)) {
+    case "exec_command":
+    case "run_terminal_command":
+    case "shell_command":
     case "bash":
       t = pick("command", "cmd");
       break;
+    case "read_file":
+    case "write_file":
+    case "edit_file":
     case "read":
     case "write":
     case "edit":
-      t = pick("file_path", "path", "file");
+      t = pick("file_path", "filePath", "path", "file");
       break;
     case "grep":
     case "glob":
@@ -65,12 +73,13 @@ function resultText(result: unknown): string {
  * text and no extra height, replacing the banner that used to sit above the
  * transcript announcing what the footer already says.
  */
-export function UserTurn(p: { text: string; pending?: boolean }) {
-  const goal = createMemo(() => goalDraft(p.text));
+export function UserTurn(p: { text: string; attached?: boolean; pending?: boolean }) {
+  const presentation = createMemo(() => messagePresentation(p.text));
+  const goal = createMemo(() => goalDraft(presentation().text));
   return (
     <div class={`user ${goal().kind === "goal" ? "goal" : ""} ${p.pending ? "pending" : ""}`}>
-      <Show when={goal().kind === "goal"}><GoalTag /></Show>
-      <span>{goal().kind === "goal" ? (goal() as { objective: string }).objective : p.text}</span>
+      <span>{goal().kind === "goal" ? (goal() as { objective: string }).objective : presentation().text}</span>
+      <Show when={p.attached || presentation().attached}><small class="user-context">Attached context</small></Show>
     </div>
   );
 }
@@ -155,17 +164,13 @@ function groupWork(input: StreamItem[], previous: Grouped[] = []): Grouped[] {
 function WorkFold(p: { items: WorkItem[] }) {
   const running = () => p.items.some((t) => (t.kind === "tool" ? !t.done : !t.done));
   const [open, setOpen] = createSignal(false);
-  const tools = () => p.items.filter((t) => t.kind === "tool").length;
   const current = () => {
     const cur = [...p.items].reverse().find((t) => (t.kind === "tool" ? !t.done : !t.done));
     if (!cur) return "Working…";
     if (cur.kind === "think") return "Thinking";
     return `${cur.name} ${toolTarget(cur.name, cur.args) ?? ""}`.trim();
   };
-  const summary = () => {
-    const n = tools();
-    return n === 0 ? "Thought" : `Worked · ${n} tool${n === 1 ? "" : "s"}`;
-  };
+  const summary = () => workSummary(p.items);
   return (
     <div class={`st-work ${open() ? "open" : ""}`}>
       <button class="st-work-head" onClick={() => setOpen(!open())}>
@@ -191,7 +196,8 @@ export function Transcript(p: { items: StreamItem[]; pending?: boolean }) {
   // Reconcile by stable keys: existing WorkFold/ToolRow instances and parsed
   // historical Markdown survive token updates and history resynchronization.
   const [grouped, setGrouped] = createStore<Grouped[]>([]);
-  const groups = createMemo<Grouped[]>((previous) => groupWork(p.items, previous), []);
+  const checklist = createMemo(() => latestChecklist(p.items));
+  const groups = createMemo<Grouped[]>((previous) => groupWork(p.items.filter(item => item.kind !== "user" || !item.queued), previous), []);
   /** Key of the last user turn, when nothing follows it yet. Compared by key
    * rather than identity: `reconcile` hands the loop store proxies, not the
    * original objects. */
@@ -217,7 +223,7 @@ export function Transcript(p: { items: StreamItem[]; pending?: boolean }) {
             case "user":
               // Only the turn still waiting for a reply animates: once anything
               // has been said or done after it, the work is visible on its own.
-              return <UserTurn text={item.text} pending={p.pending && item.key === lastUserKey()} />;
+              return <UserTurn text={item.text} attached={item.attached} pending={p.pending && item.key === lastUserKey()} />;
             case "think":
               return <ThinkBlock item={item} />;
             case "text":
@@ -233,6 +239,15 @@ export function Transcript(p: { items: StreamItem[]; pending?: boolean }) {
           }
         }}
       </For>
+      <Show when={checklist()?.tasks.length}>
+        <section class="mission-tasks" id="mission-tasks" aria-label="Tasks" tabIndex={-1}>
+          <div class="tasks-heading"><strong>Tasks</strong><span>{checklist()!.tasks.filter(task => task.status === "completed").length}/{checklist()!.tasks.length} completed</span></div>
+          <progress aria-label="Task progress" max={checklist()!.tasks.length} value={checklist()!.tasks.filter(task => task.status === "completed").length} />
+          <ol><For each={checklist()!.tasks}>{task => <li data-status={task.status}>
+            <span class={`task-state ${task.status === "in_progress" ? "shimmer" : ""}`} aria-label={task.status.replaceAll("_", " ")}>{task.status === "completed" ? "✓" : task.status === "cancelled" ? "−" : task.status === "in_progress" ? "◉" : "○"}</span><span>{task.text}</span>
+          </li>}</For></ol>
+        </section>
+      </Show>
     </>
   );
 }

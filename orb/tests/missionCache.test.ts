@@ -30,3 +30,28 @@ describe("transcript first-paint cache", () => {
     expect(peekReadyTranscript("m1")?.items).toEqual([user("hi")]);
   });
 });
+
+import { vi, afterEach } from "vitest";
+import { loadTranscript } from "../src/missionCache";
+afterEach(()=>vi.unstubAllGlobals());
+it("reload joins durable pending IDs with delivered history and preserves order",async()=>{
+  vi.stubGlobal("fetch",vi.fn(async (url:string)=>new Response(JSON.stringify(url.includes('/queue') ? [
+    {id:"one",content:"same",mission_id:"m"},{id:"two",content:"same",mission_id:"m"},{id:"other",content:"private",mission_id:"other"},
+  ] : [{id:1,event_id:"one",event_type:"user_message",content:"same",sequence:1,metadata:{queued:false},timestamp:""}]))));
+  const snap=await loadTranscript("m");
+  expect(snap.items).toMatchObject([{messageId:"one",queued:false},{messageId:"two",queued:true}]);
+  expect(snap.queueError).toBeUndefined();
+});
+it("queue read failure preserves readable history and reports the missing queue evidence",async()=>{
+  vi.stubGlobal("fetch",vi.fn(async (url:string)=>url.includes('/queue') ? new Response("Unavailable",{status:503}) : new Response(JSON.stringify([{id:1,event_id:"one",event_type:"user_message",content:"Known history",sequence:1,timestamp:""}]))));
+  const snap=await loadTranscript("m");
+  expect(snap.items).toMatchObject([{text:"Known history",queued:false}]);
+  expect(snap.queueError).toContain("Queued messages could not refresh");
+});
+it("durable inflight evidence confirms the ID while the transcript logger is behind",async()=>{
+  vi.stubGlobal("fetch",vi.fn(async (url:string)=>new Response(JSON.stringify(url.includes('/queue') ? [
+    {id:"dispatched",content:"same",mission_id:"m",inflight:true},{id:"waiting",content:"same",mission_id:"m",inflight:false},
+  ] : []))));
+  const snap=await loadTranscript("m");
+  expect(snap.items).toMatchObject([{messageId:"dispatched",queued:false},{messageId:"waiting",queued:true}]);
+});

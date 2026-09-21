@@ -166,7 +166,7 @@ export function launchError(error: unknown): string {
  * Everything else stays: anything waiting on the user, anything the server is
  * unsure about, and every failure.
  */
-const QUIET_PHASES = new Set(["Starting", "Running", "Resuming", "Remote job accepted", "Remote job finished"]);
+const QUIET_PHASES = new Set(["Starting", "Running", "Resuming"]);
 
 export function missionPhase(mission: Mission | null, activity: boolean) {
   const status = mission?.status;
@@ -181,10 +181,10 @@ export function missionPhase(mission: Mission | null, activity: boolean) {
   const job = mission?.remote_job;
   if (job || mission?.execution?.state === "waiting_remote_job") {
     // Active means durable acceptance, not that the selected harness is running.
-    if (job?.phase === "submit_ambiguous") return {label:"Checking submission",moving:true,detail:"The backend is checking whether the remote node accepted the job."};
-    if (job?.phase === "unobserved" || job?.phase === "lease_only") return {label:"Checking remote job",moving:true,detail:"Waiting for a current remote job status. Execution is not confirmed."};
     if (["failed", "lost", "cancelled", "canceled"].includes(job?.node_state ?? "") || (job?.exit_code != null && job.exit_code !== 0)) return {label:"Remote job stopped",moving:false,failed:true,detail:job?.error ?? job?.terminal_reason ?? `Remote job ${job?.node_state ?? "exited"}${job?.exit_code != null ? ` (exit ${job.exit_code})` : ""}.`};
     if (job?.phase === "finished" || job?.finished_at) return {label:"Remote job finished",moving:false,detail:"Waiting for the backend to finalize the mission."};
+    if (job?.phase === "submit_ambiguous") return {label:"Checking submission",moving:true,detail:"The backend is checking whether the remote node accepted the job."};
+    if (job?.phase === "unobserved" || job?.phase === "lease_only") return {label:"Checking remote job",moving:true,detail:"Waiting for a current remote job status. Execution is not confirmed."};
     if (job?.node_state === "running") return {label:"Running",moving:true,detail:"The remote node reports the job is running."};
     if (job?.node_state === "queued") return {label:"Queued",moving:true,detail:"The remote node is waiting for a runner slot."};
     return {label:"Remote job accepted",moving:true,detail:"Waiting for the remote node to confirm execution."};
@@ -220,7 +220,7 @@ export function phaseIsQuiet(phase: { label: string; failed?: boolean; moving?: 
  */
 export function LaunchStatus(p: { destination: string; mission?: Mission | null; activity?: boolean; submitting?: boolean; goal?: string | null }) {
   const phase = () => p.submitting ? {label:"Starting",moving:true,detail:"Submitting your request…",failed:false} : missionPhase(p.mission ?? null, !!p.activity);
-  return <Show when={!phaseIsQuiet(phase())}>
+  return <Show when={!phaseIsQuiet(phase()) && !(p.activity && phase().label === "Remote job accepted")}>
     <div class={`launch-status ${phase().failed ? "failed" : ""}`} role="status" aria-live="polite">
       <div><Show when={phase().moving}><span class="launch-pulse" aria-hidden="true" /></Show><Show when={p.goal}><GoalTag class="small" /></Show><span>{phase().label} on {p.destination}</span></div>
       <Show when={phase().detail}><p>{phase().detail}</p></Show>

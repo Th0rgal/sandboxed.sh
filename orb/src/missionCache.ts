@@ -1,8 +1,9 @@
+import { listQueuedMessages } from "./api";
 import { buildTranscript, type StreamItem } from "./transcriptModel";
 import { getMissionEvents, storedToStream, type StreamEvent } from "./stream";
 import { cacheBusy, cacheLoad, cachePeek, cachePut } from "./pageCache";
 
-export type TranscriptSnap = { items: StreamItem[]; stream: StreamEvent[]; fromLog?: boolean };
+export type TranscriptSnap = { items: StreamItem[]; stream: StreamEvent[]; fromLog?: boolean; queueError?: string };
 
 const key = (id: string) => `m:${id}:tx`;
 const heightKey = (id: string) => `m:${id}:h`;
@@ -38,13 +39,22 @@ export function putTranscriptHeight(id: string, height: number) {
 }
 
 async function fetchTranscript(id: string): Promise<TranscriptSnap> {
+  // Read pending first, then delivered history. Any delivery racing this read
+  // wins by message identity in the reducer; held SSE fills the live boundary.
+  let queueError: string | undefined;
+  const queued = await listQueuedMessages(id).catch(error => {
+    queueError = `Queued messages could not refresh: ${error instanceof Error ? error.message : String(error)}`;
+    return [];
+  });
   const events = await getMissionEvents(id);
   const stream: StreamEvent[] = [];
   for (const row of events) {
     const ev = storedToStream(row);
     if (ev) stream.push(ev);
   }
-  return { items: buildTranscript(stream), stream, fromLog: true };
+  const queueEvents: StreamEvent[] = queued.map(row => ({ type: "user_message", eventId: row.id, data: { id: row.id, content: row.content, queued: row.inflight !== true } }));
+  // History first puts accepted user turns at their actual transcript positions.
+  return { items: buildTranscript([...stream, ...queueEvents]), stream, fromLog: true, queueError };
 }
 
 export function loadTranscript(id: string): Promise<TranscriptSnap> {
@@ -53,5 +63,5 @@ export function loadTranscript(id: string): Promise<TranscriptSnap> {
 
 export function prefetchTranscript(id: string) {
   if (peekReadyTranscript(id) || cacheBusy(key(id))) return;
-  void loadTranscript(id);
+  void loadTranscript(id).catch(() => {});
 }

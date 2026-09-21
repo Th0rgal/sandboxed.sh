@@ -371,6 +371,16 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 .group.has > .tree-kids:last-child::before {
   bottom: 14px;
 }
+.sidebar-tree { --indent: 16px; --rail: 14px; --tree: color-mix(in srgb, var(--fg) 18%, transparent); }
+.tree-entry { position: relative; }
+.tree-entry > .row { padding-left: calc(6px + var(--depth) * var(--indent)); }
+.tree-entry > .row.project.expanded { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.tree-connectors { position: absolute; inset: 0; pointer-events: none; }
+.tree-connectors i { position: absolute; left: calc(var(--rail) + var(--column) * var(--indent)); border-left: 1px solid var(--tree); }
+.tree-rail, .tree-junction { top: 0; bottom: 0; }
+.tree-junction.last { bottom: 50%; }
+.tree-junction::after { content: ""; position: absolute; top: 15px; left: 0; width: 7px; border-top: 1px solid var(--tree); }
+.tree-child-link { top: 23px; bottom: 0; }
 .sb-foot {
   flex: none;
   display: flex;
@@ -1282,8 +1292,10 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 .steer-chip.pending { border: 1px solid var(--stroke-strong); }
 .steer-chip-kind { flex: none; color: var(--fg-4); font-size: 11px; }
 .steer-chip-body { color: var(--fg-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.steer-composer { grid-template-columns: 1fr auto auto; }
-.steer-composer .composer-field { grid-column: 1 / -1; }
+.steer-composer { grid-template-columns: 1fr auto; padding-left: 16px; }
+.steer-composer .composer-field { grid-column: 1; }
+.steer-composer .send-slot { grid-column: 2; }
+.steer-options { display: flex; align-items: center; padding: 0 10px; }
 .steer-run {
   display: inline-flex; align-items: center; gap: 6px;
   font-size: 12px; color: var(--fg-3); padding: 0 4px 2px;
@@ -1295,6 +1307,30 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
 }
 .attach-chip button { color: var(--fg-4); }
 
+.queued-messages { margin-bottom: 10px; padding: 10px 12px; border: 1px solid var(--stroke); border-radius: 10px; max-height: 180px; overflow-y: auto; }
+.queued-label { font-size: 11px; color: var(--fg-3); margin-bottom: 6px; }
+.queued-messages ol { margin: 0; padding-left: 20px; }
+.queued-messages li { font-size: 12px; color: var(--fg-2); }
+.queued-messages .user { white-space: pre-wrap; margin: 4px 0; padding: 0; background: none; }
+
+.mission-tasks { margin: 18px 0; padding: 14px; border: 1px solid var(--stroke); border-radius: 10px; }
+.tasks-heading { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
+.tasks-heading span { color: var(--fg-3); }
+.mission-tasks progress { width: 100%; height: 4px; accent-color: var(--fg-2); margin: 10px 0; }
+.mission-tasks ol { list-style: none; padding: 0; margin: 0; }
+.mission-tasks li { display: flex; align-items: baseline; gap: 9px; margin: 7px 0; font-size: 13px; }
+.task-state { flex: none; width: 14px; color: var(--fg-3); }
+.mission-tasks li[data-status="cancelled"] { color: var(--fg-3); text-decoration: line-through; }
+.tasks-jump { margin-top: 6px; color: var(--fg-3); font-size: 12px; }
+.tasks-jump:hover { color: var(--fg); }
+
+.tree-entry > .row.note { padding-left: calc(30px + var(--depth) * var(--indent)); }
+.queued-messages .user { border: 0; border-radius: 0; line-height: 1.5; }
+.user-context { display: block; color: var(--fg-3); font-size: 11px; margin-top: 3px; }
+.mission-tasks progress { appearance: none; border: 0; border-radius: 2px; background: var(--stroke); }
+.mission-tasks progress::-webkit-progress-bar { background: var(--stroke); border-radius: 2px; }
+.mission-tasks progress::-webkit-progress-value { background: var(--fg-2); border-radius: 2px; }
+.mission-tasks progress::-moz-progress-bar { background: var(--fg-2); border-radius: 2px; }
 /* ---------- project settings / execution pages ---------- */
 .ps-page { padding-top: 22px !important; }
 .ps-page > .page-head h2 { font-size: 20px; font-weight: 600; margin: 0 0 8px; letter-spacing: -.02em; }

@@ -11,7 +11,7 @@ test("actual App project chooser searches, selects and creates with keyboard and
    writes.push(r.postDataJSON());if(fail)return route.fulfill({status:503,body:"Project service unavailable"});
    const item={...r.postDataJSON(),status:"active",updated_at:"2026-09-20"};projects.push(item);return route.fulfill({json:item});
   }
-  const json=path==="/api/projects"?{projects}:path==="/api/control/missions"&&new URL(r.url()).searchParams.get("project")==="project-0"?Array.from({length:4},(_,i)=>({id:`mission-${i}`,title:["Importer slice: modifiers + structs","Address allocation bounds","Review the guard","Field generation"][i],status:"active",workspace_name:"project-0"})):path.endsWith("/missions")?[]:path.endsWith("/files")?{entries:[]}:path.endsWith("/crons")?{jobs:[]}:path.endsWith("/controller")?{job:null,runs:[]}:{};
+  const json=path==="/api/control/queue"?[]:path==="/api/projects"?{projects}:path==="/api/control/missions"&&new URL(r.url()).searchParams.get("project")==="project-0"?Array.from({length:4},(_,i)=>({id:`mission-${i}`,title:["Importer slice: modifiers + structs","Address allocation bounds","Review the guard","Field generation"][i],status:"active",workspace_name:"project-0"})):path.endsWith("/missions")?[]:path.endsWith("/files")?{entries:[]}:path.endsWith("/crons")?{jobs:[]}:path.endsWith("/controller")?{job:null,runs:[]}:{};
   await route.fulfill({json});
  });
  await page.goto("/");

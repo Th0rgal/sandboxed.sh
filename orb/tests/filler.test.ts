@@ -133,3 +133,12 @@ describe("no banner for a healthy running mission", () => {
     expect(phaseIsQuiet(remote({ phase: "running", node_state: "running" }))).toBe(true);
   });
 });
+
+it("preserves a punctuation answer when meaningful text belongs to another turn", () => {
+  const items: StreamItem[] = [
+    { kind: "text", key: "a", text: ".", live: false },
+    { kind: "user", key: "b", text: "Now explain it" },
+    { kind: "text", key: "c", text: "An explanation", live: false },
+  ];
+  expect(withoutFiller(items)).toEqual(items);
+});

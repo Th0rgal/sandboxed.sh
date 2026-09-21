@@ -123,3 +123,8 @@ describe("scanning", () => {
     expect(scanMentions("@notes.md").map((m) => m.value)).toEqual(["notes.md"]);
   });
 });
+
+it("keeps case-sensitive reference paths distinct", () => {
+  const files = [file("Notes.md"), file("notes.md")];
+  expect(mentionedChips("@Notes.md @notes.md", files).map(c => c.path)).toEqual(["Notes.md", "notes.md"]);
+});
