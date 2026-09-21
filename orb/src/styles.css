@@ -330,22 +330,22 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
   position: absolute;
   left: 13px;
   pointer-events: none;
-  border-color: color-mix(in srgb, var(--fg) 7%, transparent);
+  border-color: color-mix(in srgb, var(--fg) 4%, transparent);
 }
 .group.has > :not(.row.project)::before {
   top: 0;
   bottom: 0;
   width: 1px;
-  background: color-mix(in srgb, var(--fg) 7%, transparent);
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
 }
 .group.has > :not(.row.project)::after {
   top: 50%;
-  width: calc(7px + (var(--depth, 1) - 1) * 12px);
-  height: 7px;
-  margin-top: -7px;
+  width: calc(5px + (var(--depth, 1) - 1) * 12px);
+  height: 4px;
+  margin-top: -4px;
   border-left: 1px solid;
   border-bottom: 1px solid;
-  border-bottom-left-radius: 5px;
+  border-bottom-left-radius: 3px;
   background: none;
 }
 .group.has > :not(.row.project):last-child::before {
