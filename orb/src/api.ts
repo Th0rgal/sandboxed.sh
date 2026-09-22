@@ -71,7 +71,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     const text = (await res.text().catch(() => "")).trim();
-    throw new ApiError(res.status, text.slice(0, 200));
+    throw new ApiError(res.status, text);
   }
   return res.json().catch(() => undefined as unknown as T);
 }

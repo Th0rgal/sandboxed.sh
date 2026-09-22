@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createSignal, onCleanup, onMount, createEffect, on } from "solid-js";
 import { mergeById, pollWhileVisible } from "./poll";
 import { createStore } from "solid-js/store";
@@ -666,8 +667,8 @@ export function LiveProjectsSection(p: {
       <Show when={error()}>
         <div class="row note">{error()}</div>
       </Show>
-      <Show when={cronWarning()}><p class="st-error" role="alert">{cronWarning()}</p></Show>
-      <Show when={actionError()}><p class="st-error" role="alert">{actionError()}</p></Show>
+      <Show when={cronWarning()}><ErrorNotice error={cronWarning()!} /></Show>
+      <Show when={actionError()}><ErrorNotice error={actionError()!} /></Show>
       <SidebarTree nodes={tree()} label="Projects" selected={p.selected()} render={renderRow} />
       <Show when={projects().length === 0 && !error()}>
         <div class="row note">No projects on the core backend.</div>
@@ -841,7 +842,7 @@ export function ProjectFileView(p: { slug: string; path: string }) {
           <div class="scroll">
             <div class="col">
               <Show when={state() === "error"}>
-                <p class="st-error">{error()}</p>
+                <ErrorNotice error={error()!} />
               </Show>
               <Show when={text() !== null} fallback={<FileSkeleton />}>
                 <MdView text={text() ?? ""} />

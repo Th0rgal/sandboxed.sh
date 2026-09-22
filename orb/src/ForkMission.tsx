@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createSignal, createEffect, onMount, onCleanup } from "solid-js";
 import { forkMission, shortModelLabel, type HarnessChoice, type Mission } from "./api";
 import { effortLabel, supportedEfforts } from "./effort";
@@ -78,7 +79,7 @@ export function ForkMission(p: { mission: Mission; choices: HarnessChoice[]; des
     </Show>
     <div class="fork-feedback">
       <Show when={busy()}><div class="menu-group" role="status">Forking…</div></Show>
-      <Show when={error()}><p class="st-error" role="alert">{error()}</p></Show>
+      <Show when={error()}><ErrorNotice error={error()!} /></Show>
     </div>
   </div>;
 }

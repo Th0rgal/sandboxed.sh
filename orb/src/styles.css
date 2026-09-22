@@ -1426,3 +1426,17 @@ button.fork-trigger:hover { color: var(--fg); }
 .fork-feedback:has([role]) { background: var(--menu-bg); border: 1px solid var(--stroke); border-radius: 8px; padding: 8px; }
 .fork-feedback .st-error { max-width: none; margin: 0; }
 .fork-cascade .menu-item:disabled { opacity: .4; cursor: default; }
+
+/* Shared inline errors sit beside the action that failed, without competing with the draft. */
+.error-notice { display: flex; align-items: flex-start; gap: 10px; min-width: 0; margin-top: 10px; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--red) 28%, var(--stroke)); border-radius: 10px; background: color-mix(in srgb, var(--red) 3%, var(--bg)); color: var(--fg-2); text-align: left; font-size: 13px; line-height: 1.5; }
+.error-notice-icon { flex: none; color: var(--red); margin-top: 2px; }
+.error-notice-body { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.error-notice strong { color: var(--fg); font-weight: 500; }
+.error-notice p { margin: 3px 0 0; white-space: pre-wrap; }
+.error-notice details, .legacy-log { margin-top: 8px; color: var(--fg-3); font-size: 12px; }
+.error-notice summary, .legacy-log summary { cursor: pointer; width: fit-content; }
+.error-notice pre, .legacy-log pre { margin: 8px 0 0; padding: 10px; border-radius: 6px; background: var(--bg-inset); color: var(--fg-2); font: 11px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; }
+.error-notice-actions { margin-top: 8px; }
+.error-notice > .icon-btn { flex: none; width: 22px; height: 22px; }
+.fork-feedback:has(.error-notice) { padding: 0; border: 0; background: none; }
+.fork-feedback .error-notice { margin: 0; }

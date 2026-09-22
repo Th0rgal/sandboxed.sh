@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createEffect, createMemo, createSignal, on, onCleanup, type JSX } from "solid-js";
 import { createStore } from "solid-js/store";
 import * as Ic from "./icons";
@@ -299,11 +300,10 @@ export function CronForm(p: {
       </details>
 
       </fieldset>
+      <Show when={error()}><ErrorNotice error={error()!} title="Couldn’t save the controller" /></Show>
       <Show when={p.creating || dirtyCount() > 0 || skillInput().trim() || error()}>
         <div class="cs-savebar">
-          <span class={error() ? "cs-warn" : ""}>
-            {error() ?? `${dirtyCount()} unsaved change${dirtyCount() === 1 ? "" : "s"}`}
-          </span>
+          <span>{`${dirtyCount()} unsaved change${dirtyCount() === 1 ? "" : "s"}`}</span>
           <span class="dlg-spacer" />
           <Show when={p.onClose}><button class="s-btn sm quiet" disabled={saving()} onClick={() => {
             if (!(dirtyCount() || skillInput().trim()) || window.confirm("Discard this cron draft?")) { discard(); p.onClose?.(); }

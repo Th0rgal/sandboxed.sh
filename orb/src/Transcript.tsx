@@ -1,3 +1,5 @@
+import { remoteLog } from "./remoteLog";
+import { ErrorNotice } from "./ErrorNotice";
 import { forkContext } from "./forkContext";
 import { For, Show, createSignal, createEffect, createMemo } from "solid-js";
 import * as Ic from "./icons";
@@ -235,13 +237,13 @@ export function Transcript(p: { items: StreamItem[]; pending?: boolean }) {
             case "text":
               return (
                 <div class={`st-text ${item.live ? "live" : ""}`}>
-                  <MdView text={item.text} compact />
+                  <AssistantText text={item.text} />
                 </div>
               );
             case "tool":
               return <ToolRow item={item} />;
             case "error":
-              return <p class="st-error">{item.text}</p>;
+              return <ErrorNotice error={item.text} title="Mission failed" />;
           }
         }}
       </For>
@@ -256,4 +258,9 @@ export function Transcript(p: { items: StreamItem[]; pending?: boolean }) {
       </Show>
     </>
   );
+}
+
+function AssistantText(p: { text: string }) {
+  const content = createMemo(() => remoteLog(p.text));
+  return <><MdView text={content().text} compact /><Show when={content().details}><details class="legacy-log"><summary>Original execution log</summary><pre>{content().details}</pre></details></Show></>;
 }

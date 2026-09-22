@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createSignal } from "solid-js";
 import { ArrowUpIcon, Spinner } from "./icons";
 import { addProjectSteer, controllerAction, type ProjectSteer, type ProjectSteers } from "./api";
@@ -93,7 +94,7 @@ export function SteerComposer(p: {
         </div>
       </div>
       <Show when={error()}>
-        <p class="st-error cr-error">{error()}</p>
+        <ErrorNotice error={error()!} />
       </Show>
     </div>
   );

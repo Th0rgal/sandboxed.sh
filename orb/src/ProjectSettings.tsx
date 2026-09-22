@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createSignal, onCleanup } from "solid-js";
 import * as Ic from "./icons";
 import { pollWhileVisible } from "./poll";
@@ -128,7 +129,7 @@ export function ProjectSettings(p: { slug: string; onOpenPage: (id: string) => v
           Settings for the project <code>{p.slug}</code> on the connected backend.
         </p>
         <Show when={error()}>
-          <p class="st-error" role="alert">{error()}</p>
+          <ErrorNotice error={error()!} />
         </Show>
         <Show when={loaded()} fallback={<ControllerSkeleton />}>
           <section class="s-sec">
@@ -172,7 +173,7 @@ export function ProjectSettings(p: { slug: string; onOpenPage: (id: string) => v
               </div>
             </div>
             <Show when={saveError()}>
-              <p class="st-error" role="alert">{saveError()}</p>
+              <ErrorNotice error={saveError()!} />
             </Show>
             <Show when={saved()}>
               <p class="ps-saved" role="status">Saved. Only this project's limit changed.</p>

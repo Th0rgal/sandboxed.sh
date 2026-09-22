@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { LaunchStatus, MissionPending, missionPhase, phaseIsQuiet, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, launchRefusal, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, missionSettingsIdle, dockModelLabel, type LaunchReceipt, type LaunchRefusal, type RemoteSupport } from "./missionLaunch";
 import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, GoalTag, EMPTY_GOAL_ERROR, absorbGoalPrefix, composerModes, filterSlash, slashQuery, modePrompt, ModeChip, type ComposerMode } from "./goal";
 import { atQuery, chipToAttachment, filterAttach, insertMention, loadAttachItems, mentionedChips, type AttachChip, type AttachItem } from "./attach";
@@ -1702,30 +1703,6 @@ export default function App() {
                     </Show>
                   </div>
                 </div>
-                <Show when={createError()}>
-                  <div class="launch-refusal" role="alert">
-                    <p class="st-error">{createError()}</p>
-                    <Show when={createRefusal()}>
-                      {(r) => (
-                        <div class="launch-refusal-actions">
-                          <Show when={r().refusal.kind === "project_cap" && r().project}>
-                            <span class="launch-refusal-meta">
-                              {(r().refusal as Extract<LaunchRefusal, { kind: "project_cap" }>).active} of{" "}
-                              {(r().refusal as Extract<LaunchRefusal, { kind: "project_cap" }>).cap} unfinished
-                            </span>
-                          </Show>
-                          <Show when={r().project}>
-                            {(slug) => (
-                              <button class="s-btn sm" onClick={() => open(`ps:${slug()}`)}>
-                                Open project settings
-                              </button>
-                            )}
-                          </Show>
-                        </div>
-                      )}
-                    </Show>
-                  </div>
-                </Show>
                 {/* The optimistic window: the prompt appears immediately and animates while
     the request is in flight. No banner and no reserved space — LaunchStatus
     stays silent for a healthy launch and speaks only if it is refused. */}
@@ -1750,6 +1727,30 @@ export default function App() {
                   projectSlug={effectiveNewProject()}
                   onAttachments={setAttachChips}
                 />
+                <Show when={createError()}>
+                  <ErrorNotice error={createError()!} title="Couldn’t start the mission" onDismiss={() => setCreateError(null)}>
+                    <Show when={/GiB required.*GiB is free/.test(createError()!)}><button class="s-btn sm" onClick={() => setEnvOpen("machine")}>Choose machine</button></Show>
+                    <Show when={createRefusal()}>
+                      {(r) => (
+                        <div class="launch-refusal-actions">
+                          <Show when={r().refusal.kind === "project_cap" && r().project}>
+                            <span class="launch-refusal-meta">
+                              {(r().refusal as Extract<LaunchRefusal, { kind: "project_cap" }>).active} of{" "}
+                              {(r().refusal as Extract<LaunchRefusal, { kind: "project_cap" }>).cap} unfinished
+                            </span>
+                          </Show>
+                          <Show when={r().project}>
+                            {(slug) => (
+                              <button class="s-btn sm" onClick={() => open(`ps:${slug()}`)}>
+                                Open project settings
+                              </button>
+                            )}
+                          </Show>
+                        </div>
+                      )}
+                    </Show>
+                  </ErrorNotice>
+                </Show>
                 </div>
               </div>
             </div>
@@ -2268,9 +2269,6 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
               <MissionPending destination={missionDestination(mission(), receipt)} label={phaseLabel()} />
             </Show>
           </Show>
-          <Show when={sendError() || error() || queueError()}>
-            <p class="s-lead" role="alert">{sendError() || error() || queueError()}</p>
-          </Show>
         </div>
       </div>
       <div class="dock">
@@ -2292,6 +2290,9 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
             projectSlug={mission()?.project ?? undefined}
             onAttachments={setFollowAttach}
           />
+          <Show when={sendError() || error() || queueError()}>
+            <ErrorNotice error={(sendError() || error() || queueError())!} title={sendError() ? "Couldn’t send your message" : "Couldn’t load the conversation"} onDismiss={() => { setSendError(null); setError(null); setQueueError(null); }} />
+          </Show>
           <Show when={latestChecklist(items())?.tasks.length}>
             <button class="tasks-jump" onClick={() => { const tasks = scroller?.querySelector<HTMLElement>(".mission-tasks"); tasks?.scrollIntoView({ behavior: "smooth", block: "center" }); tasks?.focus({ preventScroll: true }); }}>Tasks</button>
           </Show>

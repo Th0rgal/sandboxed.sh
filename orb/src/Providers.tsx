@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import * as Ic from "./icons";
@@ -464,7 +465,7 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
       </Show>
       <Show when={phase() === "failed"}>
         <p class="s-lead">Could not start the login flow.</p>
-        <p class="s-row-desc">{error()}</p>
+        <ErrorNotice error={error()!} />
         <Show when={/^(404|405)\b/.test(error() ?? "")}>
           <p class="s-row-desc">This backend build does not expose the login endpoints yet — deploy the updated sandboxed.sh first.</p>
         </Show>
@@ -496,7 +497,7 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
           </Field>
         </Show>
         <Show when={error()}>
-          <p class="s-row-desc">{error()}</p>
+          <ErrorNotice error={error()!} />
         </Show>
         <Show when={session()?.flow !== "device"}>
           <div class="p-acc-actions">

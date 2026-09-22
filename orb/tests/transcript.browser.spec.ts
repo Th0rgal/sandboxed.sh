@@ -65,3 +65,13 @@ test("native Grok canary final assistant_message then text_delta renders once",a
   await expect(page.locator(".st-text")).toContainText("spark-de79");
   await page.screenshot({path:"test-results/orb-native-canary-once.png"});
 });
+
+test("legacy OpenCode results render as Markdown with the raw log folded away",async({page})=>{
+ await page.goto("/tests/transcript.html");await page.waitForFunction(()=>!!(window as any).transcriptHarness);
+ await page.evaluate(()=>{
+  const raw="Remote node 'dgx-spark' job 3dff58d2-508c-458e-90c1-701e402a6b5f finished with state 'succeeded' (exit Some(0))\n\nlog tail:\ntruncated first line...\n"+JSON.stringify({type:"text",sessionID:"ses_native",part:{id:"part_1",text:"## Status\n\nRunning and durable."}});
+  (window as any).transcriptHarness.reset([{type:"assistant_message",data:{content:raw}}]);
+ });
+ await expect(page.getByRole("heading",{name:"Status"})).toBeVisible();await expect(page.locator(".legacy-log pre")).toBeHidden();
+ await page.getByText("Original execution log").click();await expect(page.locator(".legacy-log pre")).toContainText('"sessionID":"ses_native"');
+});

@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { Show, createSignal, onCleanup } from "solid-js";
 import { pollWhileVisible } from "./poll";
 import { getGlobalSettings, isConnected, updateGlobalSettings, type GlobalSettings } from "./api";
@@ -76,7 +77,7 @@ export function ExecutionSettings(p: { onOpenPage?: (id: string) => void }) {
         </div>
         <p class="s-lead">Limits that apply to the whole backend, across every project.</p>
         <Show when={error()}>
-          <p class="st-error" role="alert">{error()}</p>
+          <ErrorNotice error={error()!} />
         </Show>
         <Show when={loaded()} fallback={<ControllerSkeleton />}>
           <section class="s-sec">
@@ -120,7 +121,7 @@ export function ExecutionSettings(p: { onOpenPage?: (id: string) => void }) {
               </Show>
             </div>
             <Show when={saveError()}>
-              <p class="st-error" role="alert">{saveError()}</p>
+              <ErrorNotice error={saveError()!} />
             </Show>
             <Show when={saved()}>
               <p class="ps-saved" role="status">Saved. Only the backend-wide limit changed.</p>

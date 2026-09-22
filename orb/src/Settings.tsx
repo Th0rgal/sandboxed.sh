@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createSignal, type JSX } from "solid-js";
 import * as Ic from "./icons";
 import { clearConnection, getApiUrl, isConnected, login, setApiUrl } from "./api";
@@ -193,7 +194,7 @@ function BackendTab() {
         </Row>
       </Card>
       <Show when={error()}>
-        <div class="p-toast">{error()}</div>
+        <ErrorNotice error={error()!} />
       </Show>
     </>
   );

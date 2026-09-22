@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createMemo, createSignal, onCleanup } from "solid-js";
 import { MdView } from "./Markdown";
 import { pollWhileVisible } from "./poll";
@@ -150,7 +151,7 @@ function RunCard(p: { run: ControllerRun }) {
           <MdView text={p.run.report} compact />
         </Show>
         <Show when={p.run.error}>
-          <p class="st-error cr-error">{p.run.error}</p>
+          <ErrorNotice error={p.run.error!} />
         </Show>
         <Show when={p.run.ctrl || (p.run.source && p.run.source !== "builtin")}>
           <div class="cr-meta">
@@ -211,7 +212,7 @@ function FailedFold(p: { runs: ControllerRun[]; error: string }) {
         <p class="cr-failed-title">
           {p.runs.length === 1 ? "Tick failed" : `${p.runs.length} ticks failed`} <span class="cr-failed-span">· {span()}</span>
         </p>
-        <p class="st-error cr-error">{p.error}</p>
+        <ErrorNotice error={p.error!} />
       </div>
     </div>
   );
@@ -317,10 +318,10 @@ export function ControllerView(p: { slug: string; id?: string }) {
                   </div>
                 </div>
                 <Show when={error()}>
-                  <p class="st-error cr-error">{error()}</p>
+                  <ErrorNotice error={error()!} />
                 </Show>
                 <Show when={j().last_error && state() === "attention"}>
-                  <p class="st-error cr-error">{j().last_error}</p>
+                  <ErrorNotice error={j().last_error!} />
                 </Show>
 
                 <div class="cr-tabs">

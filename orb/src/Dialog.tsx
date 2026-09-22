@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { Show, createUniqueId, onCleanup, onMount, type JSX } from "solid-js";
 
 import { trapFocus } from "./focusScope";
@@ -84,7 +85,7 @@ export function PromptSheet(p: {
           </button>
         </form>
         {p.children}
-        <Show when={p.error}><p class="st-error" role="alert">{p.error}</p></Show>
+        <Show when={p.error}><ErrorNotice error={p.error!} /></Show>
         <Show when={p.footer}><div class="prompt-foot">{p.footer}</div></Show>
       </div>
     </div>
