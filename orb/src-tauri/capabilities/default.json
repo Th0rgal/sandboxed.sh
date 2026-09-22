@@ -10,6 +10,7 @@
     "allow-voice",
     "allow-paloma-ssh-pubkey",
     "allow-window-theme",
-    "allow-open-url"
+    "allow-open-url",
+    "allow-local-agents"
   ]
 }

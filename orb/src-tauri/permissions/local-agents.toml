@@ -1,0 +1,11 @@
+[[permission]]
+identifier = "allow-local-agents"
+description = "Detect local agent CLIs, copy project files into the local workspace, and run those CLIs"
+commands.allow = [
+  "local_agents_scan",
+  "local_agents_workspace",
+  "local_agents_write",
+  "local_agents_start",
+  "local_agents_poll",
+  "local_agents_stop",
+]

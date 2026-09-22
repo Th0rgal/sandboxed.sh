@@ -7,6 +7,7 @@
 //! - supports frontend/interactive tools by accepting tool results
 //! - supports persistent missions (goal-oriented sessions)
 
+pub(crate) mod client_placement;
 pub(crate) mod deferred_messages;
 pub(crate) mod dispatch_admission;
 #[cfg(test)]
@@ -5114,6 +5115,12 @@ pub async fn post_message(
     }
     let control = control_for_user(&state, &user).await;
     if let Some(mid) = target_mission_id {
+        if mission_is_client_placed(&control, mid).await.map_err(internal_error)? {
+            return Err((
+                StatusCode::CONFLICT,
+                "this mission runs on the Orb client; the backend will not execute it".into(),
+            ));
+        }
         if let Some(placement) =
             remote_grok::placement(&state.config.working_dir, &control.mission_store, mid)
                 .await
@@ -8173,6 +8180,10 @@ pub struct CreateMissionRequest {
     /// Orb `@` chips: materialized into `.paloma/` before the harness starts.
     #[serde(default)]
     pub attachments: Option<Vec<crate::api::mission_payload::MissionAttachment>>,
+    /// `"client"` means the Orb desktop that created the mission runs the CLI.
+    /// The backend records the mission and does not start a harness.
+    #[serde(default)]
+    pub placement: Option<String>,
     /// Catch-all for unrecognized request fields. Serde ignores unknown fields
     /// by default, which has repeatedly hidden client bugs (a `prompt` sent
     /// before the field existed, a mistyped `target_mission_id`). Captured
@@ -10340,6 +10351,7 @@ pub async fn create_mission(
         origin: None,
         origin_session_id: None,
         attachments: None,
+        placement: None,
         extra: Default::default(),
     });
 
@@ -10850,11 +10862,27 @@ pub async fn create_mission(
     // Remote-node missions execute on the selected node, not in the local
     // workspace, so probing the local/container CLI would reject perfectly
     // runnable work — skip the preflight for them.
-    let runs_locally = req
-        .remote_node_id
-        .as_deref()
-        .map(str::trim)
-        .is_none_or(str::is_empty);
+    let client_placement = client_placement::is_client_placement(req.placement.as_deref());
+    if client_placement
+        && req
+            .remote_node_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|id| !id.is_empty())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "placement client cannot target a remote node".into(),
+        ));
+    }
+    // A client placement executes on the Orb machine, same as a remote node:
+    // do not probe the backend host for the CLI.
+    let runs_locally = !client_placement
+        && req
+            .remote_node_id
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty);
     if let (true, Some(ws_id), Some(backend_id)) = (runs_locally, workspace_id, backend.as_deref())
     {
         if matches!(backend_id, "codex" | "claudecode" | "gemini" | "grok") {
@@ -10953,6 +10981,12 @@ pub async fn create_mission(
             StatusCode::BAD_REQUEST,
             "disk-reservation-v1 tags are reserved internal admission state".to_string(),
         ));
+    }
+    if client_placement {
+        let tags = normalized_request_tags.get_or_insert_with(Vec::new);
+        if !client_placement::is_tagged(tags) {
+            tags.push(client_placement::TAG.to_string());
+        }
     }
     if let Some(estimated_gib) = effective_estimated_disk_gib {
         let tag = format!("disk-estimate-gib:{estimated_gib}");
@@ -11559,7 +11593,10 @@ pub async fn create_mission(
         // drivers only recognise `/goal <objective>` with a space.
         let prompt = canonical_goal_message(&prompt).unwrap_or(prompt);
         let prompt_event_id = Uuid::new_v4();
-        if !remote_launch {
+        // Client placements keep the prompt out of the scheduler ticket.
+        // `get_scheduled_pending_missions` only returns rows that still have
+        // a deferred goal, and the stores also exclude `placement:client`.
+        if !remote_launch && !client_placement {
             control
                 .mission_store
                 .set_deferred_goal(
@@ -11646,6 +11683,14 @@ pub async fn create_mission(
                 return Err((StatusCode::BAD_GATEWAY, message));
             }
         }
+    }
+
+    if client_placement {
+        persist_remote_mission_prompt(&control, mission.id, &user.id, initial_prompt.take())
+            .await
+            .map_err(internal_error)?;
+        let value = mission_create_response(&state, &control, mission).await?;
+        return Ok((headers, Json(value)));
     }
 
     let value = mission_create_response(&state, &control, mission).await?;
@@ -15037,6 +15082,125 @@ pub async fn mark_mission_opened(
 }
 
 /// Set mission status (completed/failed).
+async fn mission_is_client_placed(control: &ControlState, id: Uuid) -> Result<bool, String> {
+    let Some(mission) = control.mission_store.get_mission(id).await? else {
+        return Ok(false);
+    };
+    Ok(client_placement::is_tagged(&mission.project.tags))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClientTranscriptRequest {
+    pub id: Uuid,
+    /// `user` or `assistant`.
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClientStatusRequest {
+    pub status: String,
+}
+
+/// Append one transcript row for a mission the Orb client is executing.
+/// Refused for every other mission so this cannot inject history into a
+/// backend-owned run.
+pub async fn append_client_transcript(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ClientTranscriptRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let content = req.content.trim().to_string();
+    if content.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "content is required".into()));
+    }
+    let control = control_for_user(&state, &user).await;
+    if !mission_is_client_placed(&control, id).await.map_err(internal_error)? {
+        return Err((
+            StatusCode::CONFLICT,
+            "transcript append is only for client-placed missions".into(),
+        ));
+    }
+    let event = match req.role.as_str() {
+        "user" => AgentEvent::UserMessage {
+            id: req.id,
+            content,
+            queued: false,
+            mission_id: Some(id),
+            source: Some(format!("orb-client:{}", user.id)),
+        },
+        "assistant" => AgentEvent::AssistantMessage {
+            id: req.id,
+            content,
+            success: true,
+            cost_cents: 0,
+            cost_source: crate::agents::CostSource::Unknown,
+            usage: None,
+            model: None,
+            model_normalized: None,
+            mission_id: Some(id),
+            shared_files: None,
+            resumable: false,
+            completion_evidence: None,
+        },
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "role must be user or assistant".into(),
+            ))
+        }
+    };
+    control
+        .mission_store
+        .log_event(id, &event)
+        .await
+        .map_err(internal_error)?;
+    let _ = control.events_tx.send(event);
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Terminal status for a client-placed mission. Does not start a runner.
+pub async fn set_client_mission_status(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ClientStatusRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let status = match req.status.as_str() {
+        "completed" => MissionStatus::Completed,
+        "failed" => MissionStatus::Failed,
+        "interrupted" => MissionStatus::Interrupted,
+        "awaiting_user" => MissionStatus::AwaitingUser,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unsupported client status {other}"),
+            ))
+        }
+    };
+    let control = control_for_user(&state, &user).await;
+    if !mission_is_client_placed(&control, id).await.map_err(internal_error)? {
+        return Err((
+            StatusCode::CONFLICT,
+            "status updates of this kind are only for client-placed missions".into(),
+        ));
+    }
+    control
+        .mission_store
+        .update_mission_status_with_reason(id, status, Some("client_runner"))
+        .await
+        .map_err(internal_error)?;
+    let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        completion: None,
+        execution: None,
+        mission_id: id,
+        status,
+        summary: Some("client_runner".into()),
+    });
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 pub async fn set_mission_status(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -16557,6 +16721,7 @@ pub async fn clone_mission(
         origin: source.origin.clone(),
         origin_session_id: source.origin_session_id.clone(),
         attachments: None,
+        placement: None,
         extra: Default::default(),
     };
 
@@ -16635,6 +16800,12 @@ pub async fn resume_mission(
     let actor = resolve_actor(request.actor.clone(), &user);
 
     let control = control_for_user(&state, &user).await;
+    if mission_is_client_placed(&control, mission_id).await.map_err(internal_error)? {
+        return Err((
+            StatusCode::CONFLICT,
+            "this mission runs on the Orb client; resume it there".into(),
+        ));
+    }
     tracing::info!(mission_id = %mission_id, actor = %actor, "FLEET-004 mission resume requested");
 
     if let Some(placement) = remote_grok::placement(

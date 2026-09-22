@@ -5238,9 +5238,8 @@ impl MissionStore for SqliteMissionStore {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, status, title, workspace_id, workspace_name, agent, model_override,
+            let sql = format!(
+                "SELECT id, status, title, workspace_id, workspace_name, agent, model_override,
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend,
                             COALESCE(mission_mode, 'task') as mission_mode,
@@ -5248,10 +5247,11 @@ impl MissionStore for SqliteMissionStore {
                             goal_objective,
                             COALESCE(priority, 0) as priority, not_before, deadline
                      FROM missions
-                     WHERE status = 'pending' AND deferred_goal IS NOT NULL
+                     WHERE status = 'pending' AND deferred_goal IS NOT NULL{}
                      ORDER BY created_at ASC",
-                )
-                .map_err(|e| e.to_string())?;
+                crate::api::control::client_placement::SQL_EXCLUDE
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
             let missions = stmt
                 .query_map(params![], |row| {

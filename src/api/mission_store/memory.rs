@@ -1068,7 +1068,13 @@ impl MissionStore for InMemoryMissionStore {
             .read()
             .await
             .values()
-            .filter(|m| m.status == MissionStatus::Pending && goals.contains_key(&m.id))
+            .filter(|m| {
+                crate::api::control::client_placement::scheduler_accepts(
+                    m.status == MissionStatus::Pending,
+                    goals.contains_key(&m.id),
+                    &m.project.tags,
+                )
+            })
             .cloned()
             .collect();
         missions.sort_by(|a, b| a.created_at.cmp(&b.created_at));

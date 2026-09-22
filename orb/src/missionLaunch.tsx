@@ -15,7 +15,7 @@ export function recalledLaunch(id: string): LaunchReceipt | undefined {
   if (cached) return cached;
   try { return JSON.parse(sessionStorage.getItem(receiptKey(id)) ?? "null") ?? undefined; } catch { return undefined; }
 }
-export const nodeLabel = (id: string) => id === "core" ? "Core" : id === "dgx-spark" ? "DGX Spark" : id;
+export const nodeLabel = (id: string) => id === "core" ? "Core" : id === "local" ? "This computer" : id === "dgx-spark" ? "DGX Spark" : id;
 
 /** Statuses where PATCH /settings can change the next-turn model. A live turn returns 409. */
 const SETTINGS_IDLE = new Set([
@@ -33,6 +33,7 @@ export function dockModelLabel(harnessName: string, modelLabel: string): string 
   return rest || modelLabel;
 }
 export function missionDestination(mission: Mission | null, receipt?: LaunchReceipt) {
+  if (mission?.tags?.includes("placement:client") || receipt?.nodeId === "local") return "This computer";
   // Server-owned remote placement or the accepted selection takes precedence
   // over workspace_name, which can still name the host's bookkeeping workspace.
   return nodeLabel(mission?.remote_job?.node_id ?? mission?.remote_node_id ?? receipt?.nodeId ?? mission?.workspace_name ?? "selected machine");

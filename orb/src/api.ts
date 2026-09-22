@@ -169,6 +169,7 @@ export interface Mission {
   /** Reasoning effort in force for the next turn. Absent means backend default. */
   model_effort?: string | null;
   project?: string | null;
+  tags?: string[];
   created_at: string;
   updated_at: string;
 }
@@ -191,6 +192,8 @@ export interface CreateMissionBody {
   model_override?: string;
   model_effort?: string;
   attachments?: MissionAttachment[];
+  /** `"client"` records the mission and leaves execution to this Orb process. */
+  placement?: "client";
 }
 
 export type MissionAttachmentKind = "file" | "folder" | "controller";
@@ -687,6 +690,22 @@ export async function addProjectSteer(slug: string, body: string, origin = "orb"
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ body, origin }),
+  });
+}
+
+export async function appendClientTranscript(id: string, role: "user" | "assistant", content: string, eventId = crypto.randomUUID()): Promise<void> {
+  await api(`/api/control/missions/${id}/client-transcript`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: eventId, role, content }),
+  });
+}
+
+export async function setClientMissionStatus(id: string, status: "completed" | "failed" | "interrupted" | "awaiting_user"): Promise<void> {
+  await api(`/api/control/missions/${id}/client-status`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
   });
 }
 

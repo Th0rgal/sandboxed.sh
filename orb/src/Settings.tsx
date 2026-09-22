@@ -1,6 +1,7 @@
 import { For, Show, createSignal, type JSX } from "solid-js";
 import * as Ic from "./icons";
 import { clearConnection, getApiUrl, isConnected, login, setApiUrl } from "./api";
+import { localInstalled, pathOverrides, refreshLocalAgents, setPathOverride } from "./localAgents";
 import { getThemePref, setThemePref, type ThemePref } from "./theme";
 
 const THEME_LABELS: Record<ThemePref, string> = { auto: "Auto", light: "Light", dark: "Dark" };
@@ -73,6 +74,60 @@ function Card(p: { title?: string; children: JSX.Element }) {
       </Show>
       <div class="s-card">{p.children}</div>
     </section>
+  );
+}
+
+function LocalAgentsCard() {
+  const [busy, setBusy] = createSignal(false);
+  const [drafts, setDrafts] = createSignal<Record<string, string>>(pathOverrides());
+  const scan = async () => {
+    setBusy(true);
+    try {
+      await refreshLocalAgents();
+    } finally {
+      setBusy(false);
+    }
+  };
+  void scan();
+  const row = (id: string) => localInstalled().find((item) => item.id === id);
+  const label: Record<string, string> = {
+    claudecode: "Claude Code",
+    codex: "Codex",
+    grok: "Grok",
+    opencode: "OpenCode",
+  };
+  const save = (id: string) => {
+    setPathOverride(id, drafts()[id] ?? "");
+    void scan();
+  };
+  return (
+    <Card title="Local agents">
+      <Row title="This computer" desc="CLIs Orb can launch here. A blank path uses whatever is on PATH.">
+        <button class="s-btn" disabled={busy()} onClick={() => void scan()}>
+          {busy() ? "Scanning…" : "Scan"}
+        </button>
+      </Row>
+      <For each={["claudecode", "codex", "grok", "opencode"]}>
+        {(id) => {
+          const found = () => row(id);
+          return (
+            <Row title={label[id]} desc={found()?.installed ? `${found()?.version ?? "installed"} · ${found()?.path}` : "Not found"}>
+              <input
+                class="s-input"
+                aria-label={`${label[id]} path`}
+                placeholder="Path override"
+                value={drafts()[id] ?? ""}
+                onInput={(e) => setDrafts({ ...drafts(), [id]: e.currentTarget.value })}
+                onKeyDown={(e) => e.key === "Enter" && save(id)}
+              />
+              <button class="s-btn" onClick={() => save(id)}>
+                Save
+              </button>
+            </Row>
+          );
+        }}
+      </For>
+    </Card>
   );
 }
 
@@ -150,6 +205,7 @@ export function Settings(p: { onOpenPage?: (id: string) => void } = {}) {
       <div class="s-inner">
         <h2>Settings</h2>
         <BackendTab />
+        <LocalAgentsCard />
         <Show when={isConnected() && p.onOpenPage}>
           <Card title="Execution">
             <Row

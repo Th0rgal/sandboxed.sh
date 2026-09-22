@@ -29,6 +29,21 @@ import { ExecutionSettings } from "./ExecutionSettings";
 import { VoiceButton, ensureVoiceProbe, voiceAvailable } from "./VoiceButton";
 import { insertAtCaret } from "./voice";
 import { contextPct, contextWindow, estimateTokens, formatTokens } from "./missionContext";
+import {
+  bindWorkspace,
+  followLocal,
+  installedIds,
+  localBinding,
+  localLiveText,
+  localRunActive,
+  localWorkspace,
+  materializeMentions,
+  refreshLocalAgents,
+  rememberBinding,
+  startLocal,
+  stopLocal,
+  writeLocalFiles,
+} from "./localAgents";
 import { ControllerView } from "./Controller";
 import {
   createMission,
@@ -44,6 +59,8 @@ import {
   projectsVersion,
   type HarnessChoice,
   cancelMission,
+  appendClientTranscript,
+  setClientMissionStatus,
   sendMissionMessage,
   ApiError,
   MessageRejectedError,
@@ -246,6 +263,8 @@ function Composer(p: {
   scope?: string;
   /** Server-confirmed remote support for a harness on the selected machine (new agents only). */
   remoteSupport?: (backend: string) => { state: RemoteSupport; note: string };
+  /** When set, the harness menu only lists these ids (This computer). */
+  harnessIds?: string[];
   /** Follow-up: the mission's harness. New agent uses the picker. */
   backend?: string;
   onDraft?: (text: string) => void;
@@ -502,7 +521,7 @@ function Composer(p: {
             </button>
             <Show when={which() === "harness"}>
               <div class="menu">
-                <For each={harnessChoices()}>
+                <For each={harnessChoices().filter((c) => !p.harnessIds || p.harnessIds.includes(c.backend.id))}>
                   {(c) => (
                     <button
                       class={`menu-item ${c.backend.id === pick()?.backend ? "on" : ""}`}
@@ -806,7 +825,13 @@ export default function App() {
   const [creating, setCreating] = createSignal(false);
   const [launchPreview, setLaunchPreview] = createSignal<LaunchReceipt | null>(null);
   let launchAttempt: { signature: string; key: string } | undefined;
-  const [newMachine, setNewMachine] = createSignal(MACHINES[0].id);
+  const MACHINE_KEY = "orb.machine";
+  const [newMachine, setNewMachine] = createSignal(localStorage.getItem(MACHINE_KEY) || "core");
+  const chooseMachine = (id: string) => {
+    setNewMachine(id);
+    try { localStorage.setItem(MACHINE_KEY, id); } catch { /* ignore */ }
+    if (id === "local") void refreshLocalAgents();
+  };
   const [envOpen, setEnvOpen] = createSignal<"machine" | "project" | null>(null);
   const [history, setHistory] = createSignal<(string | null)[]>(["a1"]);
   const [hIdx, setHIdx] = createSignal(0);
@@ -943,7 +968,7 @@ export default function App() {
       // Seed agent ids only exist offline — don't land on a demo transcript.
       const sel = selected();
       if (sel && !sel.includes(":") && !PAGES.has(sel)) open(null);
-      if (newMachine() === "local") setNewMachine("core");
+      if (newMachine() === "local") void refreshLocalAgents();
     } else {
       // Backend views (missions, hosted files) can't render offline — e.g.
       // after a 401 cleared the token mid-session.
@@ -1068,6 +1093,43 @@ export default function App() {
     stream(c.id);
   };
 
+  const finishLocal = async (id: string) => {
+    try {
+      const state = await followLocal(id, () => {});
+      if (state.text.trim()) await appendClientTranscript(id, "assistant", state.text);
+      const failed = (state.exit_code != null && state.exit_code !== 0) || (!!state.error && !state.text.trim());
+      await setClientMissionStatus(id, failed ? "failed" : "awaiting_user");
+    } catch {
+      await setClientMissionStatus(id, "failed").catch(() => {});
+    }
+    void refreshMissions();
+  };
+  const launchLocal = async (typed: string, prompt: string, title: string, projectSlug: string | undefined, pick: HarnessPick) => {
+    if (!projectSlug) throw new Error("Choose a project before starting on this computer. Your draft is kept.");
+    const rows = await refreshLocalAgents();
+    const row = rows.find((item) => item.id === pick.backend && item.installed && item.path);
+    if (!row?.path) throw new Error("That CLI is not installed on this computer. Set its path in Settings → Local agents. Your draft is kept.");
+    const plan = await materializeMentions(projectSlug, prompt, attachChips());
+    const root = await localWorkspace(projectSlug);
+    if (plan.files.length) await writeLocalFiles(root, plan.files);
+    const sent = bindWorkspace(plan.prompt, root);
+    const effort = normalizeEffort(pick.effort, pick.backend);
+    const body = { title, prompt: typed, project: projectSlug, backend: pick.backend, model_override: pick.model, placement: "client" as const, ...(effort ? { model_effort: effort } : {}) };
+    const signature = JSON.stringify(body);
+    if (launchAttempt?.signature !== signature) launchAttempt = { signature, key: crypto.randomUUID() };
+    const m = await createMission({ ...body, idempotency_key: launchAttempt.key });
+    launchAttempt = undefined;
+    setAttachChips([]);
+    rememberBinding(m.id, { harness: pick.backend, bin: row.path, cwd: root, model: pick.model });
+    const receipt = { prompt: typed, nodeId: "local", destination: "This computer" };
+    rememberLaunch(m.id, receipt);
+    setMissions((prev) => [m, ...prev.filter((old) => old.id !== m.id)]);
+    open(`m:${m.id}`);
+    await startLocal({ id: m.id, harness: pick.backend, bin: row.path, cwd: root, prompt: sent, model: pick.model });
+    void finishLocal(m.id);
+    void refreshMissions();
+  };
+
   const create = async (text: string) => {
     if (isConnected()) {
       if (creating()) return false;
@@ -1084,6 +1146,10 @@ export default function App() {
       setCreating(true); setCreateError(null); setCreateRefusal(null); setLaunchPreview(receipt);
       try {
         if (!pick || !harnessChoices().some(c => c.backend.id === pick.backend && c.models.some(m => m.value === pick.model))) throw new Error("Choose an available harness and model before starting. Your draft is kept.");
+        if (machine === "local") {
+          await launchLocal(text, prompt, title, projectSlug, pick);
+          return true;
+        }
         if (machine !== "core") {
           // Fresh capability read every time: the server decides which
           // harnesses a node can run. A read failure refuses rather than guesses.
@@ -1527,7 +1593,7 @@ export default function App() {
                                   <button
                                     class={`menu-item ${m.id === newMachine() ? "on" : ""}`}
                                     onClick={() => {
-                                      setNewMachine(m.id);
+                                      chooseMachine(m.id);
                                       setEnvOpen(null);
                                     }}
                                   >
@@ -1544,7 +1610,7 @@ export default function App() {
                                   <button
                                     class={`menu-item ${m.id === newMachine() ? "on" : ""}`}
                                     onClick={() => {
-                                      setNewMachine(m.id);
+                                      chooseMachine(m.id);
                                       setEnvOpen(null);
                                     }}
                                   >
@@ -1562,9 +1628,24 @@ export default function App() {
                           }
                         >
                           <button
+                            class={`menu-item ${newMachine() === "local" ? "on" : ""}`}
+                            onClick={() => {
+                              chooseMachine("local");
+                              setEnvOpen(null);
+                            }}
+                          >
+                            <span class="menu-ico">
+                              <Ic.LaptopIcon />
+                            </span>
+                            <span class="menu-col">
+                              <span class="menu-title">This computer</span>
+                              <span class="menu-sub">Claude Code, Codex, Grok, OpenCode on this machine</span>
+                            </span>
+                          </button>
+                          <button
                             class={`menu-item ${newMachine() === "core" ? "on" : ""}`}
                             onClick={() => {
-                              setNewMachine("core");
+                              chooseMachine("core");
                               setEnvOpen(null);
                             }}
                           >
@@ -1582,7 +1663,7 @@ export default function App() {
                               <button
                                 class={`menu-item ${n.id === newMachine() ? "on" : ""}`}
                                 onClick={() => {
-                                  setNewMachine(n.id);
+                                  chooseMachine(n.id);
                                   setEnvOpen(null);
                                 }}
                               >
@@ -1660,6 +1741,7 @@ export default function App() {
                   tall
                   scope="new-agent"
                   remoteSupport={remoteSupport}
+                  harnessIds={newMachine() === "local" ? installedIds() : undefined}
                   files={projectFiles()}
                   attached={attached()}
                   onToggleFile={(id) =>
@@ -2051,7 +2133,9 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
     });
   });
 
+  const clientPlaced = () => !!localBinding(p.id) || !!mission()?.tags?.includes("placement:client");
   const busy = () => {
+    if (localRunActive(p.id)) return true;
     const s = mission()?.status;
     return !!s && ["active","running","pending","queued","starting","resuming"].includes(s);
   };
@@ -2072,10 +2156,12 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
 
   const viewItems = () => {
     const list = withInitialPrompt(items(), mission(), receipt);
-    if (busy()) return list;
+    const live = localLiveText(p.id);
+    const withLive = live ? [...list, { kind: "text" as const, key: `local:${p.id}`, text: live, live: localRunActive(p.id) }] : list;
+    if (busy()) return withLive;
     // Terminal mission: force-close any bubble left open by a dropped
     // assistant_message finalizer.
-    return list.map((i) => (i.kind === "text" && i.live ? { ...i, live: false } : i));
+    return withLive.map((i) => (i.kind === "text" && i.live ? { ...i, live: false } : i));
   };
 
   // Retrying an uncertain network result reuses the original message identity.
@@ -2083,6 +2169,41 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
   let retryMessage: { key: string; id: string } | null = null;
   const sendMsg = async (text: string) => {
     setSendError(null);
+    if (clientPlaced()) {
+      const binding = localBinding(p.id);
+      if (!binding) {
+        setSendError("This session runs on the computer that started it. Your draft is kept.");
+        return false;
+      }
+      const project = mission()?.project;
+      if (!project) {
+        setSendError("This mission has no project, so its files cannot be copied. Your draft is kept.");
+        return false;
+      }
+      try {
+        const plan = await materializeMentions(project, text, followAttach());
+        if (plan.files.length) await writeLocalFiles(binding.cwd, plan.files);
+        const sent = bindWorkspace(plan.prompt, binding.cwd);
+        await appendClientTranscript(p.id, "user", text);
+        await startLocal({ id: p.id, harness: binding.harness, bin: binding.bin, cwd: binding.cwd, prompt: sent, model: binding.model, sessionId: binding.sessionId });
+        setFollowAttach([]);
+        void followLocal(p.id, () => {}).then(async (state) => {
+          const note = binding.harness === "grok" && binding.sessionId && !state.resumed ? "Grok starts a new local session.\n\n" : "";
+          const body = `${note}${state.text}`.trim();
+          if (body) await appendClientTranscript(p.id, "assistant", body);
+          const failed = (state.exit_code != null && state.exit_code !== 0) || (!!state.error && !state.text.trim());
+          await setClientMissionStatus(p.id, failed ? "failed" : "awaiting_user");
+          void refresh();
+        }).catch(async () => {
+          await setClientMissionStatus(p.id, "failed").catch(() => {});
+          void refresh();
+        });
+        return true;
+      } catch (e) {
+        setSendError(e instanceof Error ? e.message : String(e));
+        return false;
+      }
+    }
     const attachments = followAttach().map(chipToAttachment);
     const key = JSON.stringify([connectionVersion(), text, attachments]);
     if (retryMessage?.key !== key) retryMessage = { key, id: crypto.randomUUID() };
@@ -2103,6 +2224,10 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
   };
 
   const stopM = () => {
+    if (clientPlaced()) {
+      void stopLocal(p.id).then(() => setClientMissionStatus(p.id, "interrupted")).then(() => refresh());
+      return;
+    }
     void cancelMission(p.id)
       .catch(() => {})
       .then(() => refresh());

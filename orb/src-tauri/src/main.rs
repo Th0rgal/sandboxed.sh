@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod local_agents;
 mod voice;
 
 use tauri::{Manager, Theme, WebviewWindow};
@@ -86,7 +87,13 @@ fn main() {
             voice::voice_prewarm,
             voice::voice_transcribe,
             voice::voice_cancel,
-            voice::voice_release
+            voice::voice_release,
+            local_agents::local_agents_scan,
+            local_agents::local_agents_workspace,
+            local_agents::local_agents_write,
+            local_agents::local_agents_start,
+            local_agents::local_agents_poll,
+            local_agents::local_agents_stop
         ])
         .run(tauri::generate_context!())
         .expect("error while running orb");

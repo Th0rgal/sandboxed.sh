@@ -866,6 +866,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(control::set_mission_status),
         )
         .route(
+            "/api/control/missions/:id/client-transcript",
+            post(control::append_client_transcript),
+        )
+        .route(
+            "/api/control/missions/:id/client-status",
+            post(control::set_client_mission_status),
+        )
+        .route(
             "/api/control/missions/:id/title",
             post(control::set_mission_title),
         )
