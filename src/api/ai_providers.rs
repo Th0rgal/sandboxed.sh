@@ -765,6 +765,52 @@ mod oauth_deadletter_tests {
     }
 
     #[test]
+    fn shared_codex_recovery_requires_matching_identity_and_fresh_jwt() {
+        use base64::Engine;
+        let now = chrono::Utc::now().timestamp_millis();
+        let token = |id: &str, expires: i64| {
+            format!("header.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&serde_json::json!({
+                "exp": expires / 1000, "https://api.openai.com/auth": {"chatgpt_account_id": id}
+            })).unwrap()))
+        };
+        let stored = OAuthCredentials {
+            access_token: token("ben", now - 60_000),
+            refresh_token: "old".into(),
+            expires_at: now - 60_000,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        for (identity, expires, refresh, expected) in [
+            ("ben", now + 3_600_000, "new", true),
+            ("thomas", now + 3_600_000, "new", false),
+            ("ben", now - 120_000, "new", false),
+            ("ben", now + 3_600_000, "", false),
+        ] {
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({"tokens": {
+                    "access_token": token(identity, expires), "refresh_token": refresh
+                }}))
+                .unwrap(),
+            )
+            .unwrap();
+            let recovered = super::newer_shared_codex_credentials(&stored, &path);
+            assert_eq!(
+                recovered.is_some(),
+                expected,
+                "{identity}, {expires}, refresh_present={}",
+                !refresh.is_empty()
+            );
+            if let Some(recovered) = recovered {
+                assert_eq!(recovered.refresh_token, "new");
+            }
+        }
+        std::fs::write(&path, "invalid JSON").unwrap();
+        assert!(super::newer_shared_codex_credentials(&stored, &path).is_none());
+    }
+
+    #[test]
     fn openai_tier_adoption_requires_same_account_and_newer_live_token() {
         let now = chrono::Utc::now().timestamp_millis();
         let store = OAuthCredentials {
@@ -4171,15 +4217,32 @@ pub fn get_all_openai_oauth_accounts(working_dir: &Path) -> Vec<CodexOAuthAccoun
             Some(o) => o,
             None => continue,
         };
-        let refresh = oauth
-            .get("refresh_token")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let access = oauth
-            .get("access_token")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let stored_expires_at = oauth.get("expires_at").and_then(|v| v.as_i64());
+        let stored = crate::ai_providers::OAuthCredentials {
+            access_token: oauth
+                .get("access_token")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            refresh_token: oauth
+                .get("refresh_token")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            expires_at: oauth
+                .get("expires_at")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+        };
+        let recovered = extract_chatgpt_account_id(&stored.access_token).and_then(|identity| {
+            newer_shared_codex_credentials(
+                &stored,
+                &shared_codex_oauth_home_for_account(&identity).join("auth.json"),
+            )
+        });
+        let effective = recovered.as_ref().unwrap_or(&stored);
+        let refresh = effective.refresh_token.as_str();
+        let access = effective.access_token.as_str();
+        let stored_expires_at = Some(effective.expires_at);
         if refresh.is_empty() || access.is_empty() {
             continue;
         }
@@ -7750,6 +7813,7 @@ async fn list_providers(
     // shared tiers since the last background cycle. Reconcile before deriving
     // UI health so a live harness credential is never shown as disconnected.
     reconcile_anthropic_store_from_tiers(&state.ai_providers).await;
+    reconcile_openai_store_from_codex_homes(&state.ai_providers).await;
 
     // All providers live in AIProviderStore now
     let store_providers = state.ai_providers.list().await;
@@ -8096,6 +8160,7 @@ async fn get_provider_usage(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     maybe_reconcile_xai_store_from_grok_cli(&state.ai_providers).await;
+    reconcile_openai_store_from_codex_homes(&state.ai_providers).await;
     collapse_duplicate_xai_oauth_accounts(&state.ai_providers).await;
 
     // Resolve provider credentials: check AIProviderStore first, then OpenCode auth.
@@ -12059,6 +12124,63 @@ fn should_adopt_anthropic_tier(
 /// The shared Codex tier represents one selected account while the provider
 /// store may contain several logins. Account identity must therefore match
 /// before adopting a token; expiry alone is not sufficient.
+fn newer_shared_codex_credentials(
+    stored: &crate::ai_providers::OAuthCredentials,
+    auth_path: &Path,
+) -> Option<crate::ai_providers::OAuthCredentials> {
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(auth_path).ok()?).ok()?;
+    let tokens = value.get("tokens")?;
+    let access = tokens.get("access_token")?.as_str()?;
+    let tier = OAuthTokenEntry {
+        access_token: access.to_string(),
+        refresh_token: tokens.get("refresh_token")?.as_str()?.to_string(),
+        expires_at: extract_jwt_exp_ms(access)?,
+    };
+    newer_matching_openai_tier_credentials(stored, &tier)
+}
+
+/// Adopt a newer token from the same account's shared Codex home. Never rotate
+/// an old token first or copy credentials between distinct ChatGPT identities.
+pub async fn reconcile_openai_store_from_codex_homes(
+    store: &crate::ai_providers::AIProviderStore,
+) -> u32 {
+    if crate::api::oauth_owner::cli_proxy_owns(ProviderType::OpenAI) {
+        return 0;
+    }
+    let mut adopted = 0;
+    for account in store.get_all_by_type(ProviderType::OpenAI).await {
+        let Some(oauth) = account.oauth.as_ref() else {
+            continue;
+        };
+        let Some(identity) = extract_chatgpt_account_id(&oauth.access_token) else {
+            continue;
+        };
+        let lock = codex_oauth_refresh_lock(&identity);
+        let _guard = lock.lock().await;
+        let Ok(_process_guard) = acquire_codex_oauth_cross_process_lock().await else {
+            continue;
+        };
+        let Some(current) = store.get(account.id).await else {
+            continue;
+        };
+        let Some(current_oauth) = current.oauth.as_ref() else {
+            continue;
+        };
+        let path = shared_codex_oauth_home_for_account(&identity).join("auth.json");
+        if let Some(fresh) = newer_shared_codex_credentials(current_oauth, &path) {
+            if store
+                .set_oauth_credentials(account.id, fresh)
+                .await
+                .is_some()
+            {
+                oauth_refresh_clear_dead(account.id);
+                adopted += 1;
+            }
+        }
+    }
+    adopted
+}
+
 fn newer_matching_openai_tier_credentials(
     store: &crate::ai_providers::OAuthCredentials,
     tier: &OAuthTokenEntry,

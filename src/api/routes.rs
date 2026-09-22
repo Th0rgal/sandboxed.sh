@@ -3061,6 +3061,8 @@ async fn oauth_token_refresher_loop(
             );
         }
 
+        ai_providers_api::reconcile_openai_store_from_codex_homes(&ai_providers).await;
+
         // Refresh store-backed OAuth accounts FIRST. For any account that also
         // owns the shared credential tiers, this rotates the token AND writes it
         // to the tiers before the file-tier pass runs below — otherwise that

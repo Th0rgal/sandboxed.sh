@@ -1,3 +1,4 @@
+import { codexWindowLabel, effectiveProviderStatus, usageWindows } from "./providerUsage";
 import { ProviderLogo } from "./ProviderLogo";
 import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
@@ -7,6 +8,7 @@ import { Dialog, Field } from "./Dialog";
 import { Toggle } from "./Settings";
 import {
   getAllProviderUsage,
+  getProviderUsage,
   getCliProxyLogin,
   isConnected,
   listProviders,
@@ -280,17 +282,33 @@ function LiveProviders(p: { list: AIProvider[]; onRefresh: () => void }) {
   const oauth = () => p.list.filter((x) => x.uses_oauth);
   const keys = () => p.list.filter((x) => !x.uses_oauth);
 
-  const refreshUsage = () =>
-    getAllProviderUsage()
-      .then(setUsage)
-      .catch(() => {});
-  onMount(refreshUsage);
+  let disposed = false;
+  let fetching = false;
+  const refreshUsage = async () => {
+    if (fetching) return;
+    fetching = true;
+    try {
+      const snapshot = await getAllProviderUsage();
+      if (!disposed) setUsage(snapshot);
+      // The bulk endpoint returns its cache before starting background probes.
+      // Await each Codex account so the first visit receives the result too.
+      await Promise.allSettled(oauth().filter(a => a.provider_type === "openai").map(async a => {
+        const value = await getProviderUsage(a.id);
+        if (!disposed) setUsage(previous => ({ ...previous, [a.id]: value }));
+      }));
+    } finally { fetching = false; }
+  };
+  onMount(() => {
+    void refreshUsage().catch(() => {});
+    const timer = setInterval(() => { void refreshUsage().catch(() => {}); }, 30_000);
+    onCleanup(() => { disposed = true; clearInterval(timer); });
+  });
 
   return (
     <div class="page">
       <div class="page-head">
         <h2>Providers</h2>
-        <button class="s-btn" onClick={() => { refreshUsage(); p.onRefresh(); }}>
+        <button class="s-btn" onClick={() => { void refreshUsage().catch(() => {}); p.onRefresh(); }}>
           Refresh
         </button>
       </div>
@@ -328,7 +346,7 @@ function LiveProviders(p: { list: AIProvider[]; onRefresh: () => void }) {
             onDone={() => {
               setReauth(null);
               p.onRefresh();
-              refreshUsage();
+              void refreshUsage().catch(() => {});
             }}
           />
         )}
@@ -348,12 +366,7 @@ function cliProxyReconnectable(a: AIProvider): boolean {
 }
 
 function UsageSummary(p: { usage: ProviderUsage }) {
-  const windows = createMemo(() => {
-    const out: { label: string; used: number }[] = [];
-    if (p.usage.unified_5h_utilization != null) out.push({ label: "5h", used: p.usage.unified_5h_utilization });
-    if (p.usage.unified_7d_utilization != null) out.push({ label: "7d", used: p.usage.unified_7d_utilization });
-    return out;
-  });
+  const windows = createMemo(() => usageWindows(p.usage));
   // Keep the account summary compact; detailed meters live in the expansion.
   return (
     <Show when={windows().length > 0}>
@@ -538,41 +551,42 @@ function DetailBar(p: { label: string; usedPct: number; reset?: string }) {
 }
 
 function UsageDetail(p: { usage: ProviderUsage }) {
-  const u = p.usage;
-  const type = u.provider_type;
+  const u = () => p.usage;
+  const type = () => u().provider_type;
   return (
     <div class="p-detail">
+      <Show when={u().status === "needs_reauth"}><p class="s-row-desc c-red">Reconnect this account to check its quota and use it for new requests.</p></Show>
       <div class="p-detail-meta">
-        <Show when={u.account_email}><span>{u.account_email}</span></Show>
-        <Show when={u.account_name}><span>{u.account_name}</span></Show>
-        <Show when={u.organization}><span>{u.organization}</span></Show>
-        <Show when={u.unified_status}>
-          <span class={u.unified_status === "ok" || u.unified_status === "allowed" ? "c-green" : "c-red"}>status: {u.unified_status}</span>
+        <Show when={u().account_email}><span>{u().account_email}</span></Show>
+        <Show when={u().account_name}><span>{u().account_name}</span></Show>
+        <Show when={u().organization}><span>{u().organization}</span></Show>
+        <Show when={u().unified_status}>
+          <span class={u().unified_status === "ok" || u().unified_status === "allowed" ? "c-green" : "c-red"}>status: {u().unified_status}</span>
         </Show>
       </div>
 
-      <Show when={type === "anthropic" && u.unified_5h_utilization != null}>
-        <DetailBar label="5h window" usedPct={(u.unified_5h_utilization ?? 0) * 100} reset={u.unified_5h_reset ? `reset ${fmtReset(u.unified_5h_reset!)}` : undefined} />
+      <Show when={type() === "anthropic" && u().unified_5h_utilization != null}>
+        <DetailBar label="5h window" usedPct={(u().unified_5h_utilization ?? 0) * 100} reset={u().unified_5h_reset ? `reset ${fmtReset(u().unified_5h_reset!)}` : undefined} />
       </Show>
-      <Show when={type === "anthropic" && u.unified_7d_utilization != null}>
-        <DetailBar label="7d window" usedPct={(u.unified_7d_utilization ?? 0) * 100} reset={u.unified_7d_reset ? `reset ${fmtReset(u.unified_7d_reset!)}` : undefined} />
-      </Show>
-
-      <Show when={type === "openai" && u.codex_primary_used_percent != null}>
-        <Show when={u.codex_plan_type}>
-          <div class="p-detail-meta"><span>plan: {u.codex_plan_type}</span></div>
-        </Show>
-        <DetailBar label="5h window" usedPct={u.codex_primary_used_percent ?? 0} reset={u.codex_primary_reset_at ? `reset ${fmtResetEpoch(u.codex_primary_reset_at!)}` : undefined} />
-        <Show when={u.codex_secondary_used_percent != null}>
-          <DetailBar label="Weekly" usedPct={u.codex_secondary_used_percent ?? 0} reset={u.codex_secondary_reset_at ? `reset ${fmtResetEpoch(u.codex_secondary_reset_at!)}` : undefined} />
-        </Show>
-      </Show>
-      <Show when={type === "openai" && u.requests_limit != null}>
-        <DetailBar label="Requests" usedPct={100 - ((u.requests_remaining ?? 0) / (u.requests_limit ?? 1)) * 100} reset={u.requests_reset ? `reset ${fmtReset(u.requests_reset!)}` : undefined} />
+      <Show when={type() === "anthropic" && u().unified_7d_utilization != null}>
+        <DetailBar label="7d window" usedPct={(u().unified_7d_utilization ?? 0) * 100} reset={u().unified_7d_reset ? `reset ${fmtReset(u().unified_7d_reset!)}` : undefined} />
       </Show>
 
-      <Show when={type === "minimax" && u.model_usage && u.model_usage.length > 0}>
-        <For each={u.model_usage}>
+      <Show when={type() === "openai" && u().codex_primary_used_percent != null && u().codex_primary_window_minutes !== 0}>
+        <Show when={u().codex_plan_type}>
+          <div class="p-detail-meta"><span>plan: {u().codex_plan_type}</span></div>
+        </Show>
+        <DetailBar label={codexWindowLabel(u().codex_primary_window_minutes, "Primary window")} usedPct={u().codex_primary_used_percent ?? 0} reset={u().codex_primary_reset_at ? `reset ${fmtResetEpoch(u().codex_primary_reset_at!)}` : undefined} />
+        <Show when={u().codex_secondary_used_percent != null && u().codex_secondary_window_minutes !== 0}>
+          <DetailBar label={codexWindowLabel(u().codex_secondary_window_minutes, "Secondary window")} usedPct={u().codex_secondary_used_percent ?? 0} reset={u().codex_secondary_reset_at ? `reset ${fmtResetEpoch(u().codex_secondary_reset_at!)}` : undefined} />
+        </Show>
+      </Show>
+      <Show when={type() === "openai" && u().requests_limit != null}>
+        <DetailBar label="Requests" usedPct={100 - ((u().requests_remaining ?? 0) / (u().requests_limit ?? 1)) * 100} reset={u().requests_reset ? `reset ${fmtReset(u().requests_reset!)}` : undefined} />
+      </Show>
+
+      <Show when={type() === "minimax" && u().model_usage && (u().model_usage?.length ?? 0) > 0}>
+        <For each={u().model_usage}>
           {(m) => (
             <div class="p-model">
               <div class="p-model-name">{m.model}</div>
@@ -583,18 +597,18 @@ function UsageDetail(p: { usage: ProviderUsage }) {
         </For>
       </Show>
 
-      <Show when={type === "zai" && u.zai_tokens_percentage != null}>
-        <Show when={u.zai_plan}>
-          <div class="p-detail-meta"><span>plan: {u.zai_plan}</span></div>
+      <Show when={type() === "zai" && u().zai_tokens_percentage != null}>
+        <Show when={u().zai_plan}>
+          <div class="p-detail-meta"><span>plan: {u().zai_plan}</span></div>
         </Show>
-        <DetailBar label="Tokens" usedPct={u.zai_tokens_percentage ?? 0} reset={u.zai_tokens_reset ? `reset ${fmtResetEpoch(u.zai_tokens_reset!)}` : undefined} />
-        <Show when={u.zai_mcp_percentage != null}>
-          <DetailBar label="MCP" usedPct={u.zai_mcp_percentage ?? 0} reset={u.zai_mcp_reset ? `reset ${fmtResetEpoch(u.zai_mcp_reset!)}` : undefined} />
+        <DetailBar label="Tokens" usedPct={u().zai_tokens_percentage ?? 0} reset={u().zai_tokens_reset ? `reset ${fmtResetEpoch(u().zai_tokens_reset!)}` : undefined} />
+        <Show when={u().zai_mcp_percentage != null}>
+          <DetailBar label="MCP" usedPct={u().zai_mcp_percentage ?? 0} reset={u().zai_mcp_reset ? `reset ${fmtResetEpoch(u().zai_mcp_reset!)}` : undefined} />
         </Show>
       </Show>
 
-      <Show when={u.error}>
-        <p class="s-row-desc c-red">{u.error}</p>
+      <Show when={u().error}>
+        <p class="s-row-desc c-red">{u().error}</p>
       </Show>
     </div>
   );
@@ -602,18 +616,9 @@ function UsageDetail(p: { usage: ProviderUsage }) {
 
 function LiveRow(p: { a: AIProvider; usage?: ProviderUsage; onReconnect: () => void }) {
   const a = p.a;
-  const stClass = () =>
-    a.status.type === "connected" ? "connected" : a.status.type === "needs_reauth" || a.status.type === "error" ? "needs_reauth" : "not_configured";
-  const stLabel = () =>
-    a.status.type === "connected"
-      ? "Connected"
-      : a.status.type === "needs_reauth"
-        ? "Reconnect"
-        : a.status.type === "needs_auth"
-          ? "Needs auth"
-          : a.status.type === "error"
-            ? "Error"
-            : "Unknown";
+  const status = () => effectiveProviderStatus(a, p.usage);
+  const stClass = () => status() === "connected" ? "connected" : ["needs_reauth", "error", "quota_exhausted"].includes(status()) ? "needs_reauth" : "not_configured";
+  const stLabel = () => ({ connected: "Connected", needs_reauth: "Reconnect", quota_exhausted: "Quota exhausted", needs_auth: "Needs auth", error: "Error" }[status()] ?? "Unknown");
   const canCliProxyLogin = () => cliProxyReconnectable(a);
   const [open, setOpen] = createSignal(false);
   return (
@@ -640,7 +645,7 @@ function LiveRow(p: { a: AIProvider; usage?: ProviderUsage; onReconnect: () => v
       </button>
       <Show when={open()}>
         <div class="p-acc-body">
-          <Show when={p.usage} fallback={<p class="s-row-desc">No usage data yet — the backend probes it periodically.</p>}>
+          <Show when={p.usage} fallback={<p class="s-row-desc">Usage not available yet. Refresh to check this account.</p>}>
             <UsageDetail usage={p.usage!} />
           </Show>
           <Show when={canCliProxyLogin()}>

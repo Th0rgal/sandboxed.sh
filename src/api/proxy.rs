@@ -1181,6 +1181,7 @@ async fn native_protocol_proxy(
     };
     let requested_model = req.model;
     let is_stream = req.stream.unwrap_or(false);
+    super::ai_providers::reconcile_openai_store_from_codex_homes(&state.ai_providers).await;
     let standard_accounts = super::ai_providers::read_standard_accounts(&state.config.working_dir);
     let exact_chain_exists = state.chain_store.get(&requested_model).await.is_some();
     let resolved_chain_id = if exact_chain_exists {

@@ -291,8 +291,10 @@ export interface ProviderUsage {
   codex_plan_type?: string;
   codex_primary_used_percent?: number;
   codex_primary_reset_at?: number;
+  codex_primary_window_minutes?: number;
   codex_secondary_used_percent?: number;
   codex_secondary_reset_at?: number;
+  codex_secondary_window_minutes?: number;
   minimax_interval_remaining_percent?: number;
   minimax_interval_reset?: number;
   minimax_weekly_remaining_percent?: number;
@@ -309,6 +311,10 @@ export interface ProviderUsage {
   zai_tokens_reset?: number;
   zai_mcp_percentage?: number;
   zai_mcp_reset?: number;
+}
+
+export async function getProviderUsage(id: string): Promise<ProviderUsage> {
+  return api(`/api/ai/providers/${encodeURIComponent(id)}/usage`);
 }
 
 export async function getAllProviderUsage(): Promise<Record<string, ProviderUsage>> {
