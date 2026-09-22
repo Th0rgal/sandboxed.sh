@@ -219,9 +219,9 @@ export function phaseIsQuiet(phase: { label: string; failed?: boolean; moving?: 
  * assistive technology, and anything actionable or failed still draws a
  * compact banner here.
  */
-export function LaunchStatus(p: { destination: string; mission?: Mission | null; activity?: boolean; submitting?: boolean; goal?: string | null }) {
+export function LaunchStatus(p: { destination: string; mission?: Mission | null; activity?: boolean; submitting?: boolean; goal?: string | null; failureInTranscript?: boolean }) {
   const phase = () => p.submitting ? {label:"Starting",moving:true,detail:"Submitting your request…",failed:false} : missionPhase(p.mission ?? null, !!p.activity);
-  return <Show when={!phaseIsQuiet(phase()) && !(p.activity && phase().label === "Remote job accepted")}>
+  return <Show when={!(phase().failed && p.failureInTranscript) && !(phase().label === "Queued" && !p.mission?.remote_job && !p.mission?.remote_node_id) && !phaseIsQuiet(phase()) && !(p.activity && phase().label === "Remote job accepted")}>
     <div class={`launch-status ${phase().failed ? "failed" : ""}`} role="status" aria-live="polite">
       <div><Show when={phase().moving}><span class="launch-pulse" aria-hidden="true" /></Show><Show when={p.goal}><GoalTag class="small" /></Show><span>{phase().label} on {p.destination}</span></div>
       <Show when={phase().detail}><p>{phase().detail}</p></Show>

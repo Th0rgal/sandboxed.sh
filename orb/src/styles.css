@@ -1218,9 +1218,10 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
   animation: pop .1s ease-out;
 }
 
-.new-agent.launching { justify-content: flex-start; }
-.launching .na-meta { pointer-events: none; opacity: .6; }
-.launch-preview .user { margin-top: 18px; }
+.new-agent.launching { justify-content: flex-start; padding: 16px 24px 24px; overflow-y: auto; scrollbar-gutter: stable both-edges; }
+.new-agent.launching .new-inner { max-width: var(--col); }
+.launching .na-meta { display: none; }
+.launch-preview .user { margin-top: 0; }
 .launch-status { padding: 12px 10px; color: var(--fg-3); font-size: 12px; }
 .launch-status > div { display: flex; align-items: center; gap: 8px; }
 .launch-status p { margin: 5px 0 0; font-size: 11px; }
