@@ -14,6 +14,7 @@ pub(crate) mod gemini;
 pub(crate) mod grok;
 pub(crate) mod midturn;
 pub(crate) mod opencode;
+pub(crate) mod stream_guard;
 
 use std::future::Future;
 use std::pin::Pin;

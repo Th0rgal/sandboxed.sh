@@ -9291,120 +9291,16 @@ pub(crate) fn degenerate_repeated_substring(
     min_substring_len: usize,
     min_repeats: usize,
 ) -> Option<String> {
-    if min_substring_len == 0 || min_repeats < 2 || window_chars == 0 {
-        return None;
+    match crate::api::runners::stream_guard::detect(
+        accumulated,
+        window_chars,
+        min_substring_len,
+        min_repeats,
+        &tokio_util::sync::CancellationToken::new(),
+    ) {
+        crate::api::runners::stream_guard::Verdict::Repeated { needle, .. } => Some(needle),
+        _ => None,
     }
-    let chars: Vec<char> = accumulated.chars().collect();
-    if chars.len() < min_substring_len.saturating_mul(min_repeats) {
-        return None;
-    }
-    let window_end = chars.len();
-    let window_start = window_end.saturating_sub(window_chars);
-    let window = &chars[window_start..window_end];
-
-    // Walk every starting offset in the window. For each offset, try
-    // candidate substring lengths in `min_substring_len..=2*min_substring_len`
-    // (anything longer would have been broken up by the LLM streaming
-    // cadence). Count non-overlapping occurrences; if we find >= min_repeats
-    // we have a degenerate loop.
-    //
-    // To keep this O(window_chars * substring_len_max) per delta we cap the
-    // candidate substring length at 256 and bail out early once we have a hit.
-    let max_candidate_len = min_substring_len.saturating_mul(2).min(256);
-    for start in 0..window.len().saturating_sub(min_substring_len) {
-        for len in min_substring_len..=max_candidate_len {
-            if start + len > window.len() {
-                break;
-            }
-            let needle: String = window[start..start + len].iter().collect();
-            // Skip "noise" candidates that are mostly whitespace or a single
-            // character repeated (e.g. "----").
-            if !needle.chars().any(|c| c.is_alphanumeric()) {
-                continue;
-            }
-            // Skip single-token loops (e.g. "yes, yes, yes" or
-            // "ok. ok. ok."). Require the substring to contain at least
-            // two distinct "substantive" words (length >= 4, alphabetic).
-            // This is the key differentiator between a legitimate
-            // short-token echo and a model that has lost the plot on a
-            // meaningful phrase.
-            let distinct_substantive = count_distinct_substantive_words(&needle);
-            if distinct_substantive < 2 {
-                continue;
-            }
-            let mut count = 0usize;
-            let mut idx = 0usize;
-            let mut last_end: Option<usize> = None;
-            while let Some(found) = find_subslice(window, &needle, idx) {
-                // A degenerate loop is ADJACENT: the model emits the same
-                // string back to back. A structured report legitimately
-                // repeats 40+ char scaffolding — measured 2026-08-06, mission
-                // 7fb8970f was killed mid-way through a 17-guarantee review
-                // table whose rows shared long prefixes — but those repeats
-                // are separated by distinct content. Only count a repeat when
-                // it starts within one needle-length of the previous match's
-                // end; anything farther apart is prose that happens to rhyme.
-                let adjacent = match last_end {
-                    None => true,
-                    Some(end) => found <= end.saturating_add(len),
-                };
-                if adjacent {
-                    count += 1;
-                } else {
-                    count = 1;
-                }
-                if count >= min_repeats {
-                    tracing::warn!(
-                        repeated_substring = %needle.chars().take(120).collect::<String>(),
-                        repeats = count,
-                        "degenerate-stream detector matched; this substring is \
-                         what tripped it"
-                    );
-                    return Some(needle);
-                }
-                // Non-overlapping, as the comment above has always claimed:
-                // advancing by one char let a periodic needle count its own
-                // overlaps and inflate the tally.
-                idx = found + len;
-                last_end = Some(found + len);
-            }
-        }
-    }
-    None
-}
-
-/// Count distinct "substantive" words in `s`: tokens that are at least 4
-/// characters long and made up of letters/digits. Used to differentiate a
-/// meaningful phrase like "Yielding pending your choice" (4 substantive
-/// words) from a single-token echo like "yes, yes, yes" (1 word) or
-/// "ok. ok. ok." (1 word).
-fn count_distinct_substantive_words(s: &str) -> usize {
-    let mut seen = std::collections::HashSet::new();
-    for token in s.split(|c: char| !c.is_alphanumeric()) {
-        if token.chars().count() >= 4 {
-            seen.insert(token.to_ascii_lowercase());
-        }
-    }
-    seen.len()
-}
-
-/// Find the next index in `haystack` (a Vec<char>) that begins a run equal to
-/// `needle`, starting the search at `from`. Avoids allocating a substring per
-/// comparison by indexing through `chars`.
-fn find_subslice(haystack: &[char], needle: &str, from: usize) -> Option<usize> {
-    let needle_chars: Vec<char> = needle.chars().collect();
-    if needle_chars.is_empty() || from + needle_chars.len() > haystack.len() {
-        return None;
-    }
-    'outer: for i in from..=haystack.len() - needle_chars.len() {
-        for j in 0..needle_chars.len() {
-            if haystack[i + j] != needle_chars[j] {
-                continue 'outer;
-            }
-        }
-        return Some(i);
-    }
-    None
 }
 
 /// Compact info about a running mission (for API responses).

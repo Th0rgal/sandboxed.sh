@@ -11,6 +11,40 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+fn claude_process_exited(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        if matches!(
+            stat.rsplit_once(") ")
+                .and_then(|(_, rest)| rest.chars().next()),
+            Some('Z' | 'X')
+        ) {
+            return true;
+        }
+    }
+    unsafe {
+        libc::kill(pid as i32, 0) != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn claude_exit_monitor_recognizes_unreaped_child() {
+    assert!(!claude_process_exited(std::process::id()));
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !claude_process_exited(child.id()) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let exited_before_reaping = claude_process_exited(child.id());
+    child.wait().unwrap();
+    assert!(exited_before_reaping);
+}
+
 fn successful_empty_terminal_result(
     cancelled: bool,
     had_error: bool,
@@ -1515,7 +1549,8 @@ pub fn run_claudecode_turn<'a>(
             }
         };
 
-        let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (line_tx, mut line_rx) =
+            tokio::sync::mpsc::channel::<(std::time::Instant, String)>(256);
         let reader_mission_id = mission_id.to_string();
         let reader_handle = tokio::task::spawn_blocking(move || {
             use std::io::BufRead;
@@ -1545,7 +1580,10 @@ pub fn run_claudecode_turn<'a>(
                             );
                         }
                         let s = String::from_utf8_lossy(&buf).to_string();
-                        if line_tx.send(s).is_err() {
+                        if line_tx
+                            .blocking_send((std::time::Instant::now(), s))
+                            .is_err()
+                        {
                             tracing::debug!(
                                 mission_id = %reader_mission_id,
                                 "PTY reader: channel closed"
@@ -1601,7 +1639,8 @@ pub fn run_claudecode_turn<'a>(
         // surface a marker instead of a silently empty thoughts panel.
         let mut thinking_audit = crate::backend::shared::ThinkingDeltaAudit::default();
         let mut encrypted_marker_emitted = false;
-        let mut text_buffer: HashMap<u32, String> = HashMap::new();
+        let mut text_buffer: std::collections::BTreeMap<u32, String> =
+            std::collections::BTreeMap::new();
         let mut active_thinking_index: Option<u32> = None; // Track which thinking block is active
         let mut finalized_thinking_indices: std::collections::HashSet<u32> =
             std::collections::HashSet::new(); // Blocks already sent done:true during streaming
@@ -1634,6 +1673,12 @@ pub fn run_claudecode_turn<'a>(
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(4096);
         let mut first_text_delta_at: Option<Instant> = None;
+        let mut repetition_guard = super::stream_guard::Guard::new();
+        let mut guard_tick = tokio::time::interval(Duration::from_secs(1));
+        guard_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut text_tick = tokio::time::interval(Duration::from_millis(50));
+        text_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut text_coalescer = TextDeltaCoalescer::new();
         let mut degenerate_stage_triggered: bool = false;
         let mut degenerate_evidence: Option<String> = None;
 
@@ -1693,33 +1738,29 @@ pub fn run_claudecode_turn<'a>(
         // (e.g. while `gh` is still running), child processes can keep the PTY
         // slave fd open, preventing the PTY reader from getting EOF. We detect
         // the main process exit and break the loop with a grace period.
-        let process_exit_notify = {
-            let notify = Arc::new(tokio::sync::Notify::new());
-            if let Some(pid) = pty.process_id() {
-                let notify_clone = Arc::clone(&notify);
-                let exit_mission_id = mission_id.to_string();
-                tokio::task::spawn_blocking(move || {
-                    let pid = pid as i32;
-                    loop {
-                        // kill(pid, 0) checks if the process exists without
-                        // actually sending a signal.
-                        let alive = unsafe { libc::kill(pid, 0) } == 0;
-                        if !alive {
-                            tracing::debug!(
-                                mission_id = %exit_mission_id,
-                                pid = pid,
-                                "PTY child process has exited"
-                            );
-                            notify_clone.notify_one();
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(500));
+        let process_exit_notify = Arc::new(tokio::sync::Notify::new());
+        let process_monitor_cancel = CancellationToken::new();
+        let _process_monitor_guard = process_monitor_cancel.clone().drop_guard();
+        if let Some(pid) = pty.process_id() {
+            let notify = process_exit_notify.clone();
+            let stopped = process_monitor_cancel.clone();
+            tokio::spawn(async move {
+                loop {
+                    // kill(pid, 0) also succeeds for a zombie. Recognize exit
+                    // before wait() reaps it, and never leak a blocking monitor.
+                    if claude_process_exited(pid) {
+                        notify.notify_one();
+                        break;
                     }
-                });
-            }
-            notify
-        };
+                    tokio::select! {
+                        _ = stopped.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    }
+                }
+            });
+        }
         let mut process_exited = false;
+        let mut last_queue_report = Instant::now();
         // Grace period: after process exits, wait briefly for remaining events
         // before breaking the loop. This lets us capture any final `result` event
         // that may already be buffered in the PTY/channel.
@@ -1801,7 +1842,7 @@ pub fn run_claudecode_turn<'a>(
                         "PTY child process exited, draining remaining events (3s grace)"
                     );
                 }
-                _ = tokio::time::sleep_until(process_exit_grace_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(86400))), if process_exited => {
+                _ = tokio::time::sleep_until(process_exit_grace_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(86400))), if process_exited && line_rx.is_empty() => {
                     // Grace period expired after process exit — no `result` event arrived.
                     tracing::warn!(
                         mission_id = %mission_id,
@@ -1870,12 +1911,52 @@ pub fn run_claudecode_turn<'a>(
                     });
                     last_heartbeat_at = Instant::now();
                 }
+                _ = text_tick.tick() => {
+                    let total_len = text_buffer.values().map(|s| s.len()).sum::<usize>();
+                    if total_len > last_text_len && text_coalescer.should_emit() {
+                        last_text_len = total_len;
+                        let _ = events_tx.send(AgentEvent::TextDelta {
+                            content: text_buffer.values().cloned().collect::<String>(),
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                }
+                _ = guard_tick.tick() => {
+                    if !process_exited && !degenerate_stage_triggered && repetition_guard.dirty
+                        && first_text_delta_at.is_some_and(|t| t.elapsed() >= degenerate_min_duration) {
+                        repetition_guard.start(super::stream_guard::tail(&text_buffer, degenerate_window_chars),
+                            degenerate_window_chars, degenerate_min_substring_len, degenerate_min_repeats);
+                    }
+                }
+                verdict = repetition_guard.result() => {
+                    if let super::stream_guard::Verdict::Repeated { needle, evidence } = verdict {
+                        // A completed worker is advisory. Only act while this same
+                        // turn is alive and its exact evidence is still in the current tail.
+                        if !process_exited && !cancel.is_cancelled()
+                            && !pty.process_id().is_some_and(claude_process_exited)
+                            && super::stream_guard::tail(&text_buffer, degenerate_window_chars).contains(&evidence) {
+                            tracing::warn!(mission_id = %mission_id, repeated_substring = %needle,
+                                "Claude Code stream repeats adjacent meaningful text; stopping CLI");
+                            degenerate_stage_triggered = true;
+                            degenerate_evidence = Some(needle);
+                            pty.kill();
+                            reader_handle.abort();
+                            break;
+                        }
+                    }
+                }
                 line_opt = line_rx.recv() => {
-                    let Some(raw_line) = line_opt else {
+                    let Some((read_at, raw_line)) = line_opt else {
                         // EOF - PTY closed
                         break;
                     };
 
+                    if last_queue_report.elapsed() >= Duration::from_secs(1) {
+                        tracing::debug!(mission_id = %mission_id, queue_depth = line_rx.len(),
+                            processing_delay_us = read_at.elapsed().as_micros() as u64,
+                            "Claude output dequeued");
+                        last_queue_report = Instant::now();
+                    }
                     let raw_line = raw_line.trim_end_matches(&['\r', '\n'][..]);
                     let cleaned = strip_ansi_codes(raw_line);
                     let line = cleaned.trim();
@@ -2008,7 +2089,7 @@ pub fn run_claudecode_turn<'a>(
                                                         // Stream text deltas similar to thinking panel
                                                         // This allows users to see tool use descriptions as they're generated
                                                         let total_len = text_buffer.values().map(|s| s.len()).sum::<usize>();
-                                                        if total_len > last_text_len {
+                                                        if total_len > last_text_len && text_coalescer.should_emit() {
                                                             let accumulated: String = text_buffer.values().cloned().collect::<Vec<_>>().join("");
                                                             last_text_len = total_len;
 
@@ -2018,59 +2099,8 @@ pub fn run_claudecode_turn<'a>(
                                                             });
                                                         }
 
-                                                        // Degenerate-stream detector. Some models enter a
-                                                        // tight loop emitting the same short string over
-                                                        // and over (e.g. "Yielding pending your choice.")
-                                                        // and never emit a terminal result. The per-turn
-                                                        // idle timer never fires because events keep
-                                                        // arriving, so the user is stuck watching a
-                                                        // streaming view that never finalises and is
-                                                        // billed for the full token burn. Once we see the
-                                                        // same meaningful substring repeated several
-                                                        // times in a sliding window past a minimum
-                                                        // streaming duration we kill the CLI, surface a
-                                                        // clear "model entered a degenerate loop"
-                                                        // failure, and let the user send a new turn.
-                                                        if !degenerate_stage_triggered {
-                                                            if first_text_delta_at.is_none() {
-                                                                first_text_delta_at = Some(Instant::now());
-                                                            }
-                                                            let streaming_for = first_text_delta_at
-                                                                .map(|t| t.elapsed())
-                                                                .unwrap_or(Duration::ZERO);
-                                                            let total_acc: String = text_buffer
-                                                                .values()
-                                                                .cloned()
-                                                                .collect::<Vec<_>>()
-                                                                .join("");
-                                                            let degenerate_needle =
-                                                                if streaming_for >= degenerate_min_duration {
-                                                                    crate::api::mission_runner::degenerate_repeated_substring(
-                                                                        &total_acc,
-                                                                        degenerate_window_chars,
-                                                                        degenerate_min_substring_len,
-                                                                        degenerate_min_repeats,
-                                                                    )
-                                                                } else {
-                                                                    None
-                                                                };
-                                                            if let Some(needle) = degenerate_needle {
-                                                                tracing::warn!(
-                                                                    mission_id = %mission_id,
-                                                                    streaming_for_secs = streaming_for.as_secs(),
-                                                                    total_text_chars = total_len,
-                                                                    window_chars = degenerate_window_chars,
-                                                                    min_substring_len = degenerate_min_substring_len,
-                                                                    min_repeats = degenerate_min_repeats,
-                                                                    "Claude Code stream looks degenerate (same substring repeated); killing CLI"
-                                                                );
-                                                                degenerate_stage_triggered = true;
-                                                                degenerate_evidence = Some(needle);
-                                                                pty.kill();
-                                                                reader_handle.abort();
-                                                                break;
-                                                            }
-                                                        }
+                                                        first_text_delta_at.get_or_insert_with(Instant::now);
+                                                        repetition_guard.dirty = true;
                                                     }
                                                 }
                                             }
@@ -2105,6 +2135,13 @@ pub fn run_claudecode_turn<'a>(
                                     }
                                 }
                                 ClaudeEvent::Assistant(evt) => {
+                                    if text_buffer.values().map(|s| s.len()).sum::<usize>() > last_text_len {
+                                        let _ = events_tx.send(AgentEvent::TextDelta {
+                                            content: text_buffer.values().cloned().collect::<String>(),
+                                            mission_id: Some(mission_id),
+                                        });
+                                    }
+
                                     if let Some(m) = evt.message.model.as_ref() {
                                         observed_model = Some(m.clone());
                                     }
@@ -2383,6 +2420,7 @@ pub fn run_claudecode_turn<'a>(
                                     // starts fresh (block indices restart from 0 each turn)
                                     thinking_buffer.clear();
                                     text_buffer.clear();
+                                    repetition_guard.reset();
                                     active_thinking_index = None;
                                     finalized_thinking_indices.clear();
                                     last_text_len = 0;
@@ -2528,6 +2566,17 @@ pub fn run_claudecode_turn<'a>(
             mission_id = %mission_id,
             "Event loop completed, waiting for Claude Code process"
         );
+        repetition_guard.reset();
+        process_monitor_cancel.cancel();
+        line_rx.close();
+        drop(line_rx);
+        if text_buffer.values().map(|s| s.len()).sum::<usize>() > last_text_len {
+            let _ = events_tx.send(AgentEvent::TextDelta {
+                content: text_buffer.values().cloned().collect::<String>(),
+                mission_id: Some(mission_id),
+            });
+        }
+
         // The final result has already been parsed at this point — the only
         // thing left is process teardown. The CLI can fail to exit when a
         // spawned MCP server (or any child) keeps running and holds the PTY
