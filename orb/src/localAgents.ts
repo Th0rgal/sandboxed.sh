@@ -3,6 +3,7 @@
  * runner. Detection and process control go through Tauri. Mention rewriting
  * is pure and tested without a desktop shell.
  */
+import { bufferedOutput, type OutputEvent } from "./localStream";
 import { createSignal } from "solid-js";
 import { mentionText, scanMentions, type AttachChip } from "./attach";
 import { listProjectFiles, readProjectFile, getProjectController } from "./api";
@@ -320,27 +321,38 @@ export async function stopLocal(id: string): Promise<void> {
   setRunning((prev) => ({ ...prev, [id]: false }));
 }
 
-/** Poll until the CLI exits. Calls back with the growing transcript. */
-export async function followLocal(
-  id: string,
-  onText: (text: string) => void,
-): Promise<PollLocal> {
-  let last = "";
-  for (;;) {
-    const state = await pollLocal(id);
-    if (state.text !== last) {
-      last = state.text;
-      setLiveText((prev) => ({ ...prev, [id]: state.text }));
-      onText(state.text);
+/** New native builds push ordered deltas; old binaries retain compatibility. */
+export async function followLocal(id: string, onText: (text: string) => void): Promise<PollLocal> {
+  const publish = (text:string) => {
+    setLiveText(prev=>({...prev,[id]:text}));
+    onText(text);
+  };
+  const core=(window as unknown as {__TAURI__?:{core?:{Channel?:new()=>{onmessage:(event:OutputEvent<PollLocal>)=>void}}}}).__TAURI__?.core;
+  const pollUntilDone = async ():Promise<PollLocal> => {
+    let last="";
+    for(;;){
+      const state=await pollLocal(id);
+      if(state.text!==last){last=state.text;publish(last)}
+      if(state.done)return state;
+      await new Promise(resolve=>setTimeout(resolve,400));
     }
-    if (state.done) {
-      setRunning((prev) => ({ ...prev, [id]: false }));
-      if (state.session_id) {
-        const binding = localBinding(id);
-        if (binding) rememberBinding(id, { ...binding, sessionId: state.session_id });
+  };
+  let state:PollLocal;
+  try {
+    if(core?.Channel){
+      try {
+        state=await new Promise<PollLocal>((resolve,reject)=>{
+          const buffer=bufferedOutput<PollLocal>(publish,resolve);
+          const channel=new core.Channel!();
+          channel.onmessage=event=>buffer.receive(event);
+          void tauriInvoke()!("local_agents_subscribe",{id,onEvent:channel}).catch(error=>{buffer.dispose();reject(error)});
+        });
+      } catch(error) {
+        if(!/command.*local_agents_subscribe.*not found|unknown command/i.test(String(error)))throw error;
+        state=await pollUntilDone();
       }
-      return state;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 400));
-  }
+    } else {state=await pollUntilDone();}
+    if(state.session_id){const binding=localBinding(id);if(binding)rememberBinding(id,{...binding,sessionId:state.session_id});}
+    return state;
+  } finally {setRunning(prev=>({...prev,[id]:false}));}
 }

@@ -93,7 +93,7 @@ describe("goal indicators", () => {
     const turn = container.querySelector(".user")!;
     expect(turn.classList.contains("goal")).toBe(true);
     expect(turn.querySelector(".goal-tag")).toBeNull();
-    expect(turn.querySelector(":scope > span:last-child")?.textContent).toBe("Check the guard");
+    expect(turn.textContent).toBe("Check the guard");
   });
   it("leaves ordinary turns untouched", () => {
     const { container } = render(() => <UserTurn text="Hello /goal not a command" />);

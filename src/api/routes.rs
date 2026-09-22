@@ -1163,6 +1163,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/runs/:id/tasks", get(get_run_tasks))
         .route("/api/memory/search", get(search_memory))
         // Remote file explorer endpoints (use Authorization header)
+        .route("/api/file-resources", post(super::file_resources::operate))
         .route("/api/fs/list", get(fs::list))
         .route("/api/fs/download", get(fs::download))
         .route("/api/fs/validate", get(fs::validate))

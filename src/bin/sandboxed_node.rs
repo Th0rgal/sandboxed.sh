@@ -133,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
     // Periodic disk GC for lean-build checkouts and lake cache slots
     // (SANDBOXED_NODE_MIN_FREE_GB, default 10).
     sandboxed_sh::node::spawn_cache_gc(work_root.clone());
+    sandboxed_sh::node::resource_history::start();
 
     let state = Arc::new(NodeState {
         node_id,
@@ -162,6 +163,7 @@ async fn main() -> anyhow::Result<()> {
                 .get(list_jobs),
         )
         .route("/jobs/:id", get(get_job))
+        .route("/jobs/:id/files", post(job_files))
         .route("/jobs/:id/log", get(get_job_log))
         .route("/jobs/:id/cancel", post(cancel_job))
         .with_state(state);
@@ -242,6 +244,7 @@ async fn heartbeat(
     let lean_runtime_ready = sandboxed_sh::node::lean_runtime_ready(&state.work_root);
     let labels = advertised_labels(&state.labels, lean_runtime_ready);
     Ok(Json(NodeHeartbeat {
+        resource_history: sandboxed_sh::node::resource_history::snapshot(),
         node_id: state.node_id.clone(),
         online: true,
         capacity_total: state.capacity_total,
@@ -939,4 +942,26 @@ mod tests {
         .0;
         assert!(listed.iter().any(|job| job.job_id == job_id));
     }
+}
+
+async fn job_files(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<sandboxed_sh::file_browser::Request>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    let record = state
+        .jobs
+        .get(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "Job not found".into()))?;
+    let root = state.work_root.join(record.mission_id.to_string());
+    let value =
+        tokio::task::spawn_blocking(move || sandboxed_sh::file_browser::execute(&root, &request))
+            .await
+            .map_err(|e| internal_error(e.into()))?
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(value))
 }

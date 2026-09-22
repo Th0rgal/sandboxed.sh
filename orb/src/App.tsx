@@ -1,3 +1,4 @@
+import { FilePanelProvider, FilePanelButton } from "./FilePanel";
 import { ErrorNotice } from "./ErrorNotice";
 import { LaunchStatus, MissionPending, missionPhase, phaseIsQuiet, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, launchRefusal, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, missionSettingsIdle, dockModelLabel, type LaunchReceipt, type LaunchRefusal, type RemoteSupport } from "./missionLaunch";
 import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, GoalTag, EMPTY_GOAL_ERROR, absorbGoalPrefix, composerModes, filterSlash, slashQuery, modePrompt, ModeChip, type ComposerMode } from "./goal";
@@ -250,6 +251,7 @@ function StatusGlyph(p: { agent: { status: Agent["status"] }; busy: boolean }) {
 }
 
 function Composer(p: {
+  revision?: { text: string };
   placeholder: string;
   busy: boolean;
   onSend: (t: string) => void | boolean | Promise<void | boolean>;
@@ -344,6 +346,8 @@ function Composer(p: {
     ta.style.height = "auto";
     ta.style.height = Math.min(ta.scrollHeight, 220) + "px";
   };
+
+  createEffect(() => { const revision = p.revision; if (revision) { setText(revision.text); queueMicrotask(() => { resize(); ta?.focus(); }); } });
   const draftOf = (visible: string, m = mode()) => modePrompt(m, visible);
   const write = (visible: string, nextMode = mode()) => {
     ta.value = visible;
@@ -1340,6 +1344,7 @@ export default function App() {
 
   return (
     <div class={`app ${sidebar() ? "" : "sb-hidden"}`} style={{ "--sb-w": `${sbWidth()}px` }}>
+      <FilePanelProvider scope={{ mission: currentMissionId() ? (openMission()?.id === currentMissionId() ? openMission() : missions().find(m => m.id === currentMissionId())) : undefined, project: currentController()?.slug, controller: currentController()?.id }}>
       <button class="sidebar-backdrop" aria-label="Close sidebar" onClick={() => setSidebar(false)} tabIndex={-1} />
       <aside id="orb-sidebar" class="sidebar">
         <div class="sb-top" data-tauri-drag-region />
@@ -1489,6 +1494,7 @@ export default function App() {
             </Match>
           </Switch>
         </div>
+        <FilePanelButton />
       </header>
 
       <main class="main">
@@ -1855,6 +1861,7 @@ export default function App() {
           />
         )}
       </Show>
+      </FilePanelProvider>
     </div>
   );
 }
@@ -2045,6 +2052,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
   const [error, setError] = createSignal<string | null>(null);
   const [queueError, setQueueError] = createSignal<string | null>(cached?.queueError ?? null);
   const [sendError, setSendError] = createSignal<string | null>(null);
+  const [revision, setRevision] = createSignal<{ text: string }>();
   const [followAttach, setFollowAttach] = createSignal<AttachChip[]>([]);
   let scroller: HTMLDivElement | undefined;
   let nearBottom = true;
@@ -2053,6 +2061,14 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
   const scrollIfPinned = () => {
     if (nearBottom) scroller?.scrollTo({ top: scroller.scrollHeight });
   };
+  // Resize notifications run after streaming Markdown has changed layout.
+  onMount(() => {
+    if (!scroller) return;
+    const observer = new ResizeObserver(() => { if (nearBottom) scrollIfPinned(); });
+    const content = scroller.querySelector(".col");
+    if (content) observer.observe(content);
+    onCleanup(() => observer.disconnect());
+  });
 
   const refresh = async () => {
     try {
@@ -2257,7 +2273,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
                   {(r) => (
                     <>
                       <LaunchStatus destination={missionDestination(mission(), r())} mission={mission()} goal={missionGoal(mission(), r())} />
-                      <UserTurn text={r().prompt} pending={pending()} />
+                      <UserTurn text={r().prompt} pending={pending()} onReuse={text => setRevision({ text })} />
                       <Show when={pending()}>
                         <MissionPending destination={missionDestination(mission(), r())} label={phaseLabel()} />
                       </Show>
@@ -2269,7 +2285,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
             }
           >
             <LaunchStatus destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={activity()} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
-            <Transcript items={viewItems().filter(i => i.kind !== "user" || !i.queued)} pending={pending()} />
+            <Transcript items={viewItems().filter(i => i.kind !== "user" || !i.queued)} pending={pending()} onReuse={text => setRevision({ text })} />
             <Show when={pending()}>
               <MissionPending destination={missionDestination(mission(), receipt)} label={phaseLabel()} />
             </Show>
@@ -2288,6 +2304,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
             placeholder="Send follow-up"
             picker={false}
             busy={busy()}
+            revision={revision()}
             onSend={sendMsg}
             onStop={stopM}
             scope={`m:${p.id}`}

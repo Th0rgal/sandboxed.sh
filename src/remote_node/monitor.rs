@@ -26,6 +26,8 @@ const OFFLINE_MISS_THRESHOLD: u32 = 3;
 /// Bounded length of the recent dispatch-outcome history.
 const RECENT_OUTCOMES_CAP: usize = 50;
 
+pub use crate::node::resource_history::Sample as NodeResourceSample;
+
 /// Cached status for one configured node.
 #[derive(Debug, Clone, Serialize)]
 pub struct CachedNodeStatus {
@@ -42,6 +44,7 @@ pub struct CachedNodeStatus {
     /// be represented by that heartbeat payload.
     pub last_probe_started_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
+    pub resource_history: Vec<NodeResourceSample>,
 }
 
 /// Outcome record for a remote dispatch (sync `/execute` or async job).
@@ -185,12 +188,42 @@ impl FleetMonitor {
     ) {
         let (status, misses) = status_after_probe(0, true);
         let mut statuses = self.statuses.write().unwrap_or_else(|e| e.into_inner());
+        let now = Utc::now().timestamp_millis();
+        let mut resource_history = statuses
+            .get(node_id)
+            .map(|s| s.resource_history.clone())
+            .unwrap_or_default();
+        resource_history.retain(|sample| sample.time >= now - 60_000);
+        resource_history.push(NodeResourceSample {
+            time: now,
+            cpu: None,
+            gpu: None,
+            memory: (heartbeat.mem_total_bytes > 0).then(|| {
+                heartbeat
+                    .mem_total_bytes
+                    .saturating_sub(heartbeat.mem_available_bytes) as f64
+                    / heartbeat.mem_total_bytes as f64
+                    * 100.0
+            }),
+        });
+        if !heartbeat.resource_history.is_empty() {
+            resource_history = heartbeat
+                .resource_history
+                .iter()
+                .filter(|s| s.time >= now - 60_000 && s.time <= now + 1_000)
+                .cloned()
+                .collect();
+        }
+        if resource_history.len() > 120 {
+            resource_history.drain(..resource_history.len() - 120);
+        }
         statuses.insert(
             node_id.to_string(),
             CachedNodeStatus {
                 node_id: node_id.to_string(),
                 status,
                 consecutive_misses: misses,
+                resource_history,
                 last_heartbeat: Some(heartbeat),
                 last_seen: Some(Utc::now()),
                 last_probe_started_at: Some(probe_started_at),
@@ -209,6 +242,7 @@ impl FleetMonitor {
                 node_id: node_id.to_string(),
                 status: RemoteNodeStatus::Unknown,
                 consecutive_misses: 0,
+                resource_history: Vec::new(),
                 last_heartbeat: None,
                 last_seen: None,
                 last_probe_started_at: None,
@@ -700,6 +734,7 @@ pub fn global_fleet() -> Option<Arc<FleetMonitor>> {
 /// by `GET /api/remote-nodes`.
 #[derive(Debug, Clone, Serialize)]
 pub struct RemoteNodeView {
+    pub resource_history: Vec<NodeResourceSample>,
     pub id: String,
     pub base_url: String,
     pub token_env: String,
@@ -738,6 +773,15 @@ impl RemoteNodeView {
             labels.retain(|label| label != "lean");
         }
         Self {
+            resource_history: cached
+                .map(|c| {
+                    c.resource_history
+                        .iter()
+                        .filter(|s| s.time >= Utc::now().timestamp_millis() - 60_000)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
             id: config.id.clone(),
             base_url: config.base_url.clone(),
             token_env: config.token_env.clone(),
@@ -890,6 +934,34 @@ mod tests {
     }
 
     #[test]
+    fn resource_history_prefers_node_samples_and_retains_legacy_probes() {
+        let fleet = FleetMonitor::new();
+        fleet.record_heartbeat("legacy", heartbeat("legacy"));
+        fleet.record_heartbeat("legacy", heartbeat("legacy"));
+        assert_eq!(fleet.get("legacy").unwrap().resource_history.len(), 2);
+        let mut hb = heartbeat("gpu");
+        let now = Utc::now().timestamp_millis();
+        hb.resource_history = vec![
+            NodeResourceSample {
+                time: now - 90_000,
+                cpu: Some(1.0),
+                memory: Some(2.0),
+                gpu: None,
+            },
+            NodeResourceSample {
+                time: now - 3_000,
+                cpu: Some(20.0),
+                memory: Some(30.0),
+                gpu: Some(80.0),
+            },
+        ];
+        fleet.record_heartbeat("gpu", hb);
+        let history = fleet.get("gpu").unwrap().resource_history;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].gpu, Some(80.0));
+    }
+
+    #[test]
     fn probe_transitions_follow_miss_thresholds() {
         // Fresh heartbeat is always Online with the miss counter reset.
         assert_eq!(status_after_probe(0, true), (RemoteNodeStatus::Online, 0));
@@ -979,6 +1051,7 @@ mod tests {
         }))
         .unwrap();
         CachedNodeStatus {
+            resource_history: Vec::new(),
             node_id: id.to_string(),
             status: RemoteNodeStatus::Online,
             consecutive_misses: 0,

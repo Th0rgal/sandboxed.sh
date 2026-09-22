@@ -77,6 +77,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export interface RemoteNodeView {
+  resource_history?: { time: number; memory?: number | null; cpu?: number | null; gpu?: number | null }[];
   cpu_total?: number | null;
   mem_total_bytes?: number | null;
   mem_available_bytes?: number | null;

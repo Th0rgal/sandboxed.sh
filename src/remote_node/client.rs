@@ -240,6 +240,7 @@ mod tests {
     async fn heartbeat_client_reads_node_status() {
         async fn heartbeat() -> Json<NodeHeartbeat> {
             Json(NodeHeartbeat {
+                resource_history: Vec::new(),
                 node_id: "babylon".to_string(),
                 online: true,
                 capacity_total: 2,

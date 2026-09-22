@@ -1,3 +1,4 @@
+import { FileReference, FileReferenceText } from "./fileReferenceContext";
 import { For, createMemo, createSignal, type JSX } from "solid-js";
 import { openExternalUrl } from "./api";
 
@@ -24,9 +25,10 @@ function inline(text: string): JSX.Element[] {
   const re = /\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\(([^)]+)\)/g;
   let last = 0;
   for (let m = re.exec(text); m; m = re.exec(text)) {
-    if (m.index > last) out.push(text.slice(last, m.index));
+    if (m.index > last) out.push(<FileReferenceText text={text.slice(last, m.index)} />);
     if (m[1] !== undefined) out.push(<strong>{inline(m[1])}</strong>);
-    else if (m[2] !== undefined) out.push(<code>{m[2]}</code>);
+    else if (m[2] !== undefined) out.push(<FileReference raw={m[2]}><code>{m[2]}</code></FileReference>);
+    else if (!safeHref(m[4])) out.push(<FileReference raw={m[4]}>{m[3]}</FileReference>);
     else
       out.push(
         <a
@@ -42,7 +44,7 @@ function inline(text: string): JSX.Element[] {
       );
     last = m.index + m[0].length;
   }
-  if (last < text.length) out.push(text.slice(last));
+  if (last < text.length) out.push(<FileReferenceText text={text.slice(last)} />);
   return out;
 }
 
@@ -158,8 +160,30 @@ export function parseMarkdown(src: string): Block[] {
   return out;
 }
 
+/** Freeze only completed blocks; fences keep blank lines inside the active tail. */
+export function incrementalMarkdown() {
+  let previous = "", boundary = 0, stable: Block[] = [];
+  return (text: string): Block[] => {
+    if (!text.startsWith(previous)) { boundary = 0; stable = []; }
+    previous = text;
+    const tail = text.slice(boundary);
+    let fenced = false, end = 0, offset = 0;
+    for (const line of tail.split("\n").slice(0, -1)) {
+      offset += line.length + 1;
+      if (line.startsWith("```")) fenced = !fenced;
+      if (!fenced && !line.trim()) end = offset;
+    }
+    if (end) {
+      stable = [...stable, ...parseMarkdown(tail.slice(0, end))];
+      boundary += end;
+    }
+    return [...stable, ...parseMarkdown(text.slice(boundary))];
+  };
+}
+
 export function MdView(p: { text: string; compact?: boolean }) {
-  const blocks = createMemo(() => parseMarkdown(p.text));
+  const parse = incrementalMarkdown();
+  const blocks = createMemo(() => parse(p.text));
   return (
     <div class={`md ${p.compact ? "md-compact" : ""}`}>
       <For each={blocks()}>
@@ -277,7 +301,7 @@ function hlLine(line: string): JSX.Element {
   return <>{hlInline(line)}</>;
 }
 
-export function MdSource(p: { text: string; onInput: (t: string) => void }) {
+export function MdSource(p: { text: string; onInput: (t: string) => void; readOnly?: boolean }) {
   let pre!: HTMLPreElement;
   let ta!: HTMLTextAreaElement;
   const lines = createMemo(() => p.text.split("\n"));
@@ -304,6 +328,7 @@ export function MdSource(p: { text: string; onInput: (t: string) => void }) {
       <textarea
         ref={ta}
         class="md-ta"
+        readOnly={p.readOnly}
         value={p.text}
         spellcheck={false}
         onScroll={sync}
@@ -317,4 +342,9 @@ export function MdSource(p: { text: string; onInput: (t: string) => void }) {
       />
     </div>
   );
+}
+
+/** The same syntax presentation as the editor, without a writable textarea. */
+export function ReadOnlySource(p: { text: string; line?: number }) {
+  return <div class="file-source-code"><For each={p.text.split("\n")}>{(line,i)=><div data-line={i()+1} class={p.line===i()+1?"highlight":""}><span class="file-line-number">{i()+1}</span><code>{hlLine(line)||" "}</code></div>}</For></div>;
 }

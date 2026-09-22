@@ -15,6 +15,7 @@ test("machine details use live core metrics and heartbeat capacity without inven
     return route.fulfill({ json });
   });
   await page.routeWebSocket("**/api/monitoring/ws", socket => {
+    socket.send(JSON.stringify({ type: "history", history: Array.from({ length: 60 }, (_, i) => ({ cpu_percent: 23 + Math.sin(i / 4) * 8, memory_used: (15 + i / 60) * 1024 ** 3, memory_total: 64 * 1024 ** 3, disk_used: 100 * 1024 ** 3, disk_total: 200 * 1024 ** 3, timestamp_ms: Date.now() - (60 - i) * 1000 })) }));
     socket.send(JSON.stringify({ cpu_percent: 23, memory_used: 16 * 1024 ** 3, memory_total: 64 * 1024 ** 3, disk_used: 100 * 1024 ** 3, disk_total: 200 * 1024 ** 3, timestamp_ms: Date.now() }));
   });
   await page.goto("/");
@@ -22,13 +23,16 @@ test("machine details use live core metrics and heartbeat capacity without inven
   const core = page.getByRole("button", { name: /Core Live/ });
   await core.click();
   await expect(core).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByText("Streaming live", { exact: true })).toHaveCount(0);
+  expect(await page.locator(".history-cpu").first().getAttribute("d")).toContain("L");
   await expect(page.getByText("23%", { exact: true })).toBeVisible();
   await expect(page.locator(".machine-resource").getByText("16.0 GiB / 64.0 GiB")).toBeVisible();
   const spark = page.getByRole("button", { name: /spark online/ });
   await spark.click();
   await expect(page.getByText("20 cores", { exact: true })).toBeVisible();
   await expect(page.locator(".machine-resource").getByText("96.0 GiB / 128.0 GiB")).toBeVisible();
-  await expect(page.getByText(/CPU load and GPU metrics are not reported/)).toBeVisible();
+  await expect(page.getByText(/Heartbeat snapshot/)).toHaveCount(0);
+  await expect(page.getByText("http://spark:3088", { exact: true })).toHaveCount(0);
   await page.screenshot({ path: "/tmp/orb-machines-details.png" });
   await spark.click();
   await expect(page.locator(".machine-resource").getByText("96.0 GiB / 128.0 GiB")).not.toBeVisible();
@@ -87,7 +91,9 @@ test("local machine is separate and shows native memory consumers", async ({ pag
   const local = page.locator(".local-machine");
   await expect(local.getByText("Cohere · speech to text")).toBeVisible();
   await expect(local.getByText("6.3%", { exact: true })).toBeVisible();
-  await expect(local.getByText("Not running", { exact: true })).toBeVisible();
-  await expect(local.getByRole("meter", { name: "Memory used" })).toHaveAttribute("aria-valuenow", "50");
+  await expect(local.getByText("Not running", { exact: true })).toHaveCount(0);
+  await expect(local.getByText("Local harnesses · started by Orb")).toHaveCount(0);
+  await expect(local.getByText(/Resident process memory/)).toHaveCount(0);
+  await expect(local.getByRole("img", { name: "CPU and memory usage over the last minute" })).toBeVisible();
   await page.screenshot({ path: "/tmp/orb-local-machine.png" });
 });

@@ -1,6 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[path = "../../../shared/file_browser.rs"]
+mod file_browser;
 mod local_agents;
+mod local_stream;
 mod machine_metrics;
 mod voice;
 
@@ -59,6 +62,7 @@ fn main() {
             // Local voice input: the Python worker starts on first use and
             // is released again after a stretch of inactivity.
             app.state::<voice::VoiceState>().start_idle_reaper();
+            machine_metrics::start(app.state::<voice::VoiceState>().inner().clone());
             // macOS vibrancy: the window is transparent and the sidebar
             // shows the desktop through a sidebar-material blur, like
             // Cursor/Xcode. The main pane paints an opaque background in
@@ -82,6 +86,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             paloma_ssh_pubkey,
+            browse_local_files,
             machine_metrics::local_machine_metrics,
             open_url,
             set_window_theme,
@@ -95,8 +100,21 @@ fn main() {
             local_agents::local_agents_write,
             local_agents::local_agents_start,
             local_agents::local_agents_poll,
+            local_agents::local_agents_subscribe,
             local_agents::local_agents_stop
         ])
         .run(tauri::generate_context!())
         .expect("error while running orb");
+}
+
+#[tauri::command]
+async fn browse_local_files(
+    root: String,
+    request: file_browser::Request,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        file_browser::execute(std::path::Path::new(&root), &request)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
