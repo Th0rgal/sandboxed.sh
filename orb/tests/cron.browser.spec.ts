@@ -37,11 +37,10 @@ for (const theme of ["light", "dark"]) {
     const action = page.getByRole("button", { name: "Project actions for Project notes" });
     await expect(action).toHaveCSS("opacity", "1");
     await action.focus(); await page.keyboard.press("Enter");
-    // File creation now leads the project menu, then folder creation; starting
-    // an agent or a cron follows after a separator.
-    await expect(page.getByRole("menuitem", { name: "New file" })).toBeFocused();
+    // Agent and cron creation lead; files are only created inside folders.
+    await expect(page.getByRole("menuitem", { name: "New agent" })).toBeFocused();
     await page.keyboard.press("ArrowDown");
-    await expect(page.getByRole("menuitem", { name: "New folder" })).toBeFocused();
+    await expect(page.getByRole("menuitem", { name: "New cron" })).toBeFocused();
     await page.keyboard.press("Escape"); await expect(action).toBeFocused();
     await action.click(); await page.getByRole("menuitem", { name: "New folder" }).click();
     await page.getByPlaceholder("Folder name").fill("Notes");

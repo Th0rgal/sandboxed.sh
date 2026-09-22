@@ -633,7 +633,7 @@ export function LiveProjectsSection(p: {
       <button class="row-action" aria-label={`Project actions for ${d.label}`} title="Project actions"
         onPointerDown={e => setActionFocus(e.pointerType !== "mouse")}
         onKeyDown={e => { if (e.key === "Enter" || e.key === " ") setActionFocus(true); }}
-        onClick={e => { e.stopPropagation(); const box = e.currentTarget.getBoundingClientRect(); setActionMenu({ x: Math.max(8, box.right - 176), y: box.bottom + 4, slug: d.slug, path: "" }); }}><Ic.PlusIcon size={13} /></button>
+        onClick={e => { e.stopPropagation(); e.currentTarget.focus({ preventScroll: true }); const box = e.currentTarget.getBoundingClientRect(); setActionMenu({ x: Math.max(8, box.right - 176), y: box.bottom + 4, slug: d.slug, path: "" }); }}><Ic.PlusIcon size={13} /></button>
     </div>;
     if (d.kind === "note") return <div class="row note" role="status">{d.label}<Show when={d.path !== undefined}><button onClick={() => void loadDir(d.slug, d.path!, true)}>Retry</button></Show></div>;
     if (d.kind === "cron-error") return <div class="cron-unavailable row" role="status" title={cronUnsupported() ? "This backend does not support project crons yet. Update the backend, then check again. Existing project content is unchanged." : `Crons could not refresh. Cached jobs are retained. ${cronErrors[d.slug]}`}>
@@ -650,7 +650,7 @@ export function LiveProjectsSection(p: {
       <button class="row-action" aria-label={`Folder actions for ${d.label}`} title="Folder actions"
         onPointerDown={e => setActionFocus(e.pointerType !== "mouse")}
         onKeyDown={e => { if (e.key === "Enter" || e.key === " ") setActionFocus(true); }}
-        onClick={e => { e.stopPropagation(); const box = e.currentTarget.getBoundingClientRect(); setActionMenu({ x: Math.max(8, box.right - 176), y: box.bottom + 4, slug: d.slug, path: d.path! }); }}><Ic.PlusIcon size={13} /></button>
+        onClick={e => { e.stopPropagation(); e.currentTarget.focus({ preventScroll: true }); const box = e.currentTarget.getBoundingClientRect(); setActionMenu({ x: Math.max(8, box.right - 176), y: box.bottom + 4, slug: d.slug, path: d.path! }); }}><Ic.PlusIcon size={13} /></button>
     </div>;
     if (d.kind === "cron") {
       const ticking = () => d.controller && (controllers[d.slug]?.runs ?? []).some(r => r.status === "running" || r.status === "claimed");
