@@ -104,7 +104,11 @@ pub fn local_agents_scan(request: ScanRequest) -> Vec<ScanRow> {
     HARNESSES
         .iter()
         .map(|(id, bin)| {
-            let override_path = request.overrides.get(*id).map(|s| s.trim()).filter(|s| !s.is_empty());
+            let override_path = request
+                .overrides
+                .get(*id)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
             let path = override_path
                 .map(|p| PathBuf::from(p))
                 .filter(|p| p.is_file())
@@ -186,11 +190,15 @@ pub fn local_agents_start(request: StartRequest) -> Result<(), String> {
     let exit_code = Arc::new(Mutex::new(None));
     let session_id = Arc::new(Mutex::new(request.session_id.clone()));
     let error = Arc::new(Mutex::new(None));
-    let resumed = request.session_id.as_deref().is_some_and(|s| !s.is_empty())
-        && request.harness != "grok";
+    let resumed =
+        request.session_id.as_deref().is_some_and(|s| !s.is_empty()) && request.harness != "grok";
     let child = spawn_harness(&request, &text, &session_id, &error, &done)?;
     let child = Arc::new(Mutex::new(child));
-    watch_exit(Arc::clone(&child), Arc::clone(&done), Arc::clone(&exit_code));
+    watch_exit(
+        Arc::clone(&child),
+        Arc::clone(&done),
+        Arc::clone(&exit_code),
+    );
     map.insert(
         request.id,
         Run {
@@ -208,7 +216,11 @@ pub fn local_agents_start(request: StartRequest) -> Result<(), String> {
 
 fn watch_exit(child: Arc<Mutex<Child>>, done: Arc<AtomicBool>, exit_code: Arc<Mutex<Option<i32>>>) {
     thread::spawn(move || loop {
-        let status = child.lock().ok().and_then(|mut child| child.try_wait().ok()).flatten();
+        let status = child
+            .lock()
+            .ok()
+            .and_then(|mut child| child.try_wait().ok())
+            .flatten();
         if let Some(status) = status {
             if let Ok(mut slot) = exit_code.lock() {
                 *slot = status.code();
@@ -318,7 +330,9 @@ fn spawn_claude(
         cmd.arg("--session-id").arg(&fresh);
         *slot = Some(fresh);
     }
-    let mut child = cmd.spawn().map_err(|e| format!("failed to start Claude Code: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to start Claude Code: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         let prompt = request.prompt.clone();
         thread::spawn(move || {
@@ -345,7 +359,13 @@ fn spawn_piped(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to start {}: {e}", request.harness))?;
-    pipe_output(child.stdout.take(), child.stderr.take(), text, error, parse_json);
+    pipe_output(
+        child.stdout.take(),
+        child.stderr.take(),
+        text,
+        error,
+        parse_json,
+    );
     Ok(child)
 }
 
@@ -363,7 +383,11 @@ fn pipe_output(
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
                 let Ok(line) = line else { break };
-                let piece = if parse_json { extract_text(&line) } else { Some(line) };
+                let piece = if parse_json {
+                    extract_text(&line)
+                } else {
+                    Some(line)
+                };
                 if let Some(piece) = piece.filter(|s| !s.is_empty()) {
                     if let Ok(mut buf) = text_out.lock() {
                         if !buf.is_empty() && !parse_json {
@@ -434,7 +458,16 @@ fn spawn_codex(
     }
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
-        let result = drive_codex(&mut stdin, &mut reader, &prompt, model.as_deref(), &cwd, resume.as_deref(), &text_bg, &session_bg);
+        let result = drive_codex(
+            &mut stdin,
+            &mut reader,
+            &prompt,
+            model.as_deref(),
+            &cwd,
+            resume.as_deref(),
+            &text_bg,
+            &session_bg,
+        );
         if let Err(message) = result {
             if let Ok(mut slot) = error_bg.lock() {
                 *slot = Some(if busy_thread(&message) {
@@ -451,7 +484,10 @@ fn spawn_codex(
 
 fn busy_thread(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("busy") || lower.contains("already") || lower.contains("in progress") || lower.contains("in use")
+    lower.contains("busy")
+        || lower.contains("already")
+        || lower.contains("in progress")
+        || lower.contains("in use")
 }
 
 fn drive_codex(
@@ -511,8 +547,14 @@ fn drive_codex(
         if n == 0 {
             break;
         }
-        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else { continue };
-        if let Some(message) = value.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if let Some(message) = value
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
             return Err(message.to_string());
         }
         let method = value.get("method").and_then(|m| m.as_str()).unwrap_or("");
@@ -528,7 +570,12 @@ fn drive_codex(
     Ok(())
 }
 
-fn rpc(stdin: &mut impl Write, reader: &mut impl BufRead, method: &str, params: Value) -> Result<Value, String> {
+fn rpc(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
     let id = format!("orb-{method}");
     write_line(
         stdin,
@@ -541,12 +588,25 @@ fn rpc(stdin: &mut impl Write, reader: &mut impl BufRead, method: &str, params: 
         if n == 0 {
             return Err(format!("{method} closed the stream"));
         }
-        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else { continue };
-        if value.get("id").and_then(|v| v.as_str()) == Some(id.as_str()) || value.get("id").is_some() && value.get("method").is_none() && value.get("result").is_some() || value.get("error").is_some() && value.get("method").is_none() {
-            if let Some(message) = value.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if value.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+            || value.get("id").is_some()
+                && value.get("method").is_none()
+                && value.get("result").is_some()
+            || value.get("error").is_some() && value.get("method").is_none()
+        {
+            if let Some(message) = value
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+            {
                 return Err(format!("{method}: {message}"));
             }
-            if value.get("id").and_then(|v| v.as_str()) == Some(id.as_str()) || value.get("result").is_some() {
+            if value.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                || value.get("result").is_some()
+            {
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
             }
         }
@@ -559,7 +619,9 @@ fn rpc(stdin: &mut impl Write, reader: &mut impl BufRead, method: &str, params: 
 }
 
 fn write_line(stdin: &mut impl Write, line: &str) -> Result<(), String> {
-    stdin.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    stdin
+        .write_all(line.as_bytes())
+        .map_err(|e| e.to_string())?;
     stdin.write_all(b"\n").map_err(|e| e.to_string())?;
     stdin.flush().map_err(|e| e.to_string())
 }
@@ -568,7 +630,11 @@ fn extract_text(line: &str) -> Option<String> {
     let value: Value = serde_json::from_str(line).ok()?;
     let mut out = String::new();
     collect_text(&value, &mut out);
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 fn collect_text(value: &Value, out: &mut String) {
@@ -655,7 +721,11 @@ fn version_of(path: &Path) -> Option<String> {
                         let _ = stderr.read_to_string(&mut out);
                     }
                 }
-                return out.lines().next().map(|line| line.trim().to_string()).filter(|s| !s.is_empty());
+                return out
+                    .lines()
+                    .next()
+                    .map(|line| line.trim().to_string())
+                    .filter(|s| !s.is_empty());
             }
             Ok(Some(_)) => return None,
             Ok(None) => thread::sleep(Duration::from_millis(40)),
@@ -730,12 +800,18 @@ mod tests {
         assert!(is_secret_path(".env"));
         assert!(is_secret_path("notes/id_rsa"));
         assert!(!is_secret_path("notes/foo.md"));
-        assert_eq!(safe_rel("notes/foo.md").unwrap(), PathBuf::from("notes/foo.md"));
+        assert_eq!(
+            safe_rel("notes/foo.md").unwrap(),
+            PathBuf::from("notes/foo.md")
+        );
     }
 
     #[test]
     fn grok_and_opencode_args_match_the_pinned_flags() {
-        assert_eq!(grok_args("hello"), vec!["--prompt".to_string(), "hello".to_string()]);
+        assert_eq!(
+            grok_args("hello"),
+            vec!["--prompt".to_string(), "hello".to_string()]
+        );
         let fresh = StartRequest {
             id: "1".into(),
             harness: "opencode".into(),
@@ -756,7 +832,9 @@ mod tests {
             session_id: Some("ses_abc".into()),
             ..fresh
         };
-        assert!(opencode_args(&resumed).windows(2).any(|pair| pair == ["--session".to_string(), "ses_abc".to_string()]));
+        assert!(opencode_args(&resumed)
+            .windows(2)
+            .any(|pair| pair == ["--session".to_string(), "ses_abc".to_string()]));
     }
 
     #[test]
@@ -764,4 +842,15 @@ mod tests {
         let line = r#"{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"Hi"}}}"#;
         assert_eq!(extract_text(line).as_deref(), Some("Hi"));
     }
+}
+
+/// Only live harnesses launched by this Orb instance (not unrelated terminals).
+pub fn active_pids() -> Vec<u32> {
+    let Ok(all) = runs().lock() else {
+        return Vec::new();
+    };
+    all.values()
+        .filter(|r| !r.done.load(Ordering::SeqCst))
+        .filter_map(|r| r.child.try_lock().ok().map(|c| c.id()))
+        .collect()
 }
