@@ -2,7 +2,8 @@
   color-scheme: dark;
   --bg: #141414;
   --bg-sidebar: #121313;
-  --sidebar-opacity: 94%;
+  --sidebar-opacity: 86%;
+  --surface-opacity: 96%;
   --dock-fade-opacity: 35%;
   --bg-elev: #212121;
   --bg-hover: #1e1e1e;
@@ -57,6 +58,7 @@
   --bg: #ffffff;
   --bg-sidebar: #f6f6f4;
   --sidebar-opacity: 70%;
+  --surface-opacity: 98%;
   --dock-fade-opacity: 35%;
   --bg-elev: #f1f0ed;
   --bg-hover: #efeee9;
@@ -136,7 +138,7 @@ button:focus-visible { outline: 1.5px solid var(--focus-border); outline-offset:
   height: 100%;
 }
 /* Everything right of the sidebar stays opaque. */
-.titlebar, .main { background: var(--bg); }
+.titlebar, .main { background: color-mix(in srgb, var(--bg) var(--surface-opacity), transparent); }
 .app.sb-hidden { grid-template-columns: 0 1fr; }
 .app.sb-hidden .sidebar { display: none; }
 
@@ -381,7 +383,8 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 .tree-connectors { position: absolute; inset: 0; pointer-events: none; }
 .tree-connectors i { position: absolute; left: calc(var(--rail) + var(--column) * var(--indent)); border-left: 1px solid var(--tree); }
 .tree-rail, .tree-junction { top: 0; bottom: 0; }
-.tree-junction.last { bottom: 50%; }
+.tree-junction.last { bottom: calc(50% - 1px); width: 8px; border-bottom: 1px solid var(--tree); border-bottom-left-radius: 4px; }
+.tree-junction.last::after { display: none; }
 .tree-junction::after { content: ""; position: absolute; top: 15px; left: 0; width: 7px; border-top: 1px solid var(--tree); }
 .tree-child-link { top: 23px; bottom: 0; }
 .sb-foot {
@@ -1455,3 +1458,17 @@ button.fork-trigger:hover { color: var(--fg); }
 .machine-node-state { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--fg-3); white-space: nowrap; }
 .machine-state-dot { width: 4px; height: 4px; border-radius: 50%; background: var(--fg-4); }
 .machine-state-dot.online { background: var(--fg-3); }
+
+/* Quiet, right-aligned quota summaries. */
+.p-usage.compact { margin: 0 8px 0 16px; flex: none; gap: 16px; }
+.p-usage-chip { flex-direction: column; gap: 3px; }
+.p-usage-chip .p-usage-label { width: auto; }
+.p-usage-chip .p-usage-pct { min-width: 30px; text-align: center; font-size: 12px; }
+.p-acc .s-row-title { overflow-wrap: anywhere; }
+@media (max-width: 600px) { .p-usage.compact { gap: 8px; margin-left: 4px; } }
+
+.m-list.s-card { gap: 0; }
+.machine-resources { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; padding: 14px 0; }
+.machine-resource { display: flex; flex-direction: column; gap: 6px; color: var(--fg-3); font-size: 12px; }
+.machine-resource strong { color: var(--fg-2); font-size: 18px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.machine-resource small { font-size: 11px; font-variant-numeric: tabular-nums; }
