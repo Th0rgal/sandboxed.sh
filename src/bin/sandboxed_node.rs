@@ -150,6 +150,10 @@ async fn main() -> anyhow::Result<()> {
     });
     let app = Router::new()
         .route("/heartbeat", get(heartbeat))
+        .route(
+            "/uploads",
+            post(upload_file).layer(DefaultBodyLimit::max(sandboxed_sh::uploads::MAX_BODY_BYTES)),
+        )
         .route("/execute", post(execute))
         // Private-source jobs carry bounded payloads before base64 encoding,
         // so this route needs the same bounded wire allowance as the core
@@ -964,4 +968,27 @@ async fn job_files(
             .map_err(|e| internal_error(e.into()))?
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     Ok(Json(value))
+}
+
+async fn upload_file(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    Json(request): Json<sandboxed_sh::uploads::Upload>,
+) -> Result<Json<sandboxed_sh::uploads::Receipt>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    let root = state.work_root.join("uploads");
+    let slot = sandboxed_sh::uploads::SLOTS.try_acquire().map_err(|_| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Other uploads are in progress".into(),
+        )
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        sandboxed_sh::uploads::store(&root, request)
+    })
+    .await
+    .map_err(|e| internal_error(e.into()))?
+    .map(Json)
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))
 }

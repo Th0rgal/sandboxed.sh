@@ -1630,3 +1630,7 @@ button.fork-trigger:hover { color: var(--fg); }
 .response-actions .response-copy { width:24px;height:24px;padding:0; }
 .response-copy-error { position:absolute;right:28px;bottom:0;width:240px;background:var(--bg);padding:6px 8px;border:1px solid var(--stroke);border-radius:5px; }
 @media(max-width:720px) { .response-actions { right:0; } .st-text { padding-right:30px; } }
+
+.composer-upload-status { grid-column: 1 / -1; grid-row: 2; padding: 4px 4px 0; font-size: 12px; color: var(--fg-2); }
+.composer.tall .composer-upload-status { grid-row: 3; }
+.composer-upload-status.error { color: #df7b83; }

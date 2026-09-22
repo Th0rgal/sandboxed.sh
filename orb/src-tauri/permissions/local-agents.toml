@@ -9,5 +9,7 @@ commands.allow = [
   "local_agents_poll",
   "local_agents_subscribe",
   "browse_local_files",
+  "pick_upload_files",
+  "read_upload_file",
   "local_agents_stop",
 ]

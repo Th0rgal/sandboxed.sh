@@ -185,7 +185,7 @@ pub struct MaterializeReport {
 /// The operator-owned storage root may deliberately be a volume symlink.
 /// Resolve only this trust boundary, never project/attachment-controlled
 /// descendants: those still pass through the descriptor-based no-follow walk.
-fn storage_root(working_dir: &Path) -> PathBuf {
+pub(crate) fn storage_root(working_dir: &Path) -> PathBuf {
     let root = working_dir.join(".sandboxed-sh");
     root.canonicalize().unwrap_or_else(|_| {
         working_dir

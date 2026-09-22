@@ -85,6 +85,7 @@ pub mod telegram;
 pub mod track_leases;
 pub mod tracker_import;
 pub mod types;
+pub(crate) mod uploads;
 pub mod usage_optimize;
 pub mod validation;
 pub mod webhook_markers;

@@ -58,6 +58,7 @@ pub mod settings;
 pub mod skills_registry;
 pub mod task;
 pub mod tools;
+pub mod uploads;
 pub mod util;
 pub mod watchdog;
 pub mod workspace;

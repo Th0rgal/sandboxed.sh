@@ -757,6 +757,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024 * 1024));
 
     let protected_routes = Router::new()
+        .route(
+            "/api/uploads",
+            post(super::uploads::upload)
+                .layer(DefaultBodyLimit::max(crate::uploads::MAX_BODY_BYTES)),
+        )
         .route("/api/stats", get(get_stats))
         .route("/api/remote-nodes", get(list_remote_nodes))
         .route("/api/nodes/:name/cordon", post(cordon_remote_node))

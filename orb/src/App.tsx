@@ -1,3 +1,4 @@
+import { hasNativePicker, pickNativeFiles, transferFile, prepareUploads, uploadToken, type UploadedFile, type UploadSource } from "./uploads";
 import { FilePanelProvider, FilePanelButton } from "./FilePanel";
 import { ErrorNotice } from "./ErrorNotice";
 import { MissionFailure, LaunchStatus, MissionPending, missionPhase, phaseIsQuiet, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, launchRefusal, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, missionSettingsIdle, dockModelLabel, type LaunchReceipt, type LaunchRefusal, type RemoteSupport } from "./missionLaunch";
@@ -252,7 +253,7 @@ function StatusGlyph(p: { agent: { status: Agent["status"] }; busy: boolean }) {
   );
 }
 
-function Composer(p: {
+export function Composer(p: {
   revision?: { text: string };
   placeholder: string;
   busy: boolean;
@@ -277,8 +278,42 @@ function Composer(p: {
   projectSlug?: string;
   /** Reports what the draft currently mentions; the draft text is the source. */
   onAttachments?: (next: AttachChip[]) => void;
+  uploadTarget?: string;
 }) {
   const [text, setText] = createSignal("");
+  const [uploading, setUploading] = createSignal(false);
+  const [uploadError, setUploadError] = createSignal<string | null>(null);
+  let uploaded: UploadedFile[] = [];
+  let disposed = false;
+  onCleanup(() => { disposed = true; });
+  let fileInput!: HTMLInputElement;
+  const uploadTarget = () => p.uploadTarget ?? "core";
+  const attachSources = async (sources: UploadSource[]) => {
+    const scope = p.scope;
+    const destination = uploadTarget();
+    setUploading(true); setUploadError(null); setCtx(false);
+    try {
+      for (const source of sources) {
+        if (disposed || scope !== p.scope) return;
+        const file = await transferFile(source, destination);
+        if (disposed || scope !== p.scope) return;
+        uploaded.push(file);
+        const current = ta.selectionStart ?? text().length;
+        const token = uploadToken(file.path) + " ";
+        const next = insertAtCaret(text(), current, ta.selectionEnd ?? current, token);
+        write(next.value); setCaret(next.caret); ta.setSelectionRange(next.caret, next.caret);
+      }
+    } catch (error) { setUploadError(error instanceof Error ? error.message : String(error)); }
+    finally { setUploading(false); }
+  };
+  const chooseFiles = async () => {
+    setCtx(false); setUploadError(null);
+    if (!hasNativePicker()) { fileInput.click(); return; }
+    const scope = p.scope;
+    const selection = uploadTarget();
+    try { const files = await pickNativeFiles(); if (!disposed && scope === p.scope && selection === uploadTarget()) await attachSources(files); }
+    catch (error) { setUploadError(error instanceof Error ? error.message : String(error)); }
+  };
   // Local voice input (macOS): dictated text lands at the caret, never sends.
   const [voiceActive, setVoiceActive] = createSignal(false);
   ensureVoiceProbe();
@@ -385,8 +420,8 @@ function Composer(p: {
   };
   const [sending, setSending] = createSignal(false);
   const send = async () => {
-    const payload = draftOf(text());
-    if (!payload || sending()) return;
+    let payload = draftOf(text());
+    if (!payload || sending() || uploading()) return;
     setSending(true);
     try {
       // Typing can beat the initial catalog request. Resolve references before
@@ -394,15 +429,24 @@ function Composer(p: {
       const scope = p.projectSlug;
       await attachmentLoad;
       if (scope !== p.projectSlug || draftOf(text()) !== payload) return;
+      const destination = uploadTarget();
+      const resolved = await prepareUploads(text(), uploaded, destination);
+      if (scope !== p.projectSlug || destination !== uploadTarget() || draftOf(text()) !== payload) return;
+      uploaded = resolved.files;
+      write(resolved.text);
+      payload = draftOf(text());
       p.onAttachments?.(mentioned());
       const accepted = await p.onSend(payload);
       if (accepted !== false && draftOf(text()) === payload) {
+        uploaded = [];
+        setUploadError(null);
         setMode(null);
         setText("");
         ta.value = "";
         resize();
       } else if (accepted === false && ta.isConnected) ta.focus();
-    } finally { setSending(false); }
+    } catch (error) { setUploadError(error instanceof Error ? error.message : String(error)); }
+    finally { setSending(false); }
   };
   const insertDictation = (t: string) => {
     const cur = ta.value;
@@ -438,11 +482,13 @@ function Composer(p: {
   });
   const plus = (
     <div class="plus-wrap" onPointerDown={(e) => e.stopPropagation()}>
-      <button class="plus" title="Add context" onClick={() => setCtx(!ctx())}>
+      <input ref={fileInput} type="file" multiple hidden aria-label="Choose files or images" onChange={(event) => { const files = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ""; void attachSources(files.map(file => ({ name: file.name, file }))); }} />
+      <button class="plus" title="Add context" disabled={uploading() || sending()} onClick={() => setCtx(!ctx())}>
         <Ic.PlusIcon size={14} />
       </button>
-      <Show when={ctx() && ((p.files?.length ?? 0) > 0 || atItems().length > 0)}>
+      <Show when={ctx()}>
         <div class="menu plus-menu slash-menu">
+          <button class="menu-item" onClick={chooseFiles}><span class="menu-ico"><Ic.FileIcon size={14} /></span>Upload file or image…</button>
           <Show when={atItems().some((i) => i.section === "Controller")}>
             <div class="slash-head">Controller</div>
             <For each={atItems().filter((i) => i.section === "Controller")}>
@@ -644,7 +690,7 @@ function Composer(p: {
   const sendBtn = (
     <div class="send-slot">
       <Show when={text().trim() && !slash() && !voiceActive()}>
-        <button class="send" onClick={send} title={p.busy ? "Queue for next turn" : "Send"}>
+        <button class="send" disabled={uploading() || sending()} onClick={send} title={p.busy ? "Queue for next turn" : "Send"}>
           <Ic.ArrowUpIcon size={14} />
         </button>
       </Show>
@@ -728,6 +774,8 @@ function Composer(p: {
       {plus}
       {slashMenu}
       {atMenu}
+      <Show when={uploading()}><div class="composer-upload-status" role="status">Attaching file…</div></Show>
+      <Show when={uploadError()}><div class="composer-upload-status error" role="alert">{uploadError()}</div></Show>
       <div class="composer-field">
         <Show when={mode() === "goal"}><ModeChip mode="goal" onClear={clearMode} /></Show>
         <Show when={mode()}><span class="mode-sep" aria-hidden="true" /></Show>
@@ -1732,6 +1780,7 @@ export default function App() {
                   autofocus
                   tall
                   scope="new-agent"
+                  uploadTarget={newMachine()}
                   remoteSupport={remoteSupport}
                   harnessIds={newMachine() === "local" ? installedIds() : undefined}
                   files={projectFiles()}
@@ -2323,6 +2372,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
             onSend={sendMsg}
             onStop={stopM}
             scope={`m:${p.id}`}
+            uploadTarget={clientPlaced() ? "local" : mission()?.remote_node_id ?? mission()?.remote_job?.node_id ?? "core"}
             backend={mission()?.backend}
             projectSlug={mission()?.project ?? undefined}
             onAttachments={setFollowAttach}
