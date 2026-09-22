@@ -23,15 +23,15 @@ test("machine details use live core metrics and heartbeat capacity without inven
   await core.click();
   await expect(core).toHaveAttribute("aria-expanded", "true");
   await expect(page.getByText("23%", { exact: true })).toBeVisible();
-  await expect(page.getByText("16.0 GiB / 64.0 GiB")).toBeVisible();
+  await expect(page.locator(".machine-resource").getByText("16.0 GiB / 64.0 GiB")).toBeVisible();
   const spark = page.getByRole("button", { name: /spark online/ });
   await spark.click();
   await expect(page.getByText("20 cores", { exact: true })).toBeVisible();
-  await expect(page.getByText("96.0 GiB / 128.0 GiB")).toBeVisible();
+  await expect(page.locator(".machine-resource").getByText("96.0 GiB / 128.0 GiB")).toBeVisible();
   await expect(page.getByText(/CPU load and GPU metrics are not reported/)).toBeVisible();
   await page.screenshot({ path: "/tmp/orb-machines-details.png" });
   await spark.click();
-  await expect(page.getByText("96.0 GiB / 128.0 GiB")).not.toBeVisible();
+  await expect(page.locator(".machine-resource").getByText("96.0 GiB / 128.0 GiB")).not.toBeVisible();
 });
 
 test("collapsed providers show right-aligned used percentages and local monochrome marks", async ({ page }) => {

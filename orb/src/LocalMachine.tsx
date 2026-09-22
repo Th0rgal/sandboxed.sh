@@ -36,16 +36,16 @@ export function LocalMachine() {
     <LaptopIcon size={18} /><div class="s-row-text"><div class="s-row-title">This Mac</div><div class="s-row-desc">{error() || "This computer"}</div></div>
     <Show when={sample()}>{s => <span class="s-row-desc">RAM {percent(s().memory_used, s().memory_total)}</span>}</Show>
     <span class={`chev p-acc-chev ${open() ? "open" : ""}`}>›</span>
-  </button><Show when={open()}><div class="p-acc-body">
+  </button><Show when={open()}><div class="p-acc-body machine-expanded">
     <Show when={sample()} fallback={<p class="s-row-desc">{error() || "Reading local metrics…"}</p>}>{s => <>
+      <div class="resource-breakdown"><div class="resource-breakdown-head"><span>Memory</span><span>{size(s().memory_used)} / {size(s().memory_total)}</span></div>
+        <div class="resource-track" role="meter" aria-label="Memory used" aria-valuemin={0} aria-valuemax={100} aria-valuenow={s().memory_total > 0 ? s().memory_used / s().memory_total * 100 : 0}><i style={{ width: percent(s().memory_used, s().memory_total) }} /></div>
+        <div class="resource-breakdown-legend"><span>Used {percent(s().memory_used, s().memory_total)}</span><span>Available {size(Math.max(0, s().memory_total - s().memory_used))}</span></div>
+      </div>
       <div class="machine-resources">
         <div class="machine-resource"><span>CPU</span><strong>{s().cpu_percent == null ? "Sampling…" : `${Math.round(s().cpu_percent!)}%`}</strong></div>
         <div class="machine-resource"><span>Memory</span><strong>{percent(s().memory_used, s().memory_total)}</strong><small>{size(s().memory_used)} / {size(s().memory_total)}</small></div>
         <div class="machine-resource"><span>Disk</span><strong>{percent(s().disk_used, s().disk_total)}</strong><small>{size(s().disk_used)} / {size(s().disk_total)}</small></div>
-      </div>
-      <div class="resource-breakdown"><div class="resource-breakdown-head"><span>Memory</span><span>{size(s().memory_used)} / {size(s().memory_total)}</span></div>
-        <div class="resource-track" role="meter" aria-label="Memory used" aria-valuemin={0} aria-valuemax={100} aria-valuenow={s().memory_total > 0 ? s().memory_used / s().memory_total * 100 : 0}><i style={{ width: percent(s().memory_used, s().memory_total) }} /></div>
-        <div class="resource-breakdown-legend"><span>Used {percent(s().memory_used, s().memory_total)}</span><span>Available {size(Math.max(0, s().memory_total - s().memory_used))}</span></div>
       </div>
       <div class="local-consumers"><For each={s().consumers}>{c => <div class="local-consumer"><span class="consumer-label"><i />{c.label}</span><span>{c.processes ? size(c.memory) : "Not running"}</span><span>{c.processes ? percent(c.memory, s().memory_total) : "—"}</span></div>}</For></div>
       <p class="s-row-desc local-metrics-note">Resident process memory · % of total RAM. Shared pages may overlap; macOS-managed WebKit processes may be excluded. {error() ? "Last successful snapshot." : "Updated every 3 seconds."}</p>
