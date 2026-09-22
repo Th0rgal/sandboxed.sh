@@ -1622,3 +1622,11 @@ button.fork-trigger:hover { color: var(--fg); }
 .response-actions .icon-btn { color:var(--fg-3); }
 .response-copy-error { color:var(--fg-2);font-size:12px; }
 .md blockquote > .md > :last-child { margin-bottom:0; }
+
+/* Response actions sit in the gutter, outside the conversation flow. */
+.st-text { position:relative;overflow:visible; }
+.st-text .md { min-width:0; }
+.response-actions { position:absolute;right:-24px;bottom:0;margin:0;min-height:0; }
+.response-actions .response-copy { width:24px;height:24px;padding:0; }
+.response-copy-error { position:absolute;right:28px;bottom:0;width:240px;background:var(--bg);padding:6px 8px;border:1px solid var(--stroke);border-radius:5px; }
+@media(max-width:720px) { .response-actions { right:0; } .st-text { padding-right:30px; } }

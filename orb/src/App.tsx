@@ -2210,8 +2210,12 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
         const plan = await materializeMentions(project, text, followAttach());
         if (plan.files.length) await writeLocalFiles(binding.cwd, plan.files);
         const sent = bindWorkspace(plan.prompt, binding.cwd);
-        await appendClientTranscript(p.id, "user", text);
         await startLocal({ id: p.id, harness: binding.harness, bin: binding.bin, cwd: binding.cwd, prompt: sent, model: binding.model, sessionId: binding.sessionId });
+        // Persist only accepted turns: a rejected launch must keep the draft
+        // without adding another copy to the conversation.
+        await appendClientTranscript(p.id, "user", text).catch(e => {
+          setSendError(`The local run started, but saving your message failed: ${String(e)}`);
+        });
         setFollowAttach([]);
         void followLocal(p.id, () => {}).then(async (state) => {
           const note = binding.harness === "grok" && binding.sessionId && !state.resumed ? "Grok starts a new local session.\n\n" : "";
@@ -2228,6 +2232,8 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
         });
         return true;
       } catch (e) {
+        // Launch rejection belongs to the composer; it is not a second mission failure.
+        recordLocalFailure(p.id, null);
         setSendError(e instanceof Error ? e.message : String(e));
         return false;
       }
@@ -2292,7 +2298,9 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
           >
             <LaunchStatus destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={activity()} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
             <Transcript items={viewItems().filter(i => i.kind !== "user" || !i.queued)} pending={pending()} onReuse={text => setRevision({ text })} />
-            <MissionFailure mission={mission()} active={localRunActive(p.id)} error={localFailure(p.id)} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
+            <Show when={!sendError()}>
+              <MissionFailure mission={mission()} active={localRunActive(p.id)} error={localFailure(p.id)} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
+            </Show>
             <Show when={pending()}>
               <MissionPending destination={missionDestination(mission(), receipt)} label={phaseLabel()} />
             </Show>
