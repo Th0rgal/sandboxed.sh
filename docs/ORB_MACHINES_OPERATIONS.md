@@ -39,8 +39,9 @@ host-first direction is not evidence that those containers are unused.
 
 The backend environment now specifies
 `MISSION_WORKSPACE_ROOT=/srv/sandboxed-storage/host-missions` and
-`TMPDIR=/srv/sandboxed-storage/host-tmp`. These changes take effect only at
-the next guarded backend restart. Existing generated mission paths retain
+`TMPDIR=/srv/sandboxed-storage/host-tmp`. These changes are active after the guarded backend deployment on 22 September.
+The live health endpoint now measures `/srv/sandboxed-storage/host-missions`
+and reports about 1,451 GiB free. Existing generated mission paths retain
 their persisted location. Explicit project working directories also retain
 their configured location.
 
@@ -161,3 +162,22 @@ live mission references, saved sessions, and unexported source/artifacts.
 
 The existing storage inventory is read-only and the workspace GC defaults to
 dry-run. Do not silently turn on whole-workspace deletion as a disk repair.
+
+## Validation and deployment
+
+Production runs the tested Linux debug binaries from `fad8ed6a65bb` (the
+follow-up `df0cc209` changes only test expectations). Installed binary hashes
+match the staged artifacts. The two existing agent sessions were paused for
+maintenance and resumed with their native session IDs preserved. The older
+process took longer than the initial health wait to drain; the guarded restart
+completed and backend/Hermes health was checked afterward.
+
+A scheduled production request using the exact French Pareto prompt,
+`verity-pareto`, Codex, GPT-6 Astra, Medium, and a controller attachment was
+accepted. Its payload was persisted on the data volume. The temporary mission
+was deleted before execution, so this check did not start another audit.
+
+Validation: 95 Codex tests, 14 attachment tests, 84 proxy tests, 135 remote
+tests plus the corrected raw-Claude lifecycle fixture passed; two remote
+tests remain intentionally ignored. The Orb launch/connection suite passed
+37 tests, and the client production build passed.
