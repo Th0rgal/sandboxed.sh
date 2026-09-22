@@ -171,7 +171,7 @@ fn prepare_delivery(
 
 async fn defaults(State(state): State<Arc<AppState>>, Path(slug): Path<String>) -> Response {
     match delivery_ready(&state.projects, &slug) {
-        Ok(ready) => Json(json!({ "deliver": format!("project:{slug}"), "route_ready": ready }))
+        Ok(ready) => Json(json!({ "deliver": format!("project:{slug}"), "route_ready": ready, "folders_supported": true }))
             .into_response(),
         Err(error) => error,
     }

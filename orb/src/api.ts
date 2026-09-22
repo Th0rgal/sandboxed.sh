@@ -524,7 +524,7 @@ export async function listProjectCrons(slug: string): Promise<ControllerJob[]> {
   return (data.jobs ?? []).map((job) => getProjectCronFromJob(slug, job).job!);
 }
 
-export interface ProjectCronDefaults { deliver: string; route_ready: boolean }
+export interface ProjectCronDefaults { deliver: string; route_ready: boolean; folders_supported?: boolean }
 export async function getProjectCronDefaults(slug: string): Promise<ProjectCronDefaults> {
   return api(`/api/projects/${encodeURIComponent(slug)}/crons/defaults`);
 }

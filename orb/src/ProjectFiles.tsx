@@ -299,6 +299,10 @@ export function LiveProjectsSection(p: {
     try {
       const defaults = await getProjectCronDefaults(slug);
       if (!currentConnection(version)) return;
+      if (path && !defaults.folders_supported) {
+        setActionError("This backend needs the project-folder update before it can create a cron inside a folder. No cron was created.");
+        return;
+      }
       setCronDefaults(defaults); setDefaultsError(null); setNewCron(slug);
     } catch (error) { if (currentConnection(version)) { cronFailure(slug, error); setCronInfo(slug); } }
     finally { if (currentConnection(version)) setCronChecking(false); }
