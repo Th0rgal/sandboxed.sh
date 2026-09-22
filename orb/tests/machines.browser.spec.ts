@@ -31,7 +31,8 @@ test("machine details use live core metrics and heartbeat capacity without inven
   await spark.click();
   await expect(page.getByText("20 cores", { exact: true })).toBeVisible();
   await expect(page.locator(".machine-resource").getByText("96.0 GiB / 128.0 GiB")).toBeVisible();
-  await expect(page.getByText(/CPU load and GPU metrics are not reported/)).toBeVisible();
+  await expect(page.getByText(/Heartbeat snapshot/)).toHaveCount(0);
+  await expect(page.getByText("http://spark:3088", { exact: true })).toHaveCount(0);
   await page.screenshot({ path: "/tmp/orb-machines-details.png" });
   await spark.click();
   await expect(page.locator(".machine-resource").getByText("96.0 GiB / 128.0 GiB")).not.toBeVisible();
@@ -90,7 +91,9 @@ test("local machine is separate and shows native memory consumers", async ({ pag
   const local = page.locator(".local-machine");
   await expect(local.getByText("Cohere · speech to text")).toBeVisible();
   await expect(local.getByText("6.3%", { exact: true })).toBeVisible();
-  await expect(local.getByText("Not running", { exact: true })).toBeVisible();
+  await expect(local.getByText("Not running", { exact: true })).toHaveCount(0);
+  await expect(local.getByText("Local harnesses · started by Orb")).toHaveCount(0);
+  await expect(local.getByText(/Resident process memory/)).toHaveCount(0);
   await expect(local.getByRole("img", { name: "CPU and memory usage over the last minute" })).toBeVisible();
   await page.screenshot({ path: "/tmp/orb-local-machine.png" });
 });

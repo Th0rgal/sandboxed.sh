@@ -49,8 +49,7 @@ export function LocalMachine() {
         <div class="machine-resource"><span>Disk</span><strong>{percent(s().disk_used, s().disk_total)}</strong><small>{size(s().disk_used)} / {size(s().disk_total)}</small></div>
         <div class="machine-resource"><span>GPU</span><strong>{s().gpu_percent != null ? `${Math.round(s().gpu_percent!)}%` : "Unavailable"}</strong></div>
       </div>
-      <div class="local-consumers"><For each={s().consumers}>{c => <div class="local-consumer"><span class="consumer-label"><i />{c.label}</span><span>{c.processes ? size(c.memory) : "Not running"}</span><span>{c.processes ? percent(c.memory, s().memory_total) : "—"}</span></div>}</For></div>
-      <p class="s-row-desc local-metrics-note">Resident process memory · % of total RAM. Shared pages may overlap; macOS-managed WebKit processes may be excluded. {error() ? "Last successful snapshot." : "Updated every 3 seconds."}</p>
+      <Show when={s().consumers.some(c => c.processes > 0)}><div class="local-consumers" title="Resident process memory · % of total RAM. Shared pages may overlap; macOS-managed WebKit processes may be excluded."><For each={s().consumers}>{(c, index) => <Show when={c.processes > 0}><div class="local-consumer"><span class="consumer-label"><i style={{ background: ["#92968d", "#a397bc", "#849ca4"][index()] }} />{c.label}</span><span>{size(c.memory)}</span><span>{percent(c.memory, s().memory_total)}</span></div></Show>}</For></div></Show>
     </>}</Show>
   </div></Show></div>;
 }

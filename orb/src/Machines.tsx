@@ -47,13 +47,6 @@ function target(m: Machine) {
   return m.port !== 22 ? `${m.user}@${m.host}:${m.port}` : `${m.user}@${m.host}`;
 }
 
-function nodeNote(n: RemoteNodeView) {
-  const parts = [...n.labels];
-  if (n.version) parts.push(n.version);
-  if (n.capacity_available != null && n.capacity_total != null) parts.push(`${n.capacity_available}/${n.capacity_total}`);
-  return parts.join(" · ");
-}
-
 type Draft = { id?: string; name: string; host: string; user: string; port: string; note: string };
 
 const empty = (): Draft => ({ name: "", host: "", user: "ubuntu", port: "22", note: "" });
@@ -91,8 +84,7 @@ function FleetRow(p: { node?: RemoteNodeView; core?: Metrics; live?: boolean; hi
       <Resource label="Memory" used={memory()} total={p.node?.mem_total_bytes ?? p.core?.memory_total} />
       <Resource label="Disk" used={disk()} total={p.node?.disk_total_bytes ?? p.core?.disk_total} />
       <Show when={p.node?.resource_history?.some(s => s.gpu != null)}><Resource label="GPU" value={p.node!.resource_history!.at(-1)?.gpu != null ? `${Math.round(p.node!.resource_history!.at(-1)!.gpu!)}%` : "Unavailable"} /></Show>
-    </div><Show when={p.node || !p.live}><p class="s-row-desc">{p.node ? p.node.resource_history?.at(-1)?.cpu != null ? "Heartbeat snapshot" : "Heartbeat snapshot · CPU load and GPU metrics are not reported by this node." : p.live ? "" : "Live stream unavailable · reconnecting"}</p></Show>
-    <Show when={p.node}><div class="p-detail-meta"><span>{p.node!.base_url}</span><span>{nodeNote(p.node!)}</span><span>{p.node!.last_seen ? `Last seen ${new Date(p.node!.last_seen!).toLocaleTimeString()}` : "No heartbeat received"}</span></div></Show>
+    </div>
     </div></Show></div>;
 }
 

@@ -1482,7 +1482,6 @@ button.fork-trigger:hover { color: var(--fg); }
 .local-consumers { border-top: 1px solid var(--stroke-soft); padding-top: 6px; }
 .local-consumer { display: grid; grid-template-columns: minmax(0, 1fr) auto 48px; gap: 14px; padding: 7px 0; font-size: 12px; color: var(--fg-2); font-variant-numeric: tabular-nums; }
 .local-consumer > :not(:first-child) { text-align: right; color: var(--fg-3); }
-.local-metrics-note { font-size: 11px; line-height: 1.5; margin-bottom: 0; }
 
 .resource-breakdown { margin: 6px 0 14px; }
 .resource-breakdown-head, .resource-breakdown-legend { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--fg-2); font-variant-numeric: tabular-nums; }
@@ -1491,8 +1490,6 @@ button.fork-trigger:hover { color: var(--fg); }
 .resource-track i { display: block; height: 100%; background: #92968d; border-radius: inherit; transition: width .25s ease; }
 .consumer-label { display: flex; align-items: center; gap: 8px; }
 .consumer-label i { width: 8px; height: 8px; border-radius: 2px; background: #92968d; flex: none; }
-.local-consumer:nth-child(2) .consumer-label i { background: #a397bc; }
-.local-consumer:nth-child(3) .consumer-label i { background: #849ca4; }
 
 .machine-expanded { margin: 0 12px 12px; padding: 16px !important; border: 1px solid var(--stroke-soft); border-radius: 10px; background: color-mix(in srgb, var(--bg) 65%, transparent); }
 .machine-resource > span { display: flex; gap: 10px; align-items: center; }
