@@ -39,3 +39,24 @@ an actual temporary node rejects unauthenticated uploads and accepts binary
 uploads; composer tests cover an empty context menu and failure preservation;
 Playwright covers the file chooser, byte encoding, and Core → Ashur switching
 before Send. The desktop Rust build and frontend build pass.
+
+Draft persistence keeps uploaded paths and their destination. After restarting
+Orb, an already-uploaded file can be reused on the same server/machine. Moving
+a restored draft to another machine may require selecting the original file
+again: browser file bytes and native-picker read authorization are not retained
+across restarts. A transfer failure leaves the draft intact.
+
+Production verification on 22 September 2026: Core deployed commit `55867c859`
+through the guarded deploy endpoint, followed by a healthy Hermes restart.
+The desktop debug build was relaunched with the native picker commands. The
+merged UI passed 325 unit/component tests and both browser tests (file chooser
+with machine switching, and image paste). Live binary uploads were forwarded
+through Core and read back byte-for-byte on Core, Ashur, Nippur, old-agent,
+sepolia and DGX Spark; remote reads used the `sandboxed-node` account. Only the
+diagnostic upload files were removed afterward.
+
+Babylon is the exception: its updated harnesses are installed, but the node
+upload-route binary rollout is blocked by network packet loss and incomplete
+artifact transfers. Its prior node executable was kept intact. Do not send file
+missions there until connectivity, the node update and byte-exact readback have
+all passed. The other nodes retain a backup of the replaced node executable.

@@ -54,3 +54,32 @@ Official installation references: [Codex CLI](https://learn.chatgpt.com/docs/cod
 [Claude Code setup](https://code.claude.com/docs/en/setup),
 [Grok Build](https://docs.x.ai/build/overview),
 [OpenCode releases](https://github.com/anomalyco/opencode/releases).
+
+## Production rollout receipt — 22 September 2026
+
+All six physical hosts passed the installed version/help checks above. The
+unified daily timer is active everywhere, and the superseded Codex-only timer
+is inactive. Gemini is absent from each host's command path.
+
+Inference canaries passed for Claude Code on Core and OpenCode (`kimi/k3`) on
+Core, Ashur, Nippur, old-agent and DGX Spark. These are availability probes,
+not comparable performance benchmarks. Grok's Core inference remains blocked
+on its managed login; successful executable checks do not imply authentication.
+
+Babylon initially timed out. Its configured OVH IPv6 DNS resolver did not
+answer, while the same provider's IPv4 resolver did. A persistent
+`/etc/systemd/resolved.conf.d/70-sandboxed-reliable-dns.conf` now selects
+`DNS=213.186.33.99` and `Domains=~.`; restarting only `systemd-resolved` restored
+registry and backend hostname resolution in 0.53–0.60 seconds. Subsequent SSH
+artifact transfers were still slow, so DNS alone is not evidence that all of
+Babylon's network latency is resolved.
+
+Later TCP observations confirmed substantial retransmissions on Babylon's SSH
+and node API connections (for example 47,944 retransmitted bytes of 96,807 sent
+on one SSH connection, congestion window down to one segment). Small ICMP
+samples also lost all three probes to Core and two of three to Nippur. Ethernet
+RX/TX error/drop counters were zero, CPU load was near zero, and the inspected
+host firewall contained no matching traffic shaper. Direct IPv4, IPv6 and a
+temporary SSH jump through Nippur did not yield a usable artifact transfer.
+This establishes a network-path problem, not its provider-side cause. Do not
+claim Babylon's runtime readiness from its successful harness install checks.
