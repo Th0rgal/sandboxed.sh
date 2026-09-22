@@ -141,3 +141,97 @@ transport delay and expensive parsing otherwise look like the same UI stall.
 Receipts on Core: `/tmp/harness-perf-probes.json`,
 `/tmp/harness-perf-old-agent.json`, `/tmp/harness-perf-other.json`.
 Reproducible overlap benchmarks are in `scripts/perf/stream_merge_*.rs`.
+
+## Implemented follow-up: Orb UI probes and production fixes
+
+The investigation above is the historical baseline. By 22 September 17:03 UTC,
+Core was running `1b704fea5388` with the following fixes, verified with targeted
+Rust tests on macOS and Linux:
+
+- Linear suffix/prefix overlap search, preserving snapshot/replay/append results.
+- Incremental remote logs polled every 500 ms; full status/lease checks stay at
+  three seconds. Missed ticks are delayed, not replayed in bursts.
+- Codex recognizes a labeled “Do not use tools…” clause, so a text-only prompt
+  no longer triggers a corrective retry and a false stalled failure.
+- Bare Claude model IDs are accepted by the native Messages proxy.
+- Exclusive attachment publication uses the appropriate macOS filesystem API;
+  a concurrent-write test verifies one winner and no leaked temporary files.
+
+All probes below were launched through Orb's local browser UI, except L1/L2,
+which used the actual bundled Tauri desktop application. The common prompt
+requests a 30-row French table without tools. These are single diagnostic runs,
+not a ranking of models or machines. L1 used a shorter prompt with the same task.
+
+| Probe | Placement / harness / model | Result | Create → final |
+| --- | --- | --- | --- |
+| A | Core / Claude / Opus 5 | success | 13.84 s |
+| B | Core / Codex / GPT-6 Astra, before fix | false stalled failure; repeated table | 47.26 s |
+| C | Babylon / OpenCode / K3 | success | 28.89 s |
+| D | Ashur / Claude / Sonnet 4.6 | rejected bare model ID | 3.30 s |
+| E | Core / Claude / Opus 5 | success | 15.64 s |
+| F | Core / OpenCode / K3 | success, one complete text part | 45.67 s |
+| G | Core / Codex / GPT-6 Astra, after fix | success, one table | 24.80 s |
+| H | Ashur / Claude / Sonnet 4.6, after ID fix | repeated 502s; stopped | not a speed result |
+| L1 | This computer / Claude / Opus 5 | success in native Orb | 13.30 s |
+| L2 | This computer / Codex / GPT-6 Astra | success in native Orb | 18.33 s |
+
+An independent Core SSE observer recorded metadata only. These timings end at
+SSE receipt on Core, **not** DOM paint in Orb. Persisted `text_delta` rows are
+coalesced and cannot be used as a count of live streaming updates.
+
+| Probe | SSE text operations | First text after creation | p95 inter-update gap | Maximum gap |
+| --- | --- | --- | --- | --- |
+| B | 375 | 13.952 s | 105 ms | 4.968 s |
+| E | 168 | 4.027 s | 91 ms | 722 ms |
+| G | 184 | 10.529 s | 113 ms | 383 ms |
+
+G removes the reproduced retry/failure, but its lower total time is not an
+isolated measurement of model speed. OpenCode C/F emitted only final text
+parts; more frequent node polling cannot create token events the CLI does not
+emit. A future incremental OpenCode integration should use one supported event
+transport and retain tools, usage, cancellation and native session identity.
+
+Probe H exposed a second independent bug: native Messages unconditionally sent
+Claude OAuth accounts through CLIProxyAPI. Its local `/v1/models` had no Claude
+models and `/v1/messages` returned “unknown provider for model claude-sonnet-4-6”.
+Cloudflare replaced that origin 502 body with a generic gateway error; Claude
+then retried approximately once per minute without log output. Core-owned
+Anthropic credentials must use the resolver's direct OAuth token and preserve
+the OAuth beta header. CLIProxyAPI is used only for OAuth-only entries owned by
+that proxy. Never copy refresh tokens onto nodes to work around this routing.
+
+### Reproduction and receipts
+
+`rustc scripts/perf/stream_merge_compare.rs -o /tmp/merge-compare` compares both
+algorithms with identical buffer-clone and append work and asserts equal output.
+On the diagnostic Mac debug build, the 1,095,260-byte buffer / 2,000-byte fragment
+case fell from 26,220,717 µs to 193 µs. This is an adversarial CPU fixture, not an
+end-to-end inference claim. The exhaustive Unicode oracle covers 116,281 pairs.
+
+Probe mission IDs:
+
+- A: `0f037ad2-d025-4cd3-9266-4adff681af2e`
+- B: `c8929410-414b-4c4d-808e-028171970fb1`
+- C: `37010f5b-7418-4805-b429-2fa845cbe48f`
+- D: `774e48e9-2ab7-46d9-b2c1-528deffa859a`
+- E: `924197ff-383e-40d4-8323-e2840d96f635`
+- F: `d387053b-52ad-4bc4-bba4-507e83d1f569`
+- G: `9915fd0d-a6bf-4693-a78e-77978055e8b6`
+- H: `aabfbd20-1d95-4c8c-84cb-c0091646f712`
+- L1: `b1689576-301b-4dee-9075-fdb4a29b64f3`
+- L2: `c9846ff7-61f3-4136-8be5-45d1299ddfdd`
+
+### Babylon recovery
+
+Babylon's node upload binary was installed and validated with a byte-exact
+Core→Babylon file upload, then the diagnostic file was removed. The machine was
+uncordoned and probe C completed. No reboot was necessary. The resolver fix
+persists in `/etc/systemd/resolved.conf.d/70-sandboxed-reliable-dns.conf` using
+IPv4 resolver `213.186.33.99`; the previously selected IPv6 resolver timed out.
+
+A large transfer initially stalled again but completed using rsync resume.
+Gateway pings and NIC counters were healthy; occasional path loss/retransmission
+had been observed. Intermediate traceroute loss alone does not prove provider
+packet loss. The exact cause of the intermittent bulk-transfer degradation
+remains unproven; do not describe the DNS change as a proven cure for all TCP
+stalls. Keep resumable transfers and verify node readiness after updates.

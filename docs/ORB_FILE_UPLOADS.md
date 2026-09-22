@@ -55,8 +55,9 @@ through Core and read back byte-for-byte on Core, Ashur, Nippur, old-agent,
 sepolia and DGX Spark; remote reads used the `sandboxed-node` account. Only the
 diagnostic upload files were removed afterward.
 
-Babylon is the exception: its updated harnesses are installed, but the node
-upload-route binary rollout is blocked by network packet loss and incomplete
-artifact transfers. Its prior node executable was kept intact. Do not send file
-missions there until connectivity, the node update and byte-exact readback have
-all passed. The other nodes retain a backup of the replaced node executable.
+Babylon also passed on the later 22 September retry: resumable transfer of the
+node binary completed, the update was installed, and Core→Babylon binary upload
+passed byte-exact readback as the node service user. The diagnostic file was
+removed. Babylon is now uncordoned and a subsequent OpenCode mission completed.
+The previous node binary remains backed up. Intermittent network degradation
+was observed earlier; see `HARNESS_PERFORMANCE_AUDIT.md` for the evidence.
