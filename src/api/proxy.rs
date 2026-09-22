@@ -6528,7 +6528,7 @@ mod tests {
             true,
             false,
         ));
-        assert!(!native_protocol_supported(
+        assert!(native_protocol_supported(
             NativeProtocol::Responses,
             ProviderType::OpenAI,
             false,

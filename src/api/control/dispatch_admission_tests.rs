@@ -5662,7 +5662,7 @@ async fn remote_launch_persists_prompt_and_lease_then_survives_watchdog_until_te
         spawn_fixture_node("launch-fixture", "REMOTE_LAUNCH_FIXTURE_TOKEN", "queued").await;
     let h = Harness::with_nodes(vec![fixture.node.clone()]).await;
     h.state.backend_registry.write().await.register(Arc::new(
-        crate::backend::opencode::OpenCodeBackend::new("http://127.0.0.1:9".into(), None, false),
+        crate::backend::claudecode::ClaudeCodeBackend::new(),
     ));
     let store = h.control.mission_store.clone();
     let prompt = "/goal find the most optimized kernel for this workload";
@@ -5674,6 +5674,7 @@ async fn remote_launch_persists_prompt_and_lease_then_survives_watchdog_until_te
         .post(format!("{}/missions", h.url))
         .json(&json!({
             "title": "orb remote launch",
+            "backend": "claudecode",
             "prompt": prompt,
             "remote_node_id": "launch-fixture",
             "remote_command": "claude -p 'hello from the node'",
