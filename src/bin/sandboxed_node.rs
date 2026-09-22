@@ -163,6 +163,7 @@ async fn main() -> anyhow::Result<()> {
                 .get(list_jobs),
         )
         .route("/jobs/:id", get(get_job))
+        .route("/jobs/:id/files", post(job_files))
         .route("/jobs/:id/log", get(get_job_log))
         .route("/jobs/:id/cancel", post(cancel_job))
         .with_state(state);
@@ -941,4 +942,26 @@ mod tests {
         .0;
         assert!(listed.iter().any(|job| job.job_id == job_id));
     }
+}
+
+async fn job_files(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<sandboxed_sh::file_browser::Request>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    let record = state
+        .jobs
+        .get(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "Job not found".into()))?;
+    let root = state.work_root.join(record.mission_id.to_string());
+    let value =
+        tokio::task::spawn_blocking(move || sandboxed_sh::file_browser::execute(&root, &request))
+            .await
+            .map_err(|e| internal_error(e.into()))?
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(value))
 }

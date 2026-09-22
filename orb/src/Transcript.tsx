@@ -1,8 +1,9 @@
+import { FileReferenceContext } from "./fileReferenceContext";
 import { copyText } from "./clipboard";
 import { remoteLog } from "./remoteLog";
 import { ErrorNotice } from "./ErrorNotice";
 import { forkContext } from "./forkContext";
-import { For, Show, createSignal, createEffect, createMemo } from "solid-js";
+import { For, Show, createSignal, createEffect, createMemo, useContext } from "solid-js";
 import * as Ic from "./icons";
 import { MdView } from "./Markdown";
 import { createStore, reconcile } from "solid-js/store";
@@ -248,7 +249,7 @@ export function Transcript(p: { items: StreamItem[]; pending?: boolean; onReuse?
             case "text":
               return (
                 <div class={`st-text ${item.live ? "live" : ""}`}>
-                  <AssistantText text={item.text} />
+                  <AssistantText text={item.text} live={item.live} />
                 </div>
               );
             case "tool":
@@ -271,7 +272,8 @@ export function Transcript(p: { items: StreamItem[]; pending?: boolean; onReuse?
   );
 }
 
-function AssistantText(p: { text: string }) {
+function AssistantText(p: { text: string; live?: boolean }) {
+  const references=useContext(FileReferenceContext);
   const content = createMemo(() => remoteLog(p.text));
-  return <><MdView text={content().text} compact /><Show when={content().details}><details class="legacy-log"><summary>Original execution log</summary><pre>{content().details}</pre></details></Show></>;
+  return <><Show when={!p.live} fallback={<FileReferenceContext.Provider value={undefined}><MdView text={content().text} compact /></FileReferenceContext.Provider>}><FileReferenceContext.Provider value={references}><MdView text={content().text} compact /></FileReferenceContext.Provider></Show><Show when={content().details}><details class="legacy-log"><summary>Original execution log</summary><pre>{content().details}</pre></details></Show></>;
 }

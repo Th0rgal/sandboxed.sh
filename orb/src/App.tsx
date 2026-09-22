@@ -1,3 +1,4 @@
+import { FilePanelProvider, FilePanelButton } from "./FilePanel";
 import { ErrorNotice } from "./ErrorNotice";
 import { LaunchStatus, MissionPending, missionPhase, phaseIsQuiet, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, launchRefusal, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, missionSettingsIdle, dockModelLabel, type LaunchReceipt, type LaunchRefusal, type RemoteSupport } from "./missionLaunch";
 import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, GoalTag, EMPTY_GOAL_ERROR, absorbGoalPrefix, composerModes, filterSlash, slashQuery, modePrompt, ModeChip, type ComposerMode } from "./goal";
@@ -1343,6 +1344,7 @@ export default function App() {
 
   return (
     <div class={`app ${sidebar() ? "" : "sb-hidden"}`} style={{ "--sb-w": `${sbWidth()}px` }}>
+      <FilePanelProvider scope={{ mission: currentMissionId() ? (openMission()?.id === currentMissionId() ? openMission() : missions().find(m => m.id === currentMissionId())) : undefined, project: currentController()?.slug, controller: currentController()?.id }}>
       <button class="sidebar-backdrop" aria-label="Close sidebar" onClick={() => setSidebar(false)} tabIndex={-1} />
       <aside id="orb-sidebar" class="sidebar">
         <div class="sb-top" data-tauri-drag-region />
@@ -1492,6 +1494,7 @@ export default function App() {
             </Match>
           </Switch>
         </div>
+        <FilePanelButton />
       </header>
 
       <main class="main">
@@ -1858,6 +1861,7 @@ export default function App() {
           />
         )}
       </Show>
+      </FilePanelProvider>
     </div>
   );
 }

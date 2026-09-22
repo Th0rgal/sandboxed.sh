@@ -67,3 +67,6 @@ pub use ai_providers::{AIProvider, AIProviderStore, ProviderType};
 pub use config::Config;
 pub use opencode_config::{OpenCodeConnection, OpenCodeStore};
 pub use settings::{Settings, SettingsStore};
+
+#[path = "../shared/file_browser.rs"]
+pub mod file_browser;

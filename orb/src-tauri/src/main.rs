@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[path = "../../../shared/file_browser.rs"]
+mod file_browser;
 mod local_agents;
 mod machine_metrics;
 mod voice;
@@ -83,6 +85,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             paloma_ssh_pubkey,
+            browse_local_files,
             machine_metrics::local_machine_metrics,
             open_url,
             set_window_theme,
@@ -100,4 +103,16 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running orb");
+}
+
+#[tauri::command]
+async fn browse_local_files(
+    root: String,
+    request: file_browser::Request,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        file_browser::execute(std::path::Path::new(&root), &request)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }

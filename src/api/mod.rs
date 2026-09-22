@@ -94,3 +94,5 @@ pub(crate) mod xai_usage;
 
 pub use routes::serve;
 pub use types::*;
+
+pub mod file_resources;
