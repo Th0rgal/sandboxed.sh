@@ -303,12 +303,11 @@ fn native_protocol_supported(
             }
             _ => false,
         },
-        // Direct API keys hit api.anthropic.com. OAuth (subscription) accounts
-        // route native Messages through the local CLI proxy, which owns the
-        // Claude credential and preserves signed thinking blocks on replay.
+        // The resolver supplies a direct API key or core-owned OAuth token.
+        // OAuth-only entries use CLIProxyAPI when it owns the credential.
         NativeProtocol::AnthropicMessages => {
             provider_type == ProviderType::Anthropic
-                && ((has_api_key && !has_oauth)
+                && (has_api_key
                     || (has_oauth
                         && crate::api::ai_providers::anthropic_cli_proxy_account_available()))
         }
@@ -1319,7 +1318,13 @@ async fn native_protocol_proxy(
                             .is_none()
                 }
                 NativeProtocol::AnthropicMessages => {
-                    provider_type == ProviderType::Anthropic && entry.has_oauth
+                    provider_type == ProviderType::Anthropic
+                        && entry.has_oauth
+                        && entry
+                            .api_key
+                            .as_deref()
+                            .filter(|v| !v.trim().is_empty())
+                            .is_none()
                 }
             };
         let (url, credential) = if direct_codex {
@@ -1441,11 +1446,18 @@ async fn native_protocol_proxy(
                         request = request.header(name, value);
                     }
                 }
-                // Preserve explicit protocol/beta selection from the native client.
-                for name in ["anthropic-version", "anthropic-beta"] {
+                // Preserve native features without dropping the OAuth beta
+                // required by a core-owned subscription credential.
+                for name in ["anthropic-version", "user-agent"] {
                     if let Some(value) = headers.get(name) {
                         request = request.header(name, value);
                     }
+                }
+                if let Some(beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+                    request = request.header(
+                        "anthropic-beta",
+                        native_anthropic_beta(beta, entry.has_oauth),
+                    );
                 }
             }
         }
@@ -4821,6 +4833,22 @@ fn apply_google_client_headers(builder: reqwest::RequestBuilder) -> reqwest::Req
         .header("Client-Metadata", GOOGLE_CLIENT_METADATA)
 }
 
+fn native_anthropic_beta(beta: &str, oauth: bool) -> String {
+    if oauth
+        && !beta
+            .split(',')
+            .any(|value| value.trim() == "oauth-2025-04-20")
+    {
+        if beta.trim().is_empty() {
+            "oauth-2025-04-20".into()
+        } else {
+            format!("{beta},oauth-2025-04-20")
+        }
+    } else {
+        beta.to_string()
+    }
+}
+
 fn build_anthropic_proxy_headers(credential: &str, has_oauth: bool) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
@@ -6907,6 +6935,26 @@ mod tests {
         );
         assert_eq!(normalize_retrieved_model_id("  grok-4.6  "), "grok-4.6");
         assert_eq!(normalize_retrieved_model_id("/"), "");
+    }
+
+    #[test]
+    fn native_anthropic_core_owned_oauth_is_supported() {
+        assert!(native_protocol_supported(
+            NativeProtocol::AnthropicMessages,
+            ProviderType::Anthropic,
+            true,
+            true
+        ));
+        assert_eq!(
+            native_anthropic_beta("context-1m", true),
+            "context-1m,oauth-2025-04-20"
+        );
+        assert_eq!(
+            native_anthropic_beta("context-1m,oauth-2025-04-20", true),
+            "context-1m,oauth-2025-04-20"
+        );
+        assert_eq!(native_anthropic_beta("context-1m", false), "context-1m");
+        assert_eq!(native_anthropic_beta("", true), "oauth-2025-04-20");
     }
 
     #[test]
