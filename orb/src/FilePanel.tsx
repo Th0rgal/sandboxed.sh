@@ -356,6 +356,28 @@ export function FilePanelProvider(p: {
     }
   }
   const resolver: ReferenceResolver = {
+    async loadImage(path) {
+      const g = generation;
+      const c = client;
+      const extension = path.split(".").at(-1)?.toLowerCase();
+      const mime = ({png:"image/png",jpg:"image/jpeg",jpeg:"image/jpeg",webp:"image/webp",gif:"image/gif"} as Record<string,string>)[extension ?? ""];
+      if (!mime) return null;
+      const refs = await resolver.resolve(path);
+      if (g !== generation || !refs.length) return null;
+      const ref = refs[0];
+      const chunks: Uint8Array[] = [];
+      let offset=0;
+      while (true) {
+        const part = await c.call(ref.source,{action:"download",path:ref.path,offset});
+        if (g !== generation) return null;
+        if (!part.bytes?.length || !part.size || part.size > 20 * 1024 * 1024) return null;
+        chunks.push(new Uint8Array(part.bytes));
+        offset += part.bytes.length;
+        if (offset >= part.size) break;
+        if (offset > 20 * 1024 * 1024) return null;
+      }
+      return URL.createObjectURL(new Blob(chunks as BlobPart[],{type:mime}));
+    },
     resolve(raw) {
       const parsed = parseFileTarget(raw);
       if (!parsed) return Promise.resolve([]);

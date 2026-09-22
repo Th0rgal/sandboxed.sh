@@ -15,6 +15,7 @@ import {
   type FileRef,
 } from "./fileResources";
 export interface ReferenceResolver {
+  loadImage?: (path: string) => Promise<string | null>;
   resolve: (raw: string) => Promise<FileRef[]>;
   open: (refs: FileRef[]) => void;
   search: (query: string) => void;

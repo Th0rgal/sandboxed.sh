@@ -1,3 +1,7 @@
+import { Portal } from "solid-js/web";
+import { messageImages } from "./messageImages";
+import { imagePrompt } from "./imageAttachments";
+import { Dialog } from "./Dialog";
 import { FileReferenceContext } from "./fileReferenceContext";
 import { copyText } from "./clipboard";
 import { remoteLog } from "./remoteLog";
@@ -78,10 +82,35 @@ function resultText(result: unknown): string {
  * text and no extra height, replacing the banner that used to sit above the
  * transcript announcing what the footer already says.
  */
+function MessageImage(p: {path:string; index:number}) {
+  const resolver=useContext(FileReferenceContext);
+  const [url,setUrl]=createSignal<string | null>(null);
+  const [expanded,setExpanded]=createSignal(false);
+  createEffect(() => {
+    const path=p.path;
+    let cancelled=false;
+    let loaded:string | null=null;
+    setUrl(null);
+    void resolver?.loadImage?.(path).then(value => {
+      if(cancelled) { if(value)URL.revokeObjectURL(value); return; }
+      loaded=value;setUrl(value);
+    }).catch(() => {});
+    onCleanup(() => {cancelled=true;if(loaded)URL.revokeObjectURL(loaded);});
+  });
+  return <>
+    <button class="message-image" aria-label={`Image #${p.index}`} title={url()?`Open image #${p.index}`:`Image #${p.index} — preview unavailable`} disabled={!url()} onDblClick={e=>e.stopPropagation()} onClick={e=>{e.stopPropagation();setExpanded(true);}}>
+      <Show when={url()} fallback={<Ic.FileIcon size={22}/>}>{src=><img src={src()} alt={`Image #${p.index}`} onError={()=>setUrl(null)}/>}</Show>
+      <span>#{p.index}</span>
+    </button>
+    <Show when={expanded() && url()}><Portal><Dialog title={`Image #${p.index}`} wide onClose={()=>setExpanded(false)} footer={<button class="s-btn" onClick={()=>setExpanded(false)}>Close</button>}><img class="message-image-preview" src={url()!} alt={`Image #${p.index}`}/></Dialog></Portal></Show>
+  </>;
+}
+
 export function UserTurn(p: { text: string; attached?: boolean; pending?: boolean; onReuse?: (text: string) => void }) {
   const fork = createMemo(() => forkContext(p.text));
   const presentation = createMemo(() => messagePresentation(p.text));
-  const goal = createMemo(() => goalDraft(presentation().text));
+  const images = createMemo(() => messageImages(presentation().text));
+  const goal = createMemo(() => goalDraft(images().text));
   const [editing, setEditing] = createSignal(false);
   const [draft, setDraft] = createSignal("");
   const [copyState, setCopyState] = createSignal("");
@@ -89,11 +118,12 @@ export function UserTurn(p: { text: string; attached?: boolean; pending?: boolea
     el.style.height = "auto";
     el.style.height = `${Math.min(320, el.scrollHeight)}px`;
   };
-  const edit = () => { if (fork()) return; setDraft(presentation().text); setCopyState(""); setEditing(true); };
+  const edit = () => { if (fork()) return; setDraft(images().text); setCopyState(""); setEditing(true); };
   return (
     <div onDblClick={() => { if (!editing()) edit(); }} class={`user ${goal().kind === "goal" ? "goal" : ""} ${p.pending ? "pending" : ""}`}>
+      <Show when={images().paths.length}><div class="message-images"><For each={images().paths}>{(path,index)=><MessageImage path={path} index={index()+1}/>}</For></div></Show>
       <Show when={editing()} fallback={<>
-      <Show when={fork()} fallback={<span>{goal().kind === "goal" ? (goal() as { objective: string }).objective : presentation().text}</span>}>
+      <Show when={fork()} fallback={<span>{goal().kind === "goal" ? (goal() as { objective: string }).objective : images().text}</span>}>
         {context => <details class="fork-context"><summary>Forked from {context().source_title || "conversation"} · {context().messages.length} messages</summary>
           <For each={context().messages}>{m => <div class="fork-context-message"><small>{m.role === "user" ? "You" : "Assistant"}</small><p>{m.content}</p></div>}</For>
         </details>}
@@ -106,7 +136,7 @@ export function UserTurn(p: { text: string; attached?: boolean; pending?: boolea
           <button class="icon-btn" aria-label="Cancel" title="Cancel (Esc)" onClick={() => setEditing(false)}><Ic.CloseIcon size={16} /></button>
           <button class="icon-btn" aria-label="Copy prompt" title="Copy prompt" onClick={() => { void copyText(draft()).then(() => setCopyState("Copied"), e => setCopyState(String(e))); }}><Ic.CopyIcon size={15} /></button>
           <span role="status">{copyState()}</span>
-          <Show when={p.onReuse}><button class="send" aria-label="Use as follow-up" title="Use as follow-up" disabled={!draft().trim()} onClick={() => { p.onReuse?.(draft()); setEditing(false); }}><Ic.ArrowUpIcon size={16} /></button></Show>
+          <Show when={p.onReuse}><button class="send" aria-label="Use as follow-up" title="Use as follow-up" disabled={!draft().trim()} onClick={() => { p.onReuse?.(imagePrompt(draft(),images().paths)); setEditing(false); }}><Ic.ArrowUpIcon size={16} /></button></Show>
         </div>
       </Show>
     </div>
