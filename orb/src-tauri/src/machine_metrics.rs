@@ -176,6 +176,16 @@ fn apple_gpu_usage() -> Option<f32> {
 mod tests {
     use super::*;
     #[test]
+    fn native_collector_reads_host_resources() {
+        let sample = collect(None, Vec::new()).expect("native system collector");
+        assert!(sample.memory_total > 0);
+        assert!(sample.memory_used <= sample.memory_total);
+        if let Some(gpu) = sample.gpu_percent {
+            assert!((0.0..=100.0).contains(&gpu));
+        }
+        println!("Native GPU utilization: {:?}", sample.gpu_percent);
+    }
+    #[test]
     fn specialized_consumers_are_not_counted_as_orb() {
         let system = System::new();
         let pid = Pid::from_u32(std::process::id());

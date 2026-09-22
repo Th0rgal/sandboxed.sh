@@ -942,8 +942,18 @@ mod tests {
         let mut hb = heartbeat("gpu");
         let now = Utc::now().timestamp_millis();
         hb.resource_history = vec![
-            NodeResourceSample { time: now - 90_000, cpu: Some(1.0), memory: Some(2.0), gpu: None },
-            NodeResourceSample { time: now - 3_000, cpu: Some(20.0), memory: Some(30.0), gpu: Some(80.0) },
+            NodeResourceSample {
+                time: now - 90_000,
+                cpu: Some(1.0),
+                memory: Some(2.0),
+                gpu: None,
+            },
+            NodeResourceSample {
+                time: now - 3_000,
+                cpu: Some(20.0),
+                memory: Some(30.0),
+                gpu: Some(80.0),
+            },
         ];
         fleet.record_heartbeat("gpu", hb);
         let history = fleet.get("gpu").unwrap().resource_history;

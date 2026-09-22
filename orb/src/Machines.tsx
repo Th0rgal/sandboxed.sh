@@ -1,4 +1,4 @@
-import { readHistory, saveHistory, freshSamples } from "./resourceCache";
+import { readHistory, saveHistory, freshSamples, historyScope } from "./resourceCache";
 import { ResourceHistory, appendSamples, type ResourceSample } from "./ResourceHistory";
 import { LocalMachine } from "./LocalMachine";
 import { For, Show, createSignal, createEffect, untrack, onCleanup, onMount } from "solid-js";
@@ -67,16 +67,17 @@ function Resource(p: { label: string; used?: number | null; total?: number | nul
 }
 function FleetRow(p: { node?: RemoteNodeView; core?: Metrics; live?: boolean; history?: ResourceSample[] }) {
   const [open, setOpen] = createSignal(false);
-  const [nodeHistory, setNodeHistory] = createSignal<ResourceSample[]>(readHistory(p.node ? `node:${p.node.id}` : "core"));
+  const cacheScope = historyScope();
+  const [nodeHistory, setNodeHistory] = createSignal<ResourceSample[]>(readHistory(p.node ? `node:${p.node.id}` : "core", cacheScope));
   createEffect(() => {
     const node = p.node;
     if (node?.mem_total_bytes && node.mem_available_bytes != null) {
       const time = node.last_seen ? Date.parse(node.last_seen) : Date.now();
       setNodeHistory(old => freshSamples(appendSamples(old, node.resource_history ?? [{ time, memory: (node.mem_total_bytes! - node.mem_available_bytes!) / node.mem_total_bytes! * 100 }])));
-      saveHistory(`node:${node.id}`, untrack(nodeHistory));
+      saveHistory(`node:${node.id}`, untrack(nodeHistory), false, cacheScope);
     }
   });
-  onCleanup(() => { if (p.node) saveHistory(`node:${p.node.id}`, nodeHistory(), true); });
+  onCleanup(() => { if (p.node) saveHistory(`node:${p.node.id}`, nodeHistory(), true, cacheScope); });
   const memory = () => p.node ? (p.node.mem_total_bytes != null && p.node.mem_available_bytes != null ? p.node.mem_total_bytes - p.node.mem_available_bytes : undefined) : p.core?.memory_used;
   const disk = () => p.node ? (p.node.disk_total_bytes != null && p.node.disk_available_bytes != null ? p.node.disk_total_bytes - p.node.disk_available_bytes : undefined) : p.core?.disk_used;
   return <div class="p-acc-wrap"><button class="s-row p-acc-btn" aria-expanded={open()} onClick={() => setOpen(!open())}>
@@ -96,9 +97,10 @@ function FleetRow(p: { node?: RemoteNodeView; core?: Metrics; live?: boolean; hi
 }
 
 export function Machines() {
+  const cacheScope = historyScope();
   const [list, setList] = createStore<Machine[]>([...MACHINES.map((m) => ({ ...m })), ...loadCustom()]);
   const [draft, setDraft] = createSignal<Draft | null>(null);
-  const [history, setHistory] = createSignal<ResourceSample[]>(readHistory("core"));
+  const [history, setHistory] = createSignal<ResourceSample[]>(readHistory("core", cacheScope));
   const [core, setCore] = createSignal<Metrics>();
   const [live, setLive] = createSignal(false);
   const [pub, setPub] = createSignal("");
@@ -139,7 +141,7 @@ export function Machines() {
           if (sample && Number.isFinite(sample.cpu_percent) && Number.isFinite(sample.timestamp_ms)) { setCore(sample); setLive(true);
             const samples: Metrics[] = data.type === "history" ? data.history : [sample];
             setHistory(old => freshSamples(appendSamples(old, samples.map(s => ({ time: s.timestamp_ms, cpu: s.cpu_percent, memory: s.memory_total > 0 ? s.memory_used / s.memory_total * 100 : null })))));
-            saveHistory("core", history()); }
+            saveHistory("core", history(), false, cacheScope); }
         } catch { /* Ignore non-metric frames. */ }
       };
       socket.onclose = () => { setLive(false); if (!stopped && !document.hidden) retry = setTimeout(connect, 5000); };
@@ -148,7 +150,7 @@ export function Machines() {
     const visibility = () => { clearTimeout(retry); if (document.hidden) { socket?.close(); setLive(false); } else connect(); };
     connect();
     document.addEventListener("visibilitychange", visibility);
-    onCleanup(() => { saveHistory("core", history(), true); stopped = true; clearTimeout(retry); socket?.close(); document.removeEventListener("visibilitychange", visibility); });
+    onCleanup(() => { saveHistory("core", history(), true, cacheScope); stopped = true; clearTimeout(retry); socket?.close(); document.removeEventListener("visibilitychange", visibility); });
   });
 
   const save = () => {
