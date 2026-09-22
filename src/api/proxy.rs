@@ -293,14 +293,10 @@ fn native_protocol_supported(
     match protocol {
         NativeProtocol::Responses => match provider_type {
             ProviderType::Muse => has_api_key,
-            // OAuth-only OpenAI (Codex) and xAI (Grok Build) accounts route
-            // native Responses through the local CLI proxy, which owns the
-            // credential. The CLI-proxy route is stateless: it does not honor
-            // `previous_response_id`, so continuity there is items-replay only.
-            ProviderType::OpenAI => {
-                has_api_key
-                    || (has_oauth && crate::api::ai_providers::openai_cli_proxy_account_available())
-            }
+            // OAuth Responses use the configured credential owner: core or
+            // CLIProxyAPI for Codex, CLIProxyAPI for Grok Build. These
+            // subscription routes require client-side input replay.
+            ProviderType::OpenAI => has_api_key || has_oauth,
             ProviderType::Xai => {
                 has_api_key
                     || (has_oauth && crate::api::ai_providers::xai_cli_proxy_account_available())
@@ -1281,20 +1277,66 @@ async fn native_protocol_proxy(
         // `previous_response_id`, so reject stateful continuation instead of
         // pretending it was honored. Messages continuity is client-side block
         // replay, which the CLI proxy preserves.
-        let via_cli_proxy = match protocol {
-            NativeProtocol::Responses => {
-                matches!(provider_type, ProviderType::OpenAI | ProviderType::Xai)
-                    && entry
-                        .api_key
-                        .as_deref()
-                        .filter(|v| !v.trim().is_empty())
-                        .is_none()
+        // Core-owned Codex accounts already use the shared refresh lock for
+        // local app-server launches. Remote clients use the same owner through
+        // this proxy; never copy rotating ChatGPT credentials onto leaf nodes.
+        let direct_codex = matches!(protocol, NativeProtocol::Responses)
+            && provider_type == ProviderType::OpenAI
+            && entry.has_oauth
+            && entry
+                .api_key
+                .as_deref()
+                .filter(|key| !key.trim().is_empty())
+                .is_none()
+            && !super::oauth_owner::cli_proxy_owns(ProviderType::OpenAI);
+        let mut codex_account_id = None;
+        let via_cli_proxy = !direct_codex
+            && match protocol {
+                NativeProtocol::Responses => {
+                    matches!(provider_type, ProviderType::OpenAI | ProviderType::Xai)
+                        && entry
+                            .api_key
+                            .as_deref()
+                            .filter(|v| !v.trim().is_empty())
+                            .is_none()
+                }
+                NativeProtocol::AnthropicMessages => {
+                    provider_type == ProviderType::Anthropic && entry.has_oauth
+                }
+            };
+        let (url, credential) = if direct_codex {
+            if !is_stream || body_has_previous_response_id(&body) {
+                return error_response(StatusCode::BAD_REQUEST,
+                    "Core-owned Codex OAuth requires stream=true and replayed input; previous_response_id is unsupported".to_string(), "unsupported_parameter");
             }
-            NativeProtocol::AnthropicMessages => {
-                provider_type == ProviderType::Anthropic && entry.has_oauth
-            }
-        };
-        let (url, credential) = if via_cli_proxy {
+            let Some(account) =
+                super::ai_providers::get_all_openai_oauth_accounts(&state.config.working_dir)
+                    .into_iter()
+                    .find(|account| account.provider_id == entry.account_id)
+            else {
+                continue;
+            };
+            let account = match super::ai_providers::prepare_codex_oauth_account_for_launch(
+                &state.config.working_dir,
+                &account,
+            )
+            .await
+            {
+                Ok(account) => account,
+                Err(_) => {
+                    state
+                        .health_tracker
+                        .record_entry_failure(entry, CooldownReason::AuthError, None)
+                        .await;
+                    continue;
+                }
+            };
+            codex_account_id = Some(account.chatgpt_account_id);
+            (
+                "https://chatgpt.com/backend-api/codex/responses".to_string(),
+                account.access_token,
+            )
+        } else if via_cli_proxy {
             if matches!(protocol, NativeProtocol::Responses) && body_has_previous_response_id(&body)
             {
                 return error_response(
@@ -1331,7 +1373,7 @@ async fn native_protocol_proxy(
         } else {
             entry.model_id.as_str()
         };
-        let upstream_body = match rewrite_model(&body, rewrite_model_id) {
+        let mut upstream_body = match rewrite_model(&body, rewrite_model_id) {
             Ok(body) => body,
             Err(error) => {
                 return error_response(
@@ -1341,11 +1383,25 @@ async fn native_protocol_proxy(
                 );
             }
         };
+        if direct_codex {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&upstream_body).expect("rewritten JSON");
+            value["store"] = serde_json::json!(false);
+            upstream_body = serde_json::to_vec(&value)
+                .expect("serializable JSON")
+                .into();
+        }
         let mut request = state
             .http_client
             .post(&url)
             .header(header::CONTENT_TYPE, "application/json")
             .body(upstream_body);
+        if let Some(account_id) = codex_account_id {
+            request = request
+                .header("chatgpt-account-id", account_id)
+                .header("OpenAI-Beta", "responses=experimental")
+                .header("originator", "codex_cli_rs");
+        }
         match protocol {
             NativeProtocol::Responses => {
                 request = request.bearer_auth(credential);
@@ -6365,6 +6421,12 @@ mod tests {
         let xai_key = protocol_capabilities(ProviderType::Xai, true, false);
         assert!(xai_key.chat_completions && xai_key.responses && xai_key.previous_response_id);
         assert!(!xai_key.anthropic_messages && !xai_key.thinking_blocks_replay);
+
+        let core_codex = protocol_capabilities(ProviderType::OpenAI, false, true);
+        assert!(core_codex.responses && core_codex.native_function_tools);
+        assert!(!core_codex.previous_response_id);
+        let disconnected_codex = protocol_capabilities(ProviderType::OpenAI, false, false);
+        assert!(!disconnected_codex.responses);
 
         let xai_oauth = protocol_capabilities(ProviderType::Xai, false, true);
         assert!(!xai_oauth.responses && !xai_oauth.previous_response_id);

@@ -6378,7 +6378,10 @@ async fn typed_remote_launch_is_server_planned_idempotent_and_explicit_about_sup
     assert!(detail.contains("managed-auth"), "{detail}");
     let caps = remote_launch_capabilities();
     assert!(caps.typed && caps.raw_command && caps.proxy_url_configured);
-    assert_eq!(caps.harnesses, vec!["claudecode", "opencode", "grok"]);
+    assert_eq!(
+        caps.harnesses,
+        vec!["claudecode", "opencode", "grok", "codex"]
+    );
     assert_eq!(
         store
             .list_missions_filtered(&crate::api::mission_store::MissionFilter::default(), 50, 0)
@@ -7081,6 +7084,56 @@ async fn http_status_acknowledges_only_explicit_steers() {
         h.state.projects.list_pending_steers("lido").unwrap()[0].id,
         late.id
     );
+}
+
+#[tokio::test]
+async fn http_core_codex_controller_attachment_accepts_storage_volume_symlink() {
+    if isolated_track_http_test(
+        "http_core_codex_controller_attachment_accepts_storage_volume_symlink",
+    ) {
+        return;
+    }
+    use std::os::unix::fs::symlink;
+    let h = Harness::new().await;
+    h.state
+        .backend_registry
+        .write()
+        .await
+        .register(Arc::new(crate::backend::codex::CodexBackend::new()));
+    let configured = h.state.config.working_dir.join(".sandboxed-sh");
+    let volume = h._dir.path().join("storage-volume");
+    if configured.exists() {
+        std::fs::rename(&configured, &volume).unwrap();
+    } else {
+        std::fs::create_dir_all(&volume).unwrap();
+    }
+    symlink(&volume, &configured).unwrap();
+    let prompt = "Peux-tu me faire un résumé du status de l’audit Pareto? Tu peux check le travail fait par @controller et me dire où on en est (les garanties choisies, les properties qui en découlent, classées en 3 catégories, et ce qui a été formalisé en Verity / Lean [est-ce que c’est parfait ou est-ce qu’il reste des choses à corriger sur les modèles / specs pour que ce soit rigoureux], puis ce qui a été prouvé et ce qui ne l’est pas)";
+    let response = h.state.http_client.post(format!("{}/missions", h.url)).json(&json!({
+        "title":"Pareto attachment regression", "backend":"codex", "model_override":"gpt-6-astra",
+        "model_effort":"medium", "project":"lido", "writer":false, "estimated_disk_gib":1,
+        "prompt":prompt, "attachments":[{"kind":"controller"}],
+        "not_before":(chrono::Utc::now()+chrono::Duration::hours(1)).to_rfc3339()
+    })).send().await.unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert!(status.is_success(), "{status}: {body}");
+    let mission: Mission = serde_json::from_str(&body).unwrap();
+    assert_eq!(mission.backend, "codex");
+    let payload =
+        crate::api::mission_payload::read_sidecar(&h.state.config.working_dir, mission.id)
+            .unwrap()
+            .unwrap();
+    assert!(payload.controller_md.is_some());
+    let cwd = h._dir.path().join("new-mission");
+    crate::api::mission_payload::materialize_turn(
+        &h.state.config.working_dir,
+        &cwd,
+        mission.id,
+        prompt,
+    )
+    .unwrap();
+    assert!(cwd.join(".paloma/controller.md").is_file());
 }
 
 #[tokio::test]

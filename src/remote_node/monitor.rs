@@ -794,6 +794,8 @@ pub struct RemoteLaunchCapabilities {
     pub typed: bool,
     /// Backend ids nodes can run (`claudecode`, `opencode`).
     pub harnesses: Vec<String>,
+    #[serde(default)]
+    pub requires_proxy_harnesses: Vec<String>,
     /// An explicit `remote_command` is still accepted verbatim.
     pub raw_command: bool,
     /// `SANDBOXED_PUBLIC_URL` is set, so node harnesses can reach the proxy.

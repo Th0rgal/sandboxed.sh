@@ -84,7 +84,7 @@ export function remoteLaunchPreflight(fleet: RemoteNodesResponse, nodeId: string
 export function remoteHarnessNeedsProxy(capability: RemoteLaunchCapability, backend: string): boolean {
   const listed = capability.requires_proxy_harnesses;
   if (Array.isArray(listed)) return listed.includes(backend);
-  return backend === "claudecode" || backend === "opencode";
+  return backend === "claudecode" || backend === "opencode" || backend === "codex";
 }
 /** The capability could not be read at all (network/server error): refuse rather than guess. */
 export function remoteLaunchUnconfirmed(nodeId: string, error: unknown): string {

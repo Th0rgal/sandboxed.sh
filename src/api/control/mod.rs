@@ -5115,7 +5115,10 @@ pub async fn post_message(
     }
     let control = control_for_user(&state, &user).await;
     if let Some(mid) = target_mission_id {
-        if mission_is_client_placed(&control, mid).await.map_err(internal_error)? {
+        if mission_is_client_placed(&control, mid)
+            .await
+            .map_err(internal_error)?
+        {
             return Err((
                 StatusCode::CONFLICT,
                 "this mission runs on the Orb client; the backend will not execute it".into(),
@@ -11024,7 +11027,7 @@ pub async fn create_mission(
     // runs on the node (an explicit raw `remote_command` stays supported).
     // Planned before the mission exists so an unsupported selection is a
     // clean 400, never a failed mission.
-    let remote_plan = match remote_node_id.as_deref() {
+    let mut remote_plan = match remote_node_id.as_deref() {
         Some(_) => Some(
             plan_remote_harness(
                 remote_command.as_deref(),
@@ -11036,6 +11039,13 @@ pub async fn create_mission(
         ),
         None => None,
     };
+    if let Some(RemoteHarnessPlan::Codex {
+        effort, fast_mode, ..
+    }) = remote_plan.as_mut()
+    {
+        *effort = model_effort.clone();
+        *fast_mode = req.fast_mode;
+    }
     if let Some(node_id) = remote_node_id.as_deref() {
         if remote_dispatch_is_scheduled_for_future(
             Some(node_id),
@@ -11889,7 +11899,7 @@ impl RemoteMissionOwner {
 /// Harnesses a remote node can run for a typed launch. Nodes ship the
 /// `claude`, `opencode`, and native `grok` CLIs. Other harnesses are rejected
 /// before the mission exists instead of being silently swapped.
-pub(crate) const REMOTE_NODE_HARNESSES: &[&str] = &["claudecode", "opencode", "grok"];
+pub(crate) const REMOTE_NODE_HARNESSES: &[&str] = &["claudecode", "opencode", "grok", "codex"];
 
 /// Stable prefixes of the plain-text `400` bodies a typed remote launch can
 /// return before any mission exists. Clients match on the prefix, not the
@@ -11904,6 +11914,7 @@ pub(crate) const REMOTE_MODEL_REQUIRED: &str = "REMOTE_MODEL_REQUIRED";
 pub(crate) fn remote_launch_capabilities() -> crate::remote_node::RemoteLaunchCapabilities {
     crate::remote_node::RemoteLaunchCapabilities {
         typed: true,
+        requires_proxy_harnesses: vec!["claudecode".into(), "opencode".into(), "codex".into()],
         harnesses: REMOTE_NODE_HARNESSES
             .iter()
             .map(|h| h.to_string())
@@ -11914,6 +11925,7 @@ pub(crate) fn remote_launch_capabilities() -> crate::remote_node::RemoteLaunchCa
             REMOTE_HARNESS_UNSUPPORTED.to_string(),
             REMOTE_PROMPT_REQUIRED.to_string(),
             REMOTE_MODEL_REQUIRED.to_string(),
+            "REMOTE_GOAL_UNSUPPORTED".to_string(),
             remote_grok::REMOTE_AUTH_REQUIRED.to_string(),
         ],
     }
@@ -11923,6 +11935,13 @@ pub(crate) fn remote_launch_capabilities() -> crate::remote_node::RemoteLaunchCa
 /// from the client's selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteHarnessPlan {
+    Codex {
+        effort: Option<String>,
+        fast_mode: bool,
+        model: String,
+        prompt: String,
+        resume_session_id: Option<String>,
+    },
     Grok {
         model: Option<String>,
         prompt: String,
@@ -11949,12 +11968,15 @@ impl RemoteHarnessPlan {
     pub(crate) fn uses_core_proxy(&self) -> bool {
         matches!(
             self,
-            RemoteHarnessPlan::ClaudeCode { .. } | RemoteHarnessPlan::OpenCode { .. }
+            RemoteHarnessPlan::ClaudeCode { .. }
+                | RemoteHarnessPlan::OpenCode { .. }
+                | RemoteHarnessPlan::Codex { .. }
         )
     }
 
     pub(crate) fn label(&self) -> String {
         match self {
+            RemoteHarnessPlan::Codex { model, .. } => format!("codex/{model}"),
             RemoteHarnessPlan::Raw { .. } => "raw command".to_string(),
             RemoteHarnessPlan::Grok { model, .. } => {
                 format!("grok/{}", model.as_deref().unwrap_or("node default model"))
@@ -11999,6 +12021,14 @@ pub(crate) fn plan_remote_harness(
         .filter(|m| !m.is_empty())
         .map(str::to_string);
     match backend {
+        "codex" if prompt.starts_with("/goal") => Err("REMOTE_GOAL_UNSUPPORTED: remote Codex supports native exec sessions, but not app-server goals yet; use Codex on core for /goal".to_string()),
+        "codex" => Ok(RemoteHarnessPlan::Codex {
+            effort: None,
+            fast_mode: false,
+            model: model.ok_or_else(|| format!("{REMOTE_MODEL_REQUIRED}: a Codex remote launch needs model_override"))?,
+            prompt,
+            resume_session_id: None,
+        }),
         "grok" => Ok(remote_grok::plan(model, prompt)),
         "claudecode" => Ok(RemoteHarnessPlan::ClaudeCode {
             // Claude Code expects bare model ids.
@@ -12113,6 +12143,65 @@ pub(crate) fn remote_execution_for_plan(
 ) -> RemoteExecution {
     let label = plan.label();
     match plan {
+        RemoteHarnessPlan::Codex {
+            effort,
+            fast_mode,
+            model,
+            prompt,
+            resume_session_id,
+        } => {
+            let mut command = String::from(
+                "command -v codex >/dev/null 2>&1 || { echo 'codex is not installed on this node' >&2; exit 127; }; exec codex",
+            );
+            // CLI overrides keep configuration and credentials out of project files.
+            for setting in [
+                "model_provider=\"sandboxed\"".to_string(),
+                "model_providers.sandboxed.name=\"Sandboxed\"".to_string(),
+                format!(
+                    "model_providers.sandboxed.base_url={}",
+                    serde_json::to_string(&format!("{}/v1", api_base_url.trim_end_matches('/')))
+                        .unwrap()
+                ),
+                "model_providers.sandboxed.wire_api=\"responses\"".to_string(),
+                format!("model_providers.sandboxed.env_key=\"{REMOTE_PROXY_KEY_ENV}\""),
+            ] {
+                command.push_str(" -c ");
+                command.push_str(&shell_single_quote(&setting));
+            }
+            if let Some(effort) = effort {
+                command.push_str(" -c ");
+                command.push_str(&shell_single_quote(&format!(
+                    "model_reasoning_effort={}",
+                    serde_json::to_string(effort).unwrap()
+                )));
+            }
+            if *fast_mode {
+                command.push_str(" -c 'service_tier=\"fast\"'");
+            }
+            command.push_str(" exec");
+            if resume_session_id.is_some() {
+                command.push_str(" resume");
+            }
+            command.push_str(
+                " --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --model ",
+            );
+            command.push_str(&shell_single_quote(model));
+            command.push_str(" -- ");
+            if let Some(session) = resume_session_id {
+                command.push_str(&shell_single_quote(session));
+                command.push(' ');
+            }
+            command.push_str(&shell_single_quote(prompt));
+            RemoteExecution {
+                managed_auth: Vec::new(),
+                command,
+                label,
+                env: Some(HashMap::from([
+                    (REMOTE_PROXY_KEY_ENV.to_string(), proxy_key.to_string()),
+                    ("NO_COLOR".to_string(), "1".to_string()),
+                ])),
+            }
+        }
         RemoteHarnessPlan::Grok {
             model,
             prompt,
@@ -15116,7 +15205,10 @@ pub async fn append_client_transcript(
         return Err((StatusCode::BAD_REQUEST, "content is required".into()));
     }
     let control = control_for_user(&state, &user).await;
-    if !mission_is_client_placed(&control, id).await.map_err(internal_error)? {
+    if !mission_is_client_placed(&control, id)
+        .await
+        .map_err(internal_error)?
+    {
         return Err((
             StatusCode::CONFLICT,
             "transcript append is only for client-placed missions".into(),
@@ -15180,7 +15272,10 @@ pub async fn set_client_mission_status(
         }
     };
     let control = control_for_user(&state, &user).await;
-    if !mission_is_client_placed(&control, id).await.map_err(internal_error)? {
+    if !mission_is_client_placed(&control, id)
+        .await
+        .map_err(internal_error)?
+    {
         return Err((
             StatusCode::CONFLICT,
             "status updates of this kind are only for client-placed missions".into(),
@@ -16800,7 +16895,10 @@ pub async fn resume_mission(
     let actor = resolve_actor(request.actor.clone(), &user);
 
     let control = control_for_user(&state, &user).await;
-    if mission_is_client_placed(&control, mission_id).await.map_err(internal_error)? {
+    if mission_is_client_placed(&control, mission_id)
+        .await
+        .map_err(internal_error)?
+    {
         return Err((
             StatusCode::CONFLICT,
             "this mission runs on the Orb client; resume it there".into(),
@@ -36586,6 +36684,54 @@ Investigate <service/> failures.
             no_prompt.starts_with("REMOTE_PROMPT_REQUIRED: "),
             "{no_prompt}"
         );
+    }
+
+    #[test]
+    fn remote_codex_uses_native_cli_and_secret_env_for_launch_and_resume() {
+        let plan = plan_remote_harness(
+            None,
+            "codex",
+            Some("openai/gpt-5.4"),
+            Some("say 'hi'; $(false)"),
+        )
+        .unwrap();
+        assert!(plan.uses_core_proxy());
+        let execution =
+            remote_execution_for_plan(&plan, "https://core.example/", "secret-test-key");
+        assert!(!execution.command.contains("secret-test-key"));
+        assert!(execution.command.contains("exec codex"));
+        assert!(execution.command.contains("wire_api=\"responses\""));
+        assert!(execution.command.contains("https://core.example/v1"));
+        assert!(execution
+            .command
+            .contains(&shell_single_quote("say 'hi'; $(false)")));
+        assert_eq!(
+            execution.env.unwrap()[REMOTE_PROXY_KEY_ENV],
+            "secret-test-key"
+        );
+        let resume = RemoteHarnessPlan::Codex {
+            effort: Some("high".into()),
+            fast_mode: true,
+            model: "openai/gpt-5.4".into(),
+            prompt: "continue".into(),
+            resume_session_id: Some("thread-123".into()),
+        };
+        let execution =
+            remote_execution_for_plan(&resume, "https://core.example", "secret-test-key");
+        assert!(execution.command.contains("exec resume --json"));
+        assert!(execution
+            .command
+            .contains("model_reasoning_effort=\"high\""));
+        assert!(execution.command.contains("service_tier=\"fast\""));
+        assert!(
+            plan_remote_harness(None, "codex", Some("gpt-6-astra"), Some("/goal test"))
+                .unwrap_err()
+                .starts_with("REMOTE_GOAL_UNSUPPORTED")
+        );
+        assert!(execution.command.ends_with("-- 'thread-123' 'continue'"));
+        assert!(plan_remote_harness(None, "codex", None, Some("do it"))
+            .unwrap_err()
+            .starts_with(REMOTE_MODEL_REQUIRED));
     }
 
     #[test]

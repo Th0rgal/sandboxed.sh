@@ -182,16 +182,25 @@ pub struct MaterializeReport {
     pub truncated: bool,
 }
 
+/// The operator-owned storage root may deliberately be a volume symlink.
+/// Resolve only this trust boundary, never project/attachment-controlled
+/// descendants: those still pass through the descriptor-based no-follow walk.
+fn storage_root(working_dir: &Path) -> PathBuf {
+    let root = working_dir.join(".sandboxed-sh");
+    root.canonicalize().unwrap_or_else(|_| {
+        working_dir
+            .canonicalize()
+            .unwrap_or_else(|_| working_dir.to_path_buf())
+            .join(".sandboxed-sh")
+    })
+}
+
 pub fn project_files_root(working_dir: &Path, slug: &str) -> PathBuf {
-    working_dir
-        .join(".sandboxed-sh")
-        .join("project-files")
-        .join(slug)
+    storage_root(working_dir).join("project-files").join(slug)
 }
 
 pub fn sidecar_path(working_dir: &Path, mission_id: Uuid) -> PathBuf {
-    working_dir
-        .join(".sandboxed-sh")
+    storage_root(working_dir)
         .join("mission-payloads")
         .join(format!("{mission_id}.json"))
 }
@@ -513,8 +522,8 @@ struct MessageSnapshot {
 }
 
 fn message_snapshot_path(working_dir: &Path, mission_id: Uuid, message_id: Uuid) -> PathBuf {
-    working_dir
-        .join(".sandboxed-sh/message-payloads")
+    storage_root(working_dir)
+        .join("message-payloads")
         .join(mission_id.to_string())
         .join(format!("{message_id}.json"))
 }
@@ -1112,6 +1121,52 @@ mod tests {
         assert!(message.contains(&relative));
         assert!(!message.contains(rootfs.to_str().unwrap()));
         assert!(rootfs.join("workspace/checkout").join(relative).is_file());
+    }
+
+    #[test]
+    fn controller_payload_supports_operator_storage_symlink() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp.path().join("host");
+        let volume = tmp.path().join("storage");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&volume).unwrap();
+        symlink(&volume, host.join(".sandboxed-sh")).unwrap();
+        let mid = Uuid::new_v4();
+        let payload = MissionPayload {
+            project: Some("pareto".into()),
+            attachments: vec![MissionAttachment {
+                kind: AttachmentKind::Controller,
+                path: None,
+            }],
+            controller_md: Some("# Pareto controller snapshot".into()),
+        };
+        let prompt = "Peux-tu me faire un résumé du status de l’audit Pareto? Tu peux check le travail fait par @controller et me dire où on en est (les garanties choisies, les properties qui en découlent, classées en 3 catégories, et ce qui a été formalisé en Verity / Lean [est-ce que c’est parfait ou est-ce qu’il reste des choses à corriger sur les modèles / specs pour que ce soit rigoureux], puis ce qui a été prouvé et ce qui ne l’est pas)";
+        write_sidecar(&host, mid, &payload).unwrap();
+        assert_eq!(read_sidecar(&host, mid).unwrap(), Some(payload.clone()));
+        assert!(volume
+            .join("mission-payloads")
+            .join(format!("{mid}.json"))
+            .is_file());
+        let (message, _) = stage_message(&host, mid, Uuid::new_v4(), prompt, &payload).unwrap();
+        let cwd = tmp.path().join("mission");
+        std::fs::create_dir_all(&cwd).unwrap();
+        materialize_turn(&host, &cwd, mid, &message).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cwd.join(".paloma/controller.md")).unwrap(),
+            "# Pareto controller snapshot"
+        );
+        // Resolving the configured volume must not permit a symlink below it.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::rename(
+            volume.join("mission-payloads"),
+            volume.join("saved-payloads"),
+        )
+        .unwrap();
+        symlink(&outside, volume.join("mission-payloads")).unwrap();
+        assert!(write_sidecar(&host, Uuid::new_v4(), &payload).is_err());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
     }
 
     #[test]

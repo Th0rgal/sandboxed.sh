@@ -58,6 +58,11 @@ const fleet=(remote_launch?:RemoteLaunchCapability|null,extra:Partial<RemoteNode
 const typed:RemoteLaunchCapability={typed:true,harnesses:["claudecode","opencode"],raw_command:true,proxy_url_configured:true};
 const names=(id:string)=>({claudecode:"Claude Code",opencode:"OpenCode",grok:"Grok"} as Record<string,string>)[id]??id;
 describe("remote launch preflight follows the server-advertised capability",()=>{
+ it("requires the model proxy for advertised remote Codex",()=>{
+  const codex={...typed,harnesses:["codex"],proxy_url_configured:false};
+  expect(remoteLaunchPreflight(fleet(codex),"dgx-spark",{backend:"codex",model:"gpt-6-astra"})).toContain("model proxy");
+  expect(remoteLaunchPreflight(fleet({...codex,proxy_url_configured:true}),"dgx-spark",{backend:"codex",model:"gpt-6-astra"})).toBeNull();
+ });
  it("refuses a harness the server has not confirmed and names what it does run",()=>{
   const refusal=remoteLaunchPreflight(fleet(typed),"dgx-spark",{backend:"grok",model:"grok-4.6"},names);
   expect(refusal).toContain("Remote launch for grok (grok-4.6) is not supported on dgx-spark");
