@@ -273,3 +273,11 @@ export const RunningDots = () => (
 export const PauseIcon = (p: P) => (
   <I {...p} sw={1.6}><path d="M5.5 4v8M10.5 4v8" /></I>
 );
+
+/** Core: stacked server rack. Workers: a single compute unit. */
+export const CoreServerIcon = (p: P) => (
+  <I {...p}><rect x="2.5" y="2" width="11" height="5" rx="1.3" /><rect x="2.5" y="9" width="11" height="5" rx="1.3" /><path d="M5 4.5h.01M5 11.5h.01M8 4.5h3M8 11.5h3" /></I>
+);
+export const ComputeNodeIcon = (p: P) => (
+  <I {...p}><rect x="2.5" y="3.5" width="11" height="9" rx="1.5" /><path d="M5 6.5h.01M8 6.5h3M5 9.5h6" /></I>
+);

@@ -1440,3 +1440,13 @@ button.fork-trigger:hover { color: var(--fg); }
 .error-notice > .icon-btn { flex: none; width: 22px; height: 22px; }
 .fork-feedback:has(.error-notice) { padding: 0; border: 0; background: none; }
 .fork-feedback .error-notice { margin: 0; }
+
+.machine-menu { width: 280px; }
+.machine-section-label { padding: 7px 10px 5px; font-size: 10.5px; font-weight: 500; color: var(--fg-3); letter-spacing: .04em; text-transform: uppercase; }
+.machine-nodes-label { padding-top: 12px; }
+.machine-menu .menu-sub { font: 11px/1.4 var(--sans); color: var(--fg-3); }
+.machine-menu .menu-item { gap: 10px; padding: 9px 10px; }
+.machine-menu .menu-ico { align-self: center; }
+.machine-node-state { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--fg-3); white-space: nowrap; }
+.machine-state-dot { width: 4px; height: 4px; border-radius: 50%; background: var(--fg-4); }
+.machine-state-dot.online { background: var(--fg-3); }

@@ -1577,13 +1577,13 @@ export default function App() {
                   <div class="na-drop" onPointerDown={(e) => e.stopPropagation()}>
                     <button class="na-drop-btn" onClick={() => setEnvOpen(envOpen() === "machine" ? null : "machine")}>
                       <Show when={newMachine() !== "local"} fallback={<Ic.LaptopIcon size={14} />}>
-                        <Ic.MachinesIcon size={14} />
+                        <Show when={newMachine() === "core"} fallback={<Ic.ComputeNodeIcon size={14} />}><Ic.CoreServerIcon size={14} /></Show>
                       </Show>
                       {machineLabel()}
                       <Ic.ChevronDown size={12} />
                     </button>
                     <Show when={envOpen() === "machine"}>
-                      <div class="menu na-menu">
+                      <div class="menu na-menu machine-menu">
                         <div class="na-menu-list">
                         <Show
                           when={isConnected()}
@@ -1616,7 +1616,7 @@ export default function App() {
                                     }}
                                   >
                                     <span class="menu-ico">
-                                      <Ic.MachinesIcon />
+                                      <Ic.ComputeNodeIcon />
                                     </span>
                                     <span class="menu-col">
                                       <span class="menu-title">{m.name}</span>
@@ -1628,6 +1628,7 @@ export default function App() {
                             </>
                           }
                         >
+                          <div class="machine-section-label">Local</div>
                           <button
                             class={`menu-item ${newMachine() === "local" ? "on" : ""}`}
                             onClick={() => {
@@ -1640,9 +1641,11 @@ export default function App() {
                             </span>
                             <span class="menu-col">
                               <span class="menu-title">This computer</span>
-                              <span class="menu-sub">Claude Code, Codex, Grok, OpenCode on this machine</span>
+                              <span class="menu-sub">Installed agents on your Mac</span>
                             </span>
                           </button>
+                          <div class="menu-sep" />
+                          <div class="machine-section-label">Remote</div>
                           <button
                             class={`menu-item ${newMachine() === "core" ? "on" : ""}`}
                             onClick={() => {
@@ -1651,34 +1654,31 @@ export default function App() {
                             }}
                           >
                             <span class="menu-ico">
-                              <Ic.MachinesIcon />
+                              <Ic.CoreServerIcon />
                             </span>
                             <span class="menu-col">
                               <span class="menu-title">Core (agent-core)</span>
-                              <span class="menu-sub">Backend host workspace</span>
+                              <span class="menu-sub">Control plane · agent-core</span>
                             </span>
                           </button>
-                          <div class="menu-sep" />
+                          <div class="machine-section-label machine-nodes-label">Compute nodes</div>
                           <For each={sortedNodes()}>
                             {(n) => (
                               <button
                                 class={`menu-item ${n.id === newMachine() ? "on" : ""}`}
+                                title={nodeLaunchNote()}
                                 onClick={() => {
                                   chooseMachine(n.id);
                                   setEnvOpen(null);
                                 }}
                               >
                                 <span class="menu-ico">
-                                  <Ic.MachinesIcon />
+                                  <Ic.ComputeNodeIcon />
                                 </span>
                                 <span class="menu-col">
                                   <span class="menu-title">{n.id}</span>
-                                  <span class="menu-sub">
-                                    {n.status}
-                                    {n.cordoned ? " · cordoned" : ""}
-                                    {" · "}{nodeLaunchNote()}
-                                  </span>
                                 </span>
+                                <span class="machine-node-state"><span class={`machine-state-dot ${n.status === "online" && !n.cordoned ? "online" : ""}`} />{n.cordoned ? "Cordoned" : n.status}</span>
                               </button>
                             )}
                           </For>
