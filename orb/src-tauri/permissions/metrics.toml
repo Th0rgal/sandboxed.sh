@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-local-metrics"
+description = "Read local system usage and memory of Orb-owned processes"
+commands.allow = ["local_machine_metrics"]

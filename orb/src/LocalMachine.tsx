@@ -1,3 +1,4 @@
+import { ResourceHistory, appendSamples, type ResourceSample } from "./ResourceHistory";
 import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
 import { LaptopIcon } from "./icons";
 import { pollWhileVisible } from "./poll";
@@ -11,6 +12,7 @@ const size = (n: number) => n >= 1024 ** 3 ? `${(n / 1024 ** 3).toFixed(1)} GiB`
 const percent = (used: number, total: number) => total > 0 ? `${(used / total * 100).toFixed(1)}%` : "—";
 
 export function LocalMachine() {
+  const [history, setHistory] = createSignal<ResourceSample[]>([]);
   const [open, setOpen] = createSignal(false);
   const [sample, setSample] = createSignal<Snapshot>();
   const [error, setError] = createSignal("");
@@ -24,8 +26,8 @@ export function LocalMachine() {
       pending = true;
       try {
         const result = await invoke("local_machine_metrics");
-        if (!disposed) { setSample(result); setError(""); }
-      } catch { if (!disposed) setError("Couldn’t refresh local metrics"); }
+        if (!disposed) { setSample(result); setHistory(old => appendSamples(old, [{ time: Date.now(), cpu: result.cpu_percent, memory: result.memory_total > 0 ? result.memory_used / result.memory_total * 100 : null }])); setError(""); }
+      } catch (e) { if (!disposed) setError(`Couldn’t refresh local metrics: ${String(e)}`); }
       finally { pending = false; }
     };
     void refresh();
@@ -38,10 +40,7 @@ export function LocalMachine() {
     <span class={`chev p-acc-chev ${open() ? "open" : ""}`}>›</span>
   </button><Show when={open()}><div class="p-acc-body machine-expanded">
     <Show when={sample()} fallback={<p class="s-row-desc">{error() || "Reading local metrics…"}</p>}>{s => <>
-      <div class="resource-breakdown"><div class="resource-breakdown-head"><span>Memory</span><span>{size(s().memory_used)} / {size(s().memory_total)}</span></div>
-        <div class="resource-track" role="meter" aria-label="Memory used" aria-valuemin={0} aria-valuemax={100} aria-valuenow={s().memory_total > 0 ? s().memory_used / s().memory_total * 100 : 0}><i style={{ width: percent(s().memory_used, s().memory_total) }} /></div>
-        <div class="resource-breakdown-legend"><span>Used {percent(s().memory_used, s().memory_total)}</span><span>Available {size(Math.max(0, s().memory_total - s().memory_used))}</span></div>
-      </div>
+      <ResourceHistory samples={history()} live={!error()} />
       <div class="machine-resources">
         <div class="machine-resource"><span>CPU</span><strong>{s().cpu_percent == null ? "Sampling…" : `${Math.round(s().cpu_percent!)}%`}</strong></div>
         <div class="machine-resource"><span>Memory</span><strong>{percent(s().memory_used, s().memory_total)}</strong><small>{size(s().memory_used)} / {size(s().memory_total)}</small></div>

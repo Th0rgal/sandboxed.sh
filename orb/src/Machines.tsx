@@ -1,5 +1,6 @@
+import { ResourceHistory, appendSamples, type ResourceSample } from "./ResourceHistory";
 import { LocalMachine } from "./LocalMachine";
-import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, createSignal, createEffect, onCleanup, onMount } from "solid-js";
 import { pollWhileVisible } from "./poll";
 import { createStore, produce } from "solid-js/store";
 import * as Ic from "./icons";
@@ -63,8 +64,16 @@ function Resource(p: { label: string; used?: number | null; total?: number | nul
   return <div class="machine-resource"><span>{p.label}</span><strong>{p.value ?? (known() ? `${Math.round(p.used! / p.total! * 100)}%` : "Unavailable")}</strong>
     <Show when={known()}><small>{gib(p.used!)} / {gib(p.total!)}</small></Show></div>;
 }
-function FleetRow(p: { node?: RemoteNodeView; core?: Metrics; live?: boolean }) {
+function FleetRow(p: { node?: RemoteNodeView; core?: Metrics; live?: boolean; history?: ResourceSample[] }) {
   const [open, setOpen] = createSignal(false);
+  const [nodeHistory, setNodeHistory] = createSignal<ResourceSample[]>([]);
+  createEffect(() => {
+    const node = p.node;
+    if (node?.mem_total_bytes && node.mem_available_bytes != null) {
+      const time = node.last_seen ? Date.parse(node.last_seen) : Date.now();
+      setNodeHistory(old => appendSamples(old, [{ time, memory: (node.mem_total_bytes! - node.mem_available_bytes!) / node.mem_total_bytes! * 100 }]));
+    }
+  });
   const memory = () => p.node ? (p.node.mem_total_bytes != null && p.node.mem_available_bytes != null ? p.node.mem_total_bytes - p.node.mem_available_bytes : undefined) : p.core?.memory_used;
   const disk = () => p.node ? (p.node.disk_total_bytes != null && p.node.disk_available_bytes != null ? p.node.disk_total_bytes - p.node.disk_available_bytes : undefined) : p.core?.disk_used;
   return <div class="p-acc-wrap"><button class="s-row p-acc-btn" aria-expanded={open()} onClick={() => setOpen(!open())}>
@@ -73,16 +82,11 @@ function FleetRow(p: { node?: RemoteNodeView; core?: Metrics; live?: boolean }) 
     <Show when={p.node?.active_jobs != null}><span class="s-row-desc">{p.node!.active_jobs} active</span></Show>
     <span class={`chev p-acc-chev ${open() ? "open" : ""}`}>›</span></button>
     <Show when={open()}><div class="p-acc-body machine-expanded">
-      <Show when={memory() != null && (p.node?.mem_total_bytes ?? p.core?.memory_total ?? 0) > 0}>
-        <div class="resource-breakdown">
-          <div class="resource-breakdown-head"><span>Memory usage</span><span>{gib(memory()!)} / {gib((p.node?.mem_total_bytes ?? p.core?.memory_total)!)}</span></div>
-          <div class="resource-track" role="meter" aria-label="Memory used" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(memory()! / (p.node?.mem_total_bytes ?? p.core?.memory_total)! * 100)}><i style={{ width: `${Math.min(100, Math.max(0, memory()! / (p.node?.mem_total_bytes ?? p.core?.memory_total)! * 100))}%` }} /></div>
-        </div>
-      </Show><div class="machine-resources">
+      <ResourceHistory samples={p.node ? nodeHistory() : p.history ?? []} live={p.node ? p.node.status === "online" : !!p.live} /><div class="machine-resources">
       <Resource label="CPU" value={p.node ? (p.node.cpu_total != null ? `${p.node.cpu_total} cores` : "Unavailable") : p.core ? `${Math.round(p.core.cpu_percent)}%` : "Unavailable"} />
       <Resource label="Memory" used={memory()} total={p.node?.mem_total_bytes ?? p.core?.memory_total} />
       <Resource label="Disk" used={disk()} total={p.node?.disk_total_bytes ?? p.core?.disk_total} />
-    </div><p class="s-row-desc">{p.node ? "Heartbeat snapshot · CPU load and GPU metrics are not reported by this node." : p.live ? "Streaming live" : "Live stream unavailable · reconnecting"}</p>
+    </div><Show when={p.node || !p.live}><p class="s-row-desc">{p.node ? "Heartbeat snapshot · CPU load and GPU metrics are not reported by this node." : p.live ? "" : "Live stream unavailable · reconnecting"}</p></Show>
     <Show when={p.node}><div class="p-detail-meta"><span>{p.node!.base_url}</span><span>{nodeNote(p.node!)}</span><span>{p.node!.last_seen ? `Last seen ${new Date(p.node!.last_seen!).toLocaleTimeString()}` : "No heartbeat received"}</span></div></Show>
     </div></Show></div>;
 }
@@ -90,6 +94,7 @@ function FleetRow(p: { node?: RemoteNodeView; core?: Metrics; live?: boolean }) 
 export function Machines() {
   const [list, setList] = createStore<Machine[]>([...MACHINES.map((m) => ({ ...m })), ...loadCustom()]);
   const [draft, setDraft] = createSignal<Draft | null>(null);
+  const [history, setHistory] = createSignal<ResourceSample[]>([]);
   const [core, setCore] = createSignal<Metrics>();
   const [live, setLive] = createSignal(false);
   const [pub, setPub] = createSignal("");
@@ -127,7 +132,9 @@ export function Machines() {
         try {
           const data = JSON.parse(event.data);
           const sample = data.type === "history" ? data.history?.at(-1) : data;
-          if (sample && Number.isFinite(sample.cpu_percent) && Number.isFinite(sample.timestamp_ms)) { setCore(sample); setLive(true); }
+          if (sample && Number.isFinite(sample.cpu_percent) && Number.isFinite(sample.timestamp_ms)) { setCore(sample); setLive(true);
+            const samples: Metrics[] = data.type === "history" ? data.history : [sample];
+            setHistory(old => appendSamples(old, samples.map(s => ({ time: s.timestamp_ms, cpu: s.cpu_percent, memory: s.memory_total > 0 ? s.memory_used / s.memory_total * 100 : null })))); }
         } catch { /* Ignore non-metric frames. */ }
       };
       socket.onclose = () => { setLive(false); if (!stopped && !document.hidden) retry = setTimeout(connect, 5000); };
@@ -248,7 +255,7 @@ export function Machines() {
       <h3 class="s-section-title">Remote</h3>
       <div class="m-list s-card">
         <Show when={isConnected()}>
-          <FleetRow core={core()} live={live()} />
+          <FleetRow core={core()} live={live()} history={history()} />
           <For each={(nodes() ?? []).map(n => n.id)}>{id => <FleetRow node={nodes()?.find(n => n.id === id)} />}</For>
           <Show when={nodes()?.length === 0}>
             <div class="m-note" style={{ padding: "6px 8px" }}>No remote nodes registered.</div>
