@@ -61,7 +61,7 @@ const gib = (n: number) => `${(n / 1024 ** 3).toFixed(1)} GiB`;
 function Resource(p: { label: string; used?: number | null; total?: number | null; value?: string }) {
   const known = () => p.used != null && p.total != null && p.total > 0;
   return <div class="machine-resource"><span>{p.label}</span><strong>{p.value ?? (known() ? `${Math.round(p.used! / p.total! * 100)}%` : "Unavailable")}</strong>
-    <Show when={known()}><small>{gib(p.used!)} / {gib(p.total!)}</small><div class="resource-track" role="meter" aria-label={`${p.label} used`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(p.used! / p.total! * 100)}><i style={{ width: `${Math.min(100, Math.max(0, p.used! / p.total! * 100))}%` }} /></div></Show></div>;
+    <Show when={known()}><small>{gib(p.used!)} / {gib(p.total!)}</small></Show></div>;
 }
 function FleetRow(p: { node?: RemoteNodeView; core?: Metrics; live?: boolean }) {
   const [open, setOpen] = createSignal(false);
@@ -72,7 +72,13 @@ function FleetRow(p: { node?: RemoteNodeView; core?: Metrics; live?: boolean }) 
     <div class="s-row-text"><div class="s-row-title">{p.node?.id ?? "Core"}</div><div class="s-row-desc">{p.node ? `${p.node.status}${p.node.cordoned ? " · Cordoned" : ""}` : p.live ? "Live · Control plane" : p.core ? "Disconnected · Last snapshot" : "Connecting · Control plane"}</div></div>
     <Show when={p.node?.active_jobs != null}><span class="s-row-desc">{p.node!.active_jobs} active</span></Show>
     <span class={`chev p-acc-chev ${open() ? "open" : ""}`}>›</span></button>
-    <Show when={open()}><div class="p-acc-body"><div class="machine-resources">
+    <Show when={open()}><div class="p-acc-body machine-expanded">
+      <Show when={memory() != null && (p.node?.mem_total_bytes ?? p.core?.memory_total ?? 0) > 0}>
+        <div class="resource-breakdown">
+          <div class="resource-breakdown-head"><span>Memory usage</span><span>{gib(memory()!)} / {gib((p.node?.mem_total_bytes ?? p.core?.memory_total)!)}</span></div>
+          <div class="resource-track" role="meter" aria-label="Memory used" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(memory()! / (p.node?.mem_total_bytes ?? p.core?.memory_total)! * 100)}><i style={{ width: `${Math.min(100, Math.max(0, memory()! / (p.node?.mem_total_bytes ?? p.core?.memory_total)! * 100))}%` }} /></div>
+        </div>
+      </Show><div class="machine-resources">
       <Resource label="CPU" value={p.node ? (p.node.cpu_total != null ? `${p.node.cpu_total} cores` : "Unavailable") : p.core ? `${Math.round(p.core.cpu_percent)}%` : "Unavailable"} />
       <Resource label="Memory" used={memory()} total={p.node?.mem_total_bytes ?? p.core?.memory_total} />
       <Resource label="Disk" used={disk()} total={p.node?.disk_total_bytes ?? p.core?.disk_total} />
