@@ -184,8 +184,20 @@ pub fn local_agents_start(request: StartRequest) -> Result<(), String> {
         return Err(format!("CLI not found at {}", request.bin));
     }
     let mut map = runs().lock().map_err(|e| e.to_string())?;
-    if map.contains_key(&request.id) {
-        return Err("this mission already has a local run".into());
+    if let Some(previous) = map.get(&request.id) {
+        if !previous.done.load(Ordering::SeqCst) {
+            return Err("This mission is still running locally. Wait for it to finish or stop it before sending another message.".into());
+        }
+    }
+    // Completed handles are retained for reconnect snapshots until the next turn.
+    // Retire the old app-server before resuming its thread in a fresh process.
+    if let Some(previous) = map.remove(&request.id) {
+        if let Ok(mut child) = previous.child.lock() {
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
     }
     let text = Arc::new(Output::default());
     let done = Arc::new(AtomicBool::new(false));
@@ -1018,6 +1030,28 @@ mod tests {
             &output,
         );
         assert_eq!(output.snapshot(), "Aé🙂");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_local_run_can_be_replaced_by_a_followup() {
+        let request = StartRequest {
+            id: format!("followup-test-{}", uuid_like()),
+            harness: "grok".into(),
+            bin: "/usr/bin/true".into(),
+            cwd: "/tmp".into(),
+            prompt: "test".into(),
+            model: None,
+            session_id: None,
+        };
+        local_agents_start(request.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !local_agents_poll(request.id.clone()).unwrap().done {
+            assert!(Instant::now() < deadline, "fixture did not complete");
+            thread::sleep(Duration::from_millis(10));
+        }
+        local_agents_start(request.clone()).expect("a finished run must not block a new turn");
+        local_agents_stop(request.id).unwrap();
     }
 
     #[test]

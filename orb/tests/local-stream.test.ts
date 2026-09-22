@@ -78,3 +78,14 @@ it("follows native channel output without repeatedly requesting snapshots", asyn
     vi.unstubAllGlobals();
   }
 });
+
+it("recognizes the actual Tauri permission error for compatibility fallback",async()=>{
+ const {missingStreamCommand}=await import('../src/localAgents');
+ expect(missingStreamCommand('local_agents_subscribe not allowed. Command not found')).toBe(true);
+ expect(missingStreamCommand('no local run')).toBe(false);
+});
+
+it("keeps streaming blockquotes equivalent to complete Markdown parsing", () => {
+ const parse=incrementalMarkdown(); const text="> Bonjour\n>\n> Deuxième paragraphe\n> > Citation imbriquée\n\nFin.";
+ for(let i=0;i<=text.length;i++)expect(parse(text.slice(0,i))).toEqual(parseMarkdown(text.slice(0,i)));
+});

@@ -46,3 +46,18 @@ it("preserves diagnostic errors and labels actual failures correctly", () => {
   expect(container.textContent).toContain("Mission failed");
   expect(container.textContent).toContain("Build failed");
 });
+
+it("renders a local failure below the prompt using the red notice, without a yellow banner", async () => {
+  const { LaunchStatus, MissionFailure } = await import("../src/missionLaunch");
+  const mission = {status:"failed",terminal_reason:"client_runner"} as import("../src/api").Mission;
+  const {container}=render(()=><><LaunchStatus destination="This computer" mission={mission}/><Transcript items={[{kind:"user",key:"u",text:"My prompt"}]}/><MissionFailure mission={mission} error="The local transport was rejected"/></>);
+  expect(container.querySelector('.launch-status')).toBeNull();
+  const error=container.querySelector('.error-notice')!;
+  expect(error.textContent).toContain('The local transport was rejected');
+  expect(container.querySelector('.user')!.compareDocumentPosition(error)&Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+});
+it("does not duplicate a failure already in the transcript",async()=>{
+ const {MissionFailure}=await import("../src/missionLaunch");
+ const {container}=render(()=><MissionFailure mission={{status:"failed"} as import("../src/api").Mission} failureInTranscript/>);
+ expect(container.querySelector('.error-notice')).toBeNull();
+});

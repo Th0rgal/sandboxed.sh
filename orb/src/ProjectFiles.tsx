@@ -234,7 +234,6 @@ export function LiveProjectsSection(p: {
   const [makingFile, setMakingFile] = createSignal(false);
   /** Right-click menu on an agent row. Opening it never changes the selection. */
   const [missionMenu, setMissionMenu] = createSignal<{ x: number; y: number; mission: Mission } | null>(null);
-  const [copied, setCopied] = createSignal<string | null>(null);
   const [makingCron, setMakingCron] = createSignal(false);
   const [cronWarning, setCronWarning] = createSignal<string | null>(null);
   const [cronFolder, setCronFolder] = createSignal("");
@@ -481,8 +480,6 @@ export function LiveProjectsSection(p: {
     const id = missionCopyId(mission);
     try {
       await copyText(id);
-      setCopied(id);
-      window.setTimeout(() => setCopied((cur) => (cur === id ? null : cur)), 1600);
     } catch (e) {
       setActionError(e instanceof Error ? e.message : String(e));
     }
@@ -695,9 +692,6 @@ export function LiveProjectsSection(p: {
       </Show>
       <Show when={missionMenu()}>
         {(menu) => <PopupMenu x={menu().x} y={menu().y} focus={false} items={missionMenuItems(menu().mission)} onClose={() => setMissionMenu(null)} />}
-      </Show>
-      <Show when={copied()}>
-        {(id) => <div class="row note copied-note" role="status">Copied mission ID {id()}</div>}
       </Show>
       <div ref={rowTip.setCard} id={rowTip.id} class="row-tip" role="tooltip" hidden={!rowTip.tip()} style={rowTip.tip() ? { left: `${rowTip.tip()!.x}px`, top: `${rowTip.tip()!.y}px` } : undefined}>
         <Show when={rowTip.tip()}>{(tip) => (

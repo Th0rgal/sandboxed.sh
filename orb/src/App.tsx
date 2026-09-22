@@ -1,6 +1,6 @@
 import { FilePanelProvider, FilePanelButton } from "./FilePanel";
 import { ErrorNotice } from "./ErrorNotice";
-import { LaunchStatus, MissionPending, missionPhase, phaseIsQuiet, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, launchRefusal, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, missionSettingsIdle, dockModelLabel, type LaunchReceipt, type LaunchRefusal, type RemoteSupport } from "./missionLaunch";
+import { MissionFailure, LaunchStatus, MissionPending, missionPhase, phaseIsQuiet, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, launchRefusal, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, missionSettingsIdle, dockModelLabel, type LaunchReceipt, type LaunchRefusal, type RemoteSupport } from "./missionLaunch";
 import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, GoalTag, EMPTY_GOAL_ERROR, absorbGoalPrefix, composerModes, filterSlash, slashQuery, modePrompt, ModeChip, type ComposerMode } from "./goal";
 import { atQuery, chipToAttachment, filterAttach, insertMention, loadAttachItems, mentionedChips, type AttachChip, type AttachItem } from "./attach";
 import { ProjectPicker, ProjectCreation } from "./ProjectPicker";
@@ -38,6 +38,8 @@ import {
   installedIds,
   localBinding,
   localLiveText,
+  localFailure,
+  recordLocalFailure,
   localRunActive,
   localWorkspace,
   materializeMentions,
@@ -1106,8 +1108,10 @@ export default function App() {
       const state = await followLocal(id, () => {});
       if (state.text.trim()) await appendClientTranscript(id, "assistant", state.text);
       const failed = (state.exit_code != null && state.exit_code !== 0) || (!!state.error && !state.text.trim());
+      if (failed) recordLocalFailure(id, state.error || `Local process exited with code ${state.exit_code}`);
       await setClientMissionStatus(id, failed ? "failed" : "awaiting_user");
-    } catch {
+    } catch (error) {
+      recordLocalFailure(id, error);
       await setClientMissionStatus(id, "failed").catch(() => {});
     }
     void refreshMissions();
@@ -2179,7 +2183,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
   const viewItems = () => {
     const list = withInitialPrompt(items(), mission(), receipt);
     const live = localLiveText(p.id);
-    const withLive = live ? [...list, { kind: "text" as const, key: `local:${p.id}`, text: live, live: localRunActive(p.id) }] : list;
+    const withLive = live && !list.some(item => item.kind === "text" && item.text === live) ? [...list, { kind: "text" as const, key: `local:${p.id}`, text: live, live: localRunActive(p.id) }] : list;
     if (busy()) return withLive;
     // Terminal mission: force-close any bubble left open by a dropped
     // assistant_message finalizer.
@@ -2206,22 +2210,30 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
         const plan = await materializeMentions(project, text, followAttach());
         if (plan.files.length) await writeLocalFiles(binding.cwd, plan.files);
         const sent = bindWorkspace(plan.prompt, binding.cwd);
-        await appendClientTranscript(p.id, "user", text);
         await startLocal({ id: p.id, harness: binding.harness, bin: binding.bin, cwd: binding.cwd, prompt: sent, model: binding.model, sessionId: binding.sessionId });
+        // Persist only accepted turns: a rejected launch must keep the draft
+        // without adding another copy to the conversation.
+        await appendClientTranscript(p.id, "user", text).catch(e => {
+          setSendError(`The local run started, but saving your message failed: ${String(e)}`);
+        });
         setFollowAttach([]);
         void followLocal(p.id, () => {}).then(async (state) => {
           const note = binding.harness === "grok" && binding.sessionId && !state.resumed ? "Grok starts a new local session.\n\n" : "";
           const body = `${note}${state.text}`.trim();
           if (body) await appendClientTranscript(p.id, "assistant", body);
           const failed = (state.exit_code != null && state.exit_code !== 0) || (!!state.error && !state.text.trim());
+          if (failed) recordLocalFailure(p.id, state.error || `Local process exited with code ${state.exit_code}`);
           await setClientMissionStatus(p.id, failed ? "failed" : "awaiting_user");
           void refresh();
-        }).catch(async () => {
+        }).catch(async (error) => {
+          recordLocalFailure(p.id, error);
           await setClientMissionStatus(p.id, "failed").catch(() => {});
           void refresh();
         });
         return true;
       } catch (e) {
+        // Launch rejection belongs to the composer; it is not a second mission failure.
+        recordLocalFailure(p.id, null);
         setSendError(e instanceof Error ? e.message : String(e));
         return false;
       }
@@ -2286,6 +2298,9 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
           >
             <LaunchStatus destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={activity()} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
             <Transcript items={viewItems().filter(i => i.kind !== "user" || !i.queued)} pending={pending()} onReuse={text => setRevision({ text })} />
+            <Show when={!sendError()}>
+              <MissionFailure mission={mission()} active={localRunActive(p.id)} error={localFailure(p.id)} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
+            </Show>
             <Show when={pending()}>
               <MissionPending destination={missionDestination(mission(), receipt)} label={phaseLabel()} />
             </Show>

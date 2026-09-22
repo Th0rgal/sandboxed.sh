@@ -8,6 +8,21 @@ import { createSignal } from "solid-js";
 import { mentionText, scanMentions, type AttachChip } from "./attach";
 import { listProjectFiles, readProjectFile, getProjectController } from "./api";
 
+function savedLocalFailures(): Record<string,string> {
+  try { return JSON.parse(localStorage.getItem("orb.localFailures") ?? "{}"); } catch { return {}; }
+}
+const [localFailures, setLocalFailures] = createSignal<Record<string,string>>(savedLocalFailures());
+export const localFailure = (id:string) => localFailures()[id];
+export function recordLocalFailure(id:string, error:unknown) {
+  const message = error == null ? "" : error instanceof Error ? error.message : String(error);
+  setLocalFailures(previous => { const next={...previous}; if(message)next[id]=message;else delete next[id];
+    try {localStorage.setItem("orb.localFailures",JSON.stringify(next));} catch {} return next; });
+}
+export function missingStreamCommand(error:unknown) {
+  const message=String(error);
+  return /unknown command/i.test(message) || (/local_agents_subscribe/i.test(message) && /command not found|not allowed|not found/i.test(message));
+}
+
 export const LOCAL_HARNESSES = ["claudecode", "codex", "grok", "opencode"] as const;
 export type LocalHarnessId = (typeof LOCAL_HARNESSES)[number];
 
@@ -274,6 +289,7 @@ export interface StartLocal {
 export async function startLocal(req: StartLocal): Promise<void> {
   const invoke = tauriInvoke();
   if (!invoke) throw new Error("Local agents run in the Orb desktop app.");
+  recordLocalFailure(req.id, null);
   setRunning((prev) => ({ ...prev, [req.id]: true }));
   setLiveText((prev) => ({ ...prev, [req.id]: "" }));
   try {
@@ -290,6 +306,7 @@ export async function startLocal(req: StartLocal): Promise<void> {
     });
   } catch (e) {
     setRunning((prev) => ({ ...prev, [req.id]: false }));
+    recordLocalFailure(req.id, e);
     throw e;
   }
 }
@@ -348,11 +365,12 @@ export async function followLocal(id: string, onText: (text: string) => void): P
           void tauriInvoke()!("local_agents_subscribe",{id,onEvent:channel}).catch(error=>{buffer.dispose();reject(error)});
         });
       } catch(error) {
-        if(!/command.*local_agents_subscribe.*not found|unknown command/i.test(String(error)))throw error;
+        if(!missingStreamCommand(error))throw error;
         state=await pollUntilDone();
       }
     } else {state=await pollUntilDone();}
     if(state.session_id){const binding=localBinding(id);if(binding)rememberBinding(id,{...binding,sessionId:state.session_id});}
     return state;
-  } finally {setRunning(prev=>({...prev,[id]:false}));}
+  } catch(error) {recordLocalFailure(id,error);throw error;}
+  finally {setRunning(prev=>({...prev,[id]:false}));}
 }
