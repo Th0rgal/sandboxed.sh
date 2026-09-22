@@ -175,6 +175,7 @@ export interface Mission {
 }
 
 export interface CreateMissionBody {
+  tags?: string[];
   idempotency_key?: string;
   title?: string;
   prompt?: string;
@@ -410,6 +411,7 @@ export async function listProjects(): Promise<ProjectSummary[]> {
 
 /** A project's controller: the Hermes cron job that drives it. */
 export interface ControllerJob {
+  folder?: string;
   id: string;
   name: string;
   schedule?: string | null;
@@ -477,6 +479,7 @@ export interface ControllerView {
 
 /** Only the fields that changed; "" clears an optional pin. */
 export interface ControllerPatch {
+  folder?: string;
   name?: string;
   schedule?: string;
   prompt?: string;

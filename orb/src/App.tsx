@@ -804,6 +804,8 @@ export default function App() {
   const [sidebar, setSidebar] = createSignal(!window.matchMedia("(max-width: 720px)").matches);
   const [sbWidth, setSbWidth] = createSignal(220);
   const [streamingId, setStreamingId] = createSignal<string | null>(null);
+  const [newFolder, setNewFolder] = createSignal<{ project: string; path: string } | null>(null);
+  const folderTags = (project: string | null | undefined) => newFolder()?.project === project && newFolder()?.path ? [`orb-folder:${newFolder()!.path}`] : [];
   const [newProject, setNewProject] = createSignal(seed[0].id);
   // "New project…" inside the project picker (Cursor puts creation at the
   // bottom of the picker it belongs to, never in the sidebar chrome).
@@ -1115,7 +1117,7 @@ export default function App() {
     if (plan.files.length) await writeLocalFiles(root, plan.files);
     const sent = bindWorkspace(plan.prompt, root);
     const effort = normalizeEffort(pick.effort, pick.backend);
-    const body = { title, prompt: typed, project: projectSlug, backend: pick.backend, model_override: pick.model, placement: "client" as const, ...(effort ? { model_effort: effort } : {}) };
+    const body = { title, prompt: typed, project: projectSlug, tags: folderTags(projectSlug), backend: pick.backend, model_override: pick.model, placement: "client" as const, ...(effort ? { model_effort: effort } : {}) };
     const signature = JSON.stringify(body);
     if (launchAttempt?.signature !== signature) launchAttempt = { signature, key: crypto.randomUUID() };
     const m = await createMission({ ...body, idempotency_key: launchAttempt.key });
@@ -1165,7 +1167,7 @@ export default function App() {
         // an omitted field means "backend default" rather than a stale level.
         const effort = normalizeEffort(pick.effort, pick.backend);
         const attachments = attachChips().map(chipToAttachment);
-        const body = {title,prompt,project:projectSlug,backend:pick.backend,model_override:pick.model,...(effort ? {model_effort:effort} : {}),...(machine === "core" ? {} : {remote_node_id:machine}),...(attachments.length ? {attachments} : {})};
+        const body = {title,prompt,project:projectSlug,tags:folderTags(projectSlug),backend:pick.backend,model_override:pick.model,...(effort ? {model_effort:effort} : {}),...(machine === "core" ? {} : {remote_node_id:machine}),...(attachments.length ? {attachments} : {})};
         const signature = JSON.stringify(body);
         if (launchAttempt?.signature !== signature) launchAttempt = {signature,key:crypto.randomUUID()};
         const m = await createMission({...body,idempotency_key:launchAttempt.key});
@@ -1378,7 +1380,8 @@ export default function App() {
                     open={open}
                     missionGlyph={missionGlyph}
                     StatusGlyph={StatusGlyph}
-                    onNewAgent={(slug) => {
+                    onNewAgent={(slug, path) => {
+                      setNewFolder(path ? { project: slug, path } : null);
                       setNewProject(slug);
                       open(null);
                     }}
@@ -1563,12 +1566,13 @@ export default function App() {
                       {isConnected()
                         ? (liveProjects().find((p) => p.slug === effectiveNewProject())?.title ?? effectiveNewProject() ?? "No project")
                         : projects.find((p) => p.id === newProject())?.name}
+                      <Show when={newFolder()?.project === effectiveNewProject()}><span class="new-agent-folder">/ {newFolder()?.path}</span></Show>
                       <Ic.ChevronDown size={12} />
                     </button>
                     <Show when={envOpen() === "project"}>
                       <ProjectPicker projects={isConnected() ? [...liveProjects()].sort((a,b) => (b.updated_at ?? "").localeCompare(a.updated_at ?? "")).map((p) => ({ id: p.slug, name: p.title ?? p.slug })) : projects.map((p) => ({ id: p.id, name: p.name }))}
                         selected={effectiveNewProject() ?? ""} canCreate={isConnected()}
-                        onSelect={(id) => { setNewProject(id); setEnvOpen(null); }}
+                        onSelect={(id) => { setNewFolder(null); setNewProject(id); setEnvOpen(null); }}
                         onClose={() => setEnvOpen(null)}
                         onCreate={() => { setEnvOpen(null); setNewProjectDraft(true); }}
                         onMachine={() => setEnvOpen("machine")} />

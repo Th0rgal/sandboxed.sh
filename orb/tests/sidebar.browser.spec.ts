@@ -177,8 +177,9 @@ test("project action menu is compact, pointer hover has no focus ring, keyboard 
   expect(await menu.evaluate((el) => getComputedStyle(el).backdropFilter === "none" || !getComputedStyle(el).backdropFilter)).toBeTruthy();
   const box = await menu.boundingBox();
   expect(box!.width).toBeLessThanOrEqual(220);
-  // "New file" leads the project menu; "New folder" follows it.
-  const first = page.getByRole("menuitem", { name: "New file" });
+  // Agent and cron creation lead the project menu; files require a folder.
+  const first = page.getByRole("menuitem", { name: "New agent" });
+  await expect(page.getByRole("menuitem", { name: "New file" })).toHaveCount(0);
   await expect(page.getByRole("menuitem", { name: "Rename" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Archive" })).toBeVisible();
   await expect(first).not.toBeFocused();
@@ -196,4 +197,28 @@ test("project action menu is compact, pointer hover has no focus ring, keyboard 
   await expect.poll(() => menu.evaluate((el) => Number(getComputedStyle(el).opacity))).toBe(1);
   expect(await menu.evaluate((el) => getComputedStyle(el).backgroundColor)).toBe("rgb(255, 255, 255)");
   await page.screenshot({ path: "test-results/orb-project-menu-light.png" });
+});
+
+test("project folders contain agents and crons and offer scoped creation", async ({page}) => {
+  await page.addInitScript(() => { localStorage.setItem("orb.apiUrl", location.origin); localStorage.setItem("orb.jwt", "test"); });
+  await page.route("**/api/**", async route => {
+    const url=new URL(route.request().url()), path=url.pathname;
+    const json=path==="/api/projects" ? {projects:[{slug:"test",title:"Test"}]}
+      :path==="/api/control/missions" && url.searchParams.has("project") ? [{id:"nested",title:"Audit agent",status:"active",tags:["orb-folder:audit"],history:[],created_at:"",updated_at:""}]
+      :path.endsWith("/files") ? {entries:url.searchParams.get("path") ? [] : [{name:"audit",kind:"dir"}]}
+      :path.endsWith("/crons") ? {jobs:[{id:"scheduled",name:"Audit cron",folder:"audit",enabled:true,schedule:"every 1h"}]}
+      :path.endsWith("/controller") ? {job:null,runs:[]}:[];
+    await route.fulfill({json});
+  });
+  await page.goto("/");await page.getByRole("button",{name:"Test",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Audit agent",exact:true})).toHaveCount(0);
+  await page.getByRole("button",{name:"audit",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Audit agent",exact:true})).toBeVisible();
+  await expect(page.getByRole("button",{name:/Audit cron/})).toBeVisible();
+  await page.getByRole("button",{name:"Folder actions for audit"}).click();
+  const labels=await page.getByRole("menuitem").allTextContents();
+  expect(labels.slice(0,2)).toEqual(["New agent","New cron"]);
+  await expect(page.getByRole("menuitem",{name:"New file",exact:true})).toBeVisible();
+  await page.getByRole("menuitem",{name:"New agent",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Choose project"})).toContainText("/ audit");
 });

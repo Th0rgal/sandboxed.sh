@@ -457,6 +457,12 @@ impl ProjectsStore {
     fn initialize(connection: &Connection) -> rusqlite::Result<()> {
         connection.execute_batch(SCHEMA)?;
         connection.execute_batch(REMOTE_JOBS_SCHEMA)?;
+        Self::ensure_column(
+            connection,
+            "project_crons",
+            "folder",
+            "folder TEXT NOT NULL DEFAULT ''",
+        )?;
         // project_state_events.session_id (2026-08: the overview builds
         // latest_update from the store, so the delivery's session rides along).
         Self::ensure_column(
@@ -1186,16 +1192,35 @@ impl ProjectsStore {
     }
 
     pub fn bind_project_cron(&self, slug: &str, job_id: &str) -> Result<(), String> {
+        self.bind_project_cron_in_folder(slug, job_id, "")
+    }
+
+    pub fn bind_project_cron_in_folder(
+        &self,
+        slug: &str,
+        job_id: &str,
+        folder: &str,
+    ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
         let connection = self.lock()?;
         connection
             .execute(
-                "INSERT INTO project_crons (slug, job_id, created_at) VALUES (?1, ?2, ?3) \
+                "INSERT INTO project_crons (slug, job_id, created_at, folder) VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT(slug, job_id) DO NOTHING",
-                params![slug, job_id, now],
+                params![slug, job_id, now, folder],
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    pub fn project_cron_folder(&self, slug: &str, job_id: &str) -> Result<String, String> {
+        self.lock()?
+            .query_row(
+                "SELECT folder FROM project_crons WHERE slug = ?1 AND job_id = ?2",
+                params![slug, job_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())
     }
 
     pub fn project_cron_ids(&self, slug: &str) -> Result<Vec<String>, String> {
@@ -7575,6 +7600,19 @@ mod tests {
         );
         assert!(store.owns_project_cron("orbit", "abc123def456").unwrap());
         assert!(!store.owns_project_cron("other", "abc123def456").unwrap());
+        assert_eq!(
+            store.project_cron_folder("orbit", "abc123def456").unwrap(),
+            ""
+        );
+        store
+            .bind_project_cron_in_folder("orbit", "folder-job", "audit/proofs")
+            .unwrap();
+        store.bind_project_cron("orbit", "folder-job").unwrap();
+        assert_eq!(
+            store.project_cron_folder("orbit", "folder-job").unwrap(),
+            "audit/proofs"
+        );
+        assert!(store.project_cron_folder("other", "folder-job").is_err());
     }
 
     #[test]

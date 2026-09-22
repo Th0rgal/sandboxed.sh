@@ -197,7 +197,7 @@ export function LiveProjectsSection(p: {
   missionGlyph: (status: string) => "idle" | "running" | "pr-closed" | "pr-merged";
   StatusGlyph: (props: { agent: { status: "idle" | "running" | "pr-closed" | "pr-merged" }; busy: boolean }) => any;
   /** "+" on a project row: start a new agent in that project. */
-  onNewAgent: (slug: string) => void;
+  onNewAgent: (slug: string, path?: string) => void;
   /** "+" on the section header: create a project (opens the picker flow). */
   onNewProject: () => void;
 }) {
@@ -237,6 +237,7 @@ export function LiveProjectsSection(p: {
   const [copied, setCopied] = createSignal<string | null>(null);
   const [makingCron, setMakingCron] = createSignal(false);
   const [cronWarning, setCronWarning] = createSignal<string | null>(null);
+  const [cronFolder, setCronFolder] = createSignal("");
   const [newCron, setNewCron] = createSignal<string | null>(null);
   const [actionFocus, setActionFocus] = createSignal(true);
   const [rename, setRename] = createSignal<{ slug: string; title: string } | null>(null);
@@ -288,7 +289,8 @@ export function LiveProjectsSection(p: {
     if (!isConnected()) return;
     for (const slug of Object.keys(expanded)) if (expanded[slug] && !slug.includes(":")) void loadCrons(slug);
   }, { defer: true }));
-  const beginCron = async (slug: string) => {
+  const beginCron = async (slug: string, path = "") => {
+    setCronFolder(path);
     setActionMenu(null);
     if (!isConnected()) return;
     const version = connectionVersion();
@@ -425,6 +427,7 @@ export function LiveProjectsSection(p: {
     }
   };
   const beginFile = (slug: string, path: string) => {
+    if (!path) return;
     setActionMenu(null);
     setFileName("");
     setFileError(null);
@@ -516,27 +519,21 @@ export function LiveProjectsSection(p: {
       setActionError(e instanceof Error ? e.message : String(e));
     }
   };
-  /**
-   * Actions for a project row (`path` empty) or one of its folders. A folder
-   * only holds files, so it offers file/folder creation; starting an agent or a
-   * cron is a project-level act and stays on the project row.
-   */
+  /** Folders organize both reference files and executable work. */
   const menuItems = (slug: string, path: string): MenuEntry[] => {
     const items: MenuEntry[] = [
-      { kind: "item", label: "New file", icon: Ic.FileIcon, onClick: () => beginFile(slug, path) },
+      { kind: "item", label: "New agent", icon: Ic.NewAgentIcon, onClick: () => p.onNewAgent(slug, path) },
+      { kind: "item", label: cronChecking() ? "Checking crons…" : "New cron", icon: Ic.BellIcon, onClick: () => { if (!cronChecking()) void beginCron(slug, path); } },
+      { kind: "sep" },
+      ...(path ? [{ kind: "item" as const, label: "New file", icon: Ic.FileIcon, onClick: () => beginFile(slug, path) }] : []),
       { kind: "item", label: "New folder", icon: Ic.FolderIcon, onClick: () => beginFolder(slug, path) },
     ];
-    if (!path) {
-      items.push(
-        { kind: "sep" },
-        { kind: "item", label: "New agent", icon: Ic.NewAgentIcon, onClick: () => p.onNewAgent(slug) },
-        { kind: "item", label: cronChecking() ? "Checking crons…" : "New cron", icon: Ic.BellIcon, onClick: () => { if (!cronChecking()) void beginCron(slug); } },
-        { kind: "sep" },
-        { kind: "item", label: "Project settings", icon: Ic.SlidersIcon, onClick: () => { setActionMenu(null); p.open(`ps:${slug}`); } },
-        { kind: "item", label: "Rename", icon: Ic.PencilIcon, onClick: () => beginRename(slug) },
-        { kind: "item", label: "Archive", icon: Ic.ArchiveIcon, onClick: () => void archive(slug) },
-      );
-    }
+    if (!path) items.push(
+      { kind: "sep" },
+      { kind: "item", label: "Project settings", icon: Ic.SlidersIcon, onClick: () => { setActionMenu(null); p.open(`ps:${slug}`); } },
+      { kind: "item", label: "Rename", icon: Ic.PencilIcon, onClick: () => beginRename(slug) },
+      { kind: "item", label: "Archive", icon: Ic.ArchiveIcon, onClick: () => void archive(slug) },
+    );
     return items;
   };
   /** Right-click on an agent row: identity actions only, no navigation. */
@@ -576,17 +573,35 @@ export function LiveProjectsSection(p: {
     job?: import("./api").ControllerJob; controller?: boolean;
   };
   type Node = TreeNode<RowData>;
+  const missionFolder = (mission: Mission) => mission.tags?.find(t => t.startsWith("orb-folder:"))?.slice("orb-folder:".length) ?? "";
+  const workNodes = (slug: string, path: string): Node[] => {
+    const out: Node[] = (crons[slug] ?? []).filter(job => (job.folder ?? "") === path).map(job => ({ id: `pc:${slug}:${job.id}`, data: { kind: "cron", slug, label: job.name, job } }));
+    out.push(...liveOf(slug).filter(m => missionFolder(m) === path).map(m => missionNode(slug, m)));
+    const done = doneOf(slug).filter(m => missionFolder(m) === path);
+    const key = path ? `${slug}:${path}` : slug;
+    if (done.length) out.push({ id: `finished:${key}`, data: { kind: "finished", slug, path, label: `${done.length} finished` }, expanded: !!showDone[key], children: done.map(m => missionNode(slug, m)) });
+    return out;
+  };
   const fileNodes = (slug: string, path: string): Node[] => {
     const key = `${slug}:${path}`;
-    if (dirErrors[key]) return [{ id: `error:${key}`, data: { kind: "note", slug, path, label: `Files unavailable: ${dirErrors[key]}` } }];
-    if (!dirs[key]) return [{ id: `loading:${key}`, data: { kind: "note", slug, label: "Loading files…" } }];
-    if (!dirs[key].length) return path ? [{ id: `empty:${key}`, data: { kind: "note", slug, label: "Empty folder" } }] : [];
-    return dirs[key].map(entry => {
+    const work = path ? workNodes(slug, path) : [];
+    if (dirErrors[key]) return [...work, { id: `error:${key}`, data: { kind: "note", slug, path, label: `Files unavailable: ${dirErrors[key]}` } }];
+    if (!dirs[key]) return [...work, { id: `loading:${key}`, data: { kind: "note", slug, label: "Loading files…" } }];
+    const entries = [...dirs[key]];
+    // Preserve visibility if a referenced folder listing is stale or its physical directory was removed.
+    const paths = [...(missions[slug] ?? []).map(missionFolder), ...(crons[slug] ?? []).map(j => j.folder ?? "")];
+    for (const folder of paths) {
+      const relative = path ? (folder.startsWith(path + "/") ? folder.slice(path.length + 1) : "") : folder;
+      const name = relative.split("/")[0];
+      if (name && !entries.some(e => e.name === name)) entries.push({ name, kind: "dir" });
+    }
+    if (!entries.length && !work.length) return path ? [{ id: `empty:${key}`, data: { kind: "note", slug, label: "Empty folder" } }] : [];
+    return [...work, ...entries.map((entry): Node => {
       const childPath = path ? `${path}/${entry.name}` : entry.name;
       const open = !!expanded[`${slug}:${childPath}`];
       return { id: `pf:${slug}:${childPath}`, data: { kind: entry.kind === "dir" ? "folder" : "file", slug, path: childPath, label: entry.name },
         ...(entry.kind === "dir" ? { expanded: open, children: open ? fileNodes(slug, childPath) : [] } : {}) };
-    });
+    })];
   };
   const missionNode = (slug: string, mission: Mission): Node => ({ id: `m:${mission.id}`, data: { kind: "mission", slug, mission, label: displayTitle(mission.title) || mission.id } });
   const tree = (): Node[] => projects().map(project => {
@@ -596,11 +611,9 @@ export function LiveProjectsSection(p: {
       const job = controllers[slug]?.job;
       if (job) children.push({ id: `c:${slug}`, data: { kind: "cron", slug, label: job.name, job, controller: true } });
       if (cronUnsupported() || cronErrors[slug]) children.push({ id: `crons-error:${slug}`, data: { kind: "cron-error", slug, label: "Crons unavailable" } });
-      children.push(...(crons[slug] ?? []).map(job => ({ id: `pc:${slug}:${job.id}`, data: { kind: "cron" as const, slug, label: job.name, job } })));
+
       if (missions[slug] === undefined) children.push({ id: `loading-missions:${slug}`, data: { kind: "note", slug, label: "Loading missions…" } });
-      children.push(...liveOf(slug).map(m => missionNode(slug, m)));
-      const done = doneOf(slug);
-      if (done.length) children.push({ id: `finished:${slug}`, data: { kind: "finished", slug, label: `${done.length} finished` }, expanded: !!showDone[slug], children: done.map(m => missionNode(slug, m)) });
+      children.push(...workNodes(slug, ""));
       children.push(...fileNodes(slug, ""));
       if (!children.length) children.push({ id: `empty:${slug}`, data: { kind: "note", slug, label: "No missions or files yet." } });
     }
@@ -627,14 +640,14 @@ export function LiveProjectsSection(p: {
       <Ic.BellIcon size={12} /><button class="cron-status-label" onClick={() => setCronInfo(d.slug)}>{cronUnsupported() ? "Crons need backend update" : cronRetryable[d.slug] ? "Crons temporarily unavailable" : "Crons unavailable"}</button>
       <Show when={!cronUnsupported() && cronRetryable[d.slug]}><button class="cron-retry" aria-label="Retry crons" title="Retry crons" onClick={() => void loadCrons(d.slug, true)}>↻</button></Show>
     </div>;
-    if (d.kind === "finished") return <button class="row done-toggle" aria-expanded={row.expanded} onClick={() => setShowDone(d.slug, !showDone[d.slug])}>
+    if (d.kind === "finished") return <button class="row done-toggle" aria-expanded={row.expanded} onClick={() => setShowDone(d.path ? `${d.slug}:${d.path}` : d.slug, !showDone[d.path ? `${d.slug}:${d.path}` : d.slug])}>
       <span class="row-ico"><Show when={row.expanded} fallback={<Ic.FinishedIcon />}><Ic.FinishedOpenIcon /></Show></span><span class="row-label">{d.label}</span>
     </button>;
     if (d.kind === "folder") return <div class="row folder" onContextMenu={contextMenu}>
       <button class="row-main" aria-expanded={row.expanded} {...rowTip.bind(rowDetail(d.label))} onClick={() => toggleDir(d.slug, d.path!)}>
         <span class="row-ico"><Show when={row.expanded} fallback={<Ic.FolderIcon />}><Ic.FolderOpenIcon /></Show></span><span class="row-label">{d.label}</span>
       </button>
-      <button class="row-action" aria-label={`New file in ${d.label}`} title="New file"
+      <button class="row-action" aria-label={`Folder actions for ${d.label}`} title="Folder actions"
         onPointerDown={e => setActionFocus(e.pointerType !== "mouse")}
         onKeyDown={e => { if (e.key === "Enter" || e.key === " ") setActionFocus(true); }}
         onClick={e => { e.stopPropagation(); const box = e.currentTarget.getBoundingClientRect(); setActionMenu({ x: Math.max(8, box.right - 176), y: box.bottom + 4, slug: d.slug, path: d.path! }); }}><Ic.PlusIcon size={13} /></button>
@@ -749,9 +762,9 @@ export function LiveProjectsSection(p: {
         <p>{cronUnsupported() ? "This backend does not support project crons yet. Update the connected backend, then choose Check again. Your canonical controller and existing project content remain available." : cronRetryable[slug()] ? "Project crons could not refresh. Previously loaded jobs are retained. Try again when the scheduler is available." : "The backend rejected this cron request. Check backend access and configuration, then check again. Previously loaded jobs are retained."}</p>
       </Dialog>}</Show>
       <Show when={newCron()}>
-        {(slug) => <Dialog wide title="New cron" onClose={() => !makingCron() && setNewCron(null)} footer={<span>Unfinished drafts are kept until saved or discarded.</span>}>
-          <CronForm creating deliveryRoute={{ ready: cronDefaults()?.route_ready ?? false, loading: !cronDefaults() && !defaultsError(), error: defaultsError() }} onBusyChange={setMakingCron} draftKey={`create:${slug()}`} view={{ slug: slug(), job: { id: "", name: "", schedule: "every 1h", enabled: true, failure_streak: 0 }, runs: [] }}
-            save={async (draft) => getProjectCronFromJob(slug(), await createProjectCron(slug(), draft))}
+        {(slug) => <Dialog wide title={cronFolder() ? `New cron · ${cronFolder()}` : "New cron"} onClose={() => !makingCron() && setNewCron(null)} footer={<span>Unfinished drafts are kept until saved or discarded.</span>}>
+          <CronForm creating deliveryRoute={{ ready: cronDefaults()?.route_ready ?? false, loading: !cronDefaults() && !defaultsError(), error: defaultsError() }} onBusyChange={setMakingCron} draftKey={`create:${slug()}:${cronFolder()}`} view={{ slug: slug(), job: { id: "", name: "", schedule: "every 1h", enabled: true, failure_streak: 0 }, runs: [] }}
+            save={async (draft) => getProjectCronFromJob(slug(), await createProjectCron(slug(), { ...draft, folder: cronFolder() }))}
             onClose={() => setNewCron(null)} onSaved={(view, warning) => {
               setCronWarning(warning ? `Cron created. ${warning}` : null);
               setExpanded(slug(), true);

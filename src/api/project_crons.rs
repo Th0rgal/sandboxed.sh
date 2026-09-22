@@ -234,7 +234,16 @@ async fn list(State(state): State<Arc<AppState>>, Path(slug): Path<String>) -> R
     })
     .await
     {
-        Ok(jobs) => Json(json!({"jobs": jobs})).into_response(),
+        Ok(mut jobs) => {
+            for job in &mut jobs {
+                let id = job.get("id").and_then(Value::as_str).unwrap_or("");
+                match state.projects.project_cron_folder(&slug, id) {
+                    Ok(folder) => job["folder"] = json!(folder),
+                    Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                }
+            }
+            Json(json!({"jobs": jobs})).into_response()
+        }
         Err(error) => error,
     }
 }
@@ -250,7 +259,18 @@ async fn create(
     if let Err(error) = prepare_delivery(&state.projects, &slug, &mut body, true) {
         return error;
     }
-    let result = match hermes(&state, reqwest::Method::POST, "/api/jobs", Some(body)).await {
+    let folder = match body.as_object_mut().and_then(|o| o.remove("folder")) {
+        None => String::new(),
+        Some(Value::String(folder)) if valid_folder(&folder) => folder,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "folder must be a relative project folder path",
+            )
+                .into_response()
+        }
+    };
+    let mut result = match hermes(&state, reqwest::Method::POST, "/api/jobs", Some(body)).await {
         Ok(value) => value,
         Err(e) => return e,
     };
@@ -265,7 +285,10 @@ async fn create(
         )
             .into_response();
     }
-    if let Err(e) = state.projects.bind_project_cron(&slug, id) {
+    if let Err(e) = state
+        .projects
+        .bind_project_cron_in_folder(&slug, id, &folder)
+    {
         // Avoid a scheduler orphan if our durable binding cannot be committed.
         let _ = hermes(
             &state,
@@ -276,6 +299,7 @@ async fn create(
         .await;
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
+    result["job"]["folder"] = json!(folder);
     Json(result).into_response()
 }
 
@@ -296,6 +320,14 @@ async fn get_one(
         None,
     )
     .await
+    .and_then(|mut result| {
+        let folder = state
+            .projects
+            .project_cron_folder(&slug, &id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e).into_response())?;
+        result["job"]["folder"] = json!(folder);
+        Ok(result)
+    })
     .map(Json)
     .map(IntoResponse::into_response)
     .unwrap_or_else(|e| e)
@@ -606,4 +638,13 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
     }
+}
+
+fn valid_folder(folder: &str) -> bool {
+    folder.is_empty()
+        || (!folder.contains('\\')
+            && !folder.contains('\0')
+            && folder
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != ".."))
 }
