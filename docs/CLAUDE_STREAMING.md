@@ -68,3 +68,37 @@ For future filesystem diagnostics, use known data paths and bounded traversal:
 `glob` across `/srv`, `/root`, or container root filesystems: it follows directory
 symlinks and can spend weeks traversing cycles. A slice such as `glob(... )[:8]`
 does not bound the traversal because the full list is generated first.
+
+## Production verification (22 September 2026)
+
+Deployed `e660fc0a3704` through the guarded endpoint. The backend's previous
+SHA-256 was checked before maintenance to avoid overwriting a concurrent deploy.
+The Pareto mission was paused and resumed with its original native session;
+its already-written report was preserved before maintenance. A recovery prompt
+requested redisplay without new research or external actions.
+
+The resumed response completed successfully at 14:48:03.735 UTC (27,950
+characters). The mission reached `awaiting_user` at 14:48:04.277 UTC: 542 ms
+later. The native transcript's final text timestamp was 14:48:03.009 UTC and
+the latest streamed-text timestamp 14:48:03.010 UTC. No new research tools were
+called by the resumed turn. The response exceeded the detector's 90-second
+grace, so this was also a real production test of the enabled guard.
+
+Runtime samples during the verification:
+
+- 20 analyses: p95 5.388 ms, maximum 8.610 ms, zero inconclusive results.
+- 158 sampled dequeues: processing delay p95 149 microseconds, maximum 2.082 ms.
+- Sampled queue depth: at most one message.
+- A separate 50-row Markdown-table canary completed successfully (5,249
+  characters) and was deleted afterward. Its initial artificial sleep was
+  rejected by the harness, so that phase is not counted as a successful test;
+  the real Pareto turn supplied the long-stream verification instead.
+- Seven guard tests, eight legacy repetition tests, 45 Claude tests and the
+  additional zombie-exit test passed. Linux binaries were built in debug mode.
+- Post-deploy monitoring covered 600.6 seconds (21 samples): every fleet health
+  check passed, API latency peaked at 54 ms, and memory PSI `some avg10` remained
+  zero. This observation window does not establish performance under saturation.
+
+The runtime is deployed from the isolated fix commit above. The feature branch
+also retains concurrent Orb/files/resource changes; merging those sources does
+not imply they were included in this deployment.
