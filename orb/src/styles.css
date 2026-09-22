@@ -1605,3 +1605,15 @@ button.fork-trigger:hover { color: var(--fg); }
 .file-tree-row .file-entry-name { width:auto;flex:1;overflow:hidden;text-overflow:ellipsis;color:inherit; }
 .file-actions summary::-webkit-details-marker { display:none; }
 @media(max-width:720px) { .app[data-files-open="false"] { grid-template-columns:0 minmax(0,1fr); } }
+
+/* One compact file header; navigation and window actions live in the menu. */
+.file-header { gap:4px;padding:0 10px; }
+.file-header>button { display:inline-flex;align-items:center;justify-content:center;flex:none;width:24px;height:24px;padding:0;color:var(--fg-3); }
+.file-header .file-tab-list { margin:0 4px; }
+.file-header-title { font-size:12px;color:var(--fg-2);padding:0 4px; }
+.file-header>button.file-mode { width:auto;padding:0 7px;font-size:11px; }
+.file-header .file-actions summary { width:24px;height:24px;color:var(--fg-3);border-radius:5px; }
+.file-header .file-actions summary:hover { background:var(--bg-active); }
+.file-header .file-actions button { display:flex;align-items:center;gap:6px;padding:6px 8px; }
+.file-header .file-actions button:disabled { opacity:.35; }
+.file-header .file-tab { max-width:260px; }

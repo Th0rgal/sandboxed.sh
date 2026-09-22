@@ -2061,6 +2061,14 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
   const scrollIfPinned = () => {
     if (nearBottom) scroller?.scrollTo({ top: scroller.scrollHeight });
   };
+  // Resize notifications run after streaming Markdown has changed layout.
+  onMount(() => {
+    if (!scroller) return;
+    const observer = new ResizeObserver(() => { if (nearBottom) scrollIfPinned(); });
+    const content = scroller.querySelector(".col");
+    if (content) observer.observe(content);
+    onCleanup(() => observer.disconnect());
+  });
 
   const refresh = async () => {
     try {

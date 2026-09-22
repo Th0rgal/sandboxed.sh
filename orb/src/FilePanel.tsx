@@ -599,8 +599,26 @@ export function FilePanelProvider(p: {
               aria-label="Resize file panel"
               onPointerDown={(e) => resize(e)}
             />
-            <div class="file-tabs" data-tauri-drag-region>
+            <div class="file-tabs file-header" data-tauri-drag-region>
+              <button
+                aria-label="Toggle file explorer"
+                onClick={() => setTree((v) => !v)}
+              >
+                <Ic.SidebarIcon size={16} />
+              </button>
+              <button
+                aria-label="Find file"
+                onClick={() => {
+                  setSearch("");
+                  requestAnimationFrame(() => searchInput?.focus());
+                }}
+              >
+                <Ic.SearchIcon size={16} />
+              </button>
               <div class="file-tab-list">
+                <Show when={!tabs().length}>
+                  <span class="file-header-title">Files</span>
+                </Show>
                 <For each={tabs()}>
                   {(tab) => (
                     <div
@@ -627,72 +645,13 @@ export function FilePanelProvider(p: {
                   )}
                 </For>
               </div>
-              <div class="file-window-actions">
-                <button
-                  aria-label="Expand files"
-                  onClick={() => setMaximized((v) => !v)}
-                >
-                  <Ic.ExternalIcon size={15} />
-                </button>
-                <button
-                  aria-label="Close files"
-                  onClick={() => setOpened(false)}
-                >
-                  <Ic.CloseIcon size={14} />
-                </button>
-              </div>
-            </div>
-            <div class="file-toolbar">
-              <button
-                aria-label="Toggle file explorer"
-                onClick={() => setTree((v) => !v)}
-              >
-                <Ic.SidebarIcon size={16} />
-              </button>
-              <button
-                aria-label="Find file"
-                onClick={() => {
-                  setSearch("");
-                  requestAnimationFrame(() => searchInput?.focus());
-                }}
-              >
-                <Ic.SearchIcon size={16} />
-              </button>
-              <button
-                aria-label="Previous file"
-                disabled={historyIndex() <= 0}
-                onClick={() => {
-                  setHistoryIndex((i) => i - 1);
-                  openFile(history()[historyIndex()], false, false);
-                }}
-              >
-                <Ic.ArrowLeft size={16} />
-              </button>
-              <button
-                aria-label="Next file"
-                disabled={historyIndex() >= history().length - 1}
-                onClick={() => {
-                  setHistoryIndex((i) => i + 1);
-                  openFile(history()[historyIndex()], false, false);
-                }}
-              >
-                <Ic.ArrowRight size={16} />
-              </button>
-              <span class="file-breadcrumb" title={selected()?.path}>
-                {selected()?.path ?? "Files"}
-              </span>
               <Show when={selected()?.name.match(/\.mdx?$/i)}>
                 <button
-                  class={`file-mode ${!sourceMode() ? "on" : ""}`}
-                  onClick={() => setSourceMode(false)}
+                  class="file-mode"
+                  title="Toggle Markdown/source (⌘/)"
+                  onClick={() => setSourceMode((v) => !v)}
                 >
-                  Preview
-                </button>
-                <button
-                  class={`file-mode ${sourceMode() ? "on" : ""}`}
-                  onClick={() => setSourceMode(true)}
-                >
-                  Markdown
+                  {sourceMode() ? "Preview" : "Markdown"}
                 </button>
               </Show>
               <details class="file-actions">
@@ -700,6 +659,30 @@ export function FilePanelProvider(p: {
                   <Ic.DotsIcon size={16} />
                 </summary>
                 <div>
+                  <button
+                    aria-label="Previous file"
+                    disabled={historyIndex() <= 0}
+                    onClick={() => {
+                      setHistoryIndex((i) => i - 1);
+                      openFile(history()[historyIndex()], false, false);
+                    }}
+                  >
+                    <Ic.ArrowLeft size={14} /> Previous file
+                  </button>
+                  <button
+                    aria-label="Next file"
+                    disabled={historyIndex() >= history().length - 1}
+                    onClick={() => {
+                      setHistoryIndex((i) => i + 1);
+                      openFile(history()[historyIndex()], false, false);
+                    }}
+                  >
+                    <Ic.ArrowRight size={14} /> Next file
+                  </button>
+
+                  <button onClick={() => setMaximized((v) => !v)}>
+                    {maximized() ? "Restore panel" : "Expand panel"}
+                  </button>
                   <button
                     disabled={!selected()}
                     onClick={() =>
@@ -731,7 +714,10 @@ export function FilePanelProvider(p: {
                     Download
                   </button>
                 </div>
-              </details>
+              </details>{" "}
+              <button aria-label="Close files" onClick={() => setOpened(false)}>
+                <Ic.CloseIcon size={14} />
+              </button>
             </div>
             <Show when={search() !== null || choices().length}>
               <div class="file-search">

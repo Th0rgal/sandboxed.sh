@@ -71,6 +71,7 @@ test("Cursor-style files preserve chat, resolve references and navigate Markdown
     "Keep my draft",
   );
   await expect(page.locator(".file-panel")).toBeVisible();
+  await expect(page.locator(".file-toolbar")).toHaveCount(0);
   const tabBar = await page.locator(".file-tabs").boundingBox();
   const titleBar = await page.locator(".titlebar").boundingBox();
   expect(Math.abs(tabBar!.height - titleBar!.height)).toBeLessThanOrEqual(1);
@@ -81,7 +82,9 @@ test("Cursor-style files preserve chat, resolve references and navigate Markdown
   await page.keyboard.press("Meta+/");
   await expect(page.locator(".file-source-code")).toBeVisible();
   await page.getByRole("button", { name: "Preview", exact: true }).click();
-  const handle = await page.getByRole("separator", { name: "Resize file panel", exact: true }).boundingBox();
+  const handle = await page
+    .getByRole("separator", { name: "Resize file panel", exact: true })
+    .boundingBox();
   await page.mouse.move(handle!.x + handle!.width / 2, handle!.y + 100);
   await page.mouse.down();
   await page.mouse.move(handle!.x - 70, handle!.y + 100);

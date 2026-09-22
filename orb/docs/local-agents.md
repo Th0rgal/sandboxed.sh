@@ -206,3 +206,23 @@ by the backend).
 - Path rewrite must not fire on prose. `mentionedChips` is the only resolver.
 - The default workspace is app data on purpose. Pointing it at a repository
   is a user choice, so a mention cannot write into a checkout by surprise.
+
+### Streaming
+
+New native builds expose `local_agents_subscribe` through a Tauri channel. The
+subscription sends an atomic snapshot followed by ordered text deltas; terminal
+state includes an authoritative snapshot. Text is pushed from the stdout reader,
+not fetched repeatedly. The renderer coalesces fragments over 16 ms and flushes
+terminal state immediately. Older native builds can still use `local_agents_poll`.
+
+Codex messages are tracked by item ID, so completed snapshots reconcile rather
+than duplicate streamed text. Notifications received while awaiting `turn/start`
+are retained. Claude partial events and OpenCode text events use the same output
+channel. Grok stdout is read in chunks, preserving split UTF-8 sequences without
+waiting for newlines. Normal process completion waits for stdout/stderr readers
+to drain before reporting the final state.
+
+Markdown blocks before a completed blank-line boundary are retained; only the
+unfinished tail is reparsed. Fenced code keeps internal blank lines in the tail.
+The mission view follows content resizes only while the reader is pinned to the
+bottom. This improves rendering latency, not model generation speed.

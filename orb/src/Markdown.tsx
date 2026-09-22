@@ -160,8 +160,30 @@ export function parseMarkdown(src: string): Block[] {
   return out;
 }
 
+/** Freeze only completed blocks; fences keep blank lines inside the active tail. */
+export function incrementalMarkdown() {
+  let previous = "", boundary = 0, stable: Block[] = [];
+  return (text: string): Block[] => {
+    if (!text.startsWith(previous)) { boundary = 0; stable = []; }
+    previous = text;
+    const tail = text.slice(boundary);
+    let fenced = false, end = 0, offset = 0;
+    for (const line of tail.split("\n").slice(0, -1)) {
+      offset += line.length + 1;
+      if (line.startsWith("```")) fenced = !fenced;
+      if (!fenced && !line.trim()) end = offset;
+    }
+    if (end) {
+      stable = [...stable, ...parseMarkdown(tail.slice(0, end))];
+      boundary += end;
+    }
+    return [...stable, ...parseMarkdown(text.slice(boundary))];
+  };
+}
+
 export function MdView(p: { text: string; compact?: boolean }) {
-  const blocks = createMemo(() => parseMarkdown(p.text));
+  const parse = incrementalMarkdown();
+  const blocks = createMemo(() => parse(p.text));
   return (
     <div class={`md ${p.compact ? "md-compact" : ""}`}>
       <For each={blocks()}>

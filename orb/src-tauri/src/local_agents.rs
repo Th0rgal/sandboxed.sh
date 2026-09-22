@@ -7,6 +7,7 @@
 //! Grok: `grok --prompt`. The repo has no resume flag for that CLI, so a follow-up
 //! starts a new local session and says so.
 
+use crate::local_stream::{Event as OutputEvent, Output};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -84,9 +85,10 @@ pub struct PollState {
     pub resumed: bool,
 }
 
+#[derive(Clone)]
 struct Run {
     child: Arc<Mutex<Child>>,
-    text: Arc<Mutex<String>>,
+    text: Arc<Output>,
     done: Arc<AtomicBool>,
     exit_code: Arc<Mutex<Option<i32>>>,
     session_id: Arc<Mutex<Option<String>>>,
@@ -185,7 +187,7 @@ pub fn local_agents_start(request: StartRequest) -> Result<(), String> {
     if map.contains_key(&request.id) {
         return Err("this mission already has a local run".into());
     }
-    let text = Arc::new(Mutex::new(String::new()));
+    let text = Arc::new(Output::default());
     let done = Arc::new(AtomicBool::new(false));
     let exit_code = Arc::new(Mutex::new(None));
     let session_id = Arc::new(Mutex::new(request.session_id.clone()));
@@ -198,6 +200,7 @@ pub fn local_agents_start(request: StartRequest) -> Result<(), String> {
         Arc::clone(&child),
         Arc::clone(&done),
         Arc::clone(&exit_code),
+        Arc::clone(&text),
     );
     map.insert(
         request.id,
@@ -214,7 +217,12 @@ pub fn local_agents_start(request: StartRequest) -> Result<(), String> {
     Ok(())
 }
 
-fn watch_exit(child: Arc<Mutex<Child>>, done: Arc<AtomicBool>, exit_code: Arc<Mutex<Option<i32>>>) {
+fn watch_exit(
+    child: Arc<Mutex<Child>>,
+    done: Arc<AtomicBool>,
+    exit_code: Arc<Mutex<Option<i32>>>,
+    output: Arc<Output>,
+) {
     thread::spawn(move || loop {
         let status = child
             .lock()
@@ -224,6 +232,9 @@ fn watch_exit(child: Arc<Mutex<Child>>, done: Arc<AtomicBool>, exit_code: Arc<Mu
         if let Some(status) = status {
             if let Ok(mut slot) = exit_code.lock() {
                 *slot = status.code();
+            }
+            while !output.drained() {
+                thread::sleep(Duration::from_millis(5));
             }
             done.store(true, Ordering::SeqCst);
             break;
@@ -240,7 +251,7 @@ pub fn local_agents_poll(id: String) -> Result<PollState, String> {
     let map = runs().lock().map_err(|e| e.to_string())?;
     let run = map.get(&id).ok_or_else(|| "no local run".to_string())?;
     let snapshot = PollState {
-        text: run.text.lock().map_err(|e| e.to_string())?.clone(),
+        text: run.text.snapshot(),
         done: run.done.load(Ordering::SeqCst),
         exit_code: *run.exit_code.lock().map_err(|e| e.to_string())?,
         session_id: run.session_id.lock().map_err(|e| e.to_string())?.clone(),
@@ -248,6 +259,41 @@ pub fn local_agents_poll(id: String) -> Result<PollState, String> {
         resumed: run.resumed,
     };
     Ok(snapshot)
+}
+
+/// Subscribe atomically with the snapshot so startup text cannot be missed.
+#[tauri::command]
+pub fn local_agents_subscribe(
+    id: String,
+    on_event: tauri::ipc::Channel<OutputEvent>,
+) -> Result<(), String> {
+    let run = runs()
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get(&id)
+        .cloned()
+        .ok_or("no local run")?;
+    let token = run.text.subscribe(on_event.clone())?;
+    thread::spawn(move || {
+        while !run.done.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(40));
+        }
+        let state = PollState {
+            text: run.text.snapshot(),
+            done: true,
+            exit_code: *run.exit_code.lock().unwrap(),
+            session_id: run.session_id.lock().unwrap().clone(),
+            error: run.error.lock().unwrap().clone(),
+            resumed: run.resumed,
+        };
+        let _ = on_event.send(OutputEvent {
+            text: String::new(),
+            reset: false,
+            state: Some(state),
+        });
+        run.text.unsubscribe(token);
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -258,6 +304,11 @@ pub fn local_agents_stop(id: String) -> Result<(), String> {
             let _ = child.kill();
             let _ = child.wait();
         }
+        // A cancelled tool can leave an inherited pipe open. Do not block Stop.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !run.text.drained() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
         run.done.store(true, Ordering::SeqCst);
     }
     Ok(())
@@ -265,7 +316,7 @@ pub fn local_agents_stop(id: String) -> Result<(), String> {
 
 fn spawn_harness(
     request: &StartRequest,
-    text: &Arc<Mutex<String>>,
+    text: &Arc<Output>,
     session_id: &Arc<Mutex<Option<String>>>,
     error: &Arc<Mutex<Option<String>>>,
     done: &Arc<AtomicBool>,
@@ -303,7 +354,7 @@ fn opencode_args(request: &StartRequest) -> Vec<String> {
 
 fn spawn_claude(
     request: &StartRequest,
-    text: &Arc<Mutex<String>>,
+    text: &Arc<Output>,
     session_id: &Arc<Mutex<Option<String>>>,
     error: &Arc<Mutex<Option<String>>>,
 ) -> Result<Child, String> {
@@ -347,7 +398,7 @@ fn spawn_claude(
 fn spawn_piped(
     request: &StartRequest,
     args: Vec<String>,
-    text: &Arc<Mutex<String>>,
+    text: &Arc<Output>,
     error: &Arc<Mutex<Option<String>>>,
     parse_json: bool,
 ) -> Result<Child, String> {
@@ -369,18 +420,56 @@ fn spawn_piped(
     Ok(child)
 }
 
+fn stream_plain(reader: &mut impl Read, output: &Output) {
+    let mut pending = Vec::new();
+    let mut bytes = [0u8; 4096];
+    while let Ok(n) = reader.read(&mut bytes) {
+        if n == 0 {
+            break;
+        }
+        pending.extend_from_slice(&bytes[..n]);
+        loop {
+            match std::str::from_utf8(&pending) {
+                Ok(text) => {
+                    output.append(text);
+                    pending.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    output.append(std::str::from_utf8(&pending[..valid]).unwrap());
+                    pending.drain(..valid);
+                    if let Some(invalid) = error.error_len() {
+                        output.append("�");
+                        pending.drain(..invalid);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    output.append(&String::from_utf8_lossy(&pending));
+}
+
 fn pipe_output(
     stdout: Option<std::process::ChildStdout>,
     stderr: Option<std::process::ChildStderr>,
-    text: &Arc<Mutex<String>>,
+    text: &Arc<Output>,
     error: &Arc<Mutex<Option<String>>>,
     parse_json: bool,
 ) {
     let text_out = Arc::clone(text);
     let error_out = Arc::clone(error);
     if let Some(stdout) = stdout {
+        let guard = text.reader();
         thread::spawn(move || {
-            let reader = BufReader::new(stdout);
+            let _guard = guard;
+            let mut reader = BufReader::new(stdout);
+            if !parse_json {
+                stream_plain(&mut reader, &text_out);
+                return;
+            }
             for line in reader.lines() {
                 let Ok(line) = line else { break };
                 let piece = if parse_json {
@@ -389,18 +478,15 @@ fn pipe_output(
                     Some(line)
                 };
                 if let Some(piece) = piece.filter(|s| !s.is_empty()) {
-                    if let Ok(mut buf) = text_out.lock() {
-                        if !buf.is_empty() && !parse_json {
-                            buf.push('\n');
-                        }
-                        buf.push_str(&piece);
-                    }
+                    text_out.append(&piece);
                 }
             }
         });
     }
     if let Some(stderr) = stderr {
+        let guard = text.reader();
         thread::spawn(move || {
+            let _guard = guard;
             let mut buf = String::new();
             let _ = BufReader::new(stderr).read_to_string(&mut buf);
             let trimmed = buf.trim();
@@ -417,7 +503,7 @@ fn pipe_output(
 
 fn spawn_codex(
     request: &StartRequest,
-    text: &Arc<Mutex<String>>,
+    text: &Arc<Output>,
     session_out: &Arc<Mutex<Option<String>>>,
     error: &Arc<Mutex<Option<String>>>,
     done: &Arc<AtomicBool>,
@@ -456,7 +542,9 @@ fn spawn_codex(
             }
         });
     }
+    let guard = text.reader();
     thread::spawn(move || {
+        let _guard = guard;
         let mut reader = BufReader::new(stdout);
         let result = drive_codex(
             &mut stdin,
@@ -497,7 +585,7 @@ fn drive_codex(
     model: Option<&str>,
     cwd: &str,
     resume: Option<&str>,
-    text: &Mutex<String>,
+    text: &Output,
     session_out: &Mutex<Option<String>>,
 ) -> Result<(), String> {
     rpc(
@@ -531,7 +619,8 @@ fn drive_codex(
     if let Ok(mut slot) = session_out.lock() {
         *slot = Some(thread_id.clone());
     }
-    let _ = rpc(
+    let mut pending = Vec::new();
+    let _ = rpc_collect(
         stdin,
         reader,
         "turn/start",
@@ -539,16 +628,24 @@ fn drive_codex(
             "threadId": thread_id,
             "input": [{"type": "text", "text": prompt}]
         }),
+        &mut pending,
     )?;
+    let mut pending = pending.into_iter();
+    let mut items = crate::local_stream::CodexText::default();
     let mut line = String::new();
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
+        let value = if let Some(event) = pending.next() {
+            event
+        } else {
+            line.clear();
+            let n = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("Codex stream closed before the turn completed".into());
+            }
+            let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            value
         };
         if let Some(message) = value
             .get("error")
@@ -558,14 +655,25 @@ fn drive_codex(
             return Err(message.to_string());
         }
         let method = value.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        if method.contains("turn/completed") || method.contains("turn/complete") {
-            break;
-        }
-        if let Some(piece) = extract_text(line.trim()) {
-            if let Ok(mut buf) = text.lock() {
-                buf.push_str(&piece);
+        if method == "error" {
+            if let Some(message) = value
+                .pointer("/params/error/message")
+                .and_then(Value::as_str)
+            {
+                return Err(message.to_string());
             }
         }
+        if method == "turn/completed" || method == "turn/complete" {
+            if value.pointer("/params/turn/status").and_then(Value::as_str) == Some("failed") {
+                return Err(value
+                    .pointer("/params/turn/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex turn failed")
+                    .to_owned());
+            }
+            break;
+        }
+        items.apply(&value, text);
     }
     Ok(())
 }
@@ -575,6 +683,16 @@ fn rpc(
     reader: &mut impl BufRead,
     method: &str,
     params: Value,
+) -> Result<Value, String> {
+    rpc_collect(stdin, reader, method, params, &mut Vec::new())
+}
+
+fn rpc_collect(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    method: &str,
+    params: Value,
+    pending: &mut Vec<Value>,
 ) -> Result<Value, String> {
     let id = format!("orb-{method}");
     write_line(
@@ -610,11 +728,7 @@ fn rpc(
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
             }
         }
-        if let Some(piece) = extract_text(line.trim()) {
-            // Notifications before the response are kept by the caller only
-            // after turn/start. Drop them during handshake.
-            let _ = piece;
-        }
+        pending.push(value);
     }
 }
 
@@ -637,11 +751,13 @@ fn extract_text(line: &str) -> Option<String> {
         }
     } else {
         match value["type"].as_str()? {
-            "stream_event" if value.pointer("/event/delta/type")?.as_str()? == "text_delta" =>
-                value.pointer("/event/delta/text")?.as_str(),
+            "stream_event" if value.pointer("/event/delta/type")?.as_str()? == "text_delta" => {
+                value.pointer("/event/delta/text")?.as_str()
+            }
             "text" => value.pointer("/part/text")?.as_str(), // OpenCode
-            "message" if value["role"] == "assistant" && value["delta"] == true =>
-                value["content"].as_str(), // Gemini streaming output
+            "message" if value["role"] == "assistant" && value["delta"] == true => {
+                value["content"].as_str()
+            } // Gemini streaming output
             _ => None,
         }
     }?;
@@ -830,9 +946,78 @@ mod tests {
             json!({"type":"user","message":{"content":[{"type":"text","text":"PROMPT"}]}}),
             json!({"type":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}),
         ];
-        let text: String = events.iter().filter_map(|e| extract_text(&e.to_string())).collect();
+        let text: String = events
+            .iter()
+            .filter_map(|e| extract_text(&e.to_string()))
+            .collect();
         assert_eq!(text, "Hello");
-        assert_eq!(extract_text(r#"{"type":"text","part":{"text":"OpenCode"}}"#).as_deref(), Some("OpenCode"));
+        assert_eq!(
+            extract_text(r#"{"type":"text","part":{"text":"OpenCode"}}"#).as_deref(),
+            Some("OpenCode")
+        );
+    }
+
+    #[test]
+    fn codex_keeps_early_deltas_and_reconciles_final_items() {
+        let events = [
+            json!({"id":"orb-initialize","result":{}}),
+            json!({"id":"orb-thread/start","result":{"thread":{"id":"thread"}}}),
+            json!({"method":"item/agentMessage/delta","params":{"itemId":"a","delta":"Early"}}),
+            json!({"id":"orb-turn/start","result":{}}),
+            json!({"method":"item/completed","params":{"item":{"type":"agentMessage","id":"a","text":"Early answer"}}}),
+            json!({"method":"turn/completed","params":{"turn":{"status":"completed"}}}),
+        ];
+        let input = events
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let output = Output::default();
+        drive_codex(
+            &mut Vec::new(),
+            &mut std::io::Cursor::new(input),
+            "prompt",
+            None,
+            "/tmp",
+            None,
+            &output,
+            &Mutex::new(None),
+        )
+        .unwrap();
+        assert_eq!(output.snapshot(), "Early answer");
+    }
+
+    #[test]
+    fn plain_stream_does_not_wait_for_newlines_and_preserves_utf8() {
+        struct Bytes<'a> {
+            bytes: &'a [u8],
+            output: &'a Output,
+            index: usize,
+        }
+        impl Read for Bytes<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.index == 1 {
+                    assert_eq!(self.output.snapshot(), "A");
+                }
+                if self.index == self.bytes.len() {
+                    return Ok(0);
+                }
+                buf[0] = self.bytes[self.index];
+                self.index += 1;
+                Ok(1)
+            }
+        }
+        let output = Output::default();
+        stream_plain(
+            &mut Bytes {
+                bytes: "Aé🙂".as_bytes(),
+                output: &output,
+                index: 0,
+            },
+            &output,
+        );
+        assert_eq!(output.snapshot(), "Aé🙂");
     }
 
     #[test]

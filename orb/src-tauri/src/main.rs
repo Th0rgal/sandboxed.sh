@@ -3,6 +3,7 @@
 #[path = "../../../shared/file_browser.rs"]
 mod file_browser;
 mod local_agents;
+mod local_stream;
 mod machine_metrics;
 mod voice;
 
@@ -99,6 +100,7 @@ fn main() {
             local_agents::local_agents_write,
             local_agents::local_agents_start,
             local_agents::local_agents_poll,
+            local_agents::local_agents_subscribe,
             local_agents::local_agents_stop
         ])
         .run(tauri::generate_context!())
