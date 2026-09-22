@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./ErrorNotice";
 import { Show } from "solid-js";
 import { ApiError, getApiUrl, type Mission, type RemoteLaunchCapability, type RemoteNodesResponse } from "./api";
 import { goalObjective, GoalTag } from "./goal";
@@ -221,12 +222,21 @@ export function phaseIsQuiet(phase: { label: string; failed?: boolean; moving?: 
  */
 export function LaunchStatus(p: { destination: string; mission?: Mission | null; activity?: boolean; submitting?: boolean; goal?: string | null; failureInTranscript?: boolean }) {
   const phase = () => p.submitting ? {label:"Starting",moving:true,detail:"Submitting your request…",failed:false} : missionPhase(p.mission ?? null, !!p.activity);
-  return <Show when={!(phase().failed && p.failureInTranscript) && !(phase().label === "Queued" && !p.mission?.remote_job && !p.mission?.remote_node_id) && !phaseIsQuiet(phase()) && !(p.activity && phase().label === "Remote job accepted")}>
+  return <Show when={!phase().failed && !(phase().label === "Queued" && !p.mission?.remote_job && !p.mission?.remote_node_id) && !phaseIsQuiet(phase()) && !(p.activity && phase().label === "Remote job accepted")}>
     <div class={`launch-status ${phase().failed ? "failed" : ""}`} role="status" aria-live="polite">
       <div><Show when={phase().moving}><span class="launch-pulse" aria-hidden="true" /></Show><Show when={p.goal}><GoalTag class="small" /></Show><span>{phase().label} on {p.destination}</span></div>
       <Show when={phase().detail}><p>{phase().detail}</p></Show>
     </div>
   </Show>;
+}
+
+/** Failures belong after the prompt/output, using the shared red notice. */
+export function MissionFailure(p: { mission?: Mission | null; error?: string; active?: boolean; failureInTranscript?: boolean }) {
+  const phase = () => missionPhase(p.mission ?? null, false);
+  const message = () => p.error || (phase().detail === "client runner"
+    ? "The local run could not be completed. Retry on the computer that started it."
+    : phase().detail || "The mission stopped before completion.");
+  return <Show when={!p.active && !p.failureInTranscript && (p.error || phase().failed)}><ErrorNotice title={phase().label === "Cancelled" ? "Mission cancelled" : "Mission failed"} error={message()} /></Show>;
 }
 
 /**

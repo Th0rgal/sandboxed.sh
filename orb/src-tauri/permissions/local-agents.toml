@@ -7,5 +7,7 @@ commands.allow = [
   "local_agents_write",
   "local_agents_start",
   "local_agents_poll",
+  "local_agents_subscribe",
+  "browse_local_files",
   "local_agents_stop",
 ]

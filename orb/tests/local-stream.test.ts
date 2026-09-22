@@ -78,3 +78,9 @@ it("follows native channel output without repeatedly requesting snapshots", asyn
     vi.unstubAllGlobals();
   }
 });
+
+it("recognizes the actual Tauri permission error for compatibility fallback",async()=>{
+ const {missingStreamCommand}=await import('../src/localAgents');
+ expect(missingStreamCommand('local_agents_subscribe not allowed. Command not found')).toBe(true);
+ expect(missingStreamCommand('no local run')).toBe(false);
+});
