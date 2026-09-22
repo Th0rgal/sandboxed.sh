@@ -9,7 +9,7 @@ import { goalDraft } from "./goal";
 
 import { messagePresentation } from "./messagePresentation";
 import { latestChecklist, toolArgs, toolName, workSummary } from "./workModel";
-import { withoutFiller, type StreamItem } from "./transcriptModel";
+import { visibleTranscript, type StreamItem } from "./transcriptModel";
 export { buildTranscript, applyStreamEvent } from "./transcriptModel";
 export type { StreamItem } from "./transcriptModel";
 
@@ -152,7 +152,7 @@ function groupWork(input: StreamItem[], previous: Grouped[] = []): Grouped[] {
   const out: Grouped[] = [];
   // Dropping a filler bubble also rejoins the work around it, so one stretch of
   // tool calls reads as one fold instead of being split in two by a stray ".".
-  const items = withoutFiller(input);
+  const items = visibleTranscript(input);
   for (const it of items) {
     const last = out[out.length - 1];
     if (it.kind === "tool" || it.kind === "think") {
@@ -243,7 +243,7 @@ export function Transcript(p: { items: StreamItem[]; pending?: boolean }) {
             case "tool":
               return <ToolRow item={item} />;
             case "error":
-              return <ErrorNotice error={item.text} title="Mission failed" />;
+              return <ErrorNotice error={item.text} title={item.cancelled ? "Mission cancelled" : "Mission failed"} />;
           }
         }}
       </For>
