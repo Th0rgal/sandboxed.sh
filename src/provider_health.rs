@@ -1502,6 +1502,9 @@ impl ModelChainStore {
                         && account.oauth.is_some()
                         && crate::api::ai_providers::xai_cli_proxy_account_available();
                 let entry_has_oauth = credential_is_oauth_token
+                    || (provider_type == crate::ai_providers::ProviderType::OpenAI
+                        && oauth_is_fresh
+                        && routed_api_key.is_none())
                     || google_oauth_routable
                     || xai_oauth_cli_proxy_routable
                     || anthropic_oauth_cli_proxy_routable
@@ -2527,6 +2530,38 @@ mod tests {
             preferred_store_credential(ProviderType::Kimi, Some("  "), Some("  ")),
             (None, false)
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_entries_preserves_codex_oauth_without_hoisting_it_to_an_api_key() {
+        for key in [None, Some("api-key".to_string())] {
+            let mut account = AIProvider::new(ProviderType::OpenAI, "Codex".into());
+            account.api_key = key.clone();
+            account.oauth = Some(OAuthCredentials {
+                access_token: "codex-access".into(),
+                refresh_token: "codex-refresh".into(),
+                expires_at: future_ms(1),
+            });
+            account.status = ProviderStatus::Connected;
+            let id = account.id;
+            let store = store_with(vec![account]).await;
+            let chains = store_with_chain("unused", vec![]).await;
+            let resolved = chains
+                .resolve_entries(
+                    &[ChainEntry {
+                        provider_id: "openai".into(),
+                        model_id: "gpt-6-astra".into(),
+                    }],
+                    &store,
+                    &[],
+                    &ProviderHealthTracker::new(),
+                )
+                .await;
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].account_id, id);
+            assert_eq!(resolved[0].api_key, key);
+            assert_eq!(resolved[0].has_oauth, key.is_none());
+        }
     }
 
     #[tokio::test]
