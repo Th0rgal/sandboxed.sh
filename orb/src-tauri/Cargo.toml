@@ -7,6 +7,7 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+base64 = "0.22"
 tauri = { version = "2", features = ["macos-private-api"] }
 window-vibrancy = "0.6"
 serde = { version = "1", features = ["derive"] }

@@ -8,6 +8,7 @@
 //! starts a new local session and says so.
 
 use crate::local_stream::{Event as OutputEvent, Output};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -48,6 +49,8 @@ pub struct WorkspaceRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct WriteFile {
+    #[serde(default)]
+    pub encoding: Option<String>,
     pub rel: String,
     pub content: String,
 }
@@ -60,12 +63,15 @@ pub struct WriteRequest {
 
 #[derive(Debug, Serialize)]
 pub struct WriteReport {
+    pub binary_supported: bool,
     pub written: Vec<String>,
     pub skipped: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartRequest {
+    #[serde(default)]
+    pub image_paths: Vec<String>,
     pub id: String,
     pub harness: String,
     pub bin: String,
@@ -156,7 +162,12 @@ pub fn local_agents_write(request: WriteRequest) -> Result<WriteReport, String> 
             skipped.push(format!("{rel_str} (secret)"));
             continue;
         }
-        if file.content.len() > 512 * 1024 {
+        let limit = if file.encoding.as_deref() == Some("base64") {
+            14 * 1024 * 1024
+        } else {
+            512 * 1024
+        };
+        if file.content.len() > limit {
             skipped.push(format!("{rel_str} (too large)"));
             continue;
         }
@@ -164,10 +175,21 @@ pub fn local_agents_write(request: WriteRequest) -> Result<WriteReport, String> 
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        std::fs::write(&dest, file.content.as_bytes()).map_err(|e| e.to_string())?;
+        let bytes = match file.encoding.as_deref() {
+            Some("base64") => base64::engine::general_purpose::STANDARD
+                .decode(&file.content)
+                .map_err(|e| e.to_string())?,
+            None => file.content.into_bytes(),
+            Some(_) => return Err("Unsupported attachment encoding".into()),
+        };
+        std::fs::write(&dest, bytes).map_err(|e| e.to_string())?;
         written.push(rel_str);
     }
-    Ok(WriteReport { written, skipped })
+    Ok(WriteReport {
+        written,
+        skipped,
+        binary_supported: true,
+    })
 }
 
 #[tauri::command]
@@ -366,6 +388,9 @@ fn opencode_args(request: &StartRequest) -> Vec<String> {
         None => {}
     }
     args.push(request.prompt.clone());
+    for path in &request.image_paths {
+        args.extend(["--file".into(), path.clone()]);
+    }
     args
 }
 
@@ -429,7 +454,7 @@ fn spawn_piped(
     let mut child = command
         .current_dir(&request.cwd)
         .args(&args)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -564,6 +589,7 @@ fn spawn_codex(
     let stdout = child.stdout.take().ok_or("codex stdout missing")?;
     let stderr = child.stderr.take();
     let prompt = request.prompt.clone();
+    let image_paths = request.image_paths.clone();
     let model = request.model.clone();
     let cwd = request.cwd.clone();
     let resume = request.session_id.clone().filter(|s| !s.is_empty());
@@ -595,6 +621,7 @@ fn spawn_codex(
             &mut stdin,
             &mut reader,
             &prompt,
+            &image_paths,
             model.as_deref(),
             &cwd,
             resume.as_deref(),
@@ -627,6 +654,7 @@ fn drive_codex(
     stdin: &mut impl Write,
     reader: &mut impl BufRead,
     prompt: &str,
+    image_paths: &[String],
     model: Option<&str>,
     cwd: &str,
     resume: Option<&str>,
@@ -664,6 +692,12 @@ fn drive_codex(
     if let Ok(mut slot) = session_out.lock() {
         *slot = Some(thread_id.clone());
     }
+    let mut input = vec![json!({"type":"text", "text":prompt})];
+    input.extend(
+        image_paths
+            .iter()
+            .map(|path| json!({"type":"localImage", "path":path})),
+    );
     let mut pending = Vec::new();
     let _ = rpc_collect(
         stdin,
@@ -671,7 +705,7 @@ fn drive_codex(
         "turn/start",
         json!({
             "threadId": thread_id,
-            "input": [{"type": "text", "text": prompt}]
+            "input": input
         }),
         &mut pending,
     )?;
@@ -956,6 +990,7 @@ mod tests {
             vec!["--prompt".to_string(), "hello".to_string()]
         );
         let fresh = StartRequest {
+            image_paths: vec![],
             id: "1".into(),
             harness: "opencode".into(),
             bin: "opencode".into(),
@@ -1024,10 +1059,12 @@ mod tests {
             .join("\n")
             + "\n";
         let output = Output::default();
+        let mut requests = Vec::new();
         drive_codex(
-            &mut Vec::new(),
+            &mut requests,
             &mut std::io::Cursor::new(input),
             "prompt",
+            &["/tmp/pasted.png".into()],
             None,
             "/tmp",
             None,
@@ -1036,6 +1073,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output.snapshot(), "Early answer");
+        let sent: Vec<Value> = String::from_utf8(requests)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let turn = sent
+            .iter()
+            .find(|event| event["method"] == "turn/start")
+            .unwrap();
+        assert_eq!(
+            turn["params"]["input"][1],
+            json!({"type":"localImage", "path":"/tmp/pasted.png"})
+        );
     }
 
     #[test]
@@ -1070,6 +1120,65 @@ mod tests {
         assert_eq!(output.snapshot(), "Aé🙂");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn argument_prompt_harnesses_receive_eof_on_stdin() {
+        let request = StartRequest {
+            id: "stdin-test".into(),
+            harness: "opencode".into(),
+            bin: "/bin/sh".into(),
+            cwd: "/tmp".into(),
+            prompt: "hello".into(),
+            model: None,
+            session_id: None,
+            image_paths: vec![],
+        };
+        let output = Arc::new(Output::default());
+        let mut child = spawn_piped(
+            &request,
+            vec!["-c".into(), "cat >/dev/null".into()],
+            &output,
+            &Arc::new(Mutex::new(None)),
+            false,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("harness waited forever for stdin EOF");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn pasted_image_bytes_are_written_without_text_conversion() {
+        let root = std::env::temp_dir().join(format!("orb-image-{}", uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let bytes = [137, 80, 78, 71, 0, 255];
+        let result = local_agents_write(WriteRequest {
+            root: root.to_string_lossy().into_owned(),
+            files: vec![WriteFile {
+                rel: ".paloma/images/test.png".into(),
+                content: base64::engine::general_purpose::STANDARD.encode(bytes),
+                encoding: Some("base64".into()),
+            }],
+        })
+        .unwrap();
+        assert!(result.skipped.is_empty());
+        assert_eq!(
+            std::fs::read(root.join(".paloma/images/test.png")).unwrap(),
+            bytes
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn errors_do_not_include_terminal_color_sequences() {
         assert_eq!(
@@ -1082,6 +1191,7 @@ mod tests {
     #[test]
     fn completed_local_run_can_be_replaced_by_a_followup() {
         let request = StartRequest {
+            image_paths: vec![],
             id: format!("followup-test-{}", uuid_like()),
             harness: "grok".into(),
             bin: "/usr/bin/true".into(),
