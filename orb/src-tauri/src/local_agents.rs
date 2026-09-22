@@ -626,44 +626,26 @@ fn write_line(stdin: &mut impl Write, line: &str) -> Result<(), String> {
     stdin.flush().map_err(|e| e.to_string())
 }
 
+// Consume only protocol events representing new assistant output. Recursive
+// text extraction also captures user items, tool arguments and final snapshots.
 fn extract_text(line: &str) -> Option<String> {
     let value: Value = serde_json::from_str(line).ok()?;
-    let mut out = String::new();
-    collect_text(&value, &mut out);
-    if out.is_empty() {
-        None
+    let text = if let Some(method) = value["method"].as_str() {
+        match method {
+            "item/agentMessage/delta" => value.pointer("/params/delta")?.as_str(),
+            _ => None,
+        }
     } else {
-        Some(out)
-    }
-}
-
-fn collect_text(value: &Value, out: &mut String) {
-    match value {
-        Value::Object(map) => {
-            if let Some(text) = map.get("text").and_then(|v| v.as_str()) {
-                if map.get("type").and_then(|v| v.as_str()) == Some("text_delta")
-                    || map.get("type").and_then(|v| v.as_str()) == Some("text")
-                    || map.len() == 1
-                {
-                    out.push_str(text);
-                }
-            }
-            if let Some(delta) = map.get("delta").and_then(|v| v.as_str()) {
-                out.push_str(delta);
-            }
-            for (key, child) in map {
-                if key != "text" && key != "delta" {
-                    collect_text(child, out);
-                }
-            }
+        match value["type"].as_str()? {
+            "stream_event" if value.pointer("/event/delta/type")?.as_str()? == "text_delta" =>
+                value.pointer("/event/delta/text")?.as_str(),
+            "text" => value.pointer("/part/text")?.as_str(), // OpenCode
+            "message" if value["role"] == "assistant" && value["delta"] == true =>
+                value["content"].as_str(), // Gemini streaming output
+            _ => None,
         }
-        Value::Array(items) => {
-            for item in items {
-                collect_text(item, out);
-            }
-        }
-        _ => {}
-    }
+    }?;
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 fn uuid_like() -> String {
@@ -835,6 +817,22 @@ mod tests {
         assert!(opencode_args(&resumed)
             .windows(2)
             .any(|pair| pair == ["--session".to_string(), "ses_abc".to_string()]));
+    }
+
+    #[test]
+    fn output_excludes_user_echoes_snapshots_and_tools() {
+        let events = [
+            json!({"method":"item/started","params":{"item":{"type":"userMessage","content":[{"type":"text","text":"PROMPT"}]}}}),
+            json!({"method":"item/completed","params":{"item":{"type":"userMessage","content":[{"type":"text","text":"PROMPT"}]}}}),
+            json!({"method":"item/agentMessage/delta","params":{"delta":"Hello"}}),
+            json!({"method":"item/completed","params":{"item":{"type":"agentMessage","text":"Hello"}}}),
+            json!({"method":"item/commandExecution/outputDelta","params":{"delta":"TOOL"}}),
+            json!({"type":"user","message":{"content":[{"type":"text","text":"PROMPT"}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}),
+        ];
+        let text: String = events.iter().filter_map(|e| extract_text(&e.to_string())).collect();
+        assert_eq!(text, "Hello");
+        assert_eq!(extract_text(r#"{"type":"text","part":{"text":"OpenCode"}}"#).as_deref(), Some("OpenCode"));
     }
 
     #[test]

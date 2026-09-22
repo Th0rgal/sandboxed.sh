@@ -1,4 +1,8 @@
 import { test, expect } from "@playwright/test";
+test.use({
+  browserName:
+    process.env.ORB_TEST_BROWSER === "webkit" ? "webkit" : "chromium",
+});
 test("Cursor-style files preserve chat, resolve references and navigate Markdown/source", async ({
   page,
 }) => {
@@ -55,6 +59,7 @@ test("Cursor-style files preserve chat, resolve references and navigate Markdown
   });
   await page.setViewportSize({ width: 1700, height: 1000 });
   await page.goto("/tests/file-panel.html");
+  const initialChat = await page.locator(".main").boundingBox();
   await page.getByRole("textbox", { name: "Draft" }).fill("Keep my draft");
   await page
     .getByRole("button", { name: "IMPLEMENTATION-BRIEF.md", exact: true })
@@ -66,13 +71,32 @@ test("Cursor-style files preserve chat, resolve references and navigate Markdown
     "Keep my draft",
   );
   await expect(page.locator(".file-panel")).toBeVisible();
+  const tabBar = await page.locator(".file-tabs").boundingBox();
+  const titleBar = await page.locator(".titlebar").boundingBox();
+  expect(Math.abs(tabBar!.height - titleBar!.height)).toBeLessThanOrEqual(1);
+  const tab = await page.locator(".file-tab").first().boundingBox();
+  expect(tab!.y - tabBar!.y).toBeGreaterThanOrEqual(5);
   await page.screenshot({ path: "test-results/files-dark.png" });
   await page.locator(".file-preview").click();
   await page.keyboard.press("Meta+/");
   await expect(page.locator(".file-source-code")).toBeVisible();
   await page.getByRole("button", { name: "Preview", exact: true }).click();
+  const handle = await page.getByRole("separator", { name: "Resize file panel", exact: true }).boundingBox();
+  await page.mouse.move(handle!.x + handle!.width / 2, handle!.y + 100);
+  await page.mouse.down();
+  await page.mouse.move(handle!.x - 70, handle!.y + 100);
+  await page.mouse.up();
   await page.getByRole("button", { name: "Close files", exact: true }).click();
   await expect(page.locator(".file-panel")).toHaveCount(0);
+  await expect
+    .poll(async () =>
+      Math.round((await page.locator(".main").boundingBox())!.width),
+    )
+    .toBe(Math.round(initialChat!.width));
+  await expect(page.locator(".app")).toHaveAttribute(
+    "data-files-open",
+    "false",
+  );
   await expect(page.getByRole("textbox", { name: "Draft" })).toHaveValue(
     "Keep my draft",
   );

@@ -115,6 +115,19 @@ export function FilePanelProvider(p: {
     batchTimer: ReturnType<typeof setTimeout> | undefined,
     rootPromise: Promise<FileSource[]> | undefined,
     readGeneration = 0;
+  let layoutMarker: HTMLSpanElement | undefined;
+  const [layout, setLayout] = createSignal<HTMLElement>();
+  onMount(() =>
+    setLayout(layoutMarker?.closest<HTMLElement>(".app") ?? undefined),
+  );
+  createEffect(() => {
+    const app = layout();
+    if (app) app.dataset.filesOpen = String(opened() && available());
+  });
+  onCleanup(() => {
+    const app = layout();
+    if (app) delete app.dataset.filesOpen;
+  });
   const selected = createMemo(() =>
     tabs().find((t) => identity(t) === active()),
   );
@@ -496,9 +509,17 @@ export function FilePanelProvider(p: {
                 onDblClick={() => !dir && openFile(ref, true)}
               >
                 <span>
-                  {dir ? (expanded().includes(expandedKey) ? "⌄" : "›") : "≡"}
+                  {dir ? (
+                    expanded().includes(expandedKey) ? (
+                      <Ic.ChevronDown size={12} />
+                    ) : (
+                      <Ic.ChevronRight size={12} />
+                    )
+                  ) : (
+                    <Ic.FileIcon size={14} />
+                  )}
                 </span>
-                {entry.name}
+                <span class="file-entry-name">{entry.name}</span>
               </button>
               <Show when={dir && expanded().includes(expandedKey)}>
                 <Rows source={q.source} path={entry.path} depth={q.depth + 1} />
@@ -549,6 +570,7 @@ export function FilePanelProvider(p: {
       value={{ toggle: () => setOpened((v) => !v), open: opened, available }}
     >
       <FileReferenceContext.Provider value={resolver}>
+        <span ref={layoutMarker} hidden />
         {p.children}
         <Show when={opened() && available()}>
           <aside
@@ -577,46 +599,55 @@ export function FilePanelProvider(p: {
               aria-label="Resize file panel"
               onPointerDown={(e) => resize(e)}
             />
-            <div class="file-tabs">
-              <For each={tabs()}>
-                {(tab) => (
-                  <div
-                    class={`file-tab ${active() === identity(tab) ? "selected" : ""}`}
-                  >
-                    <button
-                      style={{ "font-style": tab.pinned ? "normal" : "italic" }}
-                      title={tab.path}
-                      onClick={() => openFile(tab, tab.pinned)}
-                      onDblClick={() => openFile(tab, true)}
+            <div class="file-tabs" data-tauri-drag-region>
+              <div class="file-tab-list">
+                <For each={tabs()}>
+                  {(tab) => (
+                    <div
+                      class={`file-tab ${active() === identity(tab) ? "selected" : ""}`}
                     >
-                      {tab.name}
-                    </button>
-                    <button
-                      aria-label={`Close ${tab.name}`}
-                      onClick={() => closeTab(identity(tab))}
-                    >
-                      ×
-                    </button>
-                  </div>
-                )}
-              </For>
-              <span class="file-toolbar-spacer" />
-              <button
-                title="Expand files"
-                onClick={() => setMaximized((v) => !v)}
-              >
-                ⤢
-              </button>
-              <button aria-label="Close files" onClick={() => setOpened(false)}>
-                ×
-              </button>
+                      <button
+                        style={{
+                          "font-style": tab.pinned ? "normal" : "italic",
+                        }}
+                        title={tab.path}
+                        onClick={() => openFile(tab, tab.pinned)}
+                        onDblClick={() => openFile(tab, true)}
+                      >
+                        <Ic.FileIcon size={14} />
+                        <span>{tab.name}</span>
+                      </button>
+                      <button
+                        aria-label={`Close ${tab.name}`}
+                        onClick={() => closeTab(identity(tab))}
+                      >
+                        <Ic.CloseIcon size={14} />
+                      </button>
+                    </div>
+                  )}
+                </For>
+              </div>
+              <div class="file-window-actions">
+                <button
+                  aria-label="Expand files"
+                  onClick={() => setMaximized((v) => !v)}
+                >
+                  <Ic.ExternalIcon size={15} />
+                </button>
+                <button
+                  aria-label="Close files"
+                  onClick={() => setOpened(false)}
+                >
+                  <Ic.CloseIcon size={14} />
+                </button>
+              </div>
             </div>
             <div class="file-toolbar">
               <button
                 aria-label="Toggle file explorer"
                 onClick={() => setTree((v) => !v)}
               >
-                ☷
+                <Ic.SidebarIcon size={16} />
               </button>
               <button
                 aria-label="Find file"
@@ -625,7 +656,7 @@ export function FilePanelProvider(p: {
                   requestAnimationFrame(() => searchInput?.focus());
                 }}
               >
-                ⌕
+                <Ic.SearchIcon size={16} />
               </button>
               <button
                 aria-label="Previous file"
@@ -635,7 +666,7 @@ export function FilePanelProvider(p: {
                   openFile(history()[historyIndex()], false, false);
                 }}
               >
-                ←
+                <Ic.ArrowLeft size={16} />
               </button>
               <button
                 aria-label="Next file"
@@ -645,27 +676,29 @@ export function FilePanelProvider(p: {
                   openFile(history()[historyIndex()], false, false);
                 }}
               >
-                →
+                <Ic.ArrowRight size={16} />
               </button>
               <span class="file-breadcrumb" title={selected()?.path}>
                 {selected()?.path ?? "Files"}
               </span>
               <Show when={selected()?.name.match(/\.mdx?$/i)}>
                 <button
-                  class={!sourceMode() ? "on" : ""}
+                  class={`file-mode ${!sourceMode() ? "on" : ""}`}
                   onClick={() => setSourceMode(false)}
                 >
                   Preview
                 </button>
                 <button
-                  class={sourceMode() ? "on" : ""}
+                  class={`file-mode ${sourceMode() ? "on" : ""}`}
                   onClick={() => setSourceMode(true)}
                 >
                   Markdown
                 </button>
               </Show>
               <details class="file-actions">
-                <summary aria-label="File actions">···</summary>
+                <summary aria-label="File actions">
+                  <Ic.DotsIcon size={16} />
+                </summary>
                 <div>
                   <button
                     disabled={!selected()}
@@ -740,7 +773,10 @@ export function FilePanelProvider(p: {
                       <section>
                         <button
                           class="file-source"
-                          title={root.path}
+                          title={[root.label, root.machine, root.path]
+                            .filter(Boolean)
+                            .join(" · ")}
+                          aria-expanded={expanded().includes(root.id + ":")}
                           onClick={() =>
                             setExpanded((xs) =>
                               xs.includes(root.id + ":")
@@ -749,8 +785,18 @@ export function FilePanelProvider(p: {
                             )
                           }
                         >
-                          {root.label}
-                          {root.machine ? ` · ${root.machine}` : ""}
+                          {expanded().includes(root.id + ":") ? (
+                            <Ic.ChevronDown size={12} />
+                          ) : (
+                            <Ic.ChevronRight size={12} />
+                          )}
+                          <span class="file-source-label">
+                            {root.label.split(" · ")[0]}
+                          </span>
+                          <small>
+                            {root.machine ??
+                              root.label.split(" · ").slice(1).join(" · ")}
+                          </small>
                         </button>
                         <Show when={!root.available}>
                           <p class="file-muted">Source unavailable</p>
