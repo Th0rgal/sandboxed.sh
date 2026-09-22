@@ -77,6 +77,11 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export interface RemoteNodeView {
+  cpu_total?: number | null;
+  mem_total_bytes?: number | null;
+  mem_available_bytes?: number | null;
+  disk_total_bytes?: number | null;
+  disk_available_bytes?: number | null;
   id: string;
   base_url: string;
   token_env: string;

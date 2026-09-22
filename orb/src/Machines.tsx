@@ -3,7 +3,7 @@ import { pollWhileVisible } from "./poll";
 import { createStore, produce } from "solid-js/store";
 import * as Ic from "./icons";
 import { readPalomaPub } from "./pubKey";
-import { getRemoteNodes, isConnected, type RemoteNodeView } from "./api";
+import { getRemoteNodes, getApiUrl, getJwt, isConnected, type RemoteNodeView } from "./api";
 
 export type Machine = {
   id: string;
@@ -44,12 +44,6 @@ function target(m: Machine) {
   return m.port !== 22 ? `${m.user}@${m.host}:${m.port}` : `${m.user}@${m.host}`;
 }
 
-function dotClass(status: string) {
-  if (status === "online") return "m-dot on";
-  if (status === "offline") return "m-dot off";
-  return "m-dot warn";
-}
-
 function nodeNote(n: RemoteNodeView) {
   const parts = [...n.labels];
   if (n.version) parts.push(n.version);
@@ -61,9 +55,36 @@ type Draft = { id?: string; name: string; host: string; user: string; port: stri
 
 const empty = (): Draft => ({ name: "", host: "", user: "ubuntu", port: "22", note: "" });
 
+type Metrics = { cpu_percent: number; memory_used: number; memory_total: number; disk_used: number; disk_total: number; timestamp_ms: number };
+const gib = (n: number) => `${(n / 1024 ** 3).toFixed(1)} GiB`;
+function Resource(p: { label: string; used?: number | null; total?: number | null; value?: string }) {
+  const known = () => p.used != null && p.total != null && p.total > 0;
+  return <div class="machine-resource"><span>{p.label}</span><strong>{p.value ?? (known() ? `${Math.round(p.used! / p.total! * 100)}%` : "Unavailable")}</strong>
+    <Show when={known()}><small>{gib(p.used!)} / {gib(p.total!)}</small></Show></div>;
+}
+function FleetRow(p: { node?: RemoteNodeView; core?: Metrics; live?: boolean }) {
+  const [open, setOpen] = createSignal(false);
+  const memory = () => p.node ? (p.node.mem_total_bytes != null && p.node.mem_available_bytes != null ? p.node.mem_total_bytes - p.node.mem_available_bytes : undefined) : p.core?.memory_used;
+  const disk = () => p.node ? (p.node.disk_total_bytes != null && p.node.disk_available_bytes != null ? p.node.disk_total_bytes - p.node.disk_available_bytes : undefined) : p.core?.disk_used;
+  return <div class="p-acc-wrap"><button class="s-row p-acc-btn" aria-expanded={open()} onClick={() => setOpen(!open())}>
+    <Show when={p.node} fallback={<Ic.CoreServerIcon size={18} />}><Ic.ComputeNodeIcon size={18} /></Show>
+    <div class="s-row-text"><div class="s-row-title">{p.node?.id ?? "Core"}</div><div class="s-row-desc">{p.node ? `${p.node.status}${p.node.cordoned ? " · Cordoned" : ""}` : p.live ? "Live · Control plane" : p.core ? "Disconnected · Last snapshot" : "Connecting · Control plane"}</div></div>
+    <Show when={p.node?.active_jobs != null}><span class="s-row-desc">{p.node!.active_jobs} active</span></Show>
+    <span class={`chev p-acc-chev ${open() ? "open" : ""}`}>›</span></button>
+    <Show when={open()}><div class="p-acc-body"><div class="machine-resources">
+      <Resource label="CPU" value={p.node ? (p.node.cpu_total != null ? `${p.node.cpu_total} cores` : "Unavailable") : p.core ? `${Math.round(p.core.cpu_percent)}%` : "Unavailable"} />
+      <Resource label="Memory" used={memory()} total={p.node?.mem_total_bytes ?? p.core?.memory_total} />
+      <Resource label="Disk" used={disk()} total={p.node?.disk_total_bytes ?? p.core?.disk_total} />
+    </div><p class="s-row-desc">{p.node ? "Heartbeat snapshot · CPU load and GPU metrics are not reported by this node." : p.live ? "Streaming live" : "Live stream unavailable · reconnecting"}</p>
+    <Show when={p.node}><div class="p-detail-meta"><span>{p.node!.base_url}</span><span>{nodeNote(p.node!)}</span><span>{p.node!.last_seen ? `Last seen ${new Date(p.node!.last_seen!).toLocaleTimeString()}` : "No heartbeat received"}</span></div></Show>
+    </div></Show></div>;
+}
+
 export function Machines() {
   const [list, setList] = createStore<Machine[]>([...MACHINES.map((m) => ({ ...m })), ...loadCustom()]);
   const [draft, setDraft] = createSignal<Draft | null>(null);
+  const [core, setCore] = createSignal<Metrics>();
+  const [live, setLive] = createSignal(false);
   const [pub, setPub] = createSignal("");
   const [copied, setCopied] = createSignal(false);
   const [nodes, setNodes] = createSignal<RemoteNodeView[] | null>(null);
@@ -83,6 +104,32 @@ export function Machines() {
     void readPalomaPub().then(setPub);
     if (isConnected()) void refresh();
     onCleanup(pollWhileVisible(() => (isConnected() ? refresh() : undefined), 15000));
+  });
+
+  onMount(() => {
+    let socket: WebSocket | undefined;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    let stopped = false;
+    const connect = () => {
+      if (stopped || !isConnected() || document.hidden || (socket && socket.readyState < WebSocket.CLOSING)) return;
+      const url = new URL(getApiUrl());
+      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+      url.pathname = `${url.pathname.replace(/\/$/, "")}/api/monitoring/ws`;
+      socket = new WebSocket(url, ["sandboxed", `jwt.${getJwt()}`]);
+      socket.onmessage = event => {
+        try {
+          const data = JSON.parse(event.data);
+          const sample = data.type === "history" ? data.history?.at(-1) : data;
+          if (sample && Number.isFinite(sample.cpu_percent) && Number.isFinite(sample.timestamp_ms)) { setCore(sample); setLive(true); }
+        } catch { /* Ignore non-metric frames. */ }
+      };
+      socket.onclose = () => { setLive(false); if (!stopped && !document.hidden) retry = setTimeout(connect, 5000); };
+      socket.onerror = () => socket?.close();
+    };
+    const visibility = () => { clearTimeout(retry); if (document.hidden) { socket?.close(); setLive(false); } else connect(); };
+    connect();
+    document.addEventListener("visibilitychange", visibility);
+    onCleanup(() => { stopped = true; clearTimeout(retry); socket?.close(); document.removeEventListener("visibilitychange", visibility); });
   });
 
   const save = () => {
@@ -185,40 +232,22 @@ export function Machines() {
       </div>
       <p class="s-lead">
         {isConnected()
-          ? "Live sandboxed.sh fleet, refreshed every 15s."
+          ? "Core metrics stream live. Node heartbeats refresh every 15 seconds."
           : "New Agent runs on one of these over Paloma SSH. Connect a backend in Settings to see the live fleet."}
       </p>
 
-      <div class="m-list">
+      <div class="m-list s-card">
         <div class="m-row">
-          <span class="m-dot on" title="This computer" />
+          <Ic.LaptopIcon size={18} />
           <div class="m-text">
             <div class="m-name">{MACHINES[0].name}</div>
-            <div class="m-meta">{target(MACHINES[0])}</div>
-            <div class="m-note">{MACHINES[0].note}</div>
+            <div class="s-row-desc">This computer · Metrics unavailable</div>
           </div>
         </div>
 
         <Show when={isConnected()}>
-          <For each={nodes() ?? []}>
-            {(n) => (
-              <div class={`m-row ${n.cordoned ? "cordoned" : ""}`}>
-                <span class={dotClass(n.status)} title={n.status} />
-                <div class="m-text">
-                  <div class="m-name">
-                    {n.id}
-                    <Show when={n.cordoned}>
-                      <span class="m-tag">cordoned</span>
-                    </Show>
-                  </div>
-                  <div class="m-meta">{n.base_url}</div>
-                  <Show when={nodeNote(n)}>
-                    <div class="m-note">{nodeNote(n)}</div>
-                  </Show>
-                </div>
-              </div>
-            )}
-          </For>
+          <FleetRow core={core()} live={live()} />
+          <For each={(nodes() ?? []).map(n => n.id)}>{id => <FleetRow node={nodes()?.find(n => n.id === id)} />}</For>
           <Show when={nodes()?.length === 0}>
             <div class="m-note" style={{ padding: "6px 8px" }}>No remote nodes registered.</div>
           </Show>

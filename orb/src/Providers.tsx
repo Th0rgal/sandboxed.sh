@@ -1,3 +1,4 @@
+import { ProviderLogo } from "./ProviderLogo";
 import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { createStore, produce } from "solid-js/store";
@@ -346,15 +347,14 @@ function cliProxyReconnectable(a: AIProvider): boolean {
   return CLIPROXY_LOGIN_TYPES.has(a.provider_type);
 }
 
-function UsageBars(p: { usage: ProviderUsage }) {
-  const u = p.usage;
+function UsageSummary(p: { usage: ProviderUsage }) {
   const windows = createMemo(() => {
     const out: { label: string; used: number }[] = [];
-    if (u.unified_5h_utilization != null) out.push({ label: "5h", used: u.unified_5h_utilization });
-    if (u.unified_7d_utilization != null) out.push({ label: "7d", used: u.unified_7d_utilization });
+    if (p.usage.unified_5h_utilization != null) out.push({ label: "5h", used: p.usage.unified_5h_utilization });
+    if (p.usage.unified_7d_utilization != null) out.push({ label: "7d", used: p.usage.unified_7d_utilization });
     return out;
   });
-  // Collapsed: one line, each window as a tiny bar with its percentage.
+  // Keep the account summary compact; detailed meters live in the expansion.
   return (
     <Show when={windows().length > 0}>
       <div class="p-usage compact">
@@ -362,12 +362,6 @@ function UsageBars(p: { usage: ProviderUsage }) {
           {(w) => (
             <span class="p-usage-chip" title={`${w.label} window: ${Math.round(w.used * 100)}% used`}>
               <span class="p-usage-label">{w.label}</span>
-              <span class="p-bar">
-                <span
-                  class={`p-bar-fill ${w.used > 0.9 ? "hot" : w.used > 0.7 ? "warm" : ""}`}
-                  style={{ width: `${Math.min(100, Math.round(w.used * 100))}%` }}
-                />
-              </span>
               <span class="p-usage-pct">{Math.round(w.used * 100)}%</span>
             </span>
           )}
@@ -624,7 +618,8 @@ function LiveRow(p: { a: AIProvider; usage?: ProviderUsage; onReconnect: () => v
   const [open, setOpen] = createSignal(false);
   return (
     <div class="p-acc-wrap">
-      <button class="s-row p-acc p-acc-btn" onClick={() => setOpen(!open())}>
+      <button class="s-row p-acc p-acc-btn" aria-expanded={open()} onClick={() => setOpen(!open())}>
+        <ProviderLogo type={a.provider_type} name={a.name} />
         <div class="s-row-text">
           <div class="s-row-title">
             {a.name}
@@ -637,10 +632,10 @@ function LiveRow(p: { a: AIProvider; usage?: ProviderUsage; onReconnect: () => v
               {a.account_email}
             </Show>
           </div>
-          <Show when={!open() && p.usage && !p.usage!.error}>
-            <UsageBars usage={p.usage!} />
-          </Show>
         </div>
+        <Show when={!open() && p.usage && !p.usage!.error}>
+          <UsageSummary usage={p.usage!} />
+        </Show>
         <span class={`chev p-acc-chev ${open() ? "open" : ""}`}>›</span>
       </button>
       <Show when={open()}>
@@ -666,6 +661,7 @@ function AccountRow(p: { a: Account; onSignIn: () => void; onToggle: () => void;
   const st = a.status === "connected" ? "Connected" : a.status === "needs_reauth" ? "Reconnect" : "Not configured";
   return (
     <div class="s-row p-acc">
+      <ProviderLogo type={a.type} name={a.name} />
       <div class="s-row-text">
         <div class="s-row-title">
           {a.name}
