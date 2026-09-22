@@ -149,12 +149,12 @@ test("a refused clipboard write is reported, not swallowed", async ({ page }) =>
 
 // ---------------------------------------------------------------- feature 2
 
-test("reference subfolder: hover reveals +, whose menu creates files and folders only", async ({ page }) => {
+test("reference subfolder: hover reveals +, whose menu creates agents, crons and files", async ({ page }) => {
   const { writes, posts } = await setup(page);
   await expandProject(page);
 
   const folder = page.locator(".row.folder", { hasText: "reference" });
-  const plus = folder.getByRole("button", { name: "New file in reference" });
+  const plus = folder.getByRole("button", { name: "Folder actions for reference" });
   // Hidden until the row is hovered or focused.
   expect(await plus.evaluate((el) => getComputedStyle(el).opacity)).toBe("0");
   await folder.hover();
@@ -164,9 +164,7 @@ test("reference subfolder: hover reveals +, whose menu creates files and folders
 
   await plus.click();
   const menu = page.getByRole("menu");
-  await expect(menu.getByRole("menuitem")).toHaveText(["New file", "New folder"]);
-  await expect(menu.getByRole("menuitem", { name: "New agent" })).toHaveCount(0);
-  await expect(menu.getByRole("menuitem", { name: /New cron/ })).toHaveCount(0);
+  await expect(menu.getByRole("menuitem")).toHaveText(["New agent", "New cron", "New file", "New folder"]);
 
   await menu.getByRole("menuitem", { name: "New file" }).click();
   await page.getByLabel("File name").fill("spec");
@@ -212,25 +210,21 @@ test("a created reference file opens in Markdown, autosaves, and toggles with Cm
   await expect(toggle).toHaveText("Edit");
 });
 
-test("the project root offers New file too, alongside the project-level actions", async ({ page }) => {
+test("the project root offers agents and crons first and never file creation", async ({ page }) => {
   const { writes } = await setup(page);
   await page.getByRole("button", { name: "Project actions for Test" }).click();
-
   const menu = page.getByRole("menu");
   await expect(menu.getByRole("menuitem")).toHaveText([
-    "New file", "New folder", "New agent", "New cron", "Project settings", "Rename", "Archive",
+    "New agent", "New cron", "New folder", "Project settings", "Rename", "Archive",
   ]);
-
-  await menu.getByRole("menuitem", { name: "New file" }).click();
-  await page.getByLabel("File name").fill("README");
-  await page.getByRole("button", { name: "Create" }).click();
-  await expect.poll(() => writes.length).toBe(1);
-  expect(writes[0].path).toBe("README.md");
+  await expect(menu.getByRole("menuitem", { name: "New file" })).toHaveCount(0);
+  expect(writes).toEqual([]);
 });
 
 test("new file: traversal is refused and an existing name is never overwritten", async ({ page }) => {
-  const { writes } = await setup(page, { entries: [{ name: "notes.md", kind: "file" }] });
-  await page.getByRole("button", { name: "Project actions for Test" }).click();
+  const { writes } = await setup(page, { entries: [{ name: "reference", kind: "dir" }, { name: "notes.md", kind: "file" }] });
+  await expandProject(page);
+  await page.getByRole("button", { name: "Folder actions for reference" }).click();
   await page.getByRole("menuitem", { name: "New file" }).click();
 
   const input = page.getByLabel("File name");
@@ -250,7 +244,7 @@ test("new file: traversal is refused and an existing name is never overwritten",
   await input.fill("plan");
   await create.click();
   await expect.poll(() => writes.length).toBe(1);
-  expect(writes[0].path).toBe("plan.md");
+  expect(writes[0].path).toBe("reference/plan.md");
 });
 
 // ---------------------------------------------------------------- feature 3
