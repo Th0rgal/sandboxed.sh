@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod local_agents;
+mod machine_metrics;
 mod voice;
 
 use tauri::{Manager, Theme, WebviewWindow};
@@ -81,6 +82,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             paloma_ssh_pubkey,
+            machine_metrics::local_machine_metrics,
             open_url,
             set_window_theme,
             voice::voice_capability,

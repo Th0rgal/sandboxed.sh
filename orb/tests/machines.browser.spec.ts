@@ -63,3 +63,31 @@ test("collapsed providers show right-aligned used percentages and local monochro
   await row.click();
   await expect(row).toHaveAttribute("aria-expanded", "true");
 });
+
+test("local machine is separate and shows native memory consumers", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("orb-theme", "dark");
+    (window as any).__TAURI__ = { core: { invoke: async (name: string) => {
+      if (name === "local_machine_metrics") return {
+        cpu_percent: 12, memory_used: 32 * 1024 ** 3, memory_total: 64 * 1024 ** 3,
+        disk_used: 200 * 1024 ** 3, disk_total: 1024 ** 4,
+        consumers: [
+          { label: "Orb · native process tree", memory: 256 * 1024 ** 2, processes: 1 },
+          { label: "Cohere · speech to text", memory: 4 * 1024 ** 3, processes: 1 },
+          { label: "Local harnesses · started by Orb", memory: 0, processes: 0 },
+        ],
+      };
+      if (name === "local_agents_scan") return [];
+      return null;
+    } } };
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Machines", exact: true }).click();
+  await page.getByRole("button", { name: /This Mac/ }).click();
+  const local = page.locator(".local-machine");
+  await expect(local.getByText("Cohere · speech to text")).toBeVisible();
+  await expect(local.getByText("6.3%", { exact: true })).toBeVisible();
+  await expect(local.getByText("Not running", { exact: true })).toBeVisible();
+  await expect(local.getByRole("meter", { name: "Memory used" })).toHaveAttribute("aria-valuenow", "50");
+  await page.screenshot({ path: "/tmp/orb-local-machine.png" });
+});

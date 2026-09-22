@@ -1,3 +1,4 @@
+import { LocalMachine } from "./LocalMachine";
 import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
 import { pollWhileVisible } from "./poll";
 import { createStore, produce } from "solid-js/store";
@@ -60,7 +61,7 @@ const gib = (n: number) => `${(n / 1024 ** 3).toFixed(1)} GiB`;
 function Resource(p: { label: string; used?: number | null; total?: number | null; value?: string }) {
   const known = () => p.used != null && p.total != null && p.total > 0;
   return <div class="machine-resource"><span>{p.label}</span><strong>{p.value ?? (known() ? `${Math.round(p.used! / p.total! * 100)}%` : "Unavailable")}</strong>
-    <Show when={known()}><small>{gib(p.used!)} / {gib(p.total!)}</small></Show></div>;
+    <Show when={known()}><small>{gib(p.used!)} / {gib(p.total!)}</small><div class="resource-track" role="meter" aria-label={`${p.label} used`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(p.used! / p.total! * 100)}><i style={{ width: `${Math.min(100, Math.max(0, p.used! / p.total! * 100))}%` }} /></div></Show></div>;
 }
 function FleetRow(p: { node?: RemoteNodeView; core?: Metrics; live?: boolean }) {
   const [open, setOpen] = createSignal(false);
@@ -236,15 +237,10 @@ export function Machines() {
           : "New Agent runs on one of these over Paloma SSH. Connect a backend in Settings to see the live fleet."}
       </p>
 
+      <h3 class="s-section-title">Local</h3>
+      <LocalMachine />
+      <h3 class="s-section-title">Remote</h3>
       <div class="m-list s-card">
-        <div class="m-row">
-          <Ic.LaptopIcon size={18} />
-          <div class="m-text">
-            <div class="m-name">{MACHINES[0].name}</div>
-            <div class="s-row-desc">This computer · Metrics unavailable</div>
-          </div>
-        </div>
-
         <Show when={isConnected()}>
           <FleetRow core={core()} live={live()} />
           <For each={(nodes() ?? []).map(n => n.id)}>{id => <FleetRow node={nodes()?.find(n => n.id === id)} />}</For>

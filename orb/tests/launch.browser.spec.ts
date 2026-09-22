@@ -85,10 +85,17 @@ test("slow local POST shows prompt immediately; accepted mission opens before sl
  // The working indicator is the prompt itself now, and it must not move when
  // the user has asked for reduced motion.
  await page.emulateMedia({reducedMotion:"reduce"});await expect(page.locator(".user.pending")).toHaveCSS("animation-name","none");
+ const previewBox = await page.locator(".launch-preview .user").boundingBox();
  await page.waitForTimeout(1000);state.releasePost();await expect(page.getByPlaceholder("Send follow-up")).toBeVisible({timeout:1500});
- await expect(page.locator(".launch-status")).toContainText("Queued on Core");await expectGoalTurn(page,".user");
+ await expectGoalTurn(page,".user");
+ await expect(page.locator(".sk-transcript")).toHaveCount(0);
+ await expect(page.getByPlaceholder("Send follow-up")).toBeVisible();
  expect(state.posts[0]).toMatchObject({backend:"grok",model_override:"grok-4.6",prompt,title:"Check remote startup without losing this…"});expect(state.posts[0]).not.toHaveProperty("remote_node_id");expect(state.posts[0]).not.toHaveProperty("remote_command");expect(state.posts[0].idempotency_key).toBeTruthy();
+ const acceptedBox = await page.locator(".user").boundingBox();
+ expect(Math.abs(acceptedBox!.y - previewBox!.y)).toBeLessThan(3);
+ expect(Math.abs(acceptedBox!.x - previewBox!.x)).toBeLessThan(3);
  state.releaseHistory();await expectGoalTurn(page,".user");
+ await expect(page.locator(".new-agent")).toHaveCount(0);
  const timings=await page.evaluate(()=>(window as any).launchTiming);console.log("LAUNCH_TIMING",JSON.stringify(timings));expect(timings.optimistic).toBeLessThan(500);expect(timings.acceptedView).toBeLessThan(500);writeFileSync("test-results/launch-timings.json",JSON.stringify(timings,null,2));
 });
 

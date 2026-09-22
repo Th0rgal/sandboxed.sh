@@ -1218,9 +1218,10 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
   animation: pop .1s ease-out;
 }
 
-.new-agent.launching { justify-content: flex-start; }
-.launching .na-meta { pointer-events: none; opacity: .6; }
-.launch-preview .user { margin-top: 18px; }
+.new-agent.launching { justify-content: flex-start; padding: 16px 24px 24px; overflow-y: auto; scrollbar-gutter: stable both-edges; }
+.new-agent.launching .new-inner { max-width: var(--col); }
+.launching .na-meta { display: none; }
+.launch-preview .user { margin-top: 0; }
 .launch-status { padding: 12px 10px; color: var(--fg-3); font-size: 12px; }
 .launch-status > div { display: flex; align-items: center; gap: 8px; }
 .launch-status p { margin: 5px 0 0; font-size: 11px; }
@@ -1475,3 +1476,20 @@ button.fork-trigger:hover { color: var(--fg); }
 
 .provider-logo { display: grid; place-items: center; width: 22px; height: 22px; flex: none; color: var(--fg-2); }
 .provider-logo > span { display: block; width: 21px; height: 21px; background: currentColor; mask-size: contain; mask-repeat: no-repeat; mask-position: center; -webkit-mask-size: contain; -webkit-mask-repeat: no-repeat; -webkit-mask-position: center; }
+
+.local-machine { margin-bottom: 24px; }
+.s-section-title { font-size: 12px; font-weight: 500; color: var(--fg-3); margin: 20px 0 8px; }
+.local-consumers { border-top: 1px solid var(--stroke-soft); padding-top: 6px; }
+.local-consumer { display: grid; grid-template-columns: minmax(0, 1fr) auto 48px; gap: 14px; padding: 7px 0; font-size: 12px; color: var(--fg-2); font-variant-numeric: tabular-nums; }
+.local-consumer > :not(:first-child) { text-align: right; color: var(--fg-3); }
+.local-metrics-note { font-size: 11px; line-height: 1.5; margin-bottom: 0; }
+
+.resource-breakdown { margin: 6px 0 14px; }
+.resource-breakdown-head, .resource-breakdown-legend { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--fg-2); font-variant-numeric: tabular-nums; }
+.resource-breakdown-legend { margin-top: 8px; font-size: 11px; color: var(--fg-3); }
+.resource-track { height: 5px; background: var(--stroke); border-radius: 3px; overflow: hidden; margin-top: 10px; }
+.resource-track i { display: block; height: 100%; background: #92968d; border-radius: inherit; transition: width .25s ease; }
+.consumer-label { display: flex; align-items: center; gap: 8px; }
+.consumer-label i { width: 8px; height: 8px; border-radius: 2px; background: #92968d; flex: none; }
+.local-consumer:nth-child(2) .consumer-label i { background: #a397bc; }
+.local-consumer:nth-child(3) .consumer-label i { background: #849ca4; }

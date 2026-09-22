@@ -497,6 +497,17 @@ impl Default for VoiceState {
 }
 
 impl VoiceState {
+    pub fn worker_pid(&self) -> Option<u32> {
+        self.0
+            .child
+            .try_lock()
+            .ok()?
+            .as_ref()?
+            .try_lock()
+            .ok()
+            .map(|c| c.id())
+    }
+
     pub fn new() -> Self {
         let idle = std::env::var("ORB_VOICE_IDLE_SECS")
             .ok()

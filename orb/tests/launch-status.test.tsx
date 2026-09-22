@@ -37,3 +37,13 @@ it("does not allocate a routine running banner above an active transcript", () =
   const { container } = render(() => <LaunchStatus destination="Spark" mission={remote({ node_state: "running" })} activity />);
   expect(container.querySelector(".launch-status")).toBeNull();
 });
+
+
+it("uses the transcript failure as the sole error, retaining a banner when no error arrived", () => {
+  const [inTranscript, setInTranscript] = createSignal(false);
+  const mission = { id: "failed", status: "failed", terminal_reason: "rate limited" } as Mission;
+  const { container } = render(() => <LaunchStatus destination="Core" mission={mission} failureInTranscript={inTranscript()} />);
+  expect(container.textContent).toContain("Failed on Core");
+  setInTranscript(true);
+  expect(container.querySelector(".launch-status")).toBeNull();
+});

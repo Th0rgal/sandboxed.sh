@@ -1,3 +1,15 @@
+import { Show, createSignal, onCleanup, onMount } from "solid-js";
+
+/** Fast history reads never flash placeholder content. New missions skip this. */
+export function DelayedTranscriptSkeleton() {
+  const [visible, setVisible] = createSignal(false);
+  onMount(() => {
+    const timer = setTimeout(() => setVisible(true), 300);
+    onCleanup(() => clearTimeout(timer));
+  });
+  return <Show when={visible()}><TranscriptSkeleton /></Show>;
+}
+
 /** Placeholders that reuse live row metrics so the dock does not jump when
  * the real payload arrives. */
 export function TranscriptSkeleton() {

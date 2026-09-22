@@ -22,7 +22,8 @@ import { Transcript, UserTurn, applyStreamEvent, type StreamItem } from "./Trans
 import { cacheRemember, cacheRecents } from "./pageCache";
 import { DEFAULT_EFFORT_LABEL, effortLabel, harnessSupportsEffort, normalizeEffort, supportedEfforts } from "./effort";
 import { loadTranscript, peekReadyTranscript, peekTranscriptHeight, prefetchTranscript, putTranscript, putTranscriptHeight, putTranscriptItems } from "./missionCache";
-import { TranscriptSkeleton } from "./Skeleton";
+import { DelayedTranscriptSkeleton } from "./Skeleton";
+import { visibleTranscript } from "./transcriptModel";
 import { mergeById, pollWhileVisible } from "./poll";
 import { LiveProjectsSection, ProjectFileView } from "./ProjectFiles";
 import { ProjectSettings } from "./ProjectSettings";
@@ -2155,7 +2156,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
    */
   const pending = () => {
     const phase = missionPhase(mission(), activity());
-    return phaseIsQuiet(phase) && phase.moving && !activity();
+    return (phaseIsQuiet(phase) || phase.label === "Queued") && phase.moving && !activity();
   };
   const phaseLabel = () => missionPhase(mission(), activity()).label;
 
@@ -2249,7 +2250,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
       >
         <div class="col" style={peekTranscriptHeight(p.id) && awaiting() ? { "min-height": `${peekTranscriptHeight(p.id)}px` } : undefined}>
           <Show
-            when={!awaiting()}
+            when={!awaiting() || !!receipt || items().length > 0}
             fallback={
               <>
                 <Show when={receipt}>
@@ -2263,11 +2264,11 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
                     </>
                   )}
                 </Show>
-                <TranscriptSkeleton />
+                <DelayedTranscriptSkeleton />
               </>
             }
           >
-            <LaunchStatus destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={activity()} />
+            <LaunchStatus destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={activity()} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
             <Transcript items={viewItems().filter(i => i.kind !== "user" || !i.queued)} pending={pending()} />
             <Show when={pending()}>
               <MissionPending destination={missionDestination(mission(), receipt)} label={phaseLabel()} />
