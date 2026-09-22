@@ -3,7 +3,7 @@ import { copyText } from "./clipboard";
 import { remoteLog } from "./remoteLog";
 import { ErrorNotice } from "./ErrorNotice";
 import { forkContext } from "./forkContext";
-import { For, Show, createSignal, createEffect, createMemo, useContext } from "solid-js";
+import { For, Show, createSignal, createEffect, createMemo, useContext, onCleanup } from "solid-js";
 import * as Ic from "./icons";
 import { MdView } from "./Markdown";
 import { createStore, reconcile } from "solid-js/store";
@@ -273,7 +273,37 @@ export function Transcript(p: { items: StreamItem[]; pending?: boolean; onReuse?
 }
 
 function AssistantText(p: { text: string; live?: boolean }) {
-  const references=useContext(FileReferenceContext);
+  const references = useContext(FileReferenceContext);
   const content = createMemo(() => remoteLog(p.text));
-  return <><Show when={!p.live} fallback={<FileReferenceContext.Provider value={undefined}><MdView text={content().text} compact /></FileReferenceContext.Provider>}><FileReferenceContext.Provider value={references}><MdView text={content().text} compact /></FileReferenceContext.Provider></Show><Show when={content().details}><details class="legacy-log"><summary>Original execution log</summary><pre>{content().details}</pre></details></Show></>;
+  const [copied, setCopied] = createSignal(false);
+  const [copyError, setCopyError] = createSignal("");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  createEffect(() => { p.text; setCopied(false); setCopyError(""); clearTimeout(timer); });
+  onCleanup(() => clearTimeout(timer));
+  const copy = async () => {
+    const text = content().text;
+    try {
+      await copyText(text);
+      if (text !== content().text) return;
+      setCopied(true); setCopyError(""); clearTimeout(timer);
+      timer = setTimeout(() => setCopied(false), 2000);
+    } catch (error) {
+      if (text === content().text) setCopyError(error instanceof Error ? error.message : String(error));
+    }
+  };
+  return <>
+    <Show when={!p.live} fallback={<FileReferenceContext.Provider value={undefined}><MdView text={content().text} compact /></FileReferenceContext.Provider>}>
+      <FileReferenceContext.Provider value={references}><MdView text={content().text} compact /></FileReferenceContext.Provider>
+    </Show>
+    <Show when={content().details}><details class="legacy-log"><summary>Original execution log</summary><pre>{content().details}</pre></details></Show>
+    <Show when={!p.live && content().text.trim()}>
+      <div class="response-actions">
+        <button class="icon-btn" aria-label={copied() ? "Response copied" : "Copy response"} title={copied() ? "Copied" : "Copy response"} onClick={() => void copy()}>
+          <Show when={copied()} fallback={<Ic.CopyIcon size={14} />}><Ic.CheckIcon size={14} /></Show>
+        </button>
+        <span class="sr-only" role="status">{copied() ? "Response copied" : ""}</span>
+        <Show when={copyError()}><span class="response-copy-error" role="status">{copyError()}</span></Show>
+      </div>
+    </Show>
+  </>;
 }

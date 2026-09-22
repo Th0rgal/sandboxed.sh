@@ -70,3 +70,19 @@ describe("parseMarkdown", () => {
     expect(container.textContent).not.toContain("|---|");
   });
 });
+
+it("keeps quote separators and paragraphs in one blockquote",()=>{
+ const text="> Salut **équipe**.\n>\n> Le rapport est prêt.\n>\n> Merci.";
+ const {container}=render(()=><MdView text={text}/>);
+ expect(container.querySelectorAll('blockquote')).toHaveLength(1);
+ expect(container.querySelectorAll('blockquote p')).toHaveLength(3);
+ expect(container.textContent).not.toContain('>');
+ expect(container.querySelector('blockquote strong')?.textContent).toBe('équipe');
+});
+it("renders nested quotes, lists and fenced code within a quote",()=>{
+ const {container}=render(()=><MdView text={'> Outer\n>\n> > Inner\n>\n> - one\n> - two\n>\n> ```txt\n> code\n> ```\n\nOutside'}/>);
+ expect(container.querySelectorAll('blockquote')).toHaveLength(2);
+ expect(container.querySelectorAll('blockquote li')).toHaveLength(2);
+ expect(container.querySelector('blockquote pre')?.textContent).toBe('code');
+ expect(container.querySelector(':scope > .md > p')?.textContent).toBe('Outside');
+});

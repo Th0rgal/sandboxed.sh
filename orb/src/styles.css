@@ -1617,3 +1617,8 @@ button.fork-trigger:hover { color: var(--fg); }
 .file-header .file-actions button { display:flex;align-items:center;gap:6px;padding:6px 8px; }
 .file-header .file-actions button:disabled { opacity:.35; }
 .file-header .file-tab { max-width:260px; }
+
+.response-actions { display:flex;align-items:center;gap:8px;margin:2px 0 12px;min-height:24px; }
+.response-actions .icon-btn { color:var(--fg-3); }
+.response-copy-error { color:var(--fg-2);font-size:12px; }
+.md blockquote > .md > :last-child { margin-bottom:0; }

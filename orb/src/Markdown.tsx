@@ -127,9 +127,12 @@ export function parseMarkdown(src: string): Block[] {
       out.push({ t: "ul", items });
       continue;
     }
-    if (line.startsWith("> ")) {
-      out.push({ t: "quote", text: line.slice(2) });
-      i++;
+    if (/^ {0,3}>/.test(line)) {
+      const quoted: string[] = [];
+      while (i < lines.length && /^ {0,3}>/.test(lines[i])) {
+        quoted.push(lines[i++].replace(/^ {0,3}>[ \t]?/, ""));
+      }
+      out.push({ t: "quote", text: quoted.join("\n") });
       continue;
     }
     if (!line.trim()) {
@@ -150,7 +153,7 @@ export function parseMarkdown(src: string): Block[] {
       !/^#{1,6}\s/.test(lines[i]) &&
       !/^[-*]\s+/.test(lines[i]) &&
       !lines[i].startsWith("```") &&
-      !lines[i].startsWith("> ") &&
+      !/^ {0,3}>/.test(lines[i]) &&
       !readTable(lines, i)
     ) {
       buf.push(lines[i++]);
@@ -205,7 +208,7 @@ export function MdView(p: { text: string; compact?: boolean }) {
               <code>{b.text}</code>
             </pre>
           ) : b.t === "quote" ? (
-            <blockquote>{inline(b.text)}</blockquote>
+            <blockquote><MdView text={b.text} compact={p.compact} /></blockquote>
           ) : b.t === "table" ? (
             <div class="md-table-wrap">
               <table>
