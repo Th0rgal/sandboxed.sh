@@ -1,4 +1,6 @@
 import { hasNativePicker, pickNativeFiles, transferFile, prepareUploads, uploadToken, type UploadedFile, type UploadSource } from "./uploads";
+import { readComposerDraft, saveComposerDraft } from "./composerDrafts";
+import { readImage, imagePrompt, stageLocalImages, stageRemoteImages, IMAGE_COUNT, type DraftImage } from "./imageAttachments";
 import { FilePanelProvider, FilePanelButton } from "./FilePanel";
 import { ErrorNotice } from "./ErrorNotice";
 import { MissionFailure, LaunchStatus, MissionPending, missionPhase, phaseIsQuiet, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, launchRefusal, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, missionSettingsIdle, dockModelLabel, type LaunchReceipt, type LaunchRefusal, type RemoteSupport } from "./missionLaunch";
@@ -71,6 +73,7 @@ import {
   ApiError,
   MessageRejectedError,
   connectionVersion,
+  getApiUrl,
   updateMissionSettings,
   type Mission,
   type ProjectSummary,
@@ -257,7 +260,7 @@ export function Composer(p: {
   revision?: { text: string };
   placeholder: string;
   busy: boolean;
-  onSend: (t: string) => void | boolean | Promise<void | boolean>;
+  onSend: (t: string, images: DraftImage[]) => void | boolean | Promise<void | boolean>;
   onStop: () => void;
   autofocus?: boolean;
   tall?: boolean;
@@ -314,6 +317,42 @@ export function Composer(p: {
     try { const files = await pickNativeFiles(); if (!disposed && scope === p.scope && selection === uploadTarget()) await attachSources(files); }
     catch (error) { setUploadError(error instanceof Error ? error.message : String(error)); }
   };
+  const [images, setImages] = createSignal<DraftImage[]>([]);
+  const [draftReady, setDraftReady] = createSignal(false);
+  createEffect(on(() => p.scope, (scope, previous) => {
+    if (previous !== undefined && previous !== scope) { setText(""); setImages([]); uploaded = []; }
+    setDraftReady(false);
+    if (!scope) { setDraftReady(true); return; }
+    let current=true;
+    onCleanup(() => { current=false; });
+    void readComposerDraft(scope).then(draft => {
+      if (current && draft && !text() && !images().length) {
+        uploaded = (draft.uploads ?? []).map(file => ({...file, connection: file.endpoint === getApiUrl() ? connectionVersion() : -1}));
+        setText(draft.text);setImages(draft.images);
+        queueMicrotask(() => { if (ta?.isConnected) { ta.value=draft.text; resize(); } });
+      }
+    }).catch(() => {}).finally(() => { if (current) setDraftReady(true); });
+  }));
+  createEffect(() => {
+    const scope=p.scope;
+    if (draftReady() && scope) void saveComposerDraft(scope,{text:text(),images:images(),uploads:uploaded.map(file => ({...file, source:{name:file.source.name,localPath:file.source.localPath}}))}).catch(() => {});
+  });
+  const [imageError, setImageError] = createSignal<string | null>(null);
+  const [readingImages, setReadingImages] = createSignal(false);
+  const pasteImages = async (event: ClipboardEvent) => {
+    const files = Array.from(event.clipboardData?.files ?? []).filter(file => file.type.startsWith("image/"));
+    if (!files.length) return;
+    event.preventDefault();
+    if (readingImages()) return;
+    setImageError(null);
+    if (images().length + files.length > IMAGE_COUNT) { setImageError(`Attach up to ${IMAGE_COUNT} images at a time.`); return; }
+    const scope = p.scope;
+    setReadingImages(true);
+    try { const next = await Promise.all(files.map(readImage)); if (scope === p.scope) setImages(previous => [...previous, ...next]); }
+    catch (e) { setImageError(e instanceof Error ? e.message : String(e)); }
+    finally { setReadingImages(false); }
+  };
+  createEffect(on(() => p.scope, () => { setImages([]); setImageError(null); }, {defer:true}));
   // Local voice input (macOS): dictated text lands at the caret, never sends.
   const [voiceActive, setVoiceActive] = createSignal(false);
   ensureVoiceProbe();
@@ -421,7 +460,7 @@ export function Composer(p: {
   const [sending, setSending] = createSignal(false);
   const send = async () => {
     let payload = draftOf(text());
-    if (!payload || sending() || uploading()) return;
+    if ((!payload && !images().length) || sending() || uploading() || readingImages()) return;
     setSending(true);
     try {
       // Typing can beat the initial catalog request. Resolve references before
@@ -436,10 +475,15 @@ export function Composer(p: {
       write(resolved.text);
       payload = draftOf(text());
       p.onAttachments?.(mentioned());
-      const accepted = await p.onSend(payload);
+      const sentImages = images();
+      const draftScope = p.scope;
+      const accepted = await p.onSend(payload || "Please look at the attached images.", sentImages);
       if (accepted !== false && draftOf(text()) === payload) {
         uploaded = [];
         setUploadError(null);
+        const remaining = images().filter(image => !sentImages.some(sent => sent.id === image.id));
+        if (draftScope) await saveComposerDraft(draftScope, {text:"",images:remaining}).catch(() => {});
+        setImages(remaining);
         setMode(null);
         setText("");
         ta.value = "";
@@ -689,8 +733,8 @@ export function Composer(p: {
   // beside it. A draft still sends — the backend queues it for the next turn.
   const sendBtn = (
     <div class="send-slot">
-      <Show when={text().trim() && !slash() && !voiceActive()}>
-        <button class="send" disabled={uploading() || sending()} onClick={send} title={p.busy ? "Queue for next turn" : "Send"}>
+      <Show when={(text().trim() || images().length) && !slash() && !voiceActive()}>
+        <button class="send" disabled={uploading() || sending() || readingImages()} onClick={send} title={p.busy ? "Queue for next turn" : "Send"}>
           <Ic.ArrowUpIcon size={14} />
         </button>
       </Show>
@@ -770,17 +814,20 @@ export function Composer(p: {
     </Show>
   );
   return (
-    <div class={`composer ${p.tall ? "tall" : ""} ${voiceActive() ? "voice-on" : ""} ${mode() ? "has-mode" : ""}`} data-mode={mode() ?? ""} onClick={() => !voiceActive() && ta.focus()}>
+    <div class={`composer ${p.tall || images().length ? "tall" : ""} ${voiceActive() ? "voice-on" : ""} ${mode() ? "has-mode" : ""}`} data-mode={mode() ?? ""} onClick={() => !voiceActive() && ta.focus()}>
       {plus}
       {slashMenu}
       {atMenu}
       <Show when={uploading()}><div class="composer-upload-status" role="status">Attaching file…</div></Show>
       <Show when={uploadError()}><div class="composer-upload-status error" role="alert">{uploadError()}</div></Show>
       <div class="composer-field">
+        <Show when={images().length}><div class="composer-images"><For each={images()}>{image => <div class="composer-image"><img src={image.dataUrl} alt="Attached image" /><button class="icon-btn" aria-label="Remove image" title="Remove image" onClick={e => { e.stopPropagation(); setImages(current => current.filter(item => item.id !== image.id)); }}><Ic.CloseIcon size={12}/></button></div>}</For></div></Show>
+        <Show when={imageError()}><span class="image-paste-error" role="alert">{imageError()}</span></Show>
         <Show when={mode() === "goal"}><ModeChip mode="goal" onClear={clearMode} /></Show>
         <Show when={mode()}><span class="mode-sep" aria-hidden="true" /></Show>
         <textarea
           ref={ta}
+          onPaste={event => void pasteImages(event)}
           rows={1}
           placeholder={mode() === "goal" ? "Describe the objective" : p.placeholder}
           onInput={(e) => {
@@ -854,7 +901,8 @@ export function Composer(p: {
 
 export default function App() {
   const [projects, setProjects] = createStore(structuredClone(seed));
-  const [selected, setSelected] = createSignal<string | null>("a1");
+  const [selected, setSelected] = createSignal<string | null>(localStorage.getItem("orb.selectedConversation") === "" ? null : localStorage.getItem("orb.selectedConversation") || "a1");
+  createEffect(() => { localStorage.setItem("orb.selectedConversation",selected() ?? ""); });
   const [collapsed, setCollapsed] = createStore<Record<string, boolean>>({});
   const [sidebar, setSidebar] = createSignal(!window.matchMedia("(max-width: 720px)").matches);
   const [sbWidth, setSbWidth] = createSignal(220);
@@ -891,7 +939,7 @@ export default function App() {
     if (id === "local") void refreshLocalAgents();
   };
   const [envOpen, setEnvOpen] = createSignal<"machine" | "project" | null>(null);
-  const [history, setHistory] = createSignal<(string | null)[]>(["a1"]);
+  const [history, setHistory] = createSignal<(string | null)[]>([selected()]);
   const [hIdx, setHIdx] = createSignal(0);
 
   const [plusFor, setPlusFor] = createSignal<string | null>(null);
@@ -1164,7 +1212,7 @@ export default function App() {
     }
     void refreshMissions();
   };
-  const launchLocal = async (typed: string, prompt: string, title: string, projectSlug: string | undefined, pick: HarnessPick) => {
+  const launchLocal = async (typed: string, prompt: string, title: string, projectSlug: string | undefined, pick: HarnessPick, images: DraftImage[]) => {
     if (!projectSlug) throw new Error("Choose a project before starting on this computer. Your draft is kept.");
     const rows = await refreshLocalAgents();
     const row = rows.find((item) => item.id === pick.backend && item.installed && item.path);
@@ -1172,9 +1220,10 @@ export default function App() {
     const plan = await materializeMentions(projectSlug, prompt, attachChips());
     const root = await localWorkspace(projectSlug);
     if (plan.files.length) await writeLocalFiles(root, plan.files);
-    const sent = bindWorkspace(plan.prompt, root);
+    const imagePaths = await stageLocalImages(root, images);
+    const sent = imagePrompt(bindWorkspace(plan.prompt, root), imagePaths);
     const effort = normalizeEffort(pick.effort, pick.backend);
-    const body = { title, prompt: typed, project: projectSlug, tags: folderTags(projectSlug), backend: pick.backend, model_override: pick.model, placement: "client" as const, ...(effort ? { model_effort: effort } : {}) };
+    const body = { title, prompt: imagePrompt(typed, imagePaths), project: projectSlug, tags: folderTags(projectSlug), backend: pick.backend, model_override: pick.model, placement: "client" as const, ...(effort ? { model_effort: effort } : {}) };
     const signature = JSON.stringify(body);
     if (launchAttempt?.signature !== signature) launchAttempt = { signature, key: crypto.randomUUID() };
     const m = await createMission({ ...body, idempotency_key: launchAttempt.key });
@@ -1185,12 +1234,12 @@ export default function App() {
     rememberLaunch(m.id, receipt);
     setMissions((prev) => [m, ...prev.filter((old) => old.id !== m.id)]);
     open(`m:${m.id}`);
-    await startLocal({ id: m.id, harness: pick.backend, bin: row.path, cwd: root, prompt: sent, model: pick.model });
+    await startLocal({ id: m.id, harness: pick.backend, bin: row.path, cwd: root, prompt: sent, model: pick.model, imagePaths });
     void finishLocal(m.id);
     void refreshMissions();
   };
 
-  const create = async (text: string) => {
+  const create = async (text: string, images: DraftImage[] = []) => {
     if (isConnected()) {
       if (creating()) return false;
       const goal = goalDraft(text);
@@ -1207,7 +1256,7 @@ export default function App() {
       try {
         if (!pick || !harnessChoices().some(c => c.backend.id === pick.backend && c.models.some(m => m.value === pick.model))) throw new Error("Choose an available harness and model before starting. Your draft is kept.");
         if (machine === "local") {
-          await launchLocal(text, prompt, title, projectSlug, pick);
+          await launchLocal(text, prompt, title, projectSlug, pick, images);
           return true;
         }
         if (machine !== "core") {
@@ -1224,7 +1273,8 @@ export default function App() {
         // an omitted field means "backend default" rather than a stale level.
         const effort = normalizeEffort(pick.effort, pick.backend);
         const attachments = attachChips().map(chipToAttachment);
-        const body = {title,prompt,project:projectSlug,tags:folderTags(projectSlug),backend:pick.backend,model_override:pick.model,...(effort ? {model_effort:effort} : {}),...(machine === "core" ? {} : {remote_node_id:machine}),...(attachments.length ? {attachments} : {})};
+        const sentPrompt = imagePrompt(prompt, await stageRemoteImages(images, undefined, machine));
+        const body = {title,prompt:sentPrompt,project:projectSlug,tags:folderTags(projectSlug),backend:pick.backend,model_override:pick.model,...(effort ? {model_effort:effort} : {}),...(machine === "core" ? {} : {remote_node_id:machine}),...(attachments.length ? {attachments} : {})};
         const signature = JSON.stringify(body);
         if (launchAttempt?.signature !== signature) launchAttempt = {signature,key:crypto.randomUUID()};
         const m = await createMission({...body,idempotency_key:launchAttempt.key});
@@ -1445,8 +1495,7 @@ export default function App() {
                     }}
                     onNewProject={() => {
                       open(null);
-                      setNewProjectDraft(true);
-                      setEnvOpen(null);
+                      setEnvOpen("project");
                     }}
                   />
                 </Show>
@@ -2242,7 +2291,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
   // Retrying an uncertain network result reuses the original message identity.
   // A different draft/selection, or a definitive rejection, starts a new attempt.
   let retryMessage: { key: string; id: string } | null = null;
-  const sendMsg = async (text: string) => {
+  const sendMsg = async (text: string, images: DraftImage[] = []) => {
     setSendError(null);
     if (clientPlaced()) {
       const binding = localBinding(p.id);
@@ -2258,11 +2307,12 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
       try {
         const plan = await materializeMentions(project, text, followAttach());
         if (plan.files.length) await writeLocalFiles(binding.cwd, plan.files);
-        const sent = bindWorkspace(plan.prompt, binding.cwd);
-        await startLocal({ id: p.id, harness: binding.harness, bin: binding.bin, cwd: binding.cwd, prompt: sent, model: binding.model, sessionId: binding.sessionId });
+        const imagePaths = await stageLocalImages(binding.cwd, images);
+        const sent = imagePrompt(bindWorkspace(plan.prompt, binding.cwd), imagePaths);
+        await startLocal({ id: p.id, harness: binding.harness, bin: binding.bin, cwd: binding.cwd, prompt: sent, model: binding.model, sessionId: binding.sessionId, imagePaths });
         // Persist only accepted turns: a rejected launch must keep the draft
         // without adding another copy to the conversation.
-        await appendClientTranscript(p.id, "user", text).catch(e => {
+        await appendClientTranscript(p.id, "user", imagePrompt(text, imagePaths)).catch(e => {
           setSendError(`The local run started, but saving your message failed: ${String(e)}`);
         });
         setFollowAttach([]);
@@ -2288,12 +2338,13 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
       }
     }
     const attachments = followAttach().map(chipToAttachment);
-    const key = JSON.stringify([connectionVersion(), text, attachments]);
+    const key = JSON.stringify([connectionVersion(), text, attachments, images.map(image => image.id)]);
     if (retryMessage?.key !== key) retryMessage = { key, id: crypto.randomUUID() };
     try {
-      const result = await sendMissionMessage(p.id, text, attachments, retryMessage.id);
+      const sent = imagePrompt(text, await stageRemoteImages(images, mission()));
+      const result = await sendMissionMessage(p.id, sent, attachments, retryMessage.id);
       retryMessage = null;
-      const event: StreamEvent = { type: "user_message", eventId: result.id, data: { id: result.id, content: text, queued: result.queued, receipt: true, attached: followAttach().length > 0 } };
+      const event: StreamEvent = { type: "user_message", eventId: result.id, data: { id: result.id, content: sent, queued: result.queued, receipt: true, attached: followAttach().length > 0 } };
       if (replaying) held.push(event);
       else applyLive(event);
       setFollowAttach([]);

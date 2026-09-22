@@ -54,23 +54,19 @@ export function ProjectPicker(p: {
 
 export function ProjectCreation(p:{existingIds: string[];onCreate:(title:string,slug:string)=>Promise<void>;onClose:()=>void}) {
   const [name,setName]=createSignal("");
-  const [id,setId]=createSignal<string|null>(null);
-  const slug=()=>id()??slugify(name());
+  const slug=()=>slugify(name());
   const [busy,setBusy]=createSignal(false);
   const [error,setError]=createSignal<string|null>(null);
   const close=()=>{if(!busy())p.onClose();};
   const submit=async()=>{
     if(busy())return;
     if(!name().trim()){setError("Enter a project name.");return;}
-    if(!/^[a-z0-9][a-z0-9_-]*$/.test(slug())){setError("Use letters, numbers, hyphens or underscores for the project ID.");return;}
-    if(p.existingIds.includes(slug())){setError("A project with this ID already exists. Choose it from Recents or use a different ID.");return;}
+    if(!/^[a-z0-9][a-z0-9_-]*$/.test(slug())){setError("Choose a name containing letters or numbers.");return;}
+    if(p.existingIds.includes(slug())){setError("A project with this name already exists. Choose it from Recents or use another name.");return;}
     setBusy(true);setError(null);
     try{await p.onCreate(name().trim(),slug());}
     catch(e){setError(e instanceof Error?e.message:String(e));}
     finally{setBusy(false);}
   };
-  return <PromptSheet title="New project" label="Project name" placeholder="Project name" value={name()} onInput={v=>{setName(v);setError(null);}} action={busy()?"Creating…":"Create project"} busy={busy()} disabled={!name().trim()} error={error()} onAction={()=>void submit()} onClose={close}
-    footer={<span>Files live on the connected backend. Agents run on the machine you pick.</span>}>
-    <label class="field"><span>Project ID</span><input class="s-input" aria-label="Project ID" value={slug()} disabled={busy()} onInput={e=>setId(e.currentTarget.value)} /></label>
-  </PromptSheet>;
+  return <PromptSheet class="project-creation" title="New project" label="Project name" placeholder="Name your project…" value={name()} onInput={v=>{setName(v);setError(null);}} action={busy()?"Creating…":"Create project"} busy={busy()} disabled={!name().trim()} error={error()} onAction={()=>void submit()} onClose={close} />;
 }

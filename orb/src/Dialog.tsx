@@ -33,6 +33,7 @@ export function Dialog(p: {
 
 /** Cursor-style create/rename sheet: title + hint + X, input and action on one row. */
 export function PromptSheet(p: {
+  class?: string;
   title: string;
   hint?: string;
   label?: string;
@@ -59,7 +60,7 @@ export function PromptSheet(p: {
         aria-modal="true"
         aria-labelledby={titleId}
         tabIndex={-1}
-        class="dlg prompt-sheet"
+        class={`dlg prompt-sheet ${p.class ?? ""}`}
         onMouseDown={(e) => e.stopPropagation()}
         onClick={(e) => e.stopPropagation()}
       >

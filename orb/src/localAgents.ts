@@ -48,6 +48,7 @@ export interface LocalBinding {
 }
 
 export interface LocalFile {
+  encoding?: "base64";
   rel: string;
   content: string;
 }
@@ -273,10 +274,13 @@ export async function localWorkspace(slug: string): Promise<string> {
 export async function writeLocalFiles(root: string, files: LocalFile[]): Promise<void> {
   const invoke = tauriInvoke();
   if (!invoke) throw new Error("Local agents run in the Orb desktop app.");
-  await invoke("local_agents_write", { request: { root, files } });
+  const result = await invoke("local_agents_write", { request: { root, files } }) as {skipped?: string[]; binary_supported?: boolean};
+  if (files.some(file => file.encoding === "base64") && !result?.binary_supported) throw new Error("Restart Orb to enable image attachments. Your draft is kept.");
+  if (result?.skipped?.length) throw new Error(`Some files could not be attached: ${result.skipped.join(", ")}`);
 }
 
 export interface StartLocal {
+  imagePaths?: string[];
   id: string;
   harness: string;
   bin: string;
@@ -302,6 +306,7 @@ export async function startLocal(req: StartLocal): Promise<void> {
         prompt: req.prompt,
         model: req.model,
         session_id: req.sessionId,
+        image_paths: req.imagePaths,
       },
     });
   } catch (e) {

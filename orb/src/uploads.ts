@@ -1,8 +1,8 @@
-import { api, connectionVersion } from "./api";
+import { api, connectionVersion, getApiUrl } from "./api";
 import { mentionText, scanMentions } from "./attach";
 
 export interface UploadSource { name: string; localPath?: string; file?: File }
-export interface UploadedFile { source: UploadSource; path: string; destination: string; connection: number }
+export interface UploadedFile { source: UploadSource; path: string; destination: string; connection: number; endpoint?: string }
 export interface UploadReceipt { name: string; path: string; size: number; sha256: string }
 const MAX = 20 * 1024 * 1024;
 type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -35,7 +35,7 @@ export async function transferFile(source: UploadSource, destination: string): P
   const connection = connectionVersion();
   if (destination === "local") {
     if (!source.localPath) throw new Error("Choose this file again in the desktop app to use its local path.");
-    return { source, path: source.localPath, destination, connection };
+    return { source, path: source.localPath, destination, connection, endpoint: getApiUrl() };
   }
   const data = await encoded(source);
   if (connection !== connectionVersion()) throw new Error("The backend changed. Choose the file again.");
@@ -44,7 +44,7 @@ export async function transferFile(source: UploadSource, destination: string): P
     body: JSON.stringify({ node_id: destination, name: source.name, data_base64: data }),
   });
   if (connection !== connectionVersion()) throw new Error("The backend changed during the upload. Choose the file again.");
-  return { source, path: receipt.path, destination, connection };
+  return { source, path: receipt.path, destination, connection, endpoint: getApiUrl() };
 }
 /** Resolve only references still in the draft, and never reuse another machine's path. */
 export async function prepareUploads(text: string, files: UploadedFile[], destination: string,

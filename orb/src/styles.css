@@ -1520,9 +1520,9 @@ button.fork-trigger:hover { color: var(--fg); }
 .user { position: relative; }
 .prompt-edit { position: absolute; top: 8px; right: 8px; opacity: 0; background: var(--bg-elev); }
 .user:hover .prompt-edit, .prompt-edit:focus-visible { opacity: 1; }
-.prompt-editor { width: 100%; box-sizing: border-box; background: transparent; border: 0; outline: 0; color: var(--fg); font: inherit; line-height: inherit; resize: vertical; min-height: 100px; }
+.prompt-editor { width: 100%; box-sizing: border-box; background: transparent; border: 0; outline: 0; color: var(--fg); font: inherit; line-height: inherit; resize: none; min-height: 1.5em; max-height: 320px; display: block; padding: 0; }
 .prompt-editor-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-top: 10px; }
-.prompt-editor-actions > span { margin-right: auto; color: var(--fg-3); font-size: 11px; }
+.prompt-editor-actions > span { flex: 1; color: var(--fg-3); font-size: 11px; }
 
 /* Files: conversation stays mounted beside the read-only workbench. */
 .app[data-files-open="true"] { grid-template-columns: var(--sb-w) minmax(420px,1fr) minmax(480px,var(--file-panel-width,45%)); }
@@ -1634,3 +1634,13 @@ button.fork-trigger:hover { color: var(--fg); }
 .composer-upload-status { grid-column: 1 / -1; grid-row: 2; padding: 4px 4px 0; font-size: 12px; color: var(--fg-2); }
 .composer.tall .composer-upload-status { grid-row: 3; }
 .composer-upload-status.error { color: #df7b83; }
+/* Pasted images sit above the draft and keep the action row in place. */
+.composer-field { flex-wrap:wrap; }
+.composer-images { flex-basis:100%;display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px; }
+.composer-image { position:relative;width:64px;height:76px;border:1px solid var(--stroke);border-radius:8px;background:var(--bg); }
+.composer-image img { width:100%;height:100%;object-fit:contain;border-radius:7px; }
+.composer-image .icon-btn { position:absolute;right:-5px;top:-5px;width:18px;height:18px;border-radius:50%;background:var(--bg-elev);border:1px solid var(--stroke); }
+.image-paste-error { flex-basis:100%;color:var(--fg-2);font-size:12px; }
+.project-creation { width:min(520px,calc(100vw - 40px));padding:18px;background:var(--bg);border:1px solid var(--stroke);border-radius:14px; }
+.project-creation .prompt-head { margin-bottom:18px; }
+.project-creation .prompt-input { background:var(--bg-elev); }

@@ -169,6 +169,7 @@ export interface Mission {
   execution?: { state?: string; terminal_reason?: string | null };
   remote_job?: RemoteJob | null;
   workspace_name?: string | null;
+  workspace_id?: string | null;
   agent?: string | null;
   backend?: string;
   model_override?: string | null;

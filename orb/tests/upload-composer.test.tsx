@@ -14,7 +14,7 @@ it("opens an upload choice with no project context and inserts a real local path
   await waitFor(() => expect((screen.getByPlaceholderText("Task") as HTMLTextAreaElement).value).toBe("@/Users/test/photo.png "));
   expect(uploads.transferFile).toHaveBeenCalledWith(expect.objectContaining({ name: "photo.png" }), "local");
   fireEvent.click(screen.getByTitle("Send"));
-  await waitFor(() => expect(send).toHaveBeenCalledWith("@/Users/test/photo.png"));
+  await waitFor(() => expect(send).toHaveBeenCalledWith("@/Users/test/photo.png", []));
 });
 it("keeps the draft when transferring the file fails", async () => {
   vi.mocked(uploads.pickNativeFiles).mockResolvedValue([{ name: "photo.png", localPath: "/Users/test/photo.png" }]);
