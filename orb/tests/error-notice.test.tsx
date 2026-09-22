@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from "@solidjs/testing-library";
+import { render, screen, fireEvent, waitFor } from "@solidjs/testing-library";
 import { describe, it, expect, vi } from "vitest";
 import { ErrorNotice } from "../src/ErrorNotice";
 describe("inline errors", () => {
@@ -11,4 +11,21 @@ describe("inline errors", () => {
     expect(screen.getByText(raw).closest("details")?.open).toBe(false);
     fireEvent.click(screen.getByRole("button",{name:"Dismiss error"}));expect(dismiss).toHaveBeenCalledOnce();
   });
+});
+
+it("copies the complete raw error even when the details are folded", async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+  const raw = "Internal error: " + "long backend detail ".repeat(40);
+  render(() => <ErrorNotice error={raw} />);
+  fireEvent.click(screen.getByRole("button", { name: "Copy error" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Error copied" })).toBeTruthy());
+  expect(writeText).toHaveBeenCalledWith(raw);
+});
+it("shows clipboard failures without claiming success", async () => {
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: vi.fn().mockRejectedValue(new Error("Permission denied")) } });
+  render(() => <ErrorNotice error="Original error" />);
+  fireEvent.click(screen.getByRole("button", { name: "Copy error" }));
+  await waitFor(() => expect(screen.getByRole("status").textContent).toContain("Permission denied"));
+  expect(screen.queryByRole("button", { name: "Error copied" })).toBeNull();
 });
