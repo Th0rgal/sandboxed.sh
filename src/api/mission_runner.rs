@@ -9220,24 +9220,36 @@ impl TextDeltaCoalescer {
     }
 }
 
+// KMP examines only the suffix that can overlap the incoming fragment.
+// UTF-8 is self-synchronizing: a matching prefix of a valid string ending at
+// an existing string boundary is also a complete code-point sequence.
 fn suffix_prefix_overlap_len(existing: &str, incoming: &str) -> usize {
-    let max_chars = existing.chars().count().min(incoming.chars().count());
-    for overlap_chars in (1..=max_chars).rev() {
-        let existing_start = existing
-            .char_indices()
-            .nth(existing.chars().count() - overlap_chars)
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
-        let incoming_end = incoming
-            .char_indices()
-            .nth(overlap_chars)
-            .map(|(idx, _)| idx)
-            .unwrap_or(incoming.len());
-        if existing[existing_start..] == incoming[..incoming_end] {
-            return incoming_end;
+    let p = incoming.as_bytes();
+    if p.is_empty() {
+        return 0;
+    }
+    let mut pi = vec![0; p.len()];
+    for i in 1..p.len() {
+        let mut j = pi[i - 1];
+        while j > 0 && p[i] != p[j] {
+            j = pi[j - 1]
+        }
+        if p[i] == p[j] {
+            j += 1
+        }
+        pi[i] = j;
+    }
+    let start = existing.len().saturating_sub(p.len());
+    let mut j = 0;
+    for &b in &existing.as_bytes()[start..] {
+        while j > 0 && (j == p.len() || b != p[j]) {
+            j = pi[j - 1]
+        }
+        if b == p[j] {
+            j += 1
         }
     }
-    0
+    j
 }
 
 pub(crate) fn merge_stream_fragment(buffer: &mut String, fragment: &str) {
@@ -10135,6 +10147,45 @@ mod tests {
     }
 
     #[test]
+    fn stream_overlap_matches_unicode_oracle() {
+        fn oracle(a: &str, b: &str) -> usize {
+            b.char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(b.len()))
+                .filter(|&i| a.ends_with(&b[..i]))
+                .max()
+                .unwrap_or(0)
+        }
+        let mut strings = vec![String::new()];
+        let mut level = vec![String::new()];
+        for _ in 0..4 {
+            level = level
+                .iter()
+                .flat_map(|s| ["a", "b", "é", "🙂"].map(|c| format!("{s}{c}")))
+                .collect();
+            strings.extend(level.clone());
+        }
+        for a in &strings {
+            for b in &strings {
+                let got = super::suffix_prefix_overlap_len(a, b);
+                assert_eq!(got, oracle(a, b), "{a:?} {b:?}");
+                assert!(b.is_char_boundary(got));
+            }
+        }
+    }
+
+    #[test]
+    fn stream_overlap_handles_long_repeated_and_unicode_suffixes() {
+        let a = format!("{}é🙂ababab", "Contexte français. ".repeat(100_000));
+        assert_eq!(
+            super::suffix_prefix_overlap_len(&a, "é🙂ababab suite"),
+            "é🙂ababab".len()
+        );
+        assert_eq!(super::suffix_prefix_overlap_len(&a, &"z".repeat(2000)), 0);
+        assert_eq!(super::suffix_prefix_overlap_len("é🙂", "🙂fin"), "🙂".len());
+    }
+
+    #[test]
     fn merge_stream_fragment_accepts_delta_and_snapshot_chunks() {
         let mut buffer = String::new();
         merge_stream_fragment(&mut buffer, "I have enough evidence");
@@ -10330,6 +10381,22 @@ mod tests {
         assert!(!codex_turn_requires_tool_activity(
             "You must not edit files. Give a text-only answer.",
             "Here is the answer."
+        ));
+    }
+
+    #[test]
+    fn codex_tool_activity_handles_labeled_negative_instructions() {
+        assert!(!codex_turn_requires_tool_activity(
+            "Streaming probe: Do not use tools or access files. Write a Markdown table about software testing.",
+            "Here is the table."
+        ));
+        assert!(codex_turn_requires_tool_activity(
+            "Run cargo test: do not modify files. Report the result.",
+            "Here is the result."
+        ));
+        assert!(codex_turn_requires_tool_activity(
+            "Task: Do not modify files; run cargo test.",
+            "Here is the result."
         ));
     }
 

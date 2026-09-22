@@ -989,6 +989,23 @@ fn parse_direct_model_entry(model: &str) -> Option<crate::provider_health::Chain
     })
 }
 
+/// Native Claude Code sends bare Anthropic model IDs. Configured chains are
+/// resolved first; this fallback preserves the exact requested model.
+fn parse_native_model_entry(
+    model: &str,
+    protocol: NativeProtocol,
+) -> Option<crate::provider_health::ChainEntry> {
+    parse_direct_model_entry(model).or_else(|| {
+        (protocol == NativeProtocol::AnthropicMessages
+            && model.starts_with("claude-")
+            && !model.contains('/'))
+        .then(|| crate::provider_health::ChainEntry {
+            provider_id: "anthropic".into(),
+            model_id: model.into(),
+        })
+    })
+}
+
 /// Parse a direct `provider/model` id whose prefix is a **custom** provider
 /// referenced by its sanitized name (e.g. `spark/step3p7-flash-148b`) — the id
 /// the catalog and model-routing UI expose for self-hosted OpenAI-compatible
@@ -1207,7 +1224,7 @@ async fn native_protocol_proxy(
             )
             .await;
         (id, configured, resolved)
-    } else if let Some(direct) = parse_direct_model_entry(&requested_model)
+    } else if let Some(direct) = parse_native_model_entry(&requested_model, protocol)
         .or(parse_kimi_bare_model_entry(&requested_model))
         .or(parse_custom_direct_model_entry(&state, &requested_model).await)
     {
@@ -6890,6 +6907,26 @@ mod tests {
         );
         assert_eq!(normalize_retrieved_model_id("  grok-4.6  "), "grok-4.6");
         assert_eq!(normalize_retrieved_model_id("/"), "");
+    }
+
+    #[test]
+    fn native_anthropic_models_keep_exact_catalog_id() {
+        let e =
+            super::parse_native_model_entry("claude-sonnet-4-6", NativeProtocol::AnthropicMessages)
+                .unwrap();
+        assert_eq!(e.provider_id, "anthropic");
+        assert_eq!(e.model_id, "claude-sonnet-4-6");
+        assert!(
+            super::parse_native_model_entry("claude-sonnet-4-6", NativeProtocol::Responses)
+                .is_none()
+        );
+        assert!(
+            super::parse_native_model_entry("smart", NativeProtocol::AnthropicMessages).is_none()
+        );
+        assert!(
+            super::parse_native_model_entry("typo/model", NativeProtocol::AnthropicMessages)
+                .is_none()
+        );
     }
 
     #[test]

@@ -14136,8 +14136,22 @@ async fn poll_remote_job(
     // The preserved-status terminal note is durable once; retries of the
     // ledger cleanup must not duplicate it.
     let mut preserved_terminal_noted = false;
+    // Stream only incremental logs between the existing status/lease checks.
+    // A delayed network request must not cause a burst of catch-up polls.
+    let mut log_tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    log_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_status_check: Option<std::time::Instant> = None;
     loop {
-        tokio::time::sleep(POLL_INTERVAL).await;
+        log_tick.tick().await;
+        if last_status_check.is_some_and(|at| at.elapsed() < POLL_INTERVAL) {
+            if failures == 0 && terminal_observation.is_none() {
+                if let Some(observer) = grok.as_mut() {
+                    observer.pump(&client, &node, &shared_token).await;
+                }
+            }
+            continue;
+        }
+        last_status_check = Some(std::time::Instant::now());
 
         // Honor external mission cancellation when trivially observable: if
         // an operator moved the mission out of Active (cancel/interrupt/pause),

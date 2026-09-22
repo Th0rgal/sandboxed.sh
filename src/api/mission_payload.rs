@@ -109,13 +109,38 @@ fn atomic_write(path: &Path, bytes: &[u8], exclusive: bool) -> Result<bool, Stri
         file.sync_all().map_err(|e| e.to_string())?;
         let rc = unsafe {
             if exclusive {
-                libc::renameat2(
-                    parent.as_raw_fd(),
-                    temp_name.as_ptr(),
-                    parent.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::RENAME_NOREPLACE,
-                )
+                #[cfg(target_os = "linux")]
+                {
+                    libc::renameat2(
+                        parent.as_raw_fd(),
+                        temp_name.as_ptr(),
+                        parent.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::RENAME_NOREPLACE,
+                    )
+                }
+                #[cfg(target_vendor = "apple")]
+                {
+                    libc::renameatx_np(
+                        parent.as_raw_fd(),
+                        temp_name.as_ptr(),
+                        parent.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::RENAME_EXCL,
+                    )
+                }
+                #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+                {
+                    // linkat publishes the complete file exclusively; the temporary
+                    // name is removed below before this operation returns.
+                    libc::linkat(
+                        parent.as_raw_fd(),
+                        temp_name.as_ptr(),
+                        parent.as_raw_fd(),
+                        name.as_ptr(),
+                        0,
+                    )
+                }
             } else {
                 libc::renameat(
                     parent.as_raw_fd(),
@@ -1184,5 +1209,36 @@ mod tests {
         write_sidecar(tmp.path(), id, &payload).unwrap();
         let read = read_sidecar(tmp.path(), id).unwrap().unwrap();
         assert_eq!(read, payload);
+    }
+}
+
+#[cfg(test)]
+mod atomic_publish_tests {
+    #[test]
+    fn exclusive_publish_has_one_winner_and_preserves_its_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().canonicalize().unwrap().join("payload");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let workers: Vec<_> = (0..4u8)
+            .map(|byte| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (
+                        byte,
+                        super::atomic_write(&path, &[byte; 1024], true).unwrap(),
+                    )
+                })
+            })
+            .collect();
+        let winners: Vec<_> = workers
+            .into_iter()
+            .map(|w| w.join().unwrap())
+            .filter(|(_, won)| *won)
+            .collect();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), vec![winners[0].0; 1024]);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 }

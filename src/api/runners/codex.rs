@@ -304,7 +304,7 @@ fn user_without_negated_tool_clauses(user_lower: &str) -> String {
         .replace(" however, ", ". however, ");
     let mut actionable = String::with_capacity(clause_separated.len());
 
-    for clause in clause_separated.split_inclusive(['.', '!', '?', ';', '\n']) {
+    for clause in clause_separated.split_inclusive(['.', '!', '?', ';', ':', '\n']) {
         let trimmed = clause.trim_start();
         let directive = trimmed
             .strip_prefix("but ")
