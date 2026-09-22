@@ -5,7 +5,7 @@ export type StreamItem =
   | { kind: "user"; key: string; text: string; messageId?: string; queued?: boolean; attached?: boolean; receipt?: boolean }
   | { kind: "think"; key: string; text: string; done: boolean }
   | { kind: "text"; key: string; text: string; live: boolean }
-  | { kind: "error"; key: string; text: string }
+  | { kind: "error"; key: string; text: string; terminal?: boolean; cancelled?: boolean }
   | {
       kind: "tool";
       key: string;
@@ -156,7 +156,7 @@ export class TranscriptReducer {
         const index=this.bubbles.get(finalBubble);
         const previous=index == null ? undefined : this.items[index];
         this.close();
-        if(d.success===false){this.items.push({kind:"error",key:this.key("error"),text:text||"Mission failed"});return;}
+        if(d.success===false){this.items.push({kind:"error",key:this.key("error"),text:text||"Mission failed",terminal:true,cancelled:text.trim().toLowerCase()==="cancelled"});return;}
         if(previous?.kind === "text" && index != null){this.put(index,{...previous,text:text||previous.text,live:false});this.lastFinal=index;}
  else if(text){this.lastFinal=this.items.length;this.items.push({kind:"text",key:this.key("text"),text,live:false});}
         return;
@@ -228,6 +228,22 @@ export function isFillerBubble(item: StreamItem, index: number, items: StreamIte
 export function withoutFiller(items: StreamItem[]): StreamItem[] {
   const keep = items.filter((item, index) => !isFillerBubble(item, index, items));
   return keep.length === items.length ? items : keep;
+}
+
+/** A delivered follow-up supersedes the previous attempt's terminal notice.
+ * Keep the raw history intact, and do not dismiss failures for queued input. */
+export function visibleTranscript(items: StreamItem[]): StreamItem[] {
+  let lastDelivered = -1;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    if (item.kind === "user" && !item.queued && !item.attached) {
+      lastDelivered = i;
+      break;
+    }
+  }
+  return withoutFiller(items.filter((item, index) =>
+    !(item.kind === "error" && item.terminal && index < lastDelivered),
+  ));
 }
 
 export function buildTranscript(events: StreamEvent[]): StreamItem[] {
