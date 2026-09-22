@@ -85,6 +85,10 @@ export function UserTurn(p: { text: string; attached?: boolean; pending?: boolea
   const [editing, setEditing] = createSignal(false);
   const [draft, setDraft] = createSignal("");
   const [copyState, setCopyState] = createSignal("");
+  const resizeEditor = (el: HTMLTextAreaElement) => {
+    el.style.height = "auto";
+    el.style.height = `${Math.min(320, el.scrollHeight)}px`;
+  };
   const edit = () => { if (fork()) return; setDraft(presentation().text); setCopyState(""); setEditing(true); };
   return (
     <div onDblClick={() => { if (!editing()) edit(); }} class={`user ${goal().kind === "goal" ? "goal" : ""} ${p.pending ? "pending" : ""}`}>
@@ -97,8 +101,13 @@ export function UserTurn(p: { text: string; attached?: boolean; pending?: boolea
       <Show when={p.attached || presentation().attached}><small class="user-context">Attached context</small></Show>
       <Show when={!fork()}><button class="icon-btn prompt-edit" aria-label="Edit prompt" onClick={edit}><Ic.PencilIcon size={14} /></button></Show>
       </>}>
-        <textarea class="prompt-editor" aria-label="Edit prompt text" value={draft()} onInput={e => setDraft(e.currentTarget.value)} onKeyDown={e => { if (e.key === "Escape") { e.stopPropagation(); setEditing(false); } }} ref={el => queueMicrotask(() => { el.focus(); el.style.height = `${Math.min(420, Math.max(100, el.scrollHeight))}px`; })} />
-        <div class="prompt-editor-actions"><span role="status">{copyState()}</span><button class="s-btn sm quiet" onClick={() => setEditing(false)}>Cancel</button><button class="s-btn sm" onClick={() => { void copyText(draft()).then(() => setCopyState("Copied"), e => setCopyState(String(e))); }}>Copy</button><Show when={p.onReuse}><button class="s-btn sm" disabled={!draft().trim()} onClick={() => { p.onReuse?.(draft()); setEditing(false); }}>Use as follow-up</button></Show></div>
+        <textarea class="prompt-editor" rows={1} aria-label="Edit prompt text" value={draft()} onInput={e => { setDraft(e.currentTarget.value); resizeEditor(e.currentTarget); }} onKeyDown={e => { if (e.key === "Escape") { e.stopPropagation(); setEditing(false); } }} ref={el => queueMicrotask(() => { el.focus(); resizeEditor(el); })} />
+        <div class="prompt-editor-actions">
+          <button class="icon-btn" aria-label="Cancel" title="Cancel (Esc)" onClick={() => setEditing(false)}><Ic.CloseIcon size={16} /></button>
+          <button class="icon-btn" aria-label="Copy prompt" title="Copy prompt" onClick={() => { void copyText(draft()).then(() => setCopyState("Copied"), e => setCopyState(String(e))); }}><Ic.CopyIcon size={15} /></button>
+          <span role="status">{copyState()}</span>
+          <Show when={p.onReuse}><button class="send" aria-label="Use as follow-up" title="Use as follow-up" disabled={!draft().trim()} onClick={() => { p.onReuse?.(draft()); setEditing(false); }}><Ic.ArrowUpIcon size={16} /></button></Show>
+        </div>
       </Show>
     </div>
   );

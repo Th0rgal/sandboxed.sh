@@ -350,7 +350,12 @@ fn opencode_args(request: &StartRequest) -> Vec<String> {
     let mut args = vec!["run".into(), "--format".into(), "json".into()];
     if let Some(model) = request.model.as_deref().filter(|m| !m.is_empty()) {
         args.push("--model".into());
-        args.push(model.to_string());
+        // Backend aliases need their configured OpenCode provider namespace.
+        args.push(if model.starts_with("builtin/") {
+            format!("sandboxed-sh/{model}")
+        } else {
+            model.to_string()
+        });
     }
     match request.session_id.as_deref().filter(|s| !s.is_empty()) {
         Some(sid) if sid.starts_with("ses_") => {
@@ -414,7 +419,14 @@ fn spawn_piped(
     error: &Arc<Mutex<Option<String>>>,
     parse_json: bool,
 ) -> Result<Child, String> {
-    let mut child = Command::new(&request.bin)
+    let mut command = Command::new(&request.bin);
+    // Share the user's provider credentials/config, but not a database whose
+    // schema may belong to a different OpenCode build (e.g. the desktop app).
+    if request.harness == "opencode" && std::env::var_os("OPENCODE_DB").is_none() {
+        command.env("OPENCODE_DB", "orb-local.db");
+    }
+    command.env("NO_COLOR", "1");
+    let mut child = command
         .current_dir(&request.cwd)
         .args(&args)
         .stdin(Stdio::piped())
@@ -464,6 +476,25 @@ fn stream_plain(reader: &mut impl Read, output: &Output) {
     output.append(&String::from_utf8_lossy(&pending));
 }
 
+// Terminal styling is not meaningful inside a desktop error card.
+fn strip_terminal_codes(text: &str) -> String {
+    let mut result = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for code in chars.by_ref() {
+                if ('@'..='~').contains(&code) {
+                    break;
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 fn pipe_output(
     stdout: Option<std::process::ChildStdout>,
     stderr: Option<std::process::ChildStderr>,
@@ -501,7 +532,8 @@ fn pipe_output(
             let _guard = guard;
             let mut buf = String::new();
             let _ = BufReader::new(stderr).read_to_string(&mut buf);
-            let trimmed = buf.trim();
+            let clean = strip_terminal_codes(&buf);
+            let trimmed = clean.trim();
             if !trimmed.is_empty() {
                 if let Ok(mut slot) = error_out.lock() {
                     if slot.is_none() {
@@ -544,7 +576,8 @@ fn spawn_codex(
         thread::spawn(move || {
             let mut buf = String::new();
             let _ = BufReader::new(stderr).read_to_string(&mut buf);
-            let trimmed = buf.trim();
+            let clean = strip_terminal_codes(&buf);
+            let trimmed = clean.trim();
             if !trimmed.is_empty() {
                 if let Ok(mut slot) = stderr_error.lock() {
                     if slot.is_none() {
@@ -938,6 +971,11 @@ mod tests {
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         );
+        let smart = StartRequest {
+            model: Some("builtin/smart".into()),
+            ..fresh.clone()
+        };
+        assert!(opencode_args(&smart).contains(&"sandboxed-sh/builtin/smart".to_string()));
         let resumed = StartRequest {
             session_id: Some("ses_abc".into()),
             ..fresh
@@ -1030,6 +1068,14 @@ mod tests {
             &output,
         );
         assert_eq!(output.snapshot(), "Aé🙂");
+    }
+
+    #[test]
+    fn errors_do_not_include_terminal_color_sequences() {
+        assert_eq!(
+            strip_terminal_codes("\u{1b}[91m\u{1b}[1mError: \u{1b}[0mFailed query"),
+            "Error: Failed query"
+        );
     }
 
     #[cfg(unix)]
