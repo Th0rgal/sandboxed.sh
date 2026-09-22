@@ -165,8 +165,10 @@ dry-run. Do not silently turn on whole-workspace deletion as a disk repair.
 
 ## Validation and deployment
 
-Production runs the tested Linux debug binaries from `fad8ed6a65bb` (the
-follow-up `df0cc209` changes only test expectations). Installed binary hashes
+Production runs the tested Linux debug backend from `8dd510f8a72d`, with
+companion binaries from `fad8ed6a65bb`. The final follow-up preserves Codex
+OAuth metadata during provider-chain resolution; without that flag the
+Responses adapter could not select the core-owned account. Installed binary hashes
 match the staged artifacts. The two existing agent sessions were paused for
 maintenance and resumed with their native session IDs preserved. The older
 process took longer than the initial health wait to drain; the guarded restart
@@ -181,3 +183,15 @@ Validation: 95 Codex tests, 14 attachment tests, 84 proxy tests, 135 remote
 tests plus the corrected raw-Claude lifecycle fixture passed; two remote
 tests remain intentionally ignored. The Orb launch/connection suite passed
 37 tests, and the client production build passed.
+
+The 24 provider-health tests passed after the resolver correction. A native
+Codex request from Ashur through the public core proxy reached OpenAI and
+returned the account’s usage-limit error (reset reported as 26 September),
+rather than the previous unsupported-protocol/502 failure. Live successful
+inference and live resume remain unverified until quota is available. No
+additional account was selected and no credits were purchased.
+
+The attachment canary was repeated successfully after the final deployment.
+Core reports approximately 1,453 GiB free on the execution volume. The second
+deployment waited for the active mission to finish naturally before the
+guard admitted it.
