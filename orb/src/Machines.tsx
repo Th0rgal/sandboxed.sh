@@ -1,6 +1,7 @@
+import { readHistory, saveHistory, freshSamples } from "./resourceCache";
 import { ResourceHistory, appendSamples, type ResourceSample } from "./ResourceHistory";
 import { LocalMachine } from "./LocalMachine";
-import { For, Show, createSignal, createEffect, onCleanup, onMount } from "solid-js";
+import { For, Show, createSignal, createEffect, untrack, onCleanup, onMount } from "solid-js";
 import { pollWhileVisible } from "./poll";
 import { createStore, produce } from "solid-js/store";
 import * as Ic from "./icons";
@@ -66,14 +67,16 @@ function Resource(p: { label: string; used?: number | null; total?: number | nul
 }
 function FleetRow(p: { node?: RemoteNodeView; core?: Metrics; live?: boolean; history?: ResourceSample[] }) {
   const [open, setOpen] = createSignal(false);
-  const [nodeHistory, setNodeHistory] = createSignal<ResourceSample[]>([]);
+  const [nodeHistory, setNodeHistory] = createSignal<ResourceSample[]>(readHistory(p.node ? `node:${p.node.id}` : "core"));
   createEffect(() => {
     const node = p.node;
     if (node?.mem_total_bytes && node.mem_available_bytes != null) {
       const time = node.last_seen ? Date.parse(node.last_seen) : Date.now();
-      setNodeHistory(old => appendSamples(old, [{ time, memory: (node.mem_total_bytes! - node.mem_available_bytes!) / node.mem_total_bytes! * 100 }]));
+      setNodeHistory(old => freshSamples(appendSamples(old, node.resource_history ?? [{ time, memory: (node.mem_total_bytes! - node.mem_available_bytes!) / node.mem_total_bytes! * 100 }])));
+      saveHistory(`node:${node.id}`, untrack(nodeHistory));
     }
   });
+  onCleanup(() => { if (p.node) saveHistory(`node:${p.node.id}`, nodeHistory(), true); });
   const memory = () => p.node ? (p.node.mem_total_bytes != null && p.node.mem_available_bytes != null ? p.node.mem_total_bytes - p.node.mem_available_bytes : undefined) : p.core?.memory_used;
   const disk = () => p.node ? (p.node.disk_total_bytes != null && p.node.disk_available_bytes != null ? p.node.disk_total_bytes - p.node.disk_available_bytes : undefined) : p.core?.disk_used;
   return <div class="p-acc-wrap"><button class="s-row p-acc-btn" aria-expanded={open()} onClick={() => setOpen(!open())}>
@@ -83,10 +86,11 @@ function FleetRow(p: { node?: RemoteNodeView; core?: Metrics; live?: boolean; hi
     <span class={`chev p-acc-chev ${open() ? "open" : ""}`}>›</span></button>
     <Show when={open()}><div class="p-acc-body machine-expanded">
       <ResourceHistory samples={p.node ? nodeHistory() : p.history ?? []} live={p.node ? p.node.status === "online" : !!p.live} /><div class="machine-resources">
-      <Resource label="CPU" value={p.node ? (p.node.cpu_total != null ? `${p.node.cpu_total} cores` : "Unavailable") : p.core ? `${Math.round(p.core.cpu_percent)}%` : "Unavailable"} />
+      <Resource label="CPU" value={p.node ? (p.node.resource_history?.at(-1)?.cpu != null ? `${Math.round(p.node.resource_history.at(-1)!.cpu!)}%` : p.node.cpu_total != null ? `${p.node.cpu_total} cores` : "Unavailable") : p.core ? `${Math.round(p.core.cpu_percent)}%` : "Unavailable"} />
       <Resource label="Memory" used={memory()} total={p.node?.mem_total_bytes ?? p.core?.memory_total} />
       <Resource label="Disk" used={disk()} total={p.node?.disk_total_bytes ?? p.core?.disk_total} />
-    </div><Show when={p.node || !p.live}><p class="s-row-desc">{p.node ? "Heartbeat snapshot · CPU load and GPU metrics are not reported by this node." : p.live ? "" : "Live stream unavailable · reconnecting"}</p></Show>
+      <Show when={p.node?.resource_history?.some(s => s.gpu != null)}><Resource label="GPU" value={p.node!.resource_history!.at(-1)?.gpu != null ? `${Math.round(p.node!.resource_history!.at(-1)!.gpu!)}%` : "Unavailable"} /></Show>
+    </div><Show when={p.node || !p.live}><p class="s-row-desc">{p.node ? p.node.resource_history?.at(-1)?.cpu != null ? "Heartbeat snapshot" : "Heartbeat snapshot · CPU load and GPU metrics are not reported by this node." : p.live ? "" : "Live stream unavailable · reconnecting"}</p></Show>
     <Show when={p.node}><div class="p-detail-meta"><span>{p.node!.base_url}</span><span>{nodeNote(p.node!)}</span><span>{p.node!.last_seen ? `Last seen ${new Date(p.node!.last_seen!).toLocaleTimeString()}` : "No heartbeat received"}</span></div></Show>
     </div></Show></div>;
 }
@@ -94,7 +98,7 @@ function FleetRow(p: { node?: RemoteNodeView; core?: Metrics; live?: boolean; hi
 export function Machines() {
   const [list, setList] = createStore<Machine[]>([...MACHINES.map((m) => ({ ...m })), ...loadCustom()]);
   const [draft, setDraft] = createSignal<Draft | null>(null);
-  const [history, setHistory] = createSignal<ResourceSample[]>([]);
+  const [history, setHistory] = createSignal<ResourceSample[]>(readHistory("core"));
   const [core, setCore] = createSignal<Metrics>();
   const [live, setLive] = createSignal(false);
   const [pub, setPub] = createSignal("");
@@ -134,7 +138,8 @@ export function Machines() {
           const sample = data.type === "history" ? data.history?.at(-1) : data;
           if (sample && Number.isFinite(sample.cpu_percent) && Number.isFinite(sample.timestamp_ms)) { setCore(sample); setLive(true);
             const samples: Metrics[] = data.type === "history" ? data.history : [sample];
-            setHistory(old => appendSamples(old, samples.map(s => ({ time: s.timestamp_ms, cpu: s.cpu_percent, memory: s.memory_total > 0 ? s.memory_used / s.memory_total * 100 : null })))); }
+            setHistory(old => freshSamples(appendSamples(old, samples.map(s => ({ time: s.timestamp_ms, cpu: s.cpu_percent, memory: s.memory_total > 0 ? s.memory_used / s.memory_total * 100 : null })))));
+            saveHistory("core", history()); }
         } catch { /* Ignore non-metric frames. */ }
       };
       socket.onclose = () => { setLive(false); if (!stopped && !document.hidden) retry = setTimeout(connect, 5000); };
@@ -143,7 +148,7 @@ export function Machines() {
     const visibility = () => { clearTimeout(retry); if (document.hidden) { socket?.close(); setLive(false); } else connect(); };
     connect();
     document.addEventListener("visibilitychange", visibility);
-    onCleanup(() => { stopped = true; clearTimeout(retry); socket?.close(); document.removeEventListener("visibilitychange", visibility); });
+    onCleanup(() => { saveHistory("core", history(), true); stopped = true; clearTimeout(retry); socket?.close(); document.removeEventListener("visibilitychange", visibility); });
   });
 
   const save = () => {

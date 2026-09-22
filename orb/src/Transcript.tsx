@@ -1,3 +1,4 @@
+import { copyText } from "./clipboard";
 import { remoteLog } from "./remoteLog";
 import { ErrorNotice } from "./ErrorNotice";
 import { forkContext } from "./forkContext";
@@ -76,18 +77,28 @@ function resultText(result: unknown): string {
  * text and no extra height, replacing the banner that used to sit above the
  * transcript announcing what the footer already says.
  */
-export function UserTurn(p: { text: string; attached?: boolean; pending?: boolean }) {
+export function UserTurn(p: { text: string; attached?: boolean; pending?: boolean; onReuse?: (text: string) => void }) {
   const fork = createMemo(() => forkContext(p.text));
   const presentation = createMemo(() => messagePresentation(p.text));
   const goal = createMemo(() => goalDraft(presentation().text));
+  const [editing, setEditing] = createSignal(false);
+  const [draft, setDraft] = createSignal("");
+  const [copyState, setCopyState] = createSignal("");
+  const edit = () => { if (fork()) return; setDraft(presentation().text); setCopyState(""); setEditing(true); };
   return (
-    <div class={`user ${goal().kind === "goal" ? "goal" : ""} ${p.pending ? "pending" : ""}`}>
+    <div onDblClick={() => { if (!editing()) edit(); }} class={`user ${goal().kind === "goal" ? "goal" : ""} ${p.pending ? "pending" : ""}`}>
+      <Show when={editing()} fallback={<>
       <Show when={fork()} fallback={<span>{goal().kind === "goal" ? (goal() as { objective: string }).objective : presentation().text}</span>}>
         {context => <details class="fork-context"><summary>Forked from {context().source_title || "conversation"} · {context().messages.length} messages</summary>
           <For each={context().messages}>{m => <div class="fork-context-message"><small>{m.role === "user" ? "You" : "Assistant"}</small><p>{m.content}</p></div>}</For>
         </details>}
       </Show>
       <Show when={p.attached || presentation().attached}><small class="user-context">Attached context</small></Show>
+      <Show when={!fork()}><button class="icon-btn prompt-edit" aria-label="Edit prompt" onClick={edit}><Ic.PencilIcon size={14} /></button></Show>
+      </>}>
+        <textarea class="prompt-editor" aria-label="Edit prompt text" value={draft()} onInput={e => setDraft(e.currentTarget.value)} onKeyDown={e => { if (e.key === "Escape") { e.stopPropagation(); setEditing(false); } }} ref={el => queueMicrotask(() => { el.focus(); el.style.height = `${Math.min(420, Math.max(100, el.scrollHeight))}px`; })} />
+        <div class="prompt-editor-actions"><span role="status">{copyState()}</span><button class="s-btn sm quiet" onClick={() => setEditing(false)}>Cancel</button><button class="s-btn sm" onClick={() => { void copyText(draft()).then(() => setCopyState("Copied"), e => setCopyState(String(e))); }}>Copy</button><Show when={p.onReuse}><button class="s-btn sm" disabled={!draft().trim()} onClick={() => { p.onReuse?.(draft()); setEditing(false); }}>Use as follow-up</button></Show></div>
+      </Show>
     </div>
   );
 }
@@ -200,7 +211,7 @@ function WorkFold(p: { items: WorkItem[] }) {
   );
 }
 
-export function Transcript(p: { items: StreamItem[]; pending?: boolean }) {
+export function Transcript(p: { items: StreamItem[]; pending?: boolean; onReuse?: (text: string) => void }) {
   // Reconcile by stable keys: existing WorkFold/ToolRow instances and parsed
   // historical Markdown survive token updates and history resynchronization.
   const [grouped, setGrouped] = createStore<Grouped[]>([]);
@@ -231,7 +242,7 @@ export function Transcript(p: { items: StreamItem[]; pending?: boolean }) {
             case "user":
               // Only the turn still waiting for a reply animates: once anything
               // has been said or done after it, the work is visible on its own.
-              return <UserTurn text={item.text} attached={item.attached} pending={p.pending && item.key === lastUserKey()} />;
+              return <UserTurn text={item.text} attached={item.attached} onReuse={p.onReuse} pending={p.pending && item.key === lastUserKey()} />;
             case "think":
               return <ThinkBlock item={item} />;
             case "text":

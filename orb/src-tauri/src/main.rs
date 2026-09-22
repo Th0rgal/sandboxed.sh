@@ -59,6 +59,7 @@ fn main() {
             // Local voice input: the Python worker starts on first use and
             // is released again after a stretch of inactivity.
             app.state::<voice::VoiceState>().start_idle_reaper();
+            machine_metrics::start(app.state::<voice::VoiceState>().inner().clone());
             // macOS vibrancy: the window is transparent and the sidebar
             // shows the desktop through a sidebar-material blur, like
             // Cursor/Xcode. The main pane paints an opaque background in

@@ -1516,3 +1516,13 @@ button.fork-trigger:hover { color: var(--fg); }
 .history-keys .cpu-key { background: #a397bc; }
 .metrics-live { background: var(--fg-4); }
 .metrics-live.on { background: #819b85; box-shadow: 0 0 0 3px #819b8512; }
+
+.history-gpu { stroke: #b69a76; stroke-width: 1.5; }
+.history-keys .gpu-key, .machine-resource:nth-child(4) > span::before { background: #b69a76; }
+
+.user { position: relative; }
+.prompt-edit { position: absolute; top: 8px; right: 8px; opacity: 0; background: var(--bg-elev); }
+.user:hover .prompt-edit, .prompt-edit:focus-visible { opacity: 1; }
+.prompt-editor { width: 100%; box-sizing: border-box; background: transparent; border: 0; outline: 0; color: var(--fg); font: inherit; line-height: inherit; resize: vertical; min-height: 100px; }
+.prompt-editor-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-top: 10px; }
+.prompt-editor-actions > span { margin-right: auto; color: var(--fg-3); font-size: 11px; }

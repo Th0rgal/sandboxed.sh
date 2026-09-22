@@ -250,6 +250,7 @@ function StatusGlyph(p: { agent: { status: Agent["status"] }; busy: boolean }) {
 }
 
 function Composer(p: {
+  revision?: { text: string };
   placeholder: string;
   busy: boolean;
   onSend: (t: string) => void | boolean | Promise<void | boolean>;
@@ -344,6 +345,8 @@ function Composer(p: {
     ta.style.height = "auto";
     ta.style.height = Math.min(ta.scrollHeight, 220) + "px";
   };
+
+  createEffect(() => { const revision = p.revision; if (revision) { setText(revision.text); queueMicrotask(() => { resize(); ta?.focus(); }); } });
   const draftOf = (visible: string, m = mode()) => modePrompt(m, visible);
   const write = (visible: string, nextMode = mode()) => {
     ta.value = visible;
@@ -2045,6 +2048,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
   const [error, setError] = createSignal<string | null>(null);
   const [queueError, setQueueError] = createSignal<string | null>(cached?.queueError ?? null);
   const [sendError, setSendError] = createSignal<string | null>(null);
+  const [revision, setRevision] = createSignal<{ text: string }>();
   const [followAttach, setFollowAttach] = createSignal<AttachChip[]>([]);
   let scroller: HTMLDivElement | undefined;
   let nearBottom = true;
@@ -2257,7 +2261,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
                   {(r) => (
                     <>
                       <LaunchStatus destination={missionDestination(mission(), r())} mission={mission()} goal={missionGoal(mission(), r())} />
-                      <UserTurn text={r().prompt} pending={pending()} />
+                      <UserTurn text={r().prompt} pending={pending()} onReuse={text => setRevision({ text })} />
                       <Show when={pending()}>
                         <MissionPending destination={missionDestination(mission(), r())} label={phaseLabel()} />
                       </Show>
@@ -2269,7 +2273,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
             }
           >
             <LaunchStatus destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={activity()} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
-            <Transcript items={viewItems().filter(i => i.kind !== "user" || !i.queued)} pending={pending()} />
+            <Transcript items={viewItems().filter(i => i.kind !== "user" || !i.queued)} pending={pending()} onReuse={text => setRevision({ text })} />
             <Show when={pending()}>
               <MissionPending destination={missionDestination(mission(), receipt)} label={phaseLabel()} />
             </Show>
@@ -2288,6 +2292,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
             placeholder="Send follow-up"
             picker={false}
             busy={busy()}
+            revision={revision()}
             onSend={sendMsg}
             onStop={stopM}
             scope={`m:${p.id}`}

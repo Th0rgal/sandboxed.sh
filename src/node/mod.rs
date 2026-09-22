@@ -6,6 +6,7 @@
 pub mod job_store;
 pub mod lean;
 pub mod managed_auth;
+pub mod resource_history;
 pub mod runner;
 pub mod slot;
 

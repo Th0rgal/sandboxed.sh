@@ -133,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
     // Periodic disk GC for lean-build checkouts and lake cache slots
     // (SANDBOXED_NODE_MIN_FREE_GB, default 10).
     sandboxed_sh::node::spawn_cache_gc(work_root.clone());
+    sandboxed_sh::node::resource_history::start();
 
     let state = Arc::new(NodeState {
         node_id,
@@ -242,6 +243,7 @@ async fn heartbeat(
     let lean_runtime_ready = sandboxed_sh::node::lean_runtime_ready(&state.work_root);
     let labels = advertised_labels(&state.labels, lean_runtime_ready);
     Ok(Json(NodeHeartbeat {
+        resource_history: sandboxed_sh::node::resource_history::snapshot(),
         node_id: state.node_id.clone(),
         online: true,
         capacity_total: state.capacity_total,

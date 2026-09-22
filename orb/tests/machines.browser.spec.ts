@@ -91,6 +91,6 @@ test("local machine is separate and shows native memory consumers", async ({ pag
   await expect(local.getByText("Cohere · speech to text")).toBeVisible();
   await expect(local.getByText("6.3%", { exact: true })).toBeVisible();
   await expect(local.getByText("Not running", { exact: true })).toBeVisible();
-  await expect(local.getByRole("img", { name: "CPU and memory usage over the last two minutes" })).toBeVisible();
+  await expect(local.getByRole("img", { name: "CPU and memory usage over the last minute" })).toBeVisible();
   await page.screenshot({ path: "/tmp/orb-local-machine.png" });
 });

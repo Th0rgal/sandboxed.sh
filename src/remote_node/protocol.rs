@@ -39,8 +39,10 @@ fn default_protocol_version() -> u32 {
 /// All fields beyond the original v1 set are `#[serde(default)]`-tolerant so
 /// core can parse heartbeats from nodes that were not yet upgraded, and old
 /// cores simply ignore the extra fields of new nodes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeHeartbeat {
+    #[serde(default)]
+    pub resource_history: Vec<crate::node::resource_history::Sample>,
     pub node_id: String,
     pub online: bool,
     pub capacity_total: u32,
@@ -798,6 +800,7 @@ mod tests {
     #[test]
     fn heartbeat_v2_round_trips() {
         let heartbeat = NodeHeartbeat {
+            resource_history: Vec::new(),
             node_id: "babylon".to_string(),
             online: true,
             capacity_total: 4,
