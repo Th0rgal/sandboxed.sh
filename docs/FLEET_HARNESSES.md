@@ -83,3 +83,8 @@ host firewall contained no matching traffic shaper. Direct IPv4, IPv6 and a
 temporary SSH jump through Nippur did not yield a usable artifact transfer.
 This establishes a network-path problem, not its provider-side cause. Do not
 claim Babylon's runtime readiness from its successful harness install checks.
+
+Babylon was cordoned after the final transfer attempt also stalled without SSH
+QoS markings. It had no active or queued work. Core and all other nodes were
+healthy and uncordoned; Core API and Hermes were active. Uncordon Babylon only
+after a sustained connectivity check and the pending upload-route rollout pass.
