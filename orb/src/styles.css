@@ -137,7 +137,7 @@ button:focus-visible { outline: 1.5px solid var(--focus-border); outline-offset:
   grid-template-rows: var(--tb-h) 1fr;
   height: 100%;
 }
-/* Everything right of the sidebar stays opaque. */
+/* A faint native wallpaper tint carries across the shell. */
 .titlebar, .main { background: color-mix(in srgb, var(--bg) var(--surface-opacity), transparent); }
 .app.sb-hidden { grid-template-columns: 0 1fr; }
 .app.sb-hidden .sidebar { display: none; }
@@ -1472,3 +1472,6 @@ button.fork-trigger:hover { color: var(--fg); }
 .machine-resource { display: flex; flex-direction: column; gap: 6px; color: var(--fg-3); font-size: 12px; }
 .machine-resource strong { color: var(--fg-2); font-size: 18px; font-weight: 500; font-variant-numeric: tabular-nums; }
 .machine-resource small { font-size: 11px; font-variant-numeric: tabular-nums; }
+
+.provider-logo { display: grid; place-items: center; width: 22px; height: 22px; flex: none; color: var(--fg-2); }
+.provider-logo > span { display: block; width: 21px; height: 21px; background: currentColor; mask-size: contain; mask-repeat: no-repeat; mask-position: center; -webkit-mask-size: contain; -webkit-mask-repeat: no-repeat; -webkit-mask-position: center; }
