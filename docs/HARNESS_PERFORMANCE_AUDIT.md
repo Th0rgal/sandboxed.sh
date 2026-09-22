@@ -235,3 +235,39 @@ had been observed. Intermediate traceroute loss alone does not prove provider
 packet loss. The exact cause of the intermittent bulk-transfer degradation
 remains unproven; do not describe the DNS change as a proven cure for all TCP
 stalls. Keep resumable transfers and verify node readiness after updates.
+
+### Final live validation of Claude routing
+
+Core deployed `3eeea6856eac` through the guarded endpoint when no harness was
+running, then Hermes was restarted and fleet health checked.
+
+- I (`513d442d-a4a3-40de-a548-ef96fb932afd`) reached Sonnet on Ashur in 6.82 s,
+  but the model rejected the synthetic marker framing as an injection probe.
+  This proves the request reached inference, **not** successful task completion.
+  Checking only that `STREAM_END` appears would incorrectly accept this refusal.
+- K (`dbf123b1-700f-446b-825c-1d7693875aab`) used a natural French request for
+  the same 30-row table without markers. Sonnet on Ashur returned all 30 numbered
+  rows, verified in Orb and in the stored output, in 18.89 s.
+- J (`e02ec2cc-8365-44f3-ad0b-e73bb36fe12e`) ran Codex/GPT-6 Astra on Nippur
+  and returned all 30 numbered rows in 20.18 s.
+
+Remote Claude currently uses plain `claude -p`: Orb receives the terminal log
+output, not Claude's incremental structured text events. The Core/local Claude
+streaming measurements must not be generalized to that remote path. Supporting
+remote Claude stream-json requires a typed parser with native session, tool,
+usage, cancellation and completion handling, not just adding a CLI flag.
+
+### Host pressure during the investigation
+
+Core had roughly 52 GiB available RAM, memory PSI 0, and 1.5 TiB free on the
+storage volume. CPU PSI was 34–39% during the debug build. Four Python jobs in
+old root SSH sessions had been alive for 34–37 days, accumulating 22–25 CPU days;
+they were outside `missions.slice`. Their lifetime CPU percentages are not a
+measurement of the original Pareto stall.
+
+Their priority was lowered from nice 0 to nice 10, without terminating them:
+PIDs 1016309, 543515, 505664 and 2944346. `/tmp/orb-old-ssh-priority-receipt.json`
+on Core records process start ticks and old/new priorities for safe reversal.
+A separate four-hour Python job was left unchanged. Attribute old scripts before
+terminating them; future operator compute should also run in a bounded scope.
+No measured mission speedup is attributed to this priority change.
