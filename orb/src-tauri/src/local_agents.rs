@@ -227,14 +227,15 @@ fn watch_exit(child: Arc<Mutex<Child>>, done: Arc<AtomicBool>, exit_code: Arc<Mu
 pub fn local_agents_poll(id: String) -> Result<PollState, String> {
     let map = runs().lock().map_err(|e| e.to_string())?;
     let run = map.get(&id).ok_or_else(|| "no local run".to_string())?;
-    Ok(PollState {
+    let snapshot = PollState {
         text: run.text.lock().map_err(|e| e.to_string())?.clone(),
         done: run.done.load(Ordering::SeqCst),
         exit_code: *run.exit_code.lock().map_err(|e| e.to_string())?,
         session_id: run.session_id.lock().map_err(|e| e.to_string())?.clone(),
         error: run.error.lock().map_err(|e| e.to_string())?.clone(),
         resumed: run.resumed,
-    })
+    };
+    Ok(snapshot)
 }
 
 #[tauri::command]
