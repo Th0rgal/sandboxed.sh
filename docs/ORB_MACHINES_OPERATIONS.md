@@ -231,3 +231,8 @@ Ashur through the core proxy completed successfully, then resumed the same
 thread and recalled its marker; both processes exited zero. The temporary
 proxy key was revoked. Core health reports `ok` with 1,452 GiB free on the
 execution volume.
+
+A second live canary exercised the exact Core harness path: Codex, GPT-6 Astra,
+Medium. Its assistant response was `CORE_CODEX_OK`, with structured success and
+`TurnComplete` evidence. The temporary mission was removed after verification.
+Hermes also completed its graceful restart and both services are active.
