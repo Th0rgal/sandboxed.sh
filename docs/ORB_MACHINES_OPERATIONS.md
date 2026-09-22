@@ -187,11 +187,47 @@ tests remain intentionally ignored. The Orb launch/connection suite passed
 The 24 provider-health tests passed after the resolver correction. A native
 Codex request from Ashur through the public core proxy reached OpenAI and
 returned the account’s usage-limit error (reset reported as 26 September),
-rather than the previous unsupported-protocol/502 failure. Live successful
-inference and live resume remain unverified until quota is available. No
-additional account was selected and no credits were purchased.
+rather than the previous unsupported-protocol/502 failure. This first probe
+only reached Thomas’s exhausted account. The subsequent account-recovery
+investigation below supersedes the initial quota diagnosis. No credits were
+purchased.
 
 The attachment canary was repeated successfully after the final deployment.
 Core reports approximately 1,453 GiB free on the execution volume. The second
 deployment waited for the active mission to finish naturally before the
 guard admitted it.
+
+
+### Codex account recovery and quota visibility
+
+The provider store held an expired Ben credential while the account-specific
+shared Codex home held a newer, valid generation for the same ChatGPT identity.
+The launcher filtered the stale store entry before considering the shared
+credential, leaving only Thomas’s exhausted account. A direct GPT-6 Astra
+probe confirmed Ben had 45% of the weekly quota used (55% available); Thomas
+reported 100%. These are measurements at repair time, not fixed allowances.
+
+The backend now reconciles newer credentials under the existing per-account
+and cross-process refresh locks before provider listing, usage probing,
+native proxy routing and proactive refresh. Launcher account enumeration also
+considers the same-account shared credential before excluding expired entries.
+Recovery requires a matching ChatGPT identity, a newer unexpired JWT and a
+nonempty refresh token; it never copies credentials across accounts.
+
+Orb now waits for per-account Codex usage after the initial bulk cache response
+and refreshes the display periodically. It shows Codex percentages in the
+account rows, distinguishes exhausted quota from connected credentials, uses
+the provider’s actual window duration, and omits zero-duration windows. Open
+usage details remain reactive when updated measurements arrive.
+
+Validation: four OAuth recovery/deadletter tests, 97 Codex tests and 278 Orb
+tests passed. The merged client build and 13 affected UI tests also passed.
+
+Production deployment `90707ecfc79a` passed the guarded idle check. The Pareto
+Claude mission was paused and resumed with its original session preserved.
+The production usage endpoints now return Ben at 45% used and Thomas at 100%,
+both on 10,080-minute weekly windows. A native Codex GPT-6 Astra invocation on
+Ashur through the core proxy completed successfully, then resumed the same
+thread and recalled its marker; both processes exited zero. The temporary
+proxy key was revoked. Core health reports `ok` with 1,452 GiB free on the
+execution volume.
