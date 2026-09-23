@@ -1,3 +1,4 @@
+import { CodeBlock } from "./CodeBlock";
 import { FileReference, FileReferenceText } from "./fileReferenceContext";
 import { For, createMemo, createSignal, type JSX } from "solid-js";
 import { openExternalUrl } from "./api";
@@ -204,9 +205,7 @@ export function MdView(p: { text: string; compact?: boolean }) {
               ))}
             </ul>
           ) : b.t === "pre" ? (
-            <pre>
-              <code>{b.text}</code>
-            </pre>
+            <CodeBlock text={b.text} lang={b.lang}/>
           ) : b.t === "quote" ? (
             <blockquote><MdView text={b.text} compact={p.compact} /></blockquote>
           ) : b.t === "table" ? (

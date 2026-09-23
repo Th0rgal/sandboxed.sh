@@ -54,6 +54,7 @@ export interface LocalFile {
 }
 
 const [installed, setInstalled] = createSignal<ScanRow[]>([]);
+const runVersions = new Map<string,number>();
 const [running, setRunning] = createSignal<Record<string, boolean>>({});
 const [liveText, setLiveText] = createSignal<Record<string, string>>({});
 
@@ -293,6 +294,7 @@ export interface StartLocal {
 export async function startLocal(req: StartLocal): Promise<void> {
   const invoke = tauriInvoke();
   if (!invoke) throw new Error("Local agents run in the Orb desktop app.");
+  runVersions.set(req.id,(runVersions.get(req.id) ?? 0)+1);
   recordLocalFailure(req.id, null);
   setRunning((prev) => ({ ...prev, [req.id]: true }));
   setLiveText((prev) => ({ ...prev, [req.id]: "" }));
@@ -310,7 +312,7 @@ export async function startLocal(req: StartLocal): Promise<void> {
       },
     });
   } catch (e) {
-    setRunning((prev) => ({ ...prev, [req.id]: false }));
+    await reconcileLocalRun(req.id);
     recordLocalFailure(req.id, e);
     throw e;
   }
@@ -331,14 +333,29 @@ export async function pollLocal(id: string): Promise<PollLocal> {
   return (await invoke("local_agents_poll", { id })) as PollLocal;
 }
 
+/** The native runner survives webview reloads; frontend flags do not. */
+export async function reconcileLocalRun(id: string): Promise<void> {
+  const version=runVersions.get(id);
+  try {
+    const state = await pollLocal(id);
+    if (runVersions.get(id)!==version) return;
+    setRunning(prev => ({ ...prev, [id]: !state.done }));
+    setLiveText(prev => ({ ...prev, [id]: state.text }));
+    if (state.session_id) {
+      const binding = localBinding(id);
+      if (binding) rememberBinding(id, { ...binding, sessionId: state.session_id });
+    }
+  } catch (error) {
+    // A transport error does not mean the process stopped.
+    if (runVersions.get(id)===version && /no local run/i.test(String(error))) setRunning(prev => ({ ...prev, [id]: false }));
+  }
+}
+
 export async function stopLocal(id: string): Promise<void> {
+  runVersions.set(id,(runVersions.get(id) ?? 0)+1);
   const invoke = tauriInvoke();
   if (invoke) {
-    try {
-      await invoke("local_agents_stop", { id });
-    } catch {
-      /* already gone */
-    }
+    await invoke("local_agents_stop", { id });
   }
   setRunning((prev) => ({ ...prev, [id]: false }));
 }
@@ -375,7 +392,7 @@ export async function followLocal(id: string, onText: (text: string) => void): P
       }
     } else {state=await pollUntilDone();}
     if(state.session_id){const binding=localBinding(id);if(binding)rememberBinding(id,{...binding,sessionId:state.session_id});}
+    setRunning(prev=>({...prev,[id]:false}));
     return state;
-  } catch(error) {recordLocalFailure(id,error);throw error;}
-  finally {setRunning(prev=>({...prev,[id]:false}));}
+  } catch(error) {await reconcileLocalRun(id);recordLocalFailure(id,error);throw error;}
 }

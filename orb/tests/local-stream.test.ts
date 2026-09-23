@@ -89,3 +89,21 @@ it("keeps streaming blockquotes equivalent to complete Markdown parsing", () => 
  const parse=incrementalMarkdown(); const text="> Bonjour\n>\n> Deuxième paragraphe\n> > Citation imbriquée\n\nFin.";
  for(let i=0;i<=text.length;i++)expect(parse(text.slice(0,i))).toEqual(parseMarkdown(text.slice(0,i)));
 });
+
+it("recovers native activity after reload and preserves it when a new start is rejected",async()=>{
+ const {reconcileLocalRun,localRunActive,startLocal,stopLocal}=await import('../src/localAgents');
+ const invoke=vi.fn(async(command:string)=>{
+  if(command==='local_agents_poll')return {text:'Working',done:false,resumed:true};
+  throw new Error('This mission is still running locally');
+ });
+ vi.stubGlobal('__TAURI__',{core:{invoke}});
+ try {
+  await reconcileLocalRun('recovered');expect(localRunActive('recovered')).toBe(true);
+  await expect(startLocal({id:'recovered',harness:'codex',bin:'/codex',cwd:'/tmp',prompt:'next'})).rejects.toThrow('still running');
+  expect(localRunActive('recovered')).toBe(true);
+  await expect(stopLocal('recovered')).rejects.toThrow();
+  expect(localRunActive('recovered')).toBe(true);
+  invoke.mockImplementation(async()=>({text:'Finished',done:true,resumed:true}));
+  await reconcileLocalRun('recovered');expect(localRunActive('recovered')).toBe(false);
+ } finally {vi.unstubAllGlobals();}
+});

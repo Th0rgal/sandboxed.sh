@@ -44,6 +44,7 @@ import {
   localFailure,
   recordLocalFailure,
   localRunActive,
+  reconcileLocalRun,
   localWorkspace,
   materializeMentions,
   refreshLocalAgents,
@@ -2257,6 +2258,15 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
     });
   });
 
+  createEffect(() => {
+    const id = p.id;
+    if (!localBinding(id)) return;
+    const reconcile = () => reconcileLocalRun(id);
+    void reconcile();
+    const stop = pollWhileVisible(reconcile, 2000);
+    onCleanup(stop);
+  });
+
   const clientPlaced = () => !!localBinding(p.id) || !!mission()?.tags?.includes("placement:client");
   const busy = () => {
     if (localRunActive(p.id)) return true;
@@ -2359,7 +2369,7 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
 
   const stopM = () => {
     if (clientPlaced()) {
-      void stopLocal(p.id).then(() => setClientMissionStatus(p.id, "interrupted")).then(() => refresh());
+      void stopLocal(p.id).then(() => setClientMissionStatus(p.id, "interrupted")).then(() => refresh()).catch(e => setSendError(String(e)));
       return;
     }
     void cancelMission(p.id)
