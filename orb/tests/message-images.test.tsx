@@ -16,12 +16,12 @@ it("leaves ordinary text untouched and preserves inline numbering",()=>{
  expect(messageImages('See [Uploaded: /tmp/a.png] here.').text).toBe('See #1 here.');
 });
 it("reusing an edited prompt keeps its image attachments",()=>{
- const reuse=vi.fn();
- render(()=><UserTurn text={'Original\n\n[Uploaded: /tmp/a.png]'} onReuse={reuse}/>);
+ const reuse=vi.fn().mockResolvedValue(true);
+ render(()=><UserTurn text={'Original\n\n[Uploaded: /tmp/a.png]'} onSend={reuse}/>);
  fireEvent.click(screen.getByRole('button',{name:'Edit prompt'}));
  const editor=screen.getByRole('textbox');
  expect((editor as HTMLTextAreaElement).value).toBe('Original');
  fireEvent.input(editor,{target:{value:'Revised'}});
- fireEvent.click(screen.getByRole('button',{name:'Use as follow-up'}));
+ fireEvent.click(screen.getByRole('button',{name:'Send follow-up'}));
  expect(reuse).toHaveBeenCalledWith('Revised\n\n[Uploaded: /tmp/a.png]');
 });

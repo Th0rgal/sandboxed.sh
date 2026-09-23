@@ -2195,7 +2195,6 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
   const [error, setError] = createSignal<string | null>(null);
   const [queueError, setQueueError] = createSignal<string | null>(cached?.queueError ?? null);
   const [sendError, setSendError] = createSignal<string | null>(null);
-  const [revision, setRevision] = createSignal<{ text: string }>();
   const [followAttach, setFollowAttach] = createSignal<AttachChip[]>([]);
   let scroller: HTMLDivElement | undefined;
   let nearBottom = true;
@@ -2344,7 +2343,7 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
   // Retrying an uncertain network result reuses the original message identity.
   // A different draft/selection, or a definitive rejection, starts a new attempt.
   let retryMessage: { key: string; id: string } | null = null;
-  const sendMsg = async (text: string, images: DraftImage[] = []) => {
+  const sendMsg = async (text: string, images: DraftImage[] = [], chips: AttachChip[] = followAttach()) => {
     setSendError(null);
     if (clientPlaced()) {
       await import("./localAgents").then(m => m.restoreLocalBindings()).catch(console.error);
@@ -2359,7 +2358,7 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
         return false;
       }
       try {
-        const plan = await materializeMentions(project, text, followAttach());
+        const plan = await materializeMentions(project, text, chips);
         if (plan.files.length) await writeLocalFiles(binding.cwd, plan.files);
         const imagePaths = await stageLocalImages(binding.cwd, images);
         const sent = imagePrompt(bindWorkspace(plan.prompt, binding.cwd), imagePaths);
@@ -2369,7 +2368,7 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
         await appendClientTranscript(p.id, "user", imagePrompt(text, imagePaths)).catch(e => {
           setSendError(`The local run started, but saving your message failed: ${String(e)}`);
         });
-        setFollowAttach([]);
+        if (chips === followAttach()) setFollowAttach([]);
         void followLocal(p.id, () => {}).then(async (state) => {
           const note = binding.harness === "grok" && binding.sessionId && !state.resumed ? "Grok starts a new local session.\n\n" : "";
           const body = `${note}${state.text}`.trim();
@@ -2391,17 +2390,17 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
         return false;
       }
     }
-    const attachments = followAttach().map(chipToAttachment);
+    const attachments = chips.map(chipToAttachment);
     const key = JSON.stringify([connectionVersion(), text, attachments, images.map(image => image.id)]);
     if (retryMessage?.key !== key) retryMessage = { key, id: crypto.randomUUID() };
     try {
       const sent = imagePrompt(text, await stageRemoteImages(images, mission()));
       const result = await sendMissionMessage(p.id, sent, attachments, retryMessage.id);
       retryMessage = null;
-      const event: StreamEvent = { type: "user_message", eventId: result.id, data: { id: result.id, content: sent, queued: result.queued, receipt: true, attached: followAttach().length > 0 } };
+      const event: StreamEvent = { type: "user_message", eventId: result.id, data: { id: result.id, content: sent, queued: result.queued, receipt: true, attached: chips.length > 0 } };
       if (replaying) held.push(event);
       else applyLive(event);
-      setFollowAttach([]);
+      if (chips === followAttach()) setFollowAttach([]);
       void refresh();
       return true;
     }
@@ -2409,6 +2408,15 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
       if (e instanceof MessageRejectedError || (e instanceof ApiError && e.status < 500 && e.status !== 408)) retryMessage = null;
       setSendError(launchError(e)); return false;
     }
+  };
+
+  const sendEditedPrompt = async (text: string) => {
+    if (clientPlaced() && busy()) throw new Error("Wait for the local agent to finish or stop it before sending this follow-up.");
+    // The inline editor sends only this message's existing attachments, not
+    // unrelated context chips or an unsent draft in the main composer.
+    const accepted = await sendMsg(text, [], []);
+    if (!accepted) throw new Error(sendError() || "The message was not sent. Your draft is kept.");
+    return true;
   };
 
   const stopM = () => {
@@ -2439,7 +2447,7 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
                   {(r) => (
                     <>
                       <LaunchStatus destination={missionDestination(mission(), r())} mission={mission()} goal={missionGoal(mission(), r())} />
-                      <UserTurn text={r().prompt} pending={pending()} onReuse={text => setRevision({ text })} />
+                      <UserTurn text={r().prompt} pending={pending()} onSend={sendEditedPrompt} />
                       <Show when={pending()}>
                         <MissionPending destination={missionDestination(mission(), r())} label={phaseLabel()} />
                       </Show>
@@ -2451,7 +2459,7 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
             }
           >
             <LaunchStatus submitting={localRunActive(p.id)} destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={activity()} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
-            <Transcript items={viewItems().filter(i => i.kind !== "user" || !i.queued)} pending={pending()} onReuse={text => setRevision({ text })} />
+            <Transcript items={viewItems().filter(i => i.kind !== "user" || !i.queued)} pending={pending()} onSend={sendEditedPrompt} />
             <Show when={!sendError()}>
               <MissionFailure mission={mission()} active={localRunActive(p.id)} error={localFailure(p.id)} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
             </Show>
@@ -2473,7 +2481,6 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
             placeholder="Send follow-up"
             picker={false}
             busy={busy()}
-            revision={revision()}
             onSend={sendMsg}
             onStop={stopM}
             scope={`m:${p.id}`}

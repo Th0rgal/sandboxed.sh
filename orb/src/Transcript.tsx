@@ -106,7 +106,7 @@ function MessageImage(p: {path:string; index:number}) {
   </>;
 }
 
-export function UserTurn(p: { text: string; attached?: boolean; pending?: boolean; onReuse?: (text: string) => void }) {
+export function UserTurn(p: { text: string; attached?: boolean; pending?: boolean; onSend?: (text: string) => boolean | Promise<boolean> }) {
   const fork = createMemo(() => forkContext(p.text));
   const presentation = createMemo(() => messagePresentation(p.text));
   const images = createMemo(() => messageImages(presentation().text));
@@ -114,13 +114,25 @@ export function UserTurn(p: { text: string; attached?: boolean; pending?: boolea
   const [editing, setEditing] = createSignal(false);
   const [draft, setDraft] = createSignal("");
   const [copyState, setCopyState] = createSignal("");
+  const [sending, setSending] = createSignal(false);
+  const [sendError, setSendError] = createSignal("");
+  const submit = async () => {
+    if (sending() || !draft().trim() || !p.onSend) return;
+    setSending(true); setSendError("");
+    try {
+      const accepted = await p.onSend(imagePrompt(draft(), images().paths));
+      if (accepted) setEditing(false);
+      else setSendError("The message was not sent. Your draft is kept; try again.");
+    } catch (e) { setSendError(e instanceof Error ? e.message : String(e)); }
+    finally { setSending(false); }
+  };
   const resizeEditor = (el: HTMLTextAreaElement) => {
     el.style.height = "auto";
     el.style.height = `${Math.min(320, el.scrollHeight)}px`;
   };
-  const edit = () => { if (fork()) return; setDraft(images().text); setCopyState(""); setEditing(true); };
+  const edit = () => { if (fork()) return; setDraft(images().text); setCopyState(""); setSendError(""); setEditing(true); };
   return (
-    <div onDblClick={() => { if (!editing()) edit(); }} class={`user ${goal().kind === "goal" ? "goal" : ""} ${p.pending ? "pending" : ""}`}>
+    <div onDblClick={() => { if (!editing()) edit(); }} class={`user ${editing() ? "editing" : ""} ${goal().kind === "goal" ? "goal" : ""} ${p.pending ? "pending" : ""}`}>
       <Show when={images().paths.length}><div class="message-images"><For each={images().paths}>{(path,index)=><MessageImage path={path} index={index()+1}/>}</For></div></Show>
       <Show when={editing()} fallback={<>
       <Show when={fork()} fallback={<span>{goal().kind === "goal" ? (goal() as { objective: string }).objective : images().text}</span>}>
@@ -131,13 +143,14 @@ export function UserTurn(p: { text: string; attached?: boolean; pending?: boolea
       <Show when={p.attached || presentation().attached}><small class="user-context">Attached context</small></Show>
       <Show when={!fork()}><button class="icon-btn prompt-edit" aria-label="Edit prompt" onClick={edit}><Ic.PencilIcon size={14} /></button></Show>
       </>}>
-        <textarea class="prompt-editor" rows={1} aria-label="Edit prompt text" value={draft()} onInput={e => { setDraft(e.currentTarget.value); resizeEditor(e.currentTarget); }} onKeyDown={e => { if (e.key === "Escape") { e.stopPropagation(); setEditing(false); } }} ref={el => queueMicrotask(() => { el.focus(); resizeEditor(el); })} />
+        <textarea class="prompt-editor" rows={1} aria-label="Edit prompt text" disabled={sending()} value={draft()} onInput={e => { setDraft(e.currentTarget.value); resizeEditor(e.currentTarget); }} onKeyDown={e => { if (e.key === "Escape") { e.stopPropagation(); if (!sending()) setEditing(false); } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.isComposing) { e.preventDefault(); void submit(); } }} ref={el => queueMicrotask(() => { el.focus(); resizeEditor(el); })} />
         <div class="prompt-editor-actions">
-          <button class="icon-btn" aria-label="Cancel" title="Cancel (Esc)" onClick={() => setEditing(false)}><Ic.CloseIcon size={16} /></button>
+          <button class="icon-btn" aria-label="Cancel" title="Cancel (Esc)" disabled={sending()} onClick={() => setEditing(false)}><Ic.CloseIcon size={16} /></button>
           <button class="icon-btn" aria-label="Copy prompt" title="Copy prompt" onClick={() => { void copyText(draft()).then(() => setCopyState("Copied"), e => setCopyState(String(e))); }}><Ic.CopyIcon size={15} /></button>
           <span role="status">{copyState()}</span>
-          <Show when={p.onReuse}><button class="send" aria-label="Use as follow-up" title="Use as follow-up" disabled={!draft().trim()} onClick={() => { p.onReuse?.(imagePrompt(draft(),images().paths)); setEditing(false); }}><Ic.ArrowUpIcon size={16} /></button></Show>
+          <Show when={p.onSend}><button class="send" aria-label={sending() ? "Sending follow-up" : "Send follow-up"} title="Send as follow-up (⌘/Ctrl+Enter)" disabled={sending() || !draft().trim()} onClick={() => void submit()}><Ic.ArrowUpIcon size={16} /></button></Show>
         </div>
+        <Show when={sendError()}><ErrorNotice error={sendError()} /></Show>
       </Show>
     </div>
   );
@@ -251,7 +264,7 @@ function WorkFold(p: { items: WorkItem[] }) {
   );
 }
 
-export function Transcript(p: { items: StreamItem[]; pending?: boolean; onReuse?: (text: string) => void }) {
+export function Transcript(p: { items: StreamItem[]; pending?: boolean; onSend?: (text: string) => boolean | Promise<boolean> }) {
   // Reconcile by stable keys: existing WorkFold/ToolRow instances and parsed
   // historical Markdown survive token updates and history resynchronization.
   const [grouped, setGrouped] = createStore<Grouped[]>([]);
@@ -282,7 +295,7 @@ export function Transcript(p: { items: StreamItem[]; pending?: boolean; onReuse?
             case "user":
               // Only the turn still waiting for a reply animates: once anything
               // has been said or done after it, the work is visible on its own.
-              return <UserTurn text={item.text} attached={item.attached} onReuse={p.onReuse} pending={p.pending && item.key === lastUserKey()} />;
+              return <UserTurn text={item.text} attached={item.attached} onSend={p.onSend} pending={p.pending && item.key === lastUserKey()} />;
             case "think":
               return <ThinkBlock item={item} />;
             case "text":

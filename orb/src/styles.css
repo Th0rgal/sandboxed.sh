@@ -1535,6 +1535,8 @@ button.fork-trigger:hover { color: var(--fg); }
 .prompt-edit { position: absolute; top: 8px; right: 8px; opacity: 0; background: var(--bg-elev); }
 .user:hover .prompt-edit, .prompt-edit:focus-visible { opacity: 1; }
 .prompt-editor { width: 100%; box-sizing: border-box; background: transparent; border: 0; outline: 0; color: var(--fg); font: inherit; line-height: inherit; resize: none; min-height: 1.5em; max-height: 320px; display: block; padding: 0; }
+.user.editing { padding-right: 10px; content-visibility: visible; }
+.prompt-editor-actions .send { flex: none; margin-left: auto; }
 .prompt-editor-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-top: 10px; }
 .prompt-editor-actions > span { flex: 1; color: var(--fg-3); font-size: 11px; }
 
