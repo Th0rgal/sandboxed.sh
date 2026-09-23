@@ -5,8 +5,8 @@ mod file_browser;
 mod local_agents;
 mod local_stream;
 mod machine_metrics;
-mod uploads;
 mod session_preview;
+mod uploads;
 mod voice;
 
 use tauri::{Manager, Theme, WebviewWindow};
@@ -57,6 +57,33 @@ fn open_url(url: String) -> Result<(), String> {
     Ok(())
 }
 
+// Native storage is shared by packaged and development webview origins.
+static BINDINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[tauri::command]
+fn local_bindings(
+    id: Option<String>,
+    binding: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let _guard = BINDINGS_LOCK.lock().map_err(|e| e.to_string())?;
+    let dir =
+        std::path::PathBuf::from(std::env::var("HOME").map_err(|e| e.to_string())?).join(".orb");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("local-bindings.json");
+    let mut all: serde_json::Map<String, serde_json::Value> = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string())?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(e) => return Err(e.to_string()),
+    };
+    if let (Some(id), Some(binding)) = (id, binding) {
+        all.insert(id, binding);
+        let tmp = dir.join("local-bindings.json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&all).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        std::fs::rename(tmp, path).map_err(|e| e.to_string())?;
+    }
+    Ok(serde_json::Value::Object(all))
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(voice::VoiceState::new())
@@ -87,6 +114,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            local_bindings,
             paloma_ssh_pubkey,
             session_preview::local_session_git,
             uploads::pick_upload_files,

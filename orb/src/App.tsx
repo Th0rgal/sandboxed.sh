@@ -2347,6 +2347,7 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
   const sendMsg = async (text: string, images: DraftImage[] = []) => {
     setSendError(null);
     if (clientPlaced()) {
+      await import("./localAgents").then(m => m.restoreLocalBindings()).catch(console.error);
       const binding = localBinding(p.id);
       if (!binding) {
         setSendError("This session runs on the computer that started it. Your draft is kept.");

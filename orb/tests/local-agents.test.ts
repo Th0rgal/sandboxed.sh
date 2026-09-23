@@ -37,3 +37,19 @@ describe("local mention rewrite", () => {
     ).rejects.toThrow(/could not be read/);
   });
 });
+
+it("restores native session bindings across webview origins", async () => {
+  const { restoreLocalBindings, localBinding } = await import('../src/localAgents');
+  const binding = {harness:'codex',bin:'/bin/codex',cwd:'/work',sessionId:'original-session'};
+  const host = window as unknown as {__TAURI_INTERNALS__?: {invoke: () => Promise<unknown>}};
+  const previous = host.__TAURI_INTERNALS__;
+  localStorage.removeItem('orb.localBindings');
+  host.__TAURI_INTERNALS__ = {invoke: async () => ({mission:binding})};
+  try {
+    await restoreLocalBindings();
+    expect(localBinding('mission')).toEqual(binding);
+  } finally {
+    host.__TAURI_INTERNALS__ = previous;
+    localStorage.removeItem('orb.localBindings');
+  }
+});

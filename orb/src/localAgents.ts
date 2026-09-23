@@ -99,6 +99,7 @@ export function rememberBinding(id: string, binding: LocalBinding) {
   })();
   all[id] = binding;
   localStorage.setItem(BIND_KEY, JSON.stringify(all));
+  void tauriInvoke()?.("local_bindings", {id, binding}).catch(console.error);
 }
 
 type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -111,7 +112,20 @@ function tauriInvoke(): Invoke | null {
   return g.__TAURI__?.core?.invoke ?? g.__TAURI_INTERNALS__?.invoke ?? null;
 }
 
+export async function restoreLocalBindings() {
+  const invoke = tauriInvoke();
+  if (!invoke) return;
+  const stored = await invoke("local_bindings") as Record<string, LocalBinding>;
+  const cached = JSON.parse(localStorage.getItem(BIND_KEY) || "{}") as Record<string, LocalBinding>;
+  // Older installations only had web storage. Migrate those entries once.
+  for (const [id, binding] of Object.entries(cached)) {
+    if (!stored[id]) await invoke("local_bindings", {id, binding});
+  }
+  localStorage.setItem(BIND_KEY, JSON.stringify({...cached, ...stored}));
+}
+
 export async function refreshLocalAgents(): Promise<ScanRow[]> {
+  await restoreLocalBindings().catch(console.error);
   const invoke = tauriInvoke();
   if (!invoke) {
     setInstalled([]);
