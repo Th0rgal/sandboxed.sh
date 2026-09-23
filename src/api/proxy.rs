@@ -3610,9 +3610,13 @@ fn anthropic_body_drop_thinking_and_disable(body: &[u8]) -> Result<bytes::Bytes,
         strip_thinking_blocks(messages);
     }
     if let Some(obj) = value.as_object_mut() {
+        let adaptive_only = obj
+            .get("model")
+            .and_then(|v| v.as_str())
+            .is_some_and(crate::model_policy::requires_adaptive_thinking);
         obj.insert(
             "thinking".to_string(),
-            serde_json::json!({ "type": "disabled" }),
+            serde_json::json!({ "type": if adaptive_only { "adaptive" } else { "disabled" } }),
         );
         // Opus 5 rejects disabled thinking at xhigh/max effort. This recovery
         // path deliberately disables thinking for one turn, so cap an
@@ -3626,7 +3630,7 @@ fn anthropic_body_drop_thinking_and_disable(body: &[u8]) -> Result<bytes::Bytes,
                 .get("effort")
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|effort| matches!(effort, "xhigh" | "max"));
-            if incompatible {
+            if incompatible && !adaptive_only {
                 output_config.insert("effort".to_string(), serde_json::json!("high"));
             }
         }
@@ -6461,6 +6465,15 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use futures::StreamExt;
+
+    #[test]
+    fn opus_55_recovery_keeps_adaptive_thinking_and_effort() {
+        let body = br#"{"model":"claude-opus-5-5","thinking":{"type":"enabled","budget_tokens":2048},"output_config":{"effort":"max"},"messages":[]}"#;
+        let repaired = anthropic_body_drop_thinking_and_disable(body).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&repaired).unwrap();
+        assert_eq!(value["thinking"], serde_json::json!({"type":"adaptive"}));
+        assert_eq!(value["output_config"]["effort"], "max");
+    }
 
     #[test]
     fn protocol_capabilities_are_credential_aware_and_fail_closed() {

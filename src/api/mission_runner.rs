@@ -6097,7 +6097,16 @@ fn build_opencode_auth_from_ai_providers(
                 "expires": oauth.expires_at,
             });
             for key in &keys {
-                map.insert((*key).to_string(), entry.clone());
+                // Several accounts can share one OpenCode provider key. Never let
+                // an older OAuth record overwrite a fresher credential just because
+                // it appears later in the provider store.
+                let existing_expiry = map
+                    .get(*key)
+                    .and_then(|value| value.get("expires"))
+                    .and_then(serde_json::Value::as_i64);
+                if existing_expiry.is_none_or(|expires| oauth.expires_at > expires) {
+                    map.insert((*key).to_string(), entry.clone());
+                }
             }
         }
     }
@@ -7574,16 +7583,67 @@ fn claudecode_install_command(
 }
 
 fn desired_claudecode_version() -> String {
-    // 2.1.257 is the first production pin that supports Claude Fable 5.1
-    // (`claude-fable-5-1` requires Claude Code >= 2.1.251). It also retains
-    // the bug-fixed native `/goal` command introduced in 2.1.139 and hardened
-    // in 2.1.140. Keep the per-workspace installer at or above this version:
-    // otherwise mission startup silently downgrades the host CLI and the
-    // model appears in the catalog but every Fable 5.1 dispatch fails.
+    // Opus 5.5 requires 2.1.280. Treat the default as a minimum so fleet
+    // updates are not silently undone by mission startup. Explicit pins stay exact.
     std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "2.1.257".to_string())
+        .unwrap_or_else(|| "2.1.280".to_string())
+}
+
+fn claude_version_is_supported(output: &str, desired: &str, pinned: bool) -> bool {
+    let observed = output.split_whitespace().next().unwrap_or("");
+    if pinned {
+        return observed == desired;
+    }
+    fn version(value: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = value.split('.');
+        let result = (
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+        );
+        parts.next().is_none().then_some(result)
+    }
+    match (version(observed), version(desired)) {
+        (Some(actual), Some(minimum)) => actual >= minimum,
+        _ => false,
+    }
+}
+
+#[test]
+fn claude_cli_minimum_keeps_fleet_updates() {
+    assert!(claude_version_is_supported(
+        "2.1.280 (Claude Code)",
+        "2.1.280",
+        false
+    ));
+    assert!(claude_version_is_supported(
+        "2.1.281 (Claude Code)",
+        "2.1.280",
+        false
+    ));
+    assert!(!claude_version_is_supported(
+        "2.1.257 (Claude Code)",
+        "2.1.280",
+        false
+    ));
+    assert!(!claude_version_is_supported(
+        "2.1.2800 (Claude Code)",
+        "2.1.280",
+        true
+    ));
+    assert!(!claude_version_is_supported(
+        "2.1.281 (Claude Code)",
+        "2.1.280",
+        true
+    ));
+    assert!(claude_version_is_supported(
+        "2.1.280 (Claude Code)",
+        "2.1.280",
+        true
+    ));
+    assert!(!claude_version_is_supported("invalid", "2.1.280", false));
 }
 
 async fn claude_cli_matches_desired_version(
@@ -7615,7 +7675,9 @@ async fn claude_cli_matches_desired_version(
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let version_output = format!("{}{}", stdout, stderr);
-            if version_output.contains(desired_version) {
+            let pinned = std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION")
+                .is_ok_and(|value| !value.trim().is_empty());
+            if claude_version_is_supported(&version_output, desired_version, pinned) {
                 true
             } else {
                 tracing::info!(
@@ -10002,6 +10064,38 @@ mod tests {
         assert_eq!(merged["anthropic"]["access"], "fresh");
         assert_eq!(merged["anthropic"]["expires"], 2);
         assert_eq!(merged["unmanaged"]["key"], "preserved");
+    }
+
+    #[test]
+    fn opencode_multiple_oauth_accounts_keep_freshest_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join(".sandboxed-sh");
+        fs::create_dir_all(&store).unwrap();
+        let account = |expires_at, token: &str| {
+            let mut provider = crate::ai_providers::AIProvider::new(
+                crate::ai_providers::ProviderType::Anthropic,
+                "Test".into(),
+            );
+            provider.oauth = Some(crate::ai_providers::OAuthCredentials {
+                access_token: token.into(),
+                refresh_token: "test-refresh".into(),
+                expires_at,
+            });
+            provider
+        };
+        for accounts in [
+            vec![account(200, "fresh"), account(100, "expired")],
+            vec![account(100, "expired"), account(200, "fresh")],
+        ] {
+            fs::write(
+                store.join("ai_providers.json"),
+                serde_json::to_vec(&accounts).unwrap(),
+            )
+            .unwrap();
+            let auth = build_opencode_auth_from_ai_providers(temp.path()).unwrap();
+            assert_eq!(auth["anthropic"]["access"], "fresh");
+            assert_eq!(auth["anthropic"]["expires"], 200);
+        }
     }
 
     #[test]
