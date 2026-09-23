@@ -1206,7 +1206,7 @@ input[type="checkbox"]:enabled, input[type="radio"]:enabled { cursor: pointer; }
   height: calc(2px + var(--v, 0) * 18px);
   border-radius: 1px;
   background: currentColor;
-  transition: height 70ms linear;
+  transition: height 40ms linear;
 }
 .voice-time {
   font: 12px/20px var(--sans); color: var(--fg-3); min-width: 32px;

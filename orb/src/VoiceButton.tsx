@@ -4,7 +4,7 @@
  * is available; everywhere else `voiceAvailable()` stays false and the
  * composer shows no microphone.
  */
-import { For, Show, createEffect, createSignal, on, onCleanup, onMount } from "solid-js";
+import { For, Index, Show, createEffect, createSignal, on, onCleanup, onMount } from "solid-js";
 import * as Ic from "./icons";
 import { hasFocusScope } from "./focusScope";
 import {
@@ -176,9 +176,10 @@ export function VoiceButton(p: {
     pendingLevel = 0;
     waveTimer = window.setInterval(() => {
       const level = Math.min(1, Math.max(0, pendingLevel));
-      pendingLevel = 0;
+      // Release smoothly across scheduling jitter instead of inserting fake silence.
+      pendingLevel *= 0.65;
       setBars(prev => [...prev.slice(1), level]);
-    }, 60);
+    }, 40);
     setState("recording");
     setElapsed(0);
     const t0 = rec.startedAt;
@@ -371,7 +372,7 @@ export function VoiceButton(p: {
       </Show>
       <Show when={status() !== "idle"}>
         <div class="voice-wave" aria-hidden="true">
-          <For each={bars()}>{(v) => <span style={{ "--v": String(v) }} />}</For>
+          <Index each={bars()}>{(v) => <span style={{ "--v": String(v()) }} />}</Index>
         </div>
         <span class="voice-time" aria-live="off">
           {status() === "starting" ? "…" : fmt(elapsed())}

@@ -333,7 +333,8 @@ export const startRecording: RecorderFactory = async (opts) => {
     }
     if (ctx.state === "suspended") await ctx.resume().catch(() => {});
     source = ctx.createMediaStreamSource(stream);
-    processor = ctx.createScriptProcessor(4096, 1, 1);
+    // 32 ms at 16 kHz: large buffers made the live meter pulse between silences.
+    processor = ctx.createScriptProcessor(512, 1, 1);
     sink = ctx.createGain();
     sink.gain.value = 0; // Safari only pumps the processor when it reaches the destination.
     const maxFrames = (opts.maxSeconds ?? VOICE_MAX_SECONDS) * ctx.sampleRate;

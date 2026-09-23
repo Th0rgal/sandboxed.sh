@@ -104,7 +104,13 @@ describe("VoiceButton flow", () => {
     expect(onActive).toHaveBeenLastCalledWith(true);
     expect(screen.queryByRole("button", { name: "Dictation language" })).toBeNull(); // chip hidden while recording
     expect(document.querySelector(".voice-wave")).toBeTruthy();
+    const lastBar = document.querySelector(".voice-wave span:last-child") as HTMLElement;
     rec.state.opts?.onLevel?.(0.9);
+    await waitFor(() => expect(Number(lastBar.style.getPropertyValue("--v"))).toBeGreaterThan(0));
+    expect(document.querySelector(".voice-wave span:last-child")).toBe(lastBar);
+    // A missing audio callback must decay rather than draw a zero between packets.
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(Number(lastBar.style.getPropertyValue("--v"))).toBeGreaterThan(0);
     rec.state.opts?.onLevel?.(0.2);
     fireEvent.click(button()); // stop
     await waitFor(() => expect(onText).toHaveBeenCalledWith("hello world"));
