@@ -153,7 +153,7 @@ export function CronForm(p: {
     if (draft.repeat.trim() && (!/^\d+$/.test(draft.repeat) || !Number.isSafeInteger(Number(draft.repeat)) || Number(draft.repeat) < 1)) {
       setError("Stops after must be a positive whole number, or empty for Never."); return;
     }
-    if ((p.creating || patch().prompt !== undefined) && draft.prompt.length > (p.view.settings?.prompt_budget ?? 5000)) { setError("Instruction exceeds the allowed character budget."); return; }
+    if ((p.creating || patch().prompt !== undefined) && draft.prompt.length > (p.view.settings?.prompt_budget ?? 5000)) { setError(`Instruction is ${draft.prompt.length.toLocaleString()} characters; the limit is ${(p.view.settings?.prompt_budget ?? 5000).toLocaleString()}. Shorten it before saving. Your edits are kept.`); return; }
     if (p.creating && usesProjectRoute() && p.deliveryRoute && !p.deliveryRoute.ready) {
       setError(p.deliveryRoute.error ?? (p.deliveryRoute.loading ? "Checking project delivery route…" : "No delivery route is bound yet. Bind one first, or choose local to keep output on the job only.")); return;
     }
@@ -241,7 +241,7 @@ export function CronForm(p: {
             onInput={(e) => setDraft("prompt", e.currentTarget.value)}
           />
           <div class="cs-prompt-foot">
-            <span>{draft.prompt.length.toLocaleString()} characters</span>
+            <span class={draft.prompt.length > (budget() ?? 5000) ? "cs-warn" : ""}>{draft.prompt.length.toLocaleString()} / {(budget() ?? 5000).toLocaleString()} characters</span>
             <Show when={budget()}>
               <span class={overBudgetHint() ? "cs-warn" : ""}>
                 Bound controller: prompt plus preloaded skills must stay under {budget()!.toLocaleString()} characters
@@ -300,9 +300,10 @@ export function CronForm(p: {
       </details>
 
       </fieldset>
-      <Show when={error()}><ErrorNotice error={error()!} title="Couldn’t save the controller" /></Show>
       <Show when={p.creating || dirtyCount() > 0 || skillInput().trim() || error()}>
-        <div class="cs-savebar">
+        <div class="cs-save-area">
+          <Show when={error()}><ErrorNotice error={error()!} title="Couldn’t save the controller" /></Show>
+          <div class="cs-savebar">
           <span>{`${dirtyCount()} unsaved change${dirtyCount() === 1 ? "" : "s"}`}</span>
           <span class="dlg-spacer" />
           <Show when={p.onClose}><button class="s-btn sm quiet" disabled={saving()} onClick={() => {
@@ -314,6 +315,7 @@ export function CronForm(p: {
           <button class="s-btn sm primary" disabled={saving() || (p.creating && usesProjectRoute() && !!p.deliveryRoute && !p.deliveryRoute.ready) || (!p.creating && dirtyCount() === 0 && !skillInput().trim())} onClick={save}>
             {saving() ? (p.creating ? "Creating…" : "Saving…") : (p.creating ? "Create" : "Save")}
           </button>
+          </div>
         </div>
       </Show>
     </div>

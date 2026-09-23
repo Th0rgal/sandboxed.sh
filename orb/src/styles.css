@@ -262,10 +262,11 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 .cs-prompt-wrap { padding: 10px 12px 8px; }
 .cs-prompt {
   width: 100%; min-height: 280px; max-height: 62vh; resize: vertical; box-sizing: border-box;
-  border: 1px solid var(--stroke); border-radius: 7px; background: var(--bg-field); color: var(--fg);
-  font: 12px/1.6 var(--mono); padding: 10px 12px; max-height: none;
+  border: 0; border-radius: 0; background: transparent; color: var(--fg);
+  font: 12px/1.6 var(--mono); padding: 4px 0; resize: none;
 }
-.cs-prompt:focus { outline: 0; border-color: var(--focus-border); }
+.cs-prompt:focus { outline: 0; }
+.cs-prompt-wrap:focus-within { box-shadow: inset 2px 0 var(--focus-border); }
 .cs-prompt-foot { display: flex; justify-content: space-between; gap: 12px; margin-top: 6px; font-size: 11.5px; color: var(--fg-4); font-variant-numeric: tabular-nums; }
 .cs-warn { color: var(--amber) !important; }
 .cs-skills { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 12px; }
@@ -1669,3 +1670,10 @@ button.fork-trigger:hover { color: var(--fg); }
 [data-theme="light"] .md-code-block .token.function, [data-theme="light"] .md-code-block .token.class-name { color: #88501f; }
 [data-theme="light"] .md-code-block .token.number, [data-theme="light"] .md-code-block .token.boolean, [data-theme="light"] .md-code-block .token.constant { color: #456d39; }
 [data-theme="light"] .md-code-block .token.property, [data-theme="light"] .md-code-block .token.tag { color: #315f91; }
+
+.cs-save-area { position: sticky; bottom: 12px; margin-top: 18px; z-index: 2; }
+.cs-save-area .cs-savebar { position: static; margin-top: 6px; }
+.cs-save-area .error-notice { margin-bottom: 6px; }
+.composer-pending { margin-bottom: 12px; max-height: 32vh; overflow: auto; }
+.composer-pending .user { margin: 0; }
+.composer-pending-status { display:block; padding: 6px 10px 0; color:var(--fg-3); font-size:12px; }

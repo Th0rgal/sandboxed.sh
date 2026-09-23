@@ -10,5 +10,13 @@ test('worker highlighting and bottom-right copy remain usable with overflowing c
  await block.locator('pre').evaluate(el=>{el.scrollLeft=10000;});
  await block.getByRole('button').click();
  expect(await page.evaluate(()=>(window as any).copied)).toContain('last line');
+ await expect(page.getByRole('button',{name:'Copy response'})).toBeVisible();
+ const rect=await block.boundingBox();
+ const copyRect=await block.getByRole('button').boundingBox();
+ expect(copyRect!.x).toBeGreaterThan(rect!.x);
+ expect(copyRect!.x+copyRect!.width).toBeLessThan(rect!.x+rect!.width);
+ expect(copyRect!.y+copyRect!.height).toBeLessThan(rect!.y+rect!.height);
+ await page.getByRole('button',{name:'Copy response'}).click();
+ expect(await page.evaluate(()=>(window as any).copied)).toContain('```python');
  await page.screenshot({path:'test-results/code-block.png'});
 });

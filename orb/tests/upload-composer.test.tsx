@@ -25,3 +25,31 @@ it("keeps the draft when transferring the file fails", async () => {
   await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("Machine offline"));
   expect((screen.getByPlaceholderText("Task") as HTMLTextAreaElement).value).toBe("Keep my draft");
 });
+it("moves submitted text into a pending message immediately and restores it on rejection",async()=>{
+ let finish!:(accepted:boolean)=>void;
+ const send=vi.fn(()=>new Promise<boolean>(resolve=>{finish=resolve;}));
+ render(()=><Composer placeholder="Task" busy={false} onSend={send} onStop={()=>{}}/>);
+ const input=screen.getByPlaceholderText('Task') as HTMLTextAreaElement;
+ fireEvent.input(input,{target:{value:'Please continue'}});
+ fireEvent.click(screen.getByTitle('Send'));
+ expect(input.value).toBe('');
+ expect(input.readOnly).toBe(true);
+ expect(screen.getByLabelText('Pending message').textContent).toContain('Please continue');
+ fireEvent.keyDown(input,{key:'Enter'});
+ await waitFor(()=>expect(send).toHaveBeenCalledTimes(1));
+ finish(false);
+ await waitFor(()=>expect(input.value).toBe('Please continue'));
+ expect(screen.queryByLabelText('Pending message')).toBeNull();
+ expect(input.readOnly).toBe(false);
+});
+it("removes the pending bubble once acknowledged and leaves the composer empty",async()=>{
+ let finish!:(accepted:boolean)=>void;
+ render(()=><Composer placeholder="Task" busy={false} onSend={()=>new Promise<boolean>(resolve=>{finish=resolve;})} onStop={()=>{}}/>);
+ const input=screen.getByPlaceholderText('Task') as HTMLTextAreaElement;
+ fireEvent.input(input,{target:{value:'Accepted message'}});
+ fireEvent.keyDown(input,{key:'Enter'});
+ await waitFor(()=>expect(finish).toBeDefined());
+ finish(true);
+ await waitFor(()=>expect(screen.queryByLabelText('Pending message')).toBeNull());
+ expect(input.value).toBe('');
+});

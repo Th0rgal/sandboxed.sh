@@ -335,7 +335,7 @@ function AssistantText(p: { text: string; live?: boolean }) {
       <FileReferenceContext.Provider value={references}><MdView text={content().text} compact /></FileReferenceContext.Provider>
     </Show>
     <Show when={content().details}><details class="legacy-log"><summary>Original execution log</summary><pre>{content().details}</pre></details></Show>
-    <Show when={!p.live && content().text.trim()}>
+    <Show when={content().text.trim()}>
       <div class="response-actions">
         <button class="icon-btn response-copy" aria-label={copied() ? "Response copied" : "Copy response"} title={copied() ? "Copied" : "Copy response"} onClick={() => void copy()}>
           <Show when={copied()} fallback={<Ic.CopyIcon size={14} />}><Ic.CheckIcon size={14} /></Show>

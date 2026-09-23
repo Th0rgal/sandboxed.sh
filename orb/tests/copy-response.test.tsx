@@ -17,3 +17,13 @@ it('shows clipboard failures without claiming success',async()=>{
  await waitFor(()=>expect(getByText(/Copy was refused/)).toBeTruthy());
  expect(queryByRole('button',{name:'Response copied'})).toBeNull();
 });
+it('keeps both copy actions available while a response is streaming',async()=>{
+ const writeText=vi.fn().mockResolvedValue(undefined);
+ Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText}});
+ const text='Example:\n\n```python\nprint("hello")\n```';
+ const {getByRole}=render(()=><Transcript items={[{kind:'text',key:'live-copy',text,live:true}]}/>);
+ fireEvent.click(getByRole('button',{name:'Copy code'}));
+ await waitFor(()=>expect(writeText).toHaveBeenCalledWith('print("hello")'));
+ fireEvent.click(getByRole('button',{name:'Copy response'}));
+ await waitFor(()=>expect(writeText).toHaveBeenCalledWith(text));
+});

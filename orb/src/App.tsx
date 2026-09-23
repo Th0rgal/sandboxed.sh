@@ -319,6 +319,8 @@ export function Composer(p: {
     catch (error) { setUploadError(error instanceof Error ? error.message : String(error)); }
   };
   const [images, setImages] = createSignal<DraftImage[]>([]);
+  const [sending, setSending] = createSignal(false);
+  const [pendingSend, setPendingSend] = createSignal<{text:string; images:DraftImage[]} | null>(null);
   const [draftReady, setDraftReady] = createSignal(false);
   createEffect(on(() => p.scope, (scope, previous) => {
     if (previous !== undefined && previous !== scope) { setText(""); setImages([]); uploaded = []; }
@@ -336,7 +338,7 @@ export function Composer(p: {
   }));
   createEffect(() => {
     const scope=p.scope;
-    if (draftReady() && scope) void saveComposerDraft(scope,{text:text(),images:images(),uploads:uploaded.map(file => ({...file, source:{name:file.source.name,localPath:file.source.localPath}}))}).catch(() => {});
+    if (draftReady() && scope) void saveComposerDraft(scope,{text:pendingSend()?.text ?? text(),images:pendingSend()?.images ?? images(),uploads:uploaded.map(file => ({...file, source:{name:file.source.name,localPath:file.source.localPath}}))}).catch(() => {});
   });
   const [imageError, setImageError] = createSignal<string | null>(null);
   const [readingImages, setReadingImages] = createSignal(false);
@@ -344,7 +346,7 @@ export function Composer(p: {
     const files = Array.from(event.clipboardData?.files ?? []).filter(file => file.type.startsWith("image/"));
     if (!files.length) return;
     event.preventDefault();
-    if (readingImages()) return;
+    if (readingImages() || sending()) return;
     setImageError(null);
     if (images().length + files.length > IMAGE_COUNT) { setImageError(`Attach up to ${IMAGE_COUNT} images at a time.`); return; }
     const scope = p.scope;
@@ -458,40 +460,44 @@ export function Composer(p: {
     ta.setSelectionRange(next.caret, next.caret);
     setCaret(next.caret);
   };
-  const [sending, setSending] = createSignal(false);
   const send = async () => {
-    let payload = draftOf(text());
+    const original = text();
+    let payload = draftOf(original);
     if ((!payload && !images().length) || sending() || uploading() || readingImages()) return;
+    const sentImages = images();
+    const originalMode = mode();
+    const originalUploads = uploaded;
+    const draftScope = p.scope;
+    const project = p.projectSlug;
+    const destination = uploadTarget();
+    setPendingSend({text:original,images:sentImages});
     setSending(true);
+    setText(""); setImages([]); ta.value=""; resize();
+    let accepted = false;
     try {
-      // Typing can beat the initial catalog request. Resolve references before
-      // handing the draft to the parent, rather than silently omitting files.
-      const scope = p.projectSlug;
       await attachmentLoad;
-      if (scope !== p.projectSlug || draftOf(text()) !== payload) return;
-      const destination = uploadTarget();
-      const resolved = await prepareUploads(text(), uploaded, destination);
-      if (scope !== p.projectSlug || destination !== uploadTarget() || draftOf(text()) !== payload) return;
+      if (project !== p.projectSlug || draftScope !== p.scope || destination !== uploadTarget()) return;
+      const resolved = await prepareUploads(original, originalUploads, destination);
+      if (project !== p.projectSlug || draftScope !== p.scope || destination !== uploadTarget()) return;
       uploaded = resolved.files;
-      write(resolved.text);
-      payload = draftOf(text());
-      p.onAttachments?.(mentioned());
-      const sentImages = images();
-      const draftScope = p.scope;
-      const accepted = await p.onSend(payload || "Please look at the attached images.", sentImages);
-      if (accepted !== false && draftOf(text()) === payload) {
+      payload = draftOf(resolved.text);
+      p.onAttachments?.(mentionedChips(resolved.text,atItems()));
+      accepted = await p.onSend(payload || "Please look at the attached images.", sentImages) !== false;
+      if (accepted) {
         uploaded = [];
         setUploadError(null);
-        const remaining = images().filter(image => !sentImages.some(sent => sent.id === image.id));
-        if (draftScope) await saveComposerDraft(draftScope, {text:"",images:remaining}).catch(() => {});
-        setImages(remaining);
+        if (draftScope) await saveComposerDraft(draftScope, {text:"",images:[]}).catch(() => {});
         setMode(null);
-        setText("");
-        ta.value = "";
-        resize();
-      } else if (accepted === false && ta.isConnected) ta.focus();
+      }
     } catch (error) { setUploadError(error instanceof Error ? error.message : String(error)); }
-    finally { setSending(false); }
+    finally {
+      if (!accepted && draftScope === p.scope) {
+        uploaded = originalUploads;
+        setMode(originalMode);setText(original);setImages(sentImages);
+        ta.value=original;resize();if(ta.isConnected)ta.focus();
+      }
+      setPendingSend(null);setSending(false);
+    }
   };
   const insertDictation = (t: string) => {
     const cur = ta.value;
@@ -814,7 +820,8 @@ export function Composer(p: {
       )}
     </Show>
   );
-  return (
+  return (<>
+    <Show when={pendingSend()}>{pending=><div class="composer-pending" aria-label="Pending message"><div class="user pending"><Show when={pending().images.length}><div class="message-images"><For each={pending().images}>{(image,index)=><div class="message-image"><img src={image.dataUrl} alt={`Image #${index()+1}`}/><span>#{index()+1}</span></div>}</For></div></Show><span>{pending().text}</span></div><span class="composer-pending-status" role="status">Sending…</span></div>}</Show>
     <div class={`composer ${p.tall || images().length ? "tall" : ""} ${voiceActive() ? "voice-on" : ""} ${mode() ? "has-mode" : ""}`} data-mode={mode() ?? ""} onClick={() => !voiceActive() && ta.focus()}>
       {plus}
       {slashMenu}
@@ -826,7 +833,7 @@ export function Composer(p: {
         <Show when={imageError()}><span class="image-paste-error" role="alert">{imageError()}</span></Show>
         <Show when={mode() === "goal"}><ModeChip mode="goal" onClear={clearMode} /></Show>
         <Show when={mode()}><span class="mode-sep" aria-hidden="true" /></Show>
-        <textarea
+        <textarea readOnly={sending()}
           ref={ta}
           onPaste={event => void pasteImages(event)}
           rows={1}
@@ -897,7 +904,7 @@ export function Composer(p: {
       {voice}
       {sendBtn}
     </div>
-  );
+  </>);
 }
 
 export default function App() {

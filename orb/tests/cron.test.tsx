@@ -169,3 +169,16 @@ describe("schedule and menu interaction", () => {
    try { fireEvent.click(screen.getByText("Create")); await waitFor(() => expect(saved).toHaveBeenCalledOnce()); }
    finally { remove.mockRestore(); }
  });
+
+it("shows prompt limit failures next to Save and retains the edited instruction",async()=>{
+ const save=vi.fn();
+ render(()=><CronForm draftKey="visible-limit" view={view()} save={save} onSaved={()=>{}}/>);
+ const input=screen.getByLabelText('Instruction') as HTMLTextAreaElement;
+ fireEvent.input(input,{target:{value:'x'.repeat(7466)}});
+ fireEvent.click(screen.getByText('Save'));
+ expect(save).not.toHaveBeenCalled();
+ const error=screen.getByText(/Shorten it before saving/);
+ expect(error.closest('.cs-save-area')).toBeTruthy();
+ expect(input.value.length).toBe(7466);
+ expect(screen.getByText('7,466 / 5,000 characters')).toBeTruthy();
+});
