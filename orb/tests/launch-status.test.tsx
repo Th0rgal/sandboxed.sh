@@ -49,3 +49,17 @@ it("uses the transcript failure as the sole error, using a red notice when no er
   setInTranscript(true);
   expect(container.querySelector(".launch-status")).toBeNull();
 });
+
+it.each(['awaiting_user','waiting_user'])('keeps a normal completed response quiet in %s',status=>{
+ const mission={id:'local',status} as Mission;
+ const [activity,setActivity]=createSignal(false);
+ const {container}=render(()=><LaunchStatus destination="This computer" mission={mission} activity={activity()}/>);
+ expect(container.textContent).toContain('Waiting for input');
+ setActivity(true);
+ expect(container.querySelector('.launch-status')).toBeNull();
+});
+it('does not claim a native run is idle based on stale backend status',()=>{
+ const mission={id:'local',status:'awaiting_user'} as Mission;
+ const {container}=render(()=><LaunchStatus destination="This computer" mission={mission} activity submitting/>);
+ expect(container.querySelector('.launch-status')).toBeNull();
+});

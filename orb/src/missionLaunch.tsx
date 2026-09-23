@@ -179,6 +179,7 @@ export function missionPhase(mission: Mission | null, activity: boolean) {
       detail: reason === "orphan_no_runner" ? "The backend could not find an active runner." : mission?.status_message ?? reason?.replaceAll("_", " ") ?? "The mission stopped before completion." };
   }
   if (["completed","done"].includes(status)) return { label:"Completed", moving:false, detail:activity ? "" : "The mission completed without transcript output." };
+  if (["awaiting_user","waiting_user"].includes(status) && activity) return {label:"Waiting for input",moving:false,detail:""};
   if (["paused","blocked","awaiting_user","waiting_user"].includes(status)) return {label:status==="paused"?"Paused":"Waiting for input",moving:false,detail:"The mission is not currently running."};
   const job = mission?.remote_job;
   if (job || mission?.execution?.state === "waiting_remote_job") {
