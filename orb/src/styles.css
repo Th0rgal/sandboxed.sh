@@ -1740,15 +1740,17 @@ button.fork-trigger:hover { color: var(--fg); }
 }
 
 /* Title hover card sits outside the draggable/clipped toolbar. */
-.session-title { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; min-width: 0; border: 0; border-radius: 6px; padding: 5px 8px; margin-left: -8px; color: inherit; background: transparent; font: inherit; text-align: left; -webkit-app-region: no-drag; }
+.session-title { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; min-width: 0; border: 0; border-radius: 6px; padding: 4px 7px; margin-left: 0; color: inherit; background: transparent; font: inherit; text-align: left; -webkit-app-region: no-drag; }
 .session-title:hover, .session-title:focus-visible, .session-title[aria-describedby] { background: var(--bg-btn); color: var(--fg); }
 .session-title:focus-visible { outline: 1px solid var(--stroke); outline-offset: 2px; }
-.session-title > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-title > .session-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-title > svg { flex: none; width: 15px; height: 15px; opacity: .7; }
-.session-preview { position: fixed; z-index: 1200; padding: 13px 15px; overflow-y: auto; border: 1px solid var(--stroke); border-radius: 12px; background: var(--bg-elev); color: var(--fg-2); box-shadow: 0 8px 28px #0003; font-size: 13px; line-height: 1.5; user-select: text; -webkit-app-region: no-drag; }
-.session-preview-title { color: var(--fg); margin-bottom: 12px; font-weight: 500; overflow-wrap: anywhere; }
-.session-preview-row { display: flex; align-items: flex-start; gap: 12px; margin: 9px 0; overflow-wrap: anywhere; }
-.session-preview-row > svg { width: 16px; height: 16px; margin-top: 2px; flex: none; opacity: .7; }
+.session-preview { position: fixed; z-index: 1200; padding: 12px; overflow-y: auto; border: 1px solid var(--stroke); border-radius: 10px; background: var(--bg-elev); color: var(--fg-2); box-shadow: 0 8px 28px #0003; font-size: 12px; line-height: 1.5; user-select: text; -webkit-app-region: no-drag; }
+.session-preview-title { color: var(--fg); margin-bottom: 10px; font-weight: 500; overflow-wrap: anywhere; }
+.session-preview-row { display: flex; align-items: flex-start; gap: 9px; margin: 8px 0; overflow-wrap: anywhere; }
+.session-preview-row > svg { width: 14px; height: 14px; margin-top: 2px; flex: none; opacity: .7; }
 .session-preview-row > div, .session-preview-row > span { min-width: 0; }
 .session-preview-secondary { display: block; color: var(--fg-3, var(--fg-2)); font-size: 12px; margin-top: 2px; }
 .session-preview-project { border-top: 1px solid var(--stroke-soft); margin-top: 12px; padding-top: 9px; font-size: 12px; overflow-wrap: anywhere; }
+
+.session-title .goal-tag { border: 0; background: color-mix(in srgb, var(--blue) 10%, transparent); border-radius: 5px; }

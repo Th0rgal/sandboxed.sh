@@ -1597,8 +1597,7 @@ export default function App() {
             <Match when={currentMissionId()}>
               {(id) => (
                 <>
-                  <Show when={missionGoal(missions().find((m) => m.id === id()) ?? openMission())}><GoalTag /></Show>
-                  <SessionPreview data={sessionPreview()} />
+                  <SessionPreview data={sessionPreview()} goal={!!missionGoal(missions().find((m) => m.id === id()) ?? openMission())} />
                 </>
               )}
             </Match>

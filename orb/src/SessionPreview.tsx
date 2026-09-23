@@ -8,6 +8,7 @@ import {
 } from "solid-js";
 import { Portal } from "solid-js/web";
 import * as Ic from "./icons";
+import { GoalTag } from "./goal";
 import { localSessionGit } from "./localAgents";
 
 export interface SessionPreviewData {
@@ -22,7 +23,7 @@ export interface SessionPreviewData {
   effort?: string;
   context?: number | null;
 }
-export function SessionPreview(p: { data: SessionPreviewData }) {
+export function SessionPreview(p: { data: SessionPreviewData; goal?: boolean }) {
   const tipId = createUniqueId();
   const [open, setOpen] = createSignal(false);
   const [position, setPosition] = createSignal({ left: 0, top: 0, width: 340 });
@@ -122,7 +123,8 @@ export function SessionPreview(p: { data: SessionPreviewData }) {
         onBlur={leave}
         onClick={show}
       >
-        <span>{p.data.title}</span>
+        <Show when={p.goal}><GoalTag class="small" /></Show>
+        <span class="session-title-text">{p.data.title}</span>
         <Show when={p.data.local} fallback={<Ic.CloudIcon />}>
           <Ic.LaptopIcon />
         </Show>
