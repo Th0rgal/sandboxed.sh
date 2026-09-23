@@ -162,6 +162,7 @@ describe("recorder", () => {
       resume = async () => {};
       close = closed;
       createMediaStreamSource = () => ({ connect: vi.fn(), disconnect: vi.fn() });
+      createAnalyser = () => ({ fftSize: 1024, getFloatTimeDomainData: (data: Float32Array) => data.fill(0.25), disconnect: vi.fn() });
       createGain = () => ({ gain: { value: 1 }, connect: vi.fn(), disconnect: vi.fn() });
       createScriptProcessor = () => {
         processor = { onaudioprocess: null, connect: vi.fn(), disconnect: vi.fn() };
@@ -176,6 +177,7 @@ describe("recorder", () => {
       const buf = new Float32Array(4800).fill(0.25);
       processor!.onaudioprocess!({ inputBuffer: { getChannelData: () => buf } });
       processor!.onaudioprocess!({ inputBuffer: { getChannelData: () => buf } });
+      await new Promise(resolve => setTimeout(resolve, 50));
       expect(levels.length).toBeGreaterThan(0);
       const wav = await rec.stop();
       const v = new DataView(wav.buffer);
@@ -201,6 +203,7 @@ describe("recorder", () => {
       resume = async () => {};
       close = closed;
       createMediaStreamSource = () => ({ connect: vi.fn(), disconnect: vi.fn() });
+      createAnalyser = () => ({ fftSize: 1024, getFloatTimeDomainData: (data: Float32Array) => data.fill(0.25), disconnect: vi.fn() });
       createGain = () => ({ gain: { value: 1 }, connect: vi.fn(), disconnect: vi.fn() });
       createScriptProcessor = () => {
         throw new Error("ScriptProcessorNode is not supported");
@@ -240,6 +243,7 @@ describe("recorder", () => {
       resume = async () => {};
       close = async () => {};
       createMediaStreamSource = () => ({ connect: vi.fn(), disconnect: vi.fn() });
+      createAnalyser = () => ({ fftSize: 1024, getFloatTimeDomainData: (data: Float32Array) => data.fill(0.25), disconnect: vi.fn() });
       createGain = () => ({ gain: { value: 1 }, connect: vi.fn(), disconnect: vi.fn() });
       createScriptProcessor = () => (processor = { onaudioprocess: null, connect: vi.fn(), disconnect: vi.fn() } as never);
     }

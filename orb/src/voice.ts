@@ -322,6 +322,9 @@ export const startRecording: RecorderFactory = async (opts) => {
   let source!: MediaStreamAudioSourceNode;
   let processor!: ScriptProcessorNode;
   let sink!: GainNode;
+  let analyser: AnalyserNode | undefined;
+  let meterFrame: number | undefined;
+  let envelope = 0;
   const chunks: Float32Array[] = [];
   let frames = 0;
   let finished = false;
@@ -343,29 +346,39 @@ export const startRecording: RecorderFactory = async (opts) => {
       const data = ev.inputBuffer.getChannelData(0);
       chunks.push(new Float32Array(data));
       frames += data.length;
-      if (opts.onLevel) {
-        const hop = 512;
-        for (let off = 0; off < data.length; off += hop) {
-          let sum = 0;
-          let n = 0;
-          const end = Math.min(off + hop, data.length);
-          for (let i = off; i < end; i += 4) {
-            sum += data[i] * data[i];
-            n++;
-          }
-          const rms = Math.sqrt(sum / Math.max(1, n));
-          opts.onLevel(Math.min(1, rms * 4));
-        }
-      }
       if (frames >= maxFrames) {
         finished = true;
         opts.onAutoStop?.();
       }
     };
+    if (opts.onLevel) {
+      analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      source.connect(analyser);
+      const samples = new Float32Array(analyser.fftSize);
+      let previous = performance.now();
+      const meter = (now: number) => {
+        if (finished) return;
+        analyser!.getFloatTimeDomainData(samples);
+        let sum = 0;
+        for (const sample of samples) sum += sample * sample;
+        const rms = Math.sqrt(sum / samples.length);
+        // A perceptual range keeps ordinary speech visible without amplifying silence.
+        const target = Math.max(0, Math.min(1, (20 * Math.log10(Math.max(rms, 1e-6)) + 55) / 45));
+        const dt = Math.min(100, Math.max(0, now - previous));
+        previous = now;
+        const tau = target > envelope ? 45 : 180;
+        envelope += (target - envelope) * (1 - Math.exp(-dt / tau));
+        opts.onLevel!(envelope);
+        meterFrame = requestAnimationFrame(meter);
+      };
+      meterFrame = requestAnimationFrame(meter);
+    }
     source.connect(processor);
     processor.connect(sink);
     sink.connect(ctx.destination);
   } catch (e) {
+    if (meterFrame !== undefined) cancelAnimationFrame(meterFrame);
     stream.getTracks().forEach((t) => t.stop());
     if (ctx) void ctx.close().catch(() => {});
     if (e instanceof VoiceError) throw e;
@@ -376,6 +389,8 @@ export const startRecording: RecorderFactory = async (opts) => {
 
   const teardown = () => {
     finished = true;
+    if (meterFrame !== undefined) cancelAnimationFrame(meterFrame);
+    analyser?.disconnect();
     processor.onaudioprocess = null;
     try {
       source.disconnect();

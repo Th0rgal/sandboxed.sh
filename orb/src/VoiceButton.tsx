@@ -152,7 +152,7 @@ export function VoiceButton(p: {
       candidate = await record()({
         onLevel: (l) => {
           if (!live()) return;
-          pendingLevel = Math.max(l, pendingLevel);
+          pendingLevel = l;
         },
         maxSeconds: VOICE_MAX_SECONDS,
         onAutoStop: () => {
@@ -176,8 +176,7 @@ export function VoiceButton(p: {
     pendingLevel = 0;
     waveTimer = window.setInterval(() => {
       const level = Math.min(1, Math.max(0, pendingLevel));
-      // Release smoothly across scheduling jitter instead of inserting fake silence.
-      pendingLevel *= 0.65;
+      // The analyser supplies a continuous envelope independently of WAV chunks.
       setBars(prev => [...prev.slice(1), level]);
     }, 40);
     setState("recording");
