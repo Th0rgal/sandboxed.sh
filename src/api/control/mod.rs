@@ -4278,6 +4278,10 @@ impl FrontendToolHub {
         rx
     }
 
+    pub async fn unregister(&self, tool_call_id: &str) {
+        self.pending.lock().await.remove(tool_call_id);
+    }
+
     /// Resolve a pending tool call by id.
     ///
     /// Returns `true` if a live waiter received the result (the running mission
@@ -4306,8 +4310,7 @@ impl FrontendToolHub {
             {
                 let mut pending = self.pending.lock().await;
                 if let Some(tx) = pending.remove(tool_call_id) {
-                    let _ = tx.send(result);
-                    return true;
+                    return tx.send(result).is_ok();
                 }
             }
             if attempt < REGISTER_GRACE_ATTEMPTS {
@@ -4315,6 +4318,11 @@ impl FrontendToolHub {
             }
         }
 
+        // Native requests are registered before publication. Never replay an
+        // expired answer into a future waiter.
+        if tool_call_id.starts_with("native-") {
+            return false;
+        }
         let mut early = self.early_results.lock().await;
         const MAX_EARLY_RESULTS: usize = 256;
         if early.len() >= MAX_EARLY_RESULTS {

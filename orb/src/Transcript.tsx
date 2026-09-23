@@ -11,7 +11,7 @@ import { For, Show, createSignal, createEffect, createMemo, useContext, onCleanu
 import * as Ic from "./icons";
 import { MdView } from "./Markdown";
 import { createStore, reconcile } from "solid-js/store";
-import { goalDraft } from "./goal";
+import { goalDraft, planObjective } from "./goal";
 
 import { messagePresentation } from "./messagePresentation";
 import { latestChecklist, toolArgs, toolName, workSummary } from "./workModel";
@@ -111,6 +111,7 @@ export function UserTurn(p: { text: string; attached?: boolean; pending?: boolea
   const presentation = createMemo(() => messagePresentation(p.text));
   const images = createMemo(() => messageImages(presentation().text));
   const goal = createMemo(() => goalDraft(images().text));
+  const plan = createMemo(() => planObjective(images().text));
   const [editing, setEditing] = createSignal(false);
   const [draft, setDraft] = createSignal("");
   const [copyState, setCopyState] = createSignal("");
@@ -132,10 +133,11 @@ export function UserTurn(p: { text: string; attached?: boolean; pending?: boolea
   };
   const edit = () => { if (fork()) return; setDraft(images().text); setCopyState(""); setSendError(""); setEditing(true); };
   return (
-    <div onDblClick={() => { if (!editing()) edit(); }} class={`user ${editing() ? "editing" : ""} ${goal().kind === "goal" ? "goal" : ""} ${p.pending ? "pending" : ""}`}>
+    <div onDblClick={() => { if (!editing()) edit(); }} class={`user ${editing() ? "editing" : ""} ${goal().kind === "goal" ? "goal" : ""} ${plan() !== null ? "plan" : ""} ${p.pending ? "pending" : ""}`}>
       <Show when={images().paths.length}><div class="message-images"><For each={images().paths}>{(path,index)=><MessageImage path={path} index={index()+1}/>}</For></div></Show>
       <Show when={editing()} fallback={<>
-      <Show when={fork()} fallback={<span>{goal().kind === "goal" ? (goal() as { objective: string }).objective : images().text}</span>}>
+      <Show when={plan() !== null}><small class="user-plan"><Ic.PlanIcon size={12}/>Plan</small></Show>
+      <Show when={fork()} fallback={<span>{goal().kind === "goal" ? (goal() as { objective: string }).objective : plan() ?? images().text}</span>}>
         {context => <details class="fork-context"><summary>Forked from {context().source_title || "conversation"} · {context().messages.length} messages</summary>
           <For each={context().messages}>{m => <div class="fork-context-message"><small>{m.role === "user" ? "You" : "Assistant"}</small><p>{m.content}</p></div>}</For>
         </details>}

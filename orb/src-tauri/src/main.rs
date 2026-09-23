@@ -2,6 +2,7 @@
 
 #[path = "../../../shared/file_browser.rs"]
 mod file_browser;
+mod interactions;
 mod local_agents;
 mod local_stream;
 mod machine_metrics;
@@ -115,6 +116,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             local_bindings,
+            interactions::local_interaction,
+            interactions::local_interaction_answer,
             paloma_ssh_pubkey,
             session_preview::local_session_git,
             uploads::pick_upload_files,

@@ -975,19 +975,21 @@ pub fn run_claudecode_turn<'a>(
 
         // Check for Claude Code builtin slash commands that need special handling
         let trimmed_message = message.trim();
-        let (effective_message, permission_mode) =
-            if trimmed_message == "/plan" || trimmed_message.starts_with("/plan ") {
-                // /plan triggers plan mode via --permission-mode plan
-                let rest = trimmed_message.strip_prefix("/plan").unwrap_or("").trim();
-                let msg = if rest.is_empty() {
-                    "Please analyze the codebase and create a plan for the task.".to_string()
-                } else {
-                    rest.to_string()
-                };
-                (msg, Some("plan"))
+        let (effective_message, permission_mode) = if trimmed_message
+            .strip_prefix("/plan")
+            .is_some_and(|s| s.is_empty() || s.starts_with(char::is_whitespace))
+        {
+            // /plan triggers plan mode via --permission-mode plan
+            let rest = trimmed_message.strip_prefix("/plan").unwrap_or("").trim();
+            let msg = if rest.is_empty() {
+                "Please analyze the codebase and create a plan for the task.".to_string()
             } else {
-                (message.to_string(), None)
+                rest.to_string()
             };
+            (msg, Some("plan"))
+        } else {
+            (message.to_string(), None)
+        };
 
         // Build CLI arguments
         let mut args = vec![
@@ -1006,7 +1008,15 @@ pub fn run_claudecode_turn<'a>(
 
         // Skip all permission checks. IS_SANDBOX=1 is set in env vars below
         // to allow --dangerously-skip-permissions even when running as root.
-        args.push("--dangerously-skip-permissions".to_string());
+        let native_plan = permission_mode == Some("plan");
+        if native_plan {
+            if tool_hub.is_none() {
+                return AgentResult::failure("Native plan interactions are unavailable", 0);
+            }
+            args.extend(["--permission-prompt-tool".to_string(), "stdio".to_string()]);
+        } else {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
 
         // Claude Code settings and MCP config are loaded via CLAUDE_CONFIG_DIR
         // which points to the per-mission .claude directory. Claude Code auto-discovers
@@ -1173,8 +1183,9 @@ pub fn run_claudecode_turn<'a>(
         // MID-TURN (picked up after the current tool call completes, like
         // typing in the interactive CLI). The positional prompt is ignored
         // by the CLI in this mode, so it is not added.
-        let stream_input = crate::util::env_var_bool("SANDBOXED_SH_CLAUDE_STREAM_INPUT", false)
-            && !force_argv_prompt;
+        let stream_input = native_plan
+            || (crate::util::env_var_bool("SANDBOXED_SH_CLAUDE_STREAM_INPUT", false)
+                && !force_argv_prompt);
         if stream_input {
             args.push("--input-format".to_string());
             args.push("stream-json".to_string());
@@ -1479,6 +1490,21 @@ pub fn run_claudecode_turn<'a>(
         // Claude Code 2.1.x can hang indefinitely when stdout is a pipe (non-tty),
         // even in `--print --output-format stream-json` mode. Running it under a PTY
         // fixes this and restores streaming.
+        // SDK stream-json requires non-TTY stdin. Retain the PTY output for
+        // streaming, but pipe its raw input through cat. All CLI arguments are
+        // positional shell parameters, never interpolated into shell source.
+        let (program, full_args) = if native_plan {
+            let mut piped = vec![
+                "-c".to_string(),
+                "cat | \"$@\"".to_string(),
+                "orb-native-plan".to_string(),
+                program,
+            ];
+            piped.extend(full_args);
+            ("/bin/sh".to_string(), piped)
+        } else {
+            (program, full_args)
+        };
         let mut pty = match workspace_exec
             .spawn_streaming_pty(work_dir, &program, &full_args, env)
             .await
@@ -1516,6 +1542,14 @@ pub fn run_claudecode_turn<'a>(
             }
             let mut initial_prompt_delivered = false;
             if let Some(w) = stdin_writer.as_mut() {
+                if native_plan {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        w,
+                        "{}",
+                        serde_json::json!({"type":"control_request","request_id":"orb-init","request":{"subtype":"initialize"}})
+                    );
+                }
                 let init = serde_json::json!({
                     "type": "user",
                     "message": { "role": "user", "content": [{ "type": "text", "text": effective_message }] }
@@ -1631,6 +1665,7 @@ pub fn run_claudecode_turn<'a>(
         let mut final_result = String::new();
         let mut had_error = false;
         let mut saw_terminal_result_event = false;
+        let mut implement_after_plan = false;
         let mut process_exited_without_result = false;
         let mut idle_timeout_triggered = false;
         let mut transport_failure_stage: Option<ClaudeTransportFailureStage> = None;
@@ -1986,6 +2021,61 @@ pub fn run_claudecode_turn<'a>(
                         continue;
                     }
 
+                    if native_plan {
+                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+                            if event["type"] == "control_response" {
+                                if event["response"]["subtype"] == "error" {
+                                    pty.kill();return AgentResult::failure(format!("Native plan initialization failed: {}",event["response"]["error"]),0);
+                                }
+                                continue;
+                            }
+                            // Newer SDKs execute immediately after ExitPlanMode.
+                            // Only send a continuation if this version ended the
+                            // turn without starting any execution tools.
+                            if implement_after_plan && event["type"]=="assistant" && event["message"]["content"].as_array().is_some_and(|blocks|blocks.iter().any(|b|b["type"]=="tool_use" && b["name"]!="ExitPlanMode" && b["name"]!="AskUserQuestion")) {
+                                implement_after_plan=false;
+                            }
+                            if event["type"] == "result" && implement_after_plan {
+                                implement_after_plan = false;
+                                if let Some(w)=stdin_writer.as_mut() {
+                                    use std::io::Write as _;
+                                    let _=writeln!(w,"{}",serde_json::json!({"type":"control_request","request_id":"orb-execute","request":{"subtype":"set_permission_mode","mode":"acceptEdits"}}));
+                                    let _=writeln!(w,"{}",serde_json::json!({"type":"user","message":{"role":"user","content":"Implement the approved plan."}}));
+                                    let _=w.flush();
+                                }
+                                continue;
+                            }
+                            if event["type"] == "control_request" && event["request"]["subtype"] == "can_use_tool" {
+                                let input=event["request"]["input"].clone();
+                                let tool=event["request"]["tool_name"].as_str().unwrap_or("");
+                                let method=match tool {"AskUserQuestion"=>"claude_questions","ExitPlanMode"=>"plan",_=>"permission"};
+                                let id=format!("native-{}",Uuid::new_v4());
+                                let hub=tool_hub.as_ref().expect("checked native plan hub");
+                                let rx=hub.register(id.clone()).await;
+                                let _guard=FrontendToolHub::begin_waiting(hub,mission_id);
+                                let name="ui_native_request".to_string();
+                                let _=events_tx.send(AgentEvent::ToolCall{tool_call_id:id.clone(),name:name.clone(),args:serde_json::json!({"method":method,"params":if method=="permission" {serde_json::json!({"tool":tool,"input":input})}else{input.clone()}}),mission_id:Some(mission_id)});
+                                let answer=tokio::select! {_=cancel.cancelled()=>{hub.unregister(&id).await;pty.kill();return AgentResult::failure("Cancelled",0).with_terminal_reason(TerminalReason::Cancelled);},_=process_exit_notify.notified()=>{hub.unregister(&id).await;return AgentResult::failure("The session exited while waiting for your response",0);},answer=rx=>answer.unwrap_or(serde_json::Value::Null)};
+                                let response=if tool=="AskUserQuestion" {
+                                    let mut updated=input;updated["answers"]=answer["answers"].clone();serde_json::json!({"behavior":"allow","updatedInput":updated})
+                                }else if answer["action"]=="accept" {
+                                    if tool=="ExitPlanMode" {implement_after_plan=true;}
+                                    serde_json::json!({"behavior":"allow","updatedInput":input})
+                                }else {serde_json::json!({"behavior":"deny","message":answer["feedback"].as_str().unwrap_or("The user declined this action.")})};
+                                if let Some(w)=stdin_writer.as_mut() {
+                                    use std::io::Write as _;
+                                    if writeln!(w,"{}",serde_json::json!({"type":"control_response","response":{"subtype":"success","request_id":event["request_id"],"response":response}})).and_then(|_|w.flush()).is_err() {
+                                        pty.kill();return AgentResult::failure("The native request could not receive your answer",0);
+                                    }
+                                }
+                                let _=events_tx.send(AgentEvent::ToolResult{tool_call_id:id,name,result:answer,mission_id:Some(mission_id)});
+                                idle_deadline = claudecode_idle_deadline(turn_wait_state,Instant::now(),idle_timeout,tool_idle_timeout,post_tool_result_idle_timeout,tool_timeout_override);
+
+                                continue;
+                            }
+                        }
+                    }
+
                     let claude_event: ClaudeEvent = match serde_json::from_str(line) {
                         Ok(event) => event,
                         Err(e) => {
@@ -2238,7 +2328,7 @@ pub fn run_claudecode_turn<'a>(
                                                     }
                                                 }
 
-                                                if name == "question" || name == "AskUserQuestion" || name.starts_with("ui_") {
+                                                if !native_plan && (name == "question" || name == "AskUserQuestion" || name.starts_with("ui_")) {
                                                     if let Some(ref hub) = tool_hub {
                                                         tracing::info!(
                                                             mission_id = %mission_id,
@@ -2600,18 +2690,21 @@ pub fn run_claudecode_turn<'a>(
         if stream_input {
             drop(stdin_writer.take());
         }
-        const CLI_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+        // The SDK session intentionally keeps reading for its next turn. Once
+        // its terminal result is captured, retire this process promptly; the
+        // next user turn resumes the durable session.
+        let cli_exit_grace = std::time::Duration::from_secs(if native_plan { 1 } else { 30 });
         let child_pid = pty.process_id();
         let mut wait_handle = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
             pty.wait()
         });
-        let exit_status = match tokio::time::timeout(CLI_EXIT_GRACE, &mut wait_handle).await {
+        let exit_status = match tokio::time::timeout(cli_exit_grace, &mut wait_handle).await {
             Ok(joined) => joined,
             Err(_) => {
                 tracing::warn!(
                     mission_id = %mission_id,
-                    grace_secs = CLI_EXIT_GRACE.as_secs(),
+                    grace_secs = cli_exit_grace.as_secs(),
                     "Claude CLI did not exit after final result; killing leftover process tree"
                 );
                 #[cfg(unix)]
@@ -3067,6 +3160,10 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
     history: &[(String, String)],
     max_history_total_chars: usize,
 ) -> AgentResult {
+    let native_plan_request = message
+        .trim()
+        .strip_prefix("/plan")
+        .is_some_and(|s| s.is_empty() || s.starts_with(char::is_whitespace));
     // Track the effective message and session used for the most recent
     // attempt, so account rotation uses the right context (e.g. after
     // session corruption recovery rebuilds the message).
@@ -3082,7 +3179,11 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
     // up front (same mechanism as the ResetSessionFresh recovery arm below) so
     // the first attempt starts clean with rebuilt history instead of hanging.
     let mut first_turn_is_continuation = is_continuation;
-    if is_continuation && !cancel.is_cancelled() && !crate::api::routes::is_shutdown_initiated() {
+    if !native_plan_request
+        && is_continuation
+        && !cancel.is_cancelled()
+        && !crate::api::routes::is_shutdown_initiated()
+    {
         if let Some(sid) = effective_sid.clone() {
             if let Some(size) = claudecode_oversized_resume_transcript(work_dir, &sid) {
                 let new_session_id = Uuid::new_v4().to_string();
@@ -3157,6 +3258,11 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
     )
     .await;
 
+    // A native interactive session must never fall back to an argv-only
+    // session or lose its permission mode during recovery.
+    if native_plan_request {
+        return result;
+    }
     let mut force_argv_prompt = false;
     if crate::util::env_var_bool("SANDBOXED_SH_CLAUDE_STREAM_INPUT", false)
         && claudecode_result_is_startup_transport_failure(&result)

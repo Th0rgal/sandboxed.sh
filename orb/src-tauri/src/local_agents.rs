@@ -40,6 +40,7 @@ pub struct ScanRow {
     pub path: Option<String>,
     pub version: Option<String>,
     pub installed: bool,
+    pub plan_supported: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +127,9 @@ pub fn local_agents_scan(request: ScanRequest) -> Vec<ScanRow> {
                 id: (*id).to_string(),
                 bin: (*bin).to_string(),
                 installed: path.is_some() && version.is_some(),
+                plan_supported: version
+                    .as_deref()
+                    .is_some_and(|v| native_plan_supported(id, v)),
                 path: path.map(|p| p.display().to_string()),
                 version,
             }
@@ -194,6 +198,15 @@ pub fn local_agents_write(request: WriteRequest) -> Result<WriteReport, String> 
 
 #[tauri::command]
 pub fn local_agents_start(request: StartRequest) -> Result<(), String> {
+    if request
+        .prompt
+        .trim()
+        .strip_prefix("/plan")
+        .is_some_and(|s| s.is_empty() || s.starts_with(char::is_whitespace))
+        && !matches!(request.harness.as_str(), "codex" | "claudecode")
+    {
+        return Err("Native plan mode is not supported by this integration.".into());
+    }
     if request.id.trim().is_empty() {
         return Err("run id is required".into());
     }
@@ -228,9 +241,17 @@ pub fn local_agents_start(request: StartRequest) -> Result<(), String> {
     let error = Arc::new(Mutex::new(None));
     let resumed =
         request.session_id.as_deref().is_some_and(|s| !s.is_empty()) && request.harness != "grok";
-    let child = spawn_harness(&request, &text, &session_id, &error, &done)?;
+    let interaction = crate::interactions::begin(&request.id);
+    let child = match spawn_harness(&request, &text, &session_id, &error, &done) {
+        Ok(child) => child,
+        Err(error) => {
+            crate::interactions::finish(&interaction);
+            return Err(error);
+        }
+    };
     let child = Arc::new(Mutex::new(child));
     watch_exit(
+        interaction,
         Arc::clone(&child),
         Arc::clone(&done),
         Arc::clone(&exit_code),
@@ -252,6 +273,7 @@ pub fn local_agents_start(request: StartRequest) -> Result<(), String> {
 }
 
 fn watch_exit(
+    mission_id: crate::interactions::Session,
     child: Arc<Mutex<Child>>,
     done: Arc<AtomicBool>,
     exit_code: Arc<Mutex<Option<i32>>>,
@@ -264,6 +286,7 @@ fn watch_exit(
             .and_then(|mut child| child.try_wait().ok())
             .flatten();
         if let Some(status) = status {
+            crate::interactions::finish(&mission_id);
             if let Ok(mut slot) = exit_code.lock() {
                 *slot = status.code();
             }
@@ -332,6 +355,7 @@ pub fn local_agents_subscribe(
 
 #[tauri::command]
 pub fn local_agents_stop(id: String) -> Result<(), String> {
+    crate::interactions::cancel(&id);
     let mut map = runs().lock().map_err(|e| e.to_string())?;
     if let Some(run) = map.remove(&id) {
         if let Ok(mut child) = run.child.lock() {
@@ -400,7 +424,23 @@ fn spawn_claude(
     session_id: &Arc<Mutex<Option<String>>>,
     error: &Arc<Mutex<Option<String>>>,
 ) -> Result<Child, String> {
+    let plan = request
+        .prompt
+        .trim()
+        .strip_prefix("/plan")
+        .filter(|s| s.is_empty() || s.starts_with(char::is_whitespace))
+        .map(str::trim);
     let mut cmd = Command::new(&request.bin);
+    if plan.is_some() {
+        cmd.args([
+            "--permission-mode",
+            "plan",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+        ]);
+    }
     cmd.current_dir(&request.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -417,7 +457,7 @@ fn spawn_claude(
         cmd.arg("--model").arg(bare);
     }
     if let Some(sid) = request.session_id.as_deref().filter(|s| !s.is_empty()) {
-        cmd.arg("--session-id").arg(sid);
+        cmd.arg("--resume").arg(sid);
     } else if let Ok(mut slot) = session_id.lock() {
         let fresh = uuid_like();
         cmd.arg("--session-id").arg(&fresh);
@@ -426,6 +466,110 @@ fn spawn_claude(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to start Claude Code: {e}"))?;
+    if let Some(plan) = plan {
+        let mut stdin = child.stdin.take().ok_or("Claude stdin missing")?;
+        let stdout = child.stdout.take().ok_or("Claude stdout missing")?;
+        let mission_id = crate::interactions::session(&request.id);
+        let prompt = plan.to_owned();
+        let output = Arc::clone(text);
+        let failures = Arc::clone(error);
+        let guard = text.reader();
+        thread::spawn(move || {
+            let _guard = guard;
+            let result = (|| -> Result<(), String> {
+                write_line(&mut stdin, &json!({"type":"control_request","request_id":"orb-init","request":{"subtype":"initialize"}}).to_string())?;
+                write_line(
+                    &mut stdin,
+                    &json!({"type":"user","message":{"role":"user","content":prompt}}).to_string(),
+                )?;
+                let mut implement_after_result = false;
+                for line in BufReader::new(stdout).lines() {
+                    let line = line.map_err(|e| e.to_string())?;
+                    let Ok(event) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    if implement_after_result
+                        && event["type"] == "assistant"
+                        && event["message"]["content"]
+                            .as_array()
+                            .is_some_and(|blocks| {
+                                blocks.iter().any(|b| {
+                                    b["type"] == "tool_use"
+                                        && b["name"] != "ExitPlanMode"
+                                        && b["name"] != "AskUserQuestion"
+                                })
+                            })
+                    {
+                        implement_after_result = false;
+                    }
+                    if event["type"] == "control_response"
+                        && event["response"]["subtype"] == "error"
+                    {
+                        return Err(format!(
+                            "Native plan request failed: {}",
+                            event["response"]["error"]
+                        ));
+                    }
+                    if event["type"] == "control_request"
+                        && event["request"]["subtype"] == "can_use_tool"
+                    {
+                        let tool = event["request"]["tool_name"].as_str().unwrap_or("");
+                        let input = event["request"]["input"].clone();
+                        let response = if tool == "AskUserQuestion" {
+                            let answers = crate::interactions::ask(
+                                &mission_id,
+                                "claude_questions",
+                                input.clone(),
+                            )?;
+                            let mut updated = input;
+                            updated["answers"] = answers["answers"].clone();
+                            json!({"behavior":"allow","updatedInput":updated})
+                        } else if tool == "ExitPlanMode" {
+                            let answer =
+                                crate::interactions::ask(&mission_id, "plan", input.clone())?;
+                            if answer["action"] == "accept" {
+                                implement_after_result = true;
+                                json!({"behavior":"allow","updatedInput":input})
+                            } else {
+                                json!({"behavior":"deny","message":answer["feedback"].as_str().unwrap_or("Please revise the plan.")})
+                            }
+                        } else {
+                            {
+                                let answer = crate::interactions::ask(
+                                    &mission_id,
+                                    "permission",
+                                    json!({"tool":tool,"input":input}),
+                                )?;
+                                if answer["action"] == "accept" {
+                                    json!({"behavior":"allow","updatedInput":input})
+                                } else {
+                                    json!({"behavior":"deny","message":"The user declined this action."})
+                                }
+                            }
+                        };
+                        write_line(&mut stdin,&json!({"type":"control_response","response":{"subtype":"success","request_id":event["request_id"],"response":response}}).to_string())?;
+                    } else if event["type"] == "result" {
+                        if implement_after_result {
+                            implement_after_result = false;
+                            write_line(&mut stdin,&json!({"type":"control_request","request_id":"orb-execute","request":{"subtype":"set_permission_mode","mode":"acceptEdits"}}).to_string())?;
+                            write_line(&mut stdin,&json!({"type":"user","message":{"role":"user","content":"Implement the approved plan."}}).to_string())?;
+                            continue;
+                        }
+                        break;
+                    } else if let Some(piece) = extract_text(&line) {
+                        output.append(&piece);
+                    }
+                }
+                Ok(())
+            })();
+            crate::interactions::finish(&mission_id);
+            if let Err(e) = result {
+                *failures.lock().unwrap() = Some(e);
+            }
+        });
+        pipe_output(None, child.stderr.take(), text, error, true);
+        return Ok(child);
+    }
     if let Some(mut stdin) = child.stdin.take() {
         let prompt = request.prompt.clone();
         thread::spawn(move || {
@@ -589,6 +733,7 @@ fn spawn_codex(
     let stdout = child.stdout.take().ok_or("codex stdout missing")?;
     let stderr = child.stderr.take();
     let prompt = request.prompt.clone();
+    let mission_id = crate::interactions::session(&request.id);
     let image_paths = request.image_paths.clone();
     let model = request.model.clone();
     let cwd = request.cwd.clone();
@@ -627,7 +772,9 @@ fn spawn_codex(
             resume.as_deref(),
             &text_bg,
             &session_bg,
+            &mission_id,
         );
+        crate::interactions::finish(&mission_id);
         if let Err(message) = result {
             if let Ok(mut slot) = error_bg.lock() {
                 *slot = Some(if busy_thread(&message) {
@@ -660,6 +807,7 @@ fn drive_codex(
     resume: Option<&str>,
     text: &Output,
     session_out: &Mutex<Option<String>>,
+    mission_id: &crate::interactions::Session,
 ) -> Result<(), String> {
     rpc(
         stdin,
@@ -684,6 +832,7 @@ fn drive_codex(
     } else {
         rpc(stdin, reader, "thread/start", params)?
     };
+    let resolved_model = model.or_else(|| started.get("model").and_then(Value::as_str));
     let thread_id = started
         .pointer("/thread/id")
         .and_then(|v| v.as_str())
@@ -692,7 +841,13 @@ fn drive_codex(
     if let Ok(mut slot) = session_out.lock() {
         *slot = Some(thread_id.clone());
     }
-    let mut input = vec![json!({"type":"text", "text":prompt})];
+    let plan_prompt = prompt
+        .trim()
+        .strip_prefix("/plan")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
+    let mut planning = plan_prompt.is_some();
+    let mut input =
+        vec![json!({"type":"text", "text":plan_prompt.map(str::trim).unwrap_or(prompt)})];
     input.extend(
         image_paths
             .iter()
@@ -705,15 +860,16 @@ fn drive_codex(
         "turn/start",
         json!({
             "threadId": thread_id,
-            "input": input
+            "input": input,
+            "collaborationMode": {"mode": if planning {"plan"} else {"default"}, "settings": {"model":resolved_model.ok_or("Codex did not resolve a model for collaboration mode")?, "reasoning_effort":null, "developer_instructions":null}}
         }),
         &mut pending,
     )?;
-    let mut pending = pending.into_iter();
+    let mut pending: std::collections::VecDeque<Value> = pending.into();
     let mut items = crate::local_stream::CodexText::default();
     let mut line = String::new();
     loop {
-        let value = if let Some(event) = pending.next() {
+        let value = if let Some(event) = pending.pop_front() {
             event
         } else {
             line.clear();
@@ -734,6 +890,17 @@ fn drive_codex(
             return Err(message.to_string());
         }
         let method = value.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        if let Some(id) = value.get("id").filter(|_| !method.is_empty()) {
+            if method == "item/tool/requestUserInput" || method == "tool/requestUserInput" {
+                let answer =
+                    crate::interactions::ask(mission_id, "questions", value["params"].clone())?;
+                write_line(stdin, &json!({"id":id,"result":answer}).to_string())?;
+            } else {
+                // Never treat an unknown request as an approval.
+                write_line(stdin, &json!({"id":id,"error":{"code":-32601,"message":"Unsupported interactive request"}}).to_string())?;
+            }
+            continue;
+        }
         if method == "error" {
             if let Some(message) = value
                 .pointer("/params/error/message")
@@ -749,6 +916,30 @@ fn drive_codex(
                     .and_then(Value::as_str)
                     .unwrap_or("Codex turn failed")
                     .to_owned());
+            }
+            if planning
+                && value.pointer("/params/turn/status").and_then(Value::as_str)
+                    != Some("interrupted")
+            {
+                let answer =
+                    crate::interactions::ask(mission_id, "plan", json!({"plan":text.snapshot()}))?;
+                planning = answer["action"] != "accept";
+                let followup = if planning {
+                    answer["feedback"].as_str().unwrap_or("Revise the plan.")
+                } else {
+                    "Implement the approved plan."
+                };
+                let mut early = Vec::new();
+                let next = rpc_collect(
+                    stdin,
+                    reader,
+                    "turn/start",
+                    json!({"threadId":thread_id,"input":[{"type":"text","text":followup}],"collaborationMode":{"mode":if planning {"plan"} else {"default"},"settings":{"model":resolved_model.ok_or("Codex did not resolve a model for collaboration mode")?,"reasoning_effort":null,"developer_instructions":null}}}),
+                    &mut early,
+                );
+                next?;
+                pending.extend(early);
+                continue;
             }
             break;
         }
@@ -873,6 +1064,27 @@ fn which(name: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+// Conservative floors: these are the versions exercised by the native
+// round-trip tests, not merely a CLI binary being present on PATH.
+fn native_plan_supported(id: &str, version: &str) -> bool {
+    let minimum = match id {
+        "codex" => (0, 155, 0),
+        "claudecode" => (2, 1, 278),
+        _ => return false,
+    };
+    version
+        .split_whitespace()
+        .find_map(|part| {
+            let mut pieces = part.split('.');
+            Some((
+                pieces.next()?.parse::<u32>().ok()?,
+                pieces.next()?.parse::<u32>().ok()?,
+                pieces.next()?.parse::<u32>().ok()?,
+            ))
+        })
+        .is_some_and(|v| v >= minimum)
+}
+
 fn version_of(path: &Path) -> Option<String> {
     let mut child = Command::new(path)
         .arg("--version")
@@ -984,6 +1196,16 @@ mod tests {
     }
 
     #[test]
+    fn native_plan_capability_requires_a_verified_protocol_version() {
+        assert!(native_plan_supported("codex", "codex-cli 0.155.1"));
+        assert!(native_plan_supported("claudecode", "2.1.278 (Claude Code)"));
+        assert!(!native_plan_supported("codex", "codex-cli 0.120.0"));
+        assert!(!native_plan_supported("claudecode", "unknown"));
+        assert!(!native_plan_supported("grok", "1.0.40"));
+        assert!(!native_plan_supported("opencode", "1.15.13"));
+    }
+
+    #[test]
     fn grok_and_opencode_args_match_the_pinned_flags() {
         assert_eq!(
             grok_args("hello"),
@@ -1046,7 +1268,7 @@ mod tests {
     fn codex_keeps_early_deltas_and_reconciles_final_items() {
         let events = [
             json!({"id":"orb-initialize","result":{}}),
-            json!({"id":"orb-thread/start","result":{"thread":{"id":"thread"}}}),
+            json!({"id":"orb-thread/start","result":{"model":"test-model","thread":{"id":"thread"}}}),
             json!({"method":"item/agentMessage/delta","params":{"itemId":"a","delta":"Early"}}),
             json!({"id":"orb-turn/start","result":{}}),
             json!({"method":"item/completed","params":{"item":{"type":"agentMessage","id":"a","text":"Early answer"}}}),
@@ -1070,6 +1292,7 @@ mod tests {
             None,
             &output,
             &Mutex::new(None),
+            &crate::interactions::begin("test-codex"),
         )
         .unwrap();
         assert_eq!(output.snapshot(), "Early answer");
@@ -1226,4 +1449,77 @@ pub fn active_pids() -> Vec<u32> {
         .filter(|r| !r.done.load(Ordering::SeqCst))
         .filter_map(|r| r.child.try_lock().ok().map(|c| c.id()))
         .collect()
+}
+
+#[cfg(test)]
+mod plan_smoke {
+    use super::*;
+    #[test]
+    #[ignore = "real authenticated CLI smoke test; ORB_PLAN_HARNESS and ORB_PLAN_BIN required"]
+    fn native_plan_roundtrip() {
+        let harness = std::env::var("ORB_PLAN_HARNESS").unwrap();
+        let id = format!("plan-smoke-{}", uuid_like());
+        let cwd = std::env::temp_dir().join(&id);
+        std::fs::create_dir_all(&cwd).unwrap();
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = local_agents_stop(self.0.clone());
+            }
+        }
+        let _cleanup = Cleanup(id.clone());
+        local_agents_start(StartRequest{id:id.clone(),harness,bin:std::env::var("ORB_PLAN_BIN").unwrap(),cwd:cwd.to_string_lossy().into(),model:None,session_id:None,image_paths:vec![],prompt:"/plan Plan creating hello.txt containing hello. First ask me one question using your native question tool: should it say hello or bonjour? Then present a short plan for approval. Do not delegate. After approval implement it.".into()}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(150);
+        let mut approved = false;
+        let mut revised = std::env::var_os("ORB_PLAN_REVISE").is_none();
+        let mut questions = 0;
+        while Instant::now() < deadline {
+            if let Some(req) = crate::interactions::local_interaction(id.clone()).unwrap() {
+                eprintln!("native request: {}", req.method);
+                assert!(
+                    approved || !cwd.join("hello.txt").exists(),
+                    "write before plan approval"
+                );
+                let answer = if req.method == "plan" {
+                    if !revised {
+                        revised = true;
+                        json!({"action":"revise","feedback":"Revise the plan to explicitly verify the file contents after writing. Keep the content hello and ask for approval again."})
+                    } else {
+                        approved = true;
+                        json!({"action":"accept"})
+                    }
+                } else if req.method == "permission" {
+                    assert!(approved, "unexpected permission before plan approval");
+                    json!({"action":"accept"})
+                } else {
+                    questions += 1;
+                    let mut answers = serde_json::Map::new();
+                    for q in req.params["questions"].as_array().unwrap() {
+                        if req.method == "claude_questions" {
+                            answers.insert(q["question"].as_str().unwrap().into(), json!("hello"));
+                        } else {
+                            answers.insert(
+                                q["id"].as_str().unwrap().into(),
+                                json!({"answers":["hello"]}),
+                            );
+                        }
+                    }
+                    json!({"answers":answers})
+                };
+                crate::interactions::local_interaction_answer(id.clone(), req.id, answer).unwrap();
+            }
+            let state = local_agents_poll(id.clone()).unwrap();
+            if state.done {
+                assert!(state.error.is_none(), "{:?}", state.error);
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(approved, "no plan approval request");
+        assert!(questions > 0, "no clarification request");
+        assert!(
+            cwd.join("hello.txt").exists(),
+            "approved plan did not execute"
+        );
+    }
 }

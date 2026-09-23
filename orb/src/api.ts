@@ -212,6 +212,7 @@ export interface MissionAttachment {
 }
 
 export interface BackendInfo {
+  native_plan?: boolean;
   id: string;
   name: string;
 }

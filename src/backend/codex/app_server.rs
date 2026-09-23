@@ -148,6 +148,8 @@ pub struct ThreadStartParams {
 
 #[derive(Debug, Deserialize)]
 pub struct ThreadStartResult {
+    #[serde(default)]
+    pub model: Option<String>,
     pub thread: ThreadHandle,
 }
 
@@ -180,6 +182,8 @@ pub struct ThreadGoalGetResponse {
 
 #[derive(Debug, Serialize)]
 pub struct TurnStartParams {
+    #[serde(rename = "collaborationMode", skip_serializing_if = "Option::is_none")]
+    pub collaboration_mode: Option<Value>,
     #[serde(rename = "threadId")]
     pub thread_id: String,
     pub input: Vec<UserInputItem>,
@@ -245,6 +249,7 @@ pub struct RpcError {
 
 /// A live connection to a `codex app-server` process.
 pub struct AppServerSession {
+    closed: tokio_util::sync::CancellationToken,
     next_id: Arc<Mutex<i64>>,
     pending: PendingMap,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
@@ -354,6 +359,8 @@ impl AppServerSession {
         // Reader loop: pulls newline-delimited JSON, dispatches responses to
         // pending oneshots and notifications/server-requests onto the inbound
         // channel.
+        let closed = tokio_util::sync::CancellationToken::new();
+        let reader_closed = closed.clone();
         let pending_for_task = Arc::clone(&pending);
         let reader_task = tokio::spawn(async move {
             let reader = BufReader::new(stdout);
@@ -439,6 +446,7 @@ impl AppServerSession {
                     warn!("codex app-server: unrecognized message shape — {}", trimmed);
                 }
             }
+            reader_closed.cancel();
             debug!("codex app-server: reader loop exited (EOF)");
             // Drain any still-pending request senders so callers stuck in
             // `rx.await` get a clear error instead of hanging until the
@@ -461,6 +469,7 @@ impl AppServerSession {
         let _ = config;
 
         Ok(Self {
+            closed,
             next_id: Arc::new(Mutex::new(1)),
             pending,
             stdin: Arc::new(Mutex::new(Some(stdin))),
@@ -468,6 +477,10 @@ impl AppServerSession {
             child: Arc::new(Mutex::new(Some(child))),
             reader_task: Mutex::new(Some(reader_task)),
         })
+    }
+
+    pub async fn closed(&self) {
+        self.closed.cancelled().await;
     }
 
     /// Take the inbound message stream. Each session yields it exactly once.
@@ -738,6 +751,7 @@ impl AppServerSession {
 
     /// Hard-stop: kill the child process and drop the reader task.
     pub async fn shutdown(&self) {
+        self.closed.cancel();
         if let Some(mut child) = self.child.lock().await.take() {
             if let Err(e) = child.kill().await {
                 debug!("codex app-server kill: {}", e);
@@ -766,6 +780,7 @@ mod tests {
     #[test]
     fn turn_start_params_serialize_threadid_camelcase() {
         let p = TurnStartParams {
+            collaboration_mode: None,
             thread_id: "abc".to_string(),
             input: vec![UserInputItem::Text {
                 text: "hi".to_string(),

@@ -25,6 +25,11 @@ export function goalObjective(text: string | null | undefined): string | null {
 }
 
 /** Canonical goal prompt, identical to the server's `canonical_goal_message`. */
+export function planObjective(text: string | null | undefined): string | null {
+  const match = /^\/plan(?:\s+([\s\S]*))?$/.exec((text ?? "").trim());
+  return match ? (match[1] ?? "").trim() : null;
+}
+
 export const goalPrompt = (objective: string) => `/goal ${objective}`;
 
 export const EMPTY_GOAL_ERROR = "Add an objective after /goal, for example “/goal Make the test suite pass”. Your draft is kept.";
@@ -39,19 +44,19 @@ function shortTitle(text: string): string {
 
 /** Mission title for a composer draft: the objective for goals, never the raw `/goal` command. */
 export function missionTitle(text: string): string {
-  return shortTitle(goalObjective(text) ?? text);
+  return shortTitle(goalObjective(text) ?? planObjective(text) ?? text);
 }
 
 /** Stored titles from older clients can be the raw `/goal …` prompt; show the objective instead. */
 export function displayTitle(title: string | null | undefined): string | null {
   if (!title) return null;
-  return goalObjective(title) ?? title;
+  return goalObjective(title) ?? planObjective(title) ?? title;
 }
 
 /** Compact goal indicator shared by the composer, the launch preview and transcript turns. */
 export function GoalTag(p: { detail?: string; class?: string }) {
   return (
-    <span class={`goal-tag ${p.class ?? ""}`} title="Goal mode: the agent keeps iterating until this objective is met.">
+    <span class={`goal-tag ${p.class ?? ""}`} title="Keep iterating until the objective is met">
       <Ic.TargetIcon size={12} />
       <span class="goal-tag-label">Goal</span>
       {p.detail ? <span class="goal-tag-detail">{p.detail}</span> : null}
@@ -62,7 +67,7 @@ export function GoalTag(p: { detail?: string; class?: string }) {
 /** Native `/goal` loop — same harness ids as `native_loops.rs`. */
 export const GOAL_HARNESSES = new Set(["claudecode", "codex", "grok", "opencode"]);
 
-export type ComposerMode = "goal";
+export type ComposerMode = "goal" | "plan";
 
 export type SlashItem = {
   id: ComposerMode;
@@ -71,9 +76,9 @@ export type SlashItem = {
   title: string;
 };
 
-export function composerModes(backend?: string | null): SlashItem[] {
+export function composerModes(backend?: string | null, planSupported = false): SlashItem[] {
   if (backend && !GOAL_HARNESSES.has(backend)) return [];
-  return [{ id: "goal", section: "Modes", label: "Goal", title: "Keep iterating until this objective is met" }];
+  return [{ id: "goal", section: "Modes", label: "Goal", title: "Keep iterating until this objective is met" }, ...(planSupported ? [{id:"plan" as const,section:"Modes" as const,label:"Plan",title:"Plan before making changes"}] : [])];
 }
 
 /** `/` plus a query with no whitespace — the Cursor slash palette trigger. */
@@ -98,6 +103,7 @@ export function absorbGoalPrefix(text: string): string | null {
 export function modePrompt(mode: ComposerMode | null, visible: string): string {
   const body = visible.trim();
   if (mode === "goal") return body ? goalPrompt(body) : "/goal";
+  if (mode === "plan") return body ? `/plan ${body}` : "/plan";
   return body;
 }
 
@@ -105,15 +111,15 @@ export function modePrompt(mode: ComposerMode | null, visible: string): string {
 export function ModeChip(p: { mode: ComposerMode; onClear: () => void }) {
   return (
     <span
-      class="mode-chip goal-mode"
+      class={`mode-chip ${p.mode}-mode`}
       role="status"
       aria-live="polite"
-      aria-label="Goal mode: the agent keeps iterating until the objective is met"
-      title="Goal mode: the agent keeps iterating until this objective is met."
+      aria-label={p.mode === "plan" ? "Plan mode" : "Goal mode"}
+      title={p.mode === "plan" ? "Plan before making changes" : "Keep iterating until the objective is met"}
     >
-      <Ic.TargetIcon size={12} />
-      <span class="mode-chip-label">Goal</span>
-      <button type="button" class="mode-chip-x" tabIndex={-1} title="Remove Goal" aria-label="Remove Goal" onClick={(e) => { e.preventDefault(); e.stopPropagation(); p.onClear(); }}>
+      {p.mode === "plan" ? <Ic.PlanIcon size={12} /> : <Ic.TargetIcon size={12} />}
+      <span class="mode-chip-label">{p.mode === "plan" ? "Plan" : "Goal"}</span>
+      <button type="button" class="mode-chip-x" tabIndex={-1} title={`Remove ${p.mode === "plan" ? "Plan" : "Goal"}`} aria-label={`Remove ${p.mode === "plan" ? "Plan" : "Goal"}`} onClick={(e) => { e.preventDefault(); e.stopPropagation(); p.onClear(); }}>
         <Ic.CloseIcon size={10} />
       </button>
     </span>

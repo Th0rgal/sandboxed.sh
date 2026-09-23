@@ -1,3 +1,4 @@
+import { NativeInteraction } from "./NativeInteraction";
 import { hasNativePicker, pickNativeFiles, transferFile, prepareUploads, uploadToken, type UploadedFile, type UploadSource } from "./uploads";
 import { readComposerDraft, saveComposerDraft } from "./composerDrafts";
 import { readImage, imagePrompt, stageLocalImages, stageRemoteImages, IMAGE_COUNT, type DraftImage } from "./imageAttachments";
@@ -42,6 +43,7 @@ import {
   followLocal,
   installedIds,
   localBinding,
+  localInstalled,
   localLiveText,
   localFailure,
   recordLocalFailure,
@@ -323,9 +325,10 @@ export function Composer(p: {
   const [images, setImages] = createSignal<DraftImage[]>([]);
   const [sending, setSending] = createSignal(false);
   const [pendingSend, setPendingSend] = createSignal<{text:string; images:DraftImage[]} | null>(null);
+  const [mode, setMode] = createSignal<ComposerMode | null>(null);
   const [draftReady, setDraftReady] = createSignal(false);
   createEffect(on(() => p.scope, (scope, previous) => {
-    if (previous !== undefined && previous !== scope) { setText(""); setImages([]); uploaded = []; }
+    if (previous !== undefined && previous !== scope) { setText(""); setImages([]); setMode(null); uploaded = []; }
     setDraftReady(false);
     if (!scope) { setDraftReady(true); return; }
     let current=true;
@@ -334,13 +337,14 @@ export function Composer(p: {
       if (current && draft && !text() && !images().length) {
         uploaded = (draft.uploads ?? []).map(file => ({...file, connection: file.endpoint === getApiUrl() ? connectionVersion() : -1}));
         setText(draft.text);setImages(draft.images);
+        if(draft.mode) setMode(draft.mode);
         queueMicrotask(() => { if (ta?.isConnected) { ta.value=draft.text; resize(); } });
       }
     }).catch(() => {}).finally(() => { if (current) setDraftReady(true); });
   }));
   createEffect(() => {
     const scope=p.scope;
-    if (draftReady() && scope) void saveComposerDraft(scope,{text:pendingSend()?.text ?? text(),images:pendingSend()?.images ?? images(),uploads:uploaded.map(file => ({...file, source:{name:file.source.name,localPath:file.source.localPath}}))}).catch(() => {});
+    if (draftReady() && scope) void saveComposerDraft(scope,{text:pendingSend()?.text ?? text(),images:pendingSend()?.images ?? images(),mode:mode(),uploads:uploaded.map(file => ({...file, source:{name:file.source.name,localPath:file.source.localPath}}))}).catch(() => {});
   });
   const [imageError, setImageError] = createSignal<string | null>(null);
   const [readingImages, setReadingImages] = createSignal(false);
@@ -361,7 +365,7 @@ export function Composer(p: {
   // Local voice input (macOS): dictated text lands at the caret, never sends.
   const [voiceActive, setVoiceActive] = createSignal(false);
   ensureVoiceProbe();
-  const [mode, setMode] = createSignal<ComposerMode | null>(null);
+
   const [slashHi, setSlashHi] = createSignal(0);
   const [model, setModel] = createSignal(MODELS[0]);
   const live = () => isConnected() && harnessChoices().length > 0;
@@ -376,7 +380,7 @@ export function Composer(p: {
   let ta!: HTMLTextAreaElement;
   const pick = () => effectivePick();
   const backend = () => p.backend ?? pick()?.backend ?? null;
-  const modes = createMemo(() => composerModes(backend()));
+  const modes = createMemo(() => composerModes(backend(), p.uploadTarget === "local" ? !!localInstalled().find(h=>h.id===backend())?.plan_supported : p.uploadTarget === "core" && !!harnessChoices().find(h=>h.backend.id===backend())?.backend.native_plan));
   const slash = createMemo(() => {
     if (mode() || voiceActive() || slashOff()) return null;
     const q = slashQuery(text());
@@ -470,6 +474,10 @@ export function Composer(p: {
     const original = text();
     let payload = draftOf(original);
     if ((!payload && !images().length) || sending() || uploading() || readingImages()) return;
+    if ((mode() === "plan" || /^\/plan(?:\s|$)/.test(payload)) && !modes().some(m => m.id === "plan")) {
+      setUploadError("Plan mode is not supported by this harness on this machine. Your draft is kept.");
+      return;
+    }
     const sentImages = images();
     const originalMode = mode();
     const originalUploads = uploaded;
@@ -834,7 +842,7 @@ export function Composer(p: {
       {atMenu}
       <Show when={uploading()}><div class="composer-upload-status" role="status">Attaching file…</div></Show>
       <Show when={uploadError()}><div class="composer-upload-status error" role="alert">{uploadError()}</div></Show>
-      <Show when={mode() === "goal"}><ModeChip mode="goal" onClear={clearMode} /></Show>
+      <Show when={mode()}>{m => <ModeChip mode={m()} onClear={clearMode} />}</Show>
       <div class="composer-field">
         <Show when={images().length}><div class="composer-images"><For each={images()}>{image => <div class="composer-image"><img src={image.dataUrl} alt="Attached image" /><button class="icon-btn" aria-label="Remove image" title="Remove image" onClick={e => { e.stopPropagation(); setImages(current => current.filter(item => item.id !== image.id)); }}><Ic.CloseIcon size={12}/></button></div>}</For></div></Show>
         <Show when={imageError()}><span class="image-paste-error" role="alert">{imageError()}</span></Show>
@@ -842,12 +850,15 @@ export function Composer(p: {
           ref={ta}
           onPaste={event => void pasteImages(event)}
           rows={1}
-          placeholder={mode() === "goal" ? "Describe the objective" : p.placeholder}
+          placeholder={mode() === "goal" ? "Describe the objective" : mode() === "plan" ? "Plan before making changes…" : p.placeholder}
           onInput={(e) => {
             const next = e.currentTarget.value;
             setSlashOff(false);
             setAtOff(false);
             setCaret(e.currentTarget.selectionStart ?? next.length);
+            if (!mode() && /^\/plan(?:\s|$)/.test(next) && modes().some(m=>m.id==='plan')) {
+              enterMode('plan', next.replace(/^\/plan\s*/,'')); return;
+            }
             if (!mode() || mode() === "goal") {
               const absorbed = absorbGoalPrefix(next);
               if (absorbed !== null && modes().some((it) => it.id === "goal")) {
@@ -893,7 +904,7 @@ export function Composer(p: {
                 return;
               }
             }
-            if (e.key === "Backspace" && mode() === "goal" && !text() && ta.selectionStart === 0 && ta.selectionEnd === 0) {
+            if (e.key === "Backspace" && mode() && !text() && ta.selectionStart === 0 && ta.selectionEnd === 0) {
               e.preventDefault();
               clearMode();
               return;
@@ -2462,6 +2473,7 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
           >
             <LaunchStatus submitting={localRunActive(p.id)} destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={activity()} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
             <Transcript items={viewItems().filter(i => i.kind !== "user" || !i.queued)} pending={pending()} onSend={sendEditedPrompt} />
+            <NativeInteraction mission={p.id} active={clientPlaced() ? localRunActive(p.id) : busy()} remote={!clientPlaced()} items={viewItems()} />
             <Show when={!sendError()}>
               <MissionFailure mission={mission()} active={localRunActive(p.id)} error={localFailure(p.id)} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
             </Show>

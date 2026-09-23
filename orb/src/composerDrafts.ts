@@ -1,6 +1,6 @@
 import type {DraftImage} from "./imageAttachments";
 import type { UploadedFile } from "./uploads";
-export interface ComposerDraft { text:string; images:DraftImage[]; uploads?: UploadedFile[]; }
+export interface ComposerDraft { mode?: "goal" | "plan" | null; text:string; images:DraftImage[]; uploads?: UploadedFile[]; }
 let database: Promise<IDBDatabase> | undefined;
 function db(): Promise<IDBDatabase> {
  return database ??= new Promise((resolve,reject)=>{
@@ -22,7 +22,7 @@ export async function saveComposerDraft(scope:string,draft:ComposerDraft):Promis
  return new Promise((resolve,reject)=>{
   const transaction=database.transaction('drafts','readwrite');
   const store=transaction.objectStore('drafts');
-  if (!draft.text && !draft.images.length) store.delete(scope);else store.put(draft,scope);
+  if (!draft.text && !draft.images.length && !draft.mode) store.delete(scope);else store.put(draft,scope);
   transaction.oncomplete=()=>resolve();transaction.onerror=()=>reject(transaction.error);
  });
 }

@@ -3952,7 +3952,13 @@ async fn run_mission_turn(
     // Prepare user message and session ID (potentially with rotation)
     let (mut user_message, mut session_id) = (user_message, session_id);
 
-    if should_rotate && backend_id == "claudecode" {
+    if should_rotate
+        && backend_id == "claudecode"
+        && !user_message
+            .trim()
+            .strip_prefix("/plan")
+            .is_some_and(|s| s.is_empty() || s.starts_with(char::is_whitespace))
+    {
         tracing::info!(
             mission_id = %mission_id,
             turn_count = turn_count,
@@ -4071,6 +4077,7 @@ async fn run_mission_turn(
             } else if backend_id == "codex" {
                 super::runners::TurnExtras::Codex {
                     current_message: &user_message,
+                    tool_hub: Some(Arc::clone(&tool_hub)),
                 }
             } else {
                 super::runners::TurnExtras::None

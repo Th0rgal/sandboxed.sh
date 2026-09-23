@@ -212,6 +212,31 @@ pub fn validate_goal_message(message: &str) -> Result<(), String> {
 ///   releases the driver after its turn drains; it does not complete the goal.
 /// - Otherwise → `turn/start` with a single text input item. We finish the
 ///   mission on the first `turn/completed` notification.
+async fn native_input(
+    session: &app_server::AppServerSession,
+    cfg: &client::CodexConfig,
+    method: &str,
+    params: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let sender = cfg
+        .interactive
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Native input is not available for this runner"))?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    sender
+        .send(client::NativeRequest {
+            method: method.into(),
+            params,
+            reply: tx,
+        })
+        .await?;
+    let cancel = cfg.cancel_token.clone().unwrap_or_default();
+    tokio::select! {_ = cancel.cancelled()=> Err(anyhow::anyhow!("Cancelled")), reply=rx=>Ok(reply?), _=session.closed()=>Err(anyhow::anyhow!("The session exited while waiting for your response"))}
+}
+fn collaboration_mode(plan: bool, model: &str) -> serde_json::Value {
+    serde_json::json!({"mode":if plan {"plan"}else{"default"},"settings":{"model":model,"reasoning_effort":null,"developer_instructions":null}})
+}
+
 async fn send_message_streaming_app_server(
     mut cfg: client::CodexConfig,
     session: &Session,
@@ -222,6 +247,24 @@ async fn send_message_streaming_app_server(
         AppServerConfig, AppServerSession, GoalSetParams, InboundMessage, ThreadStartParams,
         TurnStartParams, UserInputItem,
     };
+
+    let plan_source = cfg
+        .continuity
+        .as_ref()
+        .map(|c| c.current_message.as_str())
+        .unwrap_or(message);
+    let plan_body = plan_source
+        .trim()
+        .strip_prefix("/plan")
+        .filter(|s| s.is_empty() || s.starts_with(char::is_whitespace))
+        .map(str::trim);
+    let mut planning = plan_body.is_some();
+    if planning && cfg.interactive.is_none() {
+        return Err(anyhow::anyhow!(
+            "This runner cannot handle native plan interactions"
+        ));
+    }
+    let mut plan_model = session.model.clone().or(cfg.default_model.clone());
 
     validate_goal_message(
         cfg.continuity
@@ -336,12 +379,14 @@ async fn send_message_streaming_app_server(
             session_arc.thread_start(thread_start_params.clone()).await
         };
         let thread = match thread_result {
-            Ok(t) => t.thread,
+            Ok(t) => { plan_model = plan_model.or(t.model); t.thread },
             Err(e) => {
                 let _ = session_arc.shutdown().await;
                 return Err(anyhow::anyhow!("codex {} failed; no fresh-thread fallback: {}", if resumed { "thread/resume" } else { "thread/start" }, e));
             }
         };
+        let plan_model = plan_model.unwrap_or_default();
+        if planning && plan_model.is_empty() { return Err(anyhow::anyhow!("Codex did not resolve a model for plan mode")); }
         if let Some(lease) = native_lease.as_mut() {
             if thread.cwd.as_deref() != Some(thread_cwd.as_str())
                 || (resumed && lease.binding.thread_id.as_deref() != Some(thread.id.as_str()))
@@ -394,6 +439,7 @@ async fn send_message_streaming_app_server(
                 if goal.thread_id != thread_id || (requested_goal && goal.objective != user_payload) {
                     return Err(anyhow::anyhow!("codex_continuity_goal_identity: native objective differs; explicit reassignment required"));
                 }
+                if planning && goal.status != "complete" { return Err(anyhow::anyhow!("Finish the active goal or start the plan in a separate session")); }
                 lease.note_goal()?;
                 if goal.status != "complete" || requested_goal {
                     if goal.status == "complete" {
@@ -489,9 +535,10 @@ async fn send_message_streaming_app_server(
             }
         } else if !already_primed { if let Err(e) = session_for_rpc
             .turn_start(TurnStartParams {
+                collaboration_mode: planning.then(||collaboration_mode(true, &plan_model)),
                 thread_id: thread_id.clone(),
                 input: vec![UserInputItem::Text {
-                    text: user_payload.clone(),
+                    text: plan_body.unwrap_or(&user_payload).to_owned(),
                 }],
             })
             .await
@@ -505,7 +552,7 @@ async fn send_message_streaming_app_server(
         } else {
             String::new()
         };
-        Ok((thread, inbound, is_goal_mission, pending_steer, initial_objective, pre_activation_messages))
+        Ok((thread, inbound, is_goal_mission, pending_steer, initial_objective, pre_activation_messages, plan_model))
     }.await;
     let (
         thread,
@@ -514,6 +561,7 @@ async fn send_message_streaming_app_server(
         mut pending_steer,
         initial_objective,
         pre_activation_messages,
+        plan_model,
     ) = match preparation {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -704,6 +752,9 @@ async fn send_message_streaming_app_server(
                             translator.handle_notification(&method, &params, is_goal_mission);
                         let mut journal_failed = false;
                         for ev in outcome.events {
+                            if planning && matches!(ev, ExecutionEvent::MessageComplete { .. }) {
+                                continue;
+                            }
                             match &ev {
                                 ExecutionEvent::ToolCall { id, .. } => {
                                     if let Some(descriptor) = translator.pending_tool_calls.get(id)
@@ -754,6 +805,51 @@ async fn send_message_streaming_app_server(
                         if journal_failed {
                             break 'outer;
                         }
+                        if outcome.terminal
+                            && planning
+                            && method == "turn/completed"
+                            && params["turn"]["status"] == "completed"
+                        {
+                            match native_input(&session_arc, &cfg, "plan", serde_json::json!({}))
+                                .await
+                            {
+                                Ok(answer) => {
+                                    planning = answer["action"] != "accept";
+                                    let text = if planning {
+                                        answer["feedback"].as_str().unwrap_or("Revise the plan.")
+                                    } else {
+                                        "Implement the approved plan."
+                                    };
+                                    let result = session_arc
+                                        .turn_start(TurnStartParams {
+                                            thread_id: thread_id.clone(),
+                                            input: vec![UserInputItem::Text { text: text.into() }],
+                                            collaboration_mode: Some(collaboration_mode(
+                                                planning,
+                                                &plan_model,
+                                            )),
+                                        })
+                                        .await;
+                                    if let Err(error) = result {
+                                        let _ = tx
+                                            .send(ExecutionEvent::Error {
+                                                message: error.to_string(),
+                                            })
+                                            .await;
+                                        break 'outer;
+                                    }
+                                    continue;
+                                }
+                                Err(error) => {
+                                    let _ = tx
+                                        .send(ExecutionEvent::Error {
+                                            message: error.to_string(),
+                                        })
+                                        .await;
+                                    break 'outer;
+                                }
+                            }
+                        }
                         if outcome.terminal {
                             let interrupted = reconcile_pending_before_terminal(
                                 &mut translator,
@@ -773,7 +869,24 @@ async fn send_message_streaming_app_server(
                         // requests. Exec mode runs with
                         // `--dangerously-bypass-approvals-and-sandbox`; we mirror
                         // that policy here by auto-approving every elicitation.
-                        let send_err = if method == "account/chatgptAuthTokens/refresh" {
+                        let send_err = if method == "item/tool/requestUserInput"
+                            || method == "tool/requestUserInput"
+                        {
+                            match native_input(&session_arc, &cfg, "questions", params).await {
+                                Ok(answer) => {
+                                    session_arc.respond_to_server_request(id, answer).await
+                                }
+                                Err(error) => {
+                                    session_arc
+                                        .respond_to_server_request_error(
+                                            id,
+                                            -32000,
+                                            &error.to_string(),
+                                        )
+                                        .await
+                                }
+                            }
+                        } else if method == "account/chatgptAuthTokens/refresh" {
                             match cfg.external_chatgpt_auth.as_mut() {
                                 Some(external_auth) => {
                                     let previous_account_id = params
@@ -819,6 +932,14 @@ async fn send_message_streaming_app_server(
                                         .await
                                 }
                             }
+                        } else if planning {
+                            session_arc
+                                .respond_to_server_request_error(
+                                    id,
+                                    -32601,
+                                    "This permission request is not supported in Plan mode",
+                                )
+                                .await
                         } else {
                             let result = elicitation_auto_approve(&method);
                             session_arc.respond_to_server_request(id, result).await
@@ -2596,5 +2717,57 @@ mod goal_admission_tests {
         );
         assert!(validate_goal_message(&"x".repeat(4001)).is_ok());
         assert!(validate_goal_message(&format!("/goals {}", "x".repeat(4001))).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod native_plan_integration {
+    use super::*;
+    /// Exercises the Core app-server driver against an installed, authenticated
+    /// CLI. Run explicitly: CODEX_CLI_PATH=... cargo test core_native_plan_roundtrip -- --ignored.
+    #[tokio::test]
+    #[ignore]
+    async fn core_native_plan_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("orb-core-driver-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<client::NativeRequest>(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cfg = client::CodexConfig {
+            interactive: Some(input_tx),
+            cancel_token: Some(cancel.clone()),
+            ..Default::default()
+        };
+        let session = Session {
+            id: "plan-test".into(),
+            directory: dir.to_string_lossy().into(),
+            model: None,
+            agent: None,
+        };
+        let (mut events,handle)=send_message_streaming_app_server(cfg,&session,"/plan Plan creating hello.txt containing hello. First use request_user_input to ask hello or bonjour. Then propose your plan. Do not delegate. Implement after approval.",None).await.unwrap();
+        let mut questions = 0;
+        let mut approved = false;
+        let mut completed = false;
+        let outcome=tokio::time::timeout(std::time::Duration::from_secs(150),async {
+            loop {tokio::select! {
+                request=input_rx.recv()=>{
+                    let Some(request)=request else {break};
+                    assert!(approved || !dir.join("hello.txt").exists(),"write before approval");
+                    let answer=if request.method=="plan" {approved=true;serde_json::json!({"action":"accept"})}
+                    else {questions+=1;let answers:serde_json::Map<String,serde_json::Value>=request.params["questions"].as_array().unwrap().iter().map(|q|(q["id"].as_str().unwrap().into(),serde_json::json!({"answers":["hello"]}))).collect();serde_json::json!({"answers":answers})};
+                    request.reply.send(answer).unwrap();
+                },
+                event=events.recv()=>match event {
+                    Some(ExecutionEvent::Error{message})=>panic!("{message}"),
+                    Some(ExecutionEvent::MessageComplete{..})=>{assert!(approved);completed=true;},
+                    None=>break,
+                    _=>{},
+                }
+            }}
+        }).await;
+        cancel.cancel();
+        let _ = handle.await;
+        outcome.unwrap();
+        assert!(approved && questions > 0 && completed);
+        assert!(dir.join("hello.txt").exists());
     }
 }

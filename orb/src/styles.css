@@ -1758,3 +1758,22 @@ button.fork-trigger:hover { color: var(--fg); }
 .session-preview-project { border-top: 1px solid var(--stroke-soft); margin-top: 12px; padding-top: 9px; font-size: 12px; overflow-wrap: anywhere; }
 
 .session-title .goal-tag { border: 0; background: color-mix(in srgb, var(--blue) 10%, transparent); border-radius: 5px; }
+
+.mode-chip.plan-mode { color: var(--amber); background: color-mix(in srgb, var(--amber) 12%, transparent); border-color: transparent; }
+.plan-mode .mode-chip-x { color: inherit; }
+.native-question { margin: 16px 10px; padding: 14px; border: 1px solid var(--stroke); border-radius: 12px; background: var(--bg-elev); }
+.native-question-heading { color: var(--fg); font-weight: 500; margin-bottom: 12px; }
+.native-question fieldset { border: 0; padding: 0; margin: 0 0 12px; min-width: 0; }
+.native-question legend { margin-bottom: 8px; }
+.native-question label { display: flex; align-items: baseline; gap: 8px; padding: 6px 0; }
+.native-question small { display: block; color: var(--fg-3); }
+.native-question textarea, .native-question .s-input { width: 100%; }
+.native-question-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-top: 10px; }
+.native-plan { max-height: 300px; overflow: auto; margin-bottom: 12px; }
+
+.native-question textarea { display:block;resize:vertical;min-height:64px;padding:10px 12px;border:0;border-radius:8px;background:var(--bg-field);color:var(--fg);font:inherit;line-height:1.5; }
+.native-question textarea:focus-visible { outline:1px solid var(--focus-border); }
+.native-question pre { overflow:auto;max-height:160px;white-space:pre-wrap;overflow-wrap:anywhere; }
+
+.user.plan { display:flex;flex-direction:column;align-items:flex-start;gap:6px; }
+.user-plan { display:inline-flex;align-items:center;gap:5px;color:var(--amber);font-size:11px; }

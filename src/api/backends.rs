@@ -19,11 +19,13 @@ use super::routes::AppState;
 pub struct BackendResponse {
     pub id: String,
     pub name: String,
+    pub native_plan: bool,
 }
 
 impl From<BackendInfo> for BackendResponse {
     fn from(info: BackendInfo) -> Self {
         Self {
+            native_plan: matches!(info.id.as_str(), "codex" | "claudecode"),
             id: info.id,
             name: info.name,
         }
@@ -56,6 +58,7 @@ pub async fn get_backend(
     let registry = state.backend_registry.read().await;
     match registry.get(&id) {
         Some(backend) => Ok(Json(BackendResponse {
+            native_plan: matches!(backend.id(), "codex" | "claudecode"),
             id: backend.id().to_string(),
             name: backend.name().to_string(),
         })),

@@ -37,6 +37,7 @@ export interface ScanRow {
   path?: string | null;
   version?: string | null;
   installed: boolean;
+  plan_supported?: boolean;
 }
 
 export interface LocalBinding {
