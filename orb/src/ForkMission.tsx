@@ -54,7 +54,7 @@ export function ForkMission(p: { mission: Mission; choices: HarnessChoice[]; des
   };
   return <div ref={root} class="fork-cascade" style={p.position ? { position: "fixed", left: `${p.position.x}px`, top: `${p.position.y}px`, bottom: "auto", "align-items": "flex-start" } : undefined} onKeyDown={move}>
     <div class="menu fork-harnesses" role="menu" aria-label="Fork conversation">
-      <div class="menu-group">Fork conversation</div>
+      <Show when={!p.position}><div class="menu-group">Fork conversation</div></Show>
       <For each={p.choices}>{c => <button class="menu-item" role="menuitem" aria-haspopup="menu"
         aria-expanded={backend() === c.backend.id} disabled={busy() || unavailable(c.backend.id)} title={unavailable(c.backend.id) ? "Not supported on this remote workspace" : c.backend.name}
         onMouseEnter={() => { if (!busy() && !unavailable(c.backend.id) && backend() !== c.backend.id) { setBackend(c.backend.id); setEffort(""); setEffortOpen(false); } }}
