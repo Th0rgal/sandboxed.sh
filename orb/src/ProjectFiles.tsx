@@ -1,3 +1,5 @@
+import { Portal } from "solid-js/web";
+import { ForkMission } from "./ForkMission";
 import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createSignal, onCleanup, onMount, createEffect, on } from "solid-js";
 import { mergeById, pollWhileVisible } from "./poll";
@@ -5,7 +7,7 @@ import { createStore } from "solid-js/store";
 import * as Ic from "./icons";
 import { MdSource, MdView, mdSource, setMdSource } from "./Markdown";
 import { displayTitle } from "./goal";
-import { nodeLabel } from "./missionLaunch";
+import { missionDestination, nodeLabel } from "./missionLaunch";
 import {
   isConnected,
   ApiError,
@@ -23,6 +25,7 @@ import {
   readProjectFile,
   writeProjectFile,
   type Mission,
+  type HarnessChoice,
   type ProjectFileEntry,
   type ProjectSummary,
   projectsVersion,
@@ -192,6 +195,8 @@ function useRowTip() {
 }
 
 export function LiveProjectsSection(p: {
+  harnessChoices: HarnessChoice[];
+  onFork: (mission: Mission) => void;
   selected: () => string | null;
   open: (id: string | null) => void;
   missionGlyph: (status: string) => "idle" | "running" | "pr-closed" | "pr-merged";
@@ -234,6 +239,7 @@ export function LiveProjectsSection(p: {
   const [makingFile, setMakingFile] = createSignal(false);
   /** Right-click menu on an agent row. Opening it never changes the selection. */
   const [missionMenu, setMissionMenu] = createSignal<{ x: number; y: number; mission: Mission } | null>(null);
+  const [forkTarget, setForkTarget] = createSignal<{ x: number; y: number; mission: Mission } | null>(null);
   const [makingCron, setMakingCron] = createSignal(false);
   const [cronWarning, setCronWarning] = createSignal<string | null>(null);
   const [cronFolder, setCronFolder] = createSignal("");
@@ -537,8 +543,9 @@ export function LiveProjectsSection(p: {
     );
     return items;
   };
-  /** Right-click on an agent row: identity actions only, no navigation. */
-  const missionMenuItems = (mission: Mission): MenuEntry[] => [
+  /** Fork the clicked mission without changing the currently open conversation. */
+  const missionMenuItems = (mission: Mission, x: number, y: number): MenuEntry[] => [
+    { kind: "item", label: "Fork conversation", onClick: () => setForkTarget({ mission, x, y }) },
     { kind: "item", label: "Copy mission ID", icon: Ic.CopyIcon, onClick: () => void copyMissionId(mission) },
   ];
   /** Right-click handler shared by every agent row. Suppresses the native menu
@@ -690,8 +697,13 @@ export function LiveProjectsSection(p: {
       <Show when={actionMenu()}>
         {(menu) => <PopupMenu {...menu()} focus={actionFocus()} items={menuItems(menu().slug, menu().path)} onClose={() => setActionMenu(null)} />}
       </Show>
+      <Show when={forkTarget()}>{target => <Portal>
+        <ForkMission mission={target().mission} choices={p.harnessChoices} destination={missionDestination(target().mission)}
+          position={{ x: target().x, y: target().y }} onClose={() => setForkTarget(null)}
+          onFork={mission => { setForkTarget(null); p.onFork(mission); }} />
+      </Portal>}</Show>
       <Show when={missionMenu()}>
-        {(menu) => <PopupMenu x={menu().x} y={menu().y} focus={false} items={missionMenuItems(menu().mission)} onClose={() => setMissionMenu(null)} />}
+        {(menu) => <PopupMenu x={menu().x} y={menu().y} focus={false} items={missionMenuItems(menu().mission, menu().x, menu().y)} onClose={() => setMissionMenu(null)} />}
       </Show>
       <div ref={rowTip.setCard} id={rowTip.id} class="row-tip" role="tooltip" hidden={!rowTip.tip()} style={rowTip.tip() ? { left: `${rowTip.tip()!.x}px`, top: `${rowTip.tip()!.y}px` } : undefined}>
         <Show when={rowTip.tip()}>{(tip) => (

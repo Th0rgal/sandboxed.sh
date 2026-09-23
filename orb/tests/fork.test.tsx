@@ -35,3 +35,12 @@ it("only folds complete structured history and preserves literal message content
   expect(forkContext(text.slice(0, -1))).toBeNull();
   expect(forkContext("normal prompt")).toBeNull();
 });
+it("dismisses a positioned sidebar fork when clicking outside its portal", () => {
+  const closed = vi.fn();
+  const ui = render(() => <ForkMission mission={mission} choices={choices} destination="Core" position={{ x: 200, y: 100 }} onClose={closed} onFork={() => {}} />);
+  fireEvent.pointerDown(ui.getByRole("menuitem", { name: "Codex" }));
+  expect(closed).not.toHaveBeenCalled();
+  fireEvent.pointerDown(document.body);
+  expect(closed).toHaveBeenCalledOnce();
+  ui.unmount();
+});

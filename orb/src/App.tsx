@@ -1520,6 +1520,8 @@ export default function App() {
                   }
                 >
                   <LiveProjectsSection
+                    harnessChoices={harnessChoices()}
+                    onFork={m => { setMissions(ms => [m, ...ms.filter(x => x.id !== m.id)]); bumpProjects(); open(`m:${m.id}`); }}
                     selected={selected}
                     open={open}
                     missionGlyph={missionGlyph}

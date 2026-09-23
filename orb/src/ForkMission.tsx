@@ -3,7 +3,7 @@ import { For, Show, createSignal, createEffect, onMount, onCleanup } from "solid
 import { forkMission, shortModelLabel, type HarnessChoice, type Mission } from "./api";
 import { effortLabel, supportedEfforts } from "./effort";
 
-export function ForkMission(p: { mission: Mission; choices: HarnessChoice[]; destination: string; onClose: () => void; onFork: (mission: Mission) => void }) {
+export function ForkMission(p: { mission: Mission; choices: HarnessChoice[]; destination: string; position?: { x: number; y: number }; onClose: () => void; onFork: (mission: Mission) => void }) {
   const [backend, setBackend] = createSignal(p.mission.backend ?? p.choices[0]?.backend.id ?? "");
   const choices = () => p.choices.find(c => c.backend.id === backend())?.models ?? [];
   const [model, setModel] = createSignal(choices().find(m => m.value === p.mission.model_override)?.value ?? choices()[0]?.value ?? "");
@@ -29,11 +29,13 @@ export function ForkMission(p: { mission: Mission; choices: HarnessChoice[]; des
       if (!root?.isConnected) return;
       root.style.transform = "";
       const rect = root.getBoundingClientRect();
-      if (rect.right > window.innerWidth - 12) root.style.transform = `translateX(${Math.min(0, window.innerWidth - 12 - rect.right)}px)`;
+      const dx = Math.max(12 - rect.left, Math.min(0, window.innerWidth - 12 - rect.right));
+      const dy = p.position ? Math.max(12 - rect.top, Math.min(0, window.innerHeight - 12 - rect.bottom)) : 0;
+      root.style.transform = `translate(${dx}px, ${dy}px)`;
     });
   });
   onMount(() => {
-    const outside = (e: PointerEvent) => { if (!busy() && !root.parentElement?.contains(e.target as Node)) p.onClose(); };
+    const outside = (e: PointerEvent) => { if (!busy() && !(p.position ? root : root.parentElement)?.contains(e.target as Node)) p.onClose(); };
     const escape = (e: KeyboardEvent) => { if (e.key === "Escape" && !busy()) { e.preventDefault(); p.onClose(); } };
     window.addEventListener("pointerdown", outside);
     window.addEventListener("keydown", escape);
@@ -50,7 +52,7 @@ export function ForkMission(p: { mission: Mission; choices: HarnessChoice[]; des
     if (e.key === "ArrowRight") { e.preventDefault(); root.querySelector<HTMLButtonElement>(menu?.classList.contains('fork-models') ? '.fork-effort-menu > button' : '.fork-models > button')?.focus(); }
     if (e.key === "ArrowLeft") { e.preventDefault(); root.querySelector<HTMLButtonElement>(menu?.classList.contains('fork-effort-menu') ? '.fork-models > button' : '.fork-harnesses > button[aria-expanded="true"]')?.focus(); }
   };
-  return <div ref={root} class="fork-cascade" onKeyDown={move}>
+  return <div ref={root} class="fork-cascade" style={p.position ? { position: "fixed", left: `${p.position.x}px`, top: `${p.position.y}px`, bottom: "auto", "align-items": "flex-start" } : undefined} onKeyDown={move}>
     <div class="menu fork-harnesses" role="menu" aria-label="Fork conversation">
       <div class="menu-group">Fork conversation</div>
       <For each={p.choices}>{c => <button class="menu-item" role="menuitem" aria-haspopup="menu"
