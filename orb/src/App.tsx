@@ -15,6 +15,7 @@ import { projects as seed, LOREM_REPLY, type Agent, type Block, type Turn } from
 import * as Ic from "./icons";
 import { ForkMission } from "./ForkMission";
 import { Settings } from "./Settings";
+import { RoutingSettings, confirmLeaveRouting } from "./RoutingSettings";
 import { MACHINES, Machines } from "./Machines";
 import { Providers } from "./Providers";
 import { PromptSheet } from "./Dialog";
@@ -84,7 +85,7 @@ import {
   openExternalUrl,
 } from "./api";
 
-const PAGES = new Set(["settings", "machines", "providers", "execution"]);
+const PAGES = new Set(["settings", "routing", "machines", "providers", "execution"]);
 
 const MODELS = ["Orb Lorem 4.6 High Fast", "Ipsum 5 Max", "Dolor 4.5 Sonnet", "Auto"];
 
@@ -1114,16 +1115,16 @@ export default function App() {
     if (!p) return [] as { id: string; name: string; text: string }[];
     return p.folders.flatMap((f) => f.files.map((file) => ({ id: `f:${p.id}:${f.id}:${file.id}`, name: `${f.name}/${file.name}`, text: file.text })));
   });
-  const onSettings = () => selected() === "settings";
+  const onSettings = () => selected() === "settings" || selected() === "routing";
   const openSettings = () => {
     open("settings");
   };
   const leaveSettings = () => {
     const h = history();
     for (let i = hIdx() - 1; i >= 0; i--) {
-      if (h[i] !== "settings") {
-        setHIdx(i);
-        open(h[i], false);
+      if (h[i] !== "settings" && h[i] !== "routing") {
+        if (selected() === "routing" && !confirmLeaveRouting(() => { if (open(h[i], false)) setHIdx(i); })) return;
+        if (open(h[i], false)) setHIdx(i);
         return;
       }
     }
@@ -1134,6 +1135,7 @@ export default function App() {
     requestAnimationFrame(() => scroller?.scrollTo({ top: scroller.scrollHeight, behavior: smooth ? "smooth" : "auto" }));
 
   const open = (id: string | null, push = true) => {
+    if (selected() === "routing" && id !== "routing" && !confirmLeaveRouting(() => open(id, push))) return false;
     if (window.matchMedia("(max-width: 720px)").matches) setSidebar(false);
     batch(() => {
       setSelected(id);
@@ -1146,12 +1148,13 @@ export default function App() {
     });
     if (id?.startsWith("m:")) void loadTranscript(id.slice(2)).catch(() => {});
     toBottom();
+    return true;
   };
   const nav = (d: number) => {
     const i = hIdx() + d;
     if (i < 0 || i >= history().length) return;
-    setHIdx(i);
-    open(history()[i], false);
+    if (selected() === "routing" && history()[i] !== "routing" && !confirmLeaveRouting(() => { if (open(history()[i], false)) setHIdx(i); })) return;
+    if (open(history()[i], false)) setHIdx(i);
   };
 
   const stop = () => {
@@ -1515,6 +1518,9 @@ export default function App() {
               <span class="row-ico"><Ic.ArrowLeft /></span>
               <span class="row-label">Back</span>
             </button>
+            <div class="section">Settings</div>
+            <button class={`row ${selected() === "settings" ? "active" : ""}`} onClick={() => open("settings")}><span class="row-label">Client</span></button>
+            <button class={`row ${selected() === "routing" ? "active" : ""}`} onClick={() => open("routing")}><span class="row-label">Routing</span></button>
           </Show>
         </nav>
         <div class="sb-foot">
@@ -1548,8 +1554,9 @@ export default function App() {
         <div class="tb-title" data-tauri-drag-region>
           <Switch>
             <Match when={selected() === "settings"}>
-              <span>Settings</span>
+              <span>Settings · Client</span>
             </Match>
+            <Match when={selected() === "routing"}><span>Settings · Routing</span></Match>
             <Match when={selected() === "machines"}>
               <span>Machines</span>
             </Match>
@@ -1610,6 +1617,9 @@ export default function App() {
         <Switch>
           <Match when={selected() === "settings"}>
             <Settings onOpenPage={open} />
+          </Match>
+          <Match when={selected() === "routing"}>
+            <RoutingSettings onOpenClient={() => open("settings")} />
           </Match>
           <Match when={selected() === "machines"}>
             <Machines />

@@ -204,7 +204,7 @@ export function Settings(p: { onOpenPage?: (id: string) => void } = {}) {
   return (
     <div class="s-body">
       <div class="s-inner">
-        <h2>Settings</h2>
+        <h2>Client</h2>
         <BackendTab />
         <LocalAgentsCard />
         <Show when={isConnected() && p.onOpenPage}>
