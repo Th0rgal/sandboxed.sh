@@ -545,7 +545,7 @@ export function LiveProjectsSection(p: {
   };
   /** Fork the clicked mission without changing the currently open conversation. */
   const missionMenuItems = (mission: Mission, x: number, y: number): MenuEntry[] => [
-    { kind: "item", label: "Fork conversation", onClick: () => setForkTarget({ mission, x, y }) },
+    { kind: "item", label: "Fork conversation", icon: Ic.BranchIcon, openOnHover: true, onClick: () => setForkTarget({ mission, x, y }) },
     { kind: "item", label: "Copy mission ID", icon: Ic.CopyIcon, onClick: () => void copyMissionId(mission) },
   ];
   /** Right-click handler shared by every agent row. Suppresses the native menu

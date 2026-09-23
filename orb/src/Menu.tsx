@@ -2,9 +2,17 @@ import { For, onCleanup, onMount, type JSX } from "solid-js";
 
 export type MenuEntry =
   | { kind: "sep" }
-  | { kind: "item"; label: string; icon?: (p: { size?: number }) => JSX.Element; danger?: boolean; onClick: () => void };
+  | { kind: "item"; label: string; icon?: (p: { size?: number }) => JSX.Element; danger?: boolean; openOnHover?: boolean; onClick: () => void };
 
 export function MenuList(p: { items: MenuEntry[]; onPick?: () => void }) {
+  let hoverTimer: ReturnType<typeof setTimeout> | undefined;
+  const clearHover = () => { clearTimeout(hoverTimer); hoverTimer = undefined; };
+  const pick = (it: Extract<MenuEntry, { kind: "item" }>) => {
+    clearHover();
+    p.onPick?.();
+    it.onClick();
+  };
+  onCleanup(clearHover);
   return (
     <For each={p.items}>
       {(it) =>
@@ -14,14 +22,15 @@ export function MenuList(p: { items: MenuEntry[]; onPick?: () => void }) {
           <button
             role="menuitem"
             class={`menu-item ${it.danger ? "danger" : ""}`}
-            onClick={() => {
-              // Restore the menu opener before an action mounts a dialog.
-              p.onPick?.();
-              it.onClick();
-            }}
+            aria-haspopup={it.openOnHover ? "menu" : undefined}
+            onMouseEnter={() => { clearHover(); if (it.openOnHover) hoverTimer = setTimeout(() => pick(it), 180); }}
+            onMouseLeave={clearHover}
+            onKeyDown={e => { if (it.openOnHover && e.key === "ArrowRight") { e.preventDefault(); pick(it); } }}
+            onClick={() => pick(it)}
           >
             <span class="menu-ico">{it.icon && <it.icon />}</span>
             {it.label}
+            {it.openOnHover && <span style={{ "margin-left": "auto", "padding-left": "12px" }} aria-hidden="true">›</span>}
           </button>
         )
       }
