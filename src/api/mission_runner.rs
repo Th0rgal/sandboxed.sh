@@ -6097,7 +6097,16 @@ fn build_opencode_auth_from_ai_providers(
                 "expires": oauth.expires_at,
             });
             for key in &keys {
-                map.insert((*key).to_string(), entry.clone());
+                // Several accounts can share one OpenCode provider key. Never let
+                // an older OAuth record overwrite a fresher credential just because
+                // it appears later in the provider store.
+                let existing_expiry = map
+                    .get(*key)
+                    .and_then(|value| value.get("expires"))
+                    .and_then(serde_json::Value::as_i64);
+                if existing_expiry.is_none_or(|expires| oauth.expires_at > expires) {
+                    map.insert((*key).to_string(), entry.clone());
+                }
             }
         }
     }
@@ -10055,6 +10064,38 @@ mod tests {
         assert_eq!(merged["anthropic"]["access"], "fresh");
         assert_eq!(merged["anthropic"]["expires"], 2);
         assert_eq!(merged["unmanaged"]["key"], "preserved");
+    }
+
+    #[test]
+    fn opencode_multiple_oauth_accounts_keep_freshest_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join(".sandboxed-sh");
+        fs::create_dir_all(&store).unwrap();
+        let account = |expires_at, token: &str| {
+            let mut provider = crate::ai_providers::AIProvider::new(
+                crate::ai_providers::ProviderType::Anthropic,
+                "Test".into(),
+            );
+            provider.oauth = Some(crate::ai_providers::OAuthCredentials {
+                access_token: token.into(),
+                refresh_token: "test-refresh".into(),
+                expires_at,
+            });
+            provider
+        };
+        for accounts in [
+            vec![account(200, "fresh"), account(100, "expired")],
+            vec![account(100, "expired"), account(200, "fresh")],
+        ] {
+            fs::write(
+                store.join("ai_providers.json"),
+                serde_json::to_vec(&accounts).unwrap(),
+            )
+            .unwrap();
+            let auth = build_opencode_auth_from_ai_providers(temp.path()).unwrap();
+            assert_eq!(auth["anthropic"]["access"], "fresh");
+            assert_eq!(auth["anthropic"]["expires"], 200);
+        }
     }
 
     #[test]
