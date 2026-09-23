@@ -80,6 +80,7 @@ const OPENROUTER_PROVIDER_ID: &str = "open-router";
 /// Best-effort seed slugs kept in the default config; prioritized when capping
 /// the models.dev OpenRouter catalog (which has no popularity sort).
 const OPENROUTER_SEED_MODEL_IDS: &[&str] = &[
+    "anthropic/claude-opus-5.5",
     "anthropic/claude-opus-5",
     "anthropic/claude-sonnet-4.6",
     "google/gemini-3.1-pro-preview",
@@ -794,6 +795,11 @@ fn default_providers_config() -> ProvidersConfig {
                     // any that the dynamic catalog or a live provider re-adds.
                     // Sonnet/Haiku entries are untouched.
                     ProviderModel {
+                        id: "claude-opus-5-5".to_string(),
+                        name: "Claude Opus 5.5".to_string(),
+                        description: Some("Agentic coding, always-adaptive thinking, 1M context".to_string()),
+                    },
+                    ProviderModel {
                         id: "claude-opus-5".to_string(),
                         name: "Claude Opus 5".to_string(),
                         description: Some(
@@ -952,6 +958,11 @@ fn default_providers_config() -> ProvidersConfig {
                     // OpenRouter's public catalog on 2026-07-25 — treat as
                     // best-effort seeds that the live catalog supersedes (slugs
                     // can drift as models are retired).
+                    ProviderModel {
+                        id: "anthropic/claude-opus-5.5".to_string(),
+                        name: "Claude Opus 5.5".to_string(),
+                        description: Some("Anthropic Claude via OpenRouter".to_string()),
+                    },
                     ProviderModel {
                         id: "anthropic/claude-opus-5".to_string(),
                         name: "Claude Opus 5".to_string(),
@@ -2990,6 +3001,22 @@ fn is_grok_backend_model_id(model_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opus_55_catalog_survives_retirement_policy() {
+        let mut config = default_providers_config();
+        retire_superseded_claude_models(&mut config.providers);
+        for (provider, id) in [
+            ("anthropic", "claude-opus-5-5"),
+            ("open-router", "anthropic/claude-opus-5.5"),
+        ] {
+            let p = config.providers.iter().find(|p| p.id == provider).unwrap();
+            assert!(p
+                .models
+                .iter()
+                .any(|m| m.id == id && m.name == "Claude Opus 5.5"));
+        }
+    }
 
     #[test]
     fn kimi_catalog_skips_a_higher_priority_account_without_oauth() {

@@ -78,7 +78,10 @@ use crate::workspace_exec::WorkspaceExec;
 /// thinking block every turn, so thoughts are captured deterministically.
 ///
 /// Returns 0 for unknown efforts, leaving thinking fully adaptive.
-fn claude_thinking_budget(effort: &str) -> u32 {
+fn claude_thinking_budget(model: Option<&str>, effort: &str) -> u32 {
+    if model.is_some_and(crate::model_policy::requires_adaptive_thinking) {
+        return 0;
+    }
     match effort.trim().to_ascii_lowercase().as_str() {
         "max" => 32_000,
         "xhigh" => 24_000,
@@ -1239,6 +1242,12 @@ pub fn run_claudecode_turn<'a>(
         // as inline JSON (not a file path), causing a SyntaxError at startup.
         // CLAUDE_CONFIG_DIR + --settings flag are sufficient.
 
+        // Opus 5.5/Fable 5.1 reject manual budgets, including inherited profile settings.
+        if model.is_some_and(crate::model_policy::requires_adaptive_thinking) {
+            env.remove("MAX_THINKING_TOKENS");
+            env.remove("CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING");
+        }
+
         // Set effort level via environment variable.
         // Claude Code reads CLAUDE_CODE_EFFORT_LEVEL to control adaptive reasoning depth.
         if let Some(effort) = model_effort {
@@ -1250,7 +1259,7 @@ pub fn run_claudecode_turn<'a>(
             // block we can capture and stream. (The capture pipeline already
             // handles thinking_delta — see backend/shared.rs — the CLI just
             // wasn't emitting any.)
-            let thinking_tokens = claude_thinking_budget(effort);
+            let thinking_tokens = claude_thinking_budget(model, effort);
             if thinking_tokens > 0 {
                 env.insert(
                     "MAX_THINKING_TOKENS".to_string(),
@@ -3703,5 +3712,23 @@ mod resilience_tests {
             None
         );
         std::env::remove_var("SANDBOXED_SH_CLAUDECODE_MAX_RESUME_TRANSCRIPT_BYTES");
+    }
+}
+
+#[cfg(test)]
+mod opus_55_tests {
+    use super::*;
+    #[test]
+    fn opus_55_effort_never_forces_a_manual_thinking_budget() {
+        for model in [
+            "claude-opus-5-5",
+            "anthropic/claude-opus-5-5",
+            "claude-fable-5-1",
+        ] {
+            for effort in ["low", "medium", "high", "xhigh", "max"] {
+                assert_eq!(claude_thinking_budget(Some(model), effort), 0);
+            }
+        }
+        assert_eq!(claude_thinking_budget(Some("claude-opus-5"), "high"), 16000);
     }
 }

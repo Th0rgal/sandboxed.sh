@@ -87,6 +87,19 @@ pub fn retired_claude_model(model: &str) -> Option<&'static str> {
     None
 }
 
+/// Models that reject both disabled thinking and manual token budgets.
+/// Keep explicit IDs so unknown future models retain their native behavior.
+pub fn requires_adaptive_thinking(model: &str) -> bool {
+    let (_, id) = split_provider(model);
+    let id = canonical(id);
+    ["claude-opus-5-5", "claude-fable-5-1"].iter().any(|known| {
+        id == *known
+            || id
+                .strip_prefix(known)
+                .is_some_and(|tail| tail.starts_with("-20"))
+    })
+}
+
 /// Whether this model may no longer be chosen for a new turn.
 pub fn is_retired_claude_model(model: &str) -> bool {
     retired_claude_model(model).is_some()
