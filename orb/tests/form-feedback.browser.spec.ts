@@ -22,3 +22,23 @@ test('controller validation stays visible beside save',async({page})=>{
  await expect(error).toBeInViewport();
  await page.screenshot({path:'test-results/controller-save-validation.png'});
 });
+
+test('goal chip moves to actions for multiline drafts',async({page})=>{
+ await page.goto('/tests/form-feedback.html');
+ const input=page.locator('.composer textarea');
+ await input.fill('/goal Ship it');
+ const chip=page.locator('.composer > .mode-chip');
+ await expect(chip).toBeVisible();
+ await input.fill('First paragraph\n\nSecond paragraph');
+ await expect(page.locator('.composer')).toHaveClass(/tall/);
+ const field=await input.boundingBox();
+ const badge=await chip.boundingBox();
+ const plus=await page.locator('.composer .plus').boundingBox();
+ expect(field!.x).toBeLessThan(badge!.x);
+ expect(badge!.y).toBeGreaterThan(field!.y+field!.height-1);
+ expect(Math.abs(badge!.y-plus!.y)).toBeLessThan(4);
+ await page.screenshot({path:'test-results/goal-composer.png'});
+ await input.fill('Short');
+ await expect(page.locator('.composer')).not.toHaveClass(/tall/);
+ await expect(input).toHaveValue('Short');
+});

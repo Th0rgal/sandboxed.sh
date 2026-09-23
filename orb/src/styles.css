@@ -624,6 +624,19 @@ code {
 .composer.tall .picks { grid-column: 2; grid-row: 2; justify-self: start; align-self: center; }
 .composer.tall .voice-slot { grid-column: 3; grid-row: 2; align-self: center; }
 .composer.tall .send-slot { grid-column: 4; grid-row: 2; align-self: center; }
+.composer.has-mode { grid-template-columns: auto auto minmax(0, 1fr) auto auto auto; }
+.composer.has-mode > .mode-chip { grid-column: 2; align-self: center; }
+.composer.has-mode .composer-field { grid-column: 3; }
+.composer.has-mode .picks { grid-column: 4; }
+.composer.has-mode .voice-slot { grid-column: 5; }
+.composer.has-mode .send-slot { grid-column: 6; }
+.composer.has-mode.tall { grid-template-columns: auto auto minmax(0, 1fr) auto auto; }
+.composer.has-mode.tall .composer-field { grid-column: 1 / -1; grid-row: 1; }
+.composer.has-mode.tall > .mode-chip { grid-column: 2; grid-row: 2; }
+.composer.has-mode.tall .picks { grid-column: 3; }
+.composer.has-mode.tall .voice-slot { grid-column: 4; }
+.composer.has-mode.tall .send-slot { grid-column: 5; }
+.composer.voice-on > .mode-chip { display: none; }
 .composer.voice-on {
   grid-template-columns: auto 1fr;
   grid-template-rows: auto;

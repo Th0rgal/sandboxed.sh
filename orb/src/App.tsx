@@ -422,9 +422,13 @@ export function Composer(p: {
   /** What the current draft refers to, resolved against this project's files. */
   const mentioned = createMemo(() => mentionedChips(text(), atItems()));
   createEffect(() => p.onAttachments?.(mentioned()));
+  const [multiline, setMultiline] = createSignal(false);
   const resize = () => {
-    ta.style.height = "auto";
+    ta.style.height = "0px";
+    ta.style.minHeight = "0";
+    setMultiline(text().includes("\n") || ta.scrollHeight > 44);
     ta.style.height = Math.min(ta.scrollHeight, 220) + "px";
+    ta.style.minHeight = "";
   };
 
   createEffect(() => { const revision = p.revision; if (revision) { setText(revision.text); queueMicrotask(() => { resize(); ta?.focus(); }); } });
@@ -823,17 +827,16 @@ export function Composer(p: {
   );
   return (<>
     <Show when={pendingSend()}>{pending=><div class="composer-pending" aria-label="Pending message"><div class="user pending"><Show when={pending().images.length}><div class="message-images"><For each={pending().images}>{(image,index)=><div class="message-image"><img src={image.dataUrl} alt={`Image #${index()+1}`}/><span>#{index()+1}</span></div>}</For></div></Show><span>{pending().text}</span></div><span class="composer-pending-status" role="status">Sending…</span></div>}</Show>
-    <div class={`composer ${p.tall || images().length ? "tall" : ""} ${voiceActive() ? "voice-on" : ""} ${mode() ? "has-mode" : ""}`} data-mode={mode() ?? ""} onClick={() => !voiceActive() && ta.focus()}>
+    <div class={`composer ${p.tall || images().length || multiline() ? "tall" : ""} ${voiceActive() ? "voice-on" : ""} ${mode() ? "has-mode" : ""}`} data-mode={mode() ?? ""} onClick={() => !voiceActive() && ta.focus()}>
       {plus}
       {slashMenu}
       {atMenu}
       <Show when={uploading()}><div class="composer-upload-status" role="status">Attaching file…</div></Show>
       <Show when={uploadError()}><div class="composer-upload-status error" role="alert">{uploadError()}</div></Show>
+      <Show when={mode() === "goal"}><ModeChip mode="goal" onClear={clearMode} /></Show>
       <div class="composer-field">
         <Show when={images().length}><div class="composer-images"><For each={images()}>{image => <div class="composer-image"><img src={image.dataUrl} alt="Attached image" /><button class="icon-btn" aria-label="Remove image" title="Remove image" onClick={e => { e.stopPropagation(); setImages(current => current.filter(item => item.id !== image.id)); }}><Ic.CloseIcon size={12}/></button></div>}</For></div></Show>
         <Show when={imageError()}><span class="image-paste-error" role="alert">{imageError()}</span></Show>
-        <Show when={mode() === "goal"}><ModeChip mode="goal" onClear={clearMode} /></Show>
-        <Show when={mode()}><span class="mode-sep" aria-hidden="true" /></Show>
         <textarea readOnly={sending()}
           ref={ta}
           onPaste={event => void pasteImages(event)}
