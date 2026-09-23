@@ -2,15 +2,15 @@ import { For, onCleanup, onMount, type JSX } from "solid-js";
 
 export type MenuEntry =
   | { kind: "sep" }
-  | { kind: "item"; label: string; icon?: (p: { size?: number }) => JSX.Element; danger?: boolean; openOnHover?: boolean; onClick: () => void };
+  | { kind: "item"; label: string; icon?: (p: { size?: number }) => JSX.Element; danger?: boolean; openOnHover?: boolean; onClick: (anchor?: HTMLButtonElement) => void };
 
 export function MenuList(p: { items: MenuEntry[]; onPick?: () => void }) {
   let hoverTimer: ReturnType<typeof setTimeout> | undefined;
   const clearHover = () => { clearTimeout(hoverTimer); hoverTimer = undefined; };
-  const pick = (it: Extract<MenuEntry, { kind: "item" }>) => {
+  const pick = (it: Extract<MenuEntry, { kind: "item" }>, anchor: HTMLButtonElement) => {
     clearHover();
-    p.onPick?.();
-    it.onClick();
+    if (!it.openOnHover) p.onPick?.();
+    it.onClick(anchor);
   };
   onCleanup(clearHover);
   return (
@@ -23,10 +23,10 @@ export function MenuList(p: { items: MenuEntry[]; onPick?: () => void }) {
             role="menuitem"
             class={`menu-item ${it.danger ? "danger" : ""}`}
             aria-haspopup={it.openOnHover ? "menu" : undefined}
-            onMouseEnter={() => { clearHover(); if (it.openOnHover) hoverTimer = setTimeout(() => pick(it), 180); }}
+            onMouseEnter={e => { clearHover(); const anchor = e.currentTarget; if (it.openOnHover) hoverTimer = setTimeout(() => pick(it, anchor), 180); }}
             onMouseLeave={clearHover}
-            onKeyDown={e => { if (it.openOnHover && e.key === "ArrowRight") { e.preventDefault(); pick(it); } }}
-            onClick={() => pick(it)}
+            onKeyDown={e => { if (it.openOnHover && e.key === "ArrowRight") { e.preventDefault(); pick(it, e.currentTarget); } }}
+            onClick={e => pick(it, e.currentTarget)}
           >
             <span class="menu-ico">{it.icon && <it.icon />}</span>
             {it.label}
@@ -38,12 +38,12 @@ export function MenuList(p: { items: MenuEntry[]; onPick?: () => void }) {
   );
 }
 
-export function PopupMenu(p: { x: number; y: number; items: MenuEntry[]; onClose: () => void; focus?: boolean }) {
+export function PopupMenu(p: { x: number; y: number; items: MenuEntry[]; onClose: () => void; focus?: boolean; children?: JSX.Element }) {
   let el!: HTMLDivElement;
   let trigger: HTMLElement | null = null;
   onMount(() => {
     trigger = document.activeElement as HTMLElement | null;
-    const buttons = () => Array.from(el.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
+    const buttons = () => Array.from(el.querySelectorAll<HTMLButtonElement>(":scope > button:not(:disabled)"));
     // Keyboard open focuses the first item; pointer open uses hover only (no focus ring).
     if (p.focus !== false) buttons()[0]?.focus();
     const r = el.getBoundingClientRect();
@@ -59,6 +59,8 @@ export function PopupMenu(p: { x: number; y: number; items: MenuEntry[]; onClose
     const key = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault(); e.stopPropagation(); p.onClose(); trigger?.focus();
+      } else if (el.contains(e.target as Node) && (e.target as HTMLElement).closest('[role="menu"]') !== el) {
+        return;
       } else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
         e.preventDefault();
         const items = buttons();
@@ -85,6 +87,7 @@ export function PopupMenu(p: { x: number; y: number; items: MenuEntry[]; onClose
       onPointerDown={(e) => e.stopPropagation()}
     >
       <MenuList items={p.items} onPick={() => { p.onClose(); trigger?.focus(); }} />
+      {p.children}
     </div>
   );
 }

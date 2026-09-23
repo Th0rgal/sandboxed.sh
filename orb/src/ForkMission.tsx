@@ -35,7 +35,7 @@ export function ForkMission(p: { mission: Mission; choices: HarnessChoice[]; des
     });
   });
   onMount(() => {
-    const outside = (e: PointerEvent) => { if (!busy() && !(p.position ? root : root.parentElement)?.contains(e.target as Node)) p.onClose(); };
+    const outside = (e: PointerEvent) => { if (!busy() && !(root.parentElement?.closest(".popup-menu") ?? (p.position ? root : root.parentElement))?.contains(e.target as Node)) p.onClose(); };
     const escape = (e: KeyboardEvent) => { if (e.key === "Escape" && !busy()) { e.preventDefault(); p.onClose(); } };
     window.addEventListener("pointerdown", outside);
     window.addEventListener("keydown", escape);

@@ -1,4 +1,3 @@
-import { Portal } from "solid-js/web";
 import { ForkMission } from "./ForkMission";
 import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createSignal, onCleanup, onMount, createEffect, on } from "solid-js";
@@ -545,7 +544,7 @@ export function LiveProjectsSection(p: {
   };
   /** Fork the clicked mission without changing the currently open conversation. */
   const missionMenuItems = (mission: Mission, x: number, y: number): MenuEntry[] => [
-    { kind: "item", label: "Fork conversation", icon: Ic.BranchIcon, openOnHover: true, onClick: () => setForkTarget({ mission, x, y }) },
+    { kind: "item", label: "Fork conversation", icon: Ic.BranchIcon, openOnHover: true, onClick: anchor => { const rect = anchor?.parentElement?.getBoundingClientRect(); setForkTarget({ mission, x: rect ? rect.right + 3 : x, y: anchor?.getBoundingClientRect().top ?? y }); } },
     { kind: "item", label: "Copy mission ID", icon: Ic.CopyIcon, onClick: () => void copyMissionId(mission) },
   ];
   /** Right-click handler shared by every agent row. Suppresses the native menu
@@ -555,6 +554,7 @@ export function LiveProjectsSection(p: {
     e.preventDefault();
     e.stopPropagation();
     setActionMenu(null);
+    setForkTarget(null);
     setMissionMenu({ x: e.clientX, y: e.clientY, mission });
   };
   const toggleProject = (slug: string) => {
@@ -697,13 +697,14 @@ export function LiveProjectsSection(p: {
       <Show when={actionMenu()}>
         {(menu) => <PopupMenu {...menu()} focus={actionFocus()} items={menuItems(menu().slug, menu().path)} onClose={() => setActionMenu(null)} />}
       </Show>
-      <Show when={forkTarget()}>{target => <Portal>
-        <ForkMission mission={target().mission} choices={p.harnessChoices} destination={missionDestination(target().mission)}
-          position={{ x: target().x, y: target().y }} onClose={() => setForkTarget(null)}
-          onFork={mission => { setForkTarget(null); p.onFork(mission); }} />
-      </Portal>}</Show>
       <Show when={missionMenu()}>
-        {(menu) => <PopupMenu x={menu().x} y={menu().y} focus={false} items={missionMenuItems(menu().mission, menu().x, menu().y)} onClose={() => setMissionMenu(null)} />}
+        {(menu) => <PopupMenu x={menu().x} y={menu().y} focus={false} items={missionMenuItems(menu().mission, menu().x, menu().y)} onClose={() => { setForkTarget(null); setMissionMenu(null); }}>
+          <Show when={forkTarget()}>{target =>
+            <ForkMission mission={target().mission} choices={p.harnessChoices} destination={missionDestination(target().mission)}
+              position={{ x: target().x, y: target().y }} onClose={() => setForkTarget(null)}
+              onFork={mission => { setForkTarget(null); setMissionMenu(null); p.onFork(mission); }} />
+          }</Show>
+        </PopupMenu>}
       </Show>
       <div ref={rowTip.setCard} id={rowTip.id} class="row-tip" role="tooltip" hidden={!rowTip.tip()} style={rowTip.tip() ? { left: `${rowTip.tip()!.x}px`, top: `${rowTip.tip()!.y}px` } : undefined}>
         <Show when={rowTip.tip()}>{(tip) => (
