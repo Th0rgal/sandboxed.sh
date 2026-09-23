@@ -15,6 +15,7 @@ import { projects as seed, LOREM_REPLY, type Agent, type Block, type Turn } from
 import * as Ic from "./icons";
 import { ForkMission } from "./ForkMission";
 import { Settings } from "./Settings";
+import { SessionPreview, type SessionPreviewData } from "./SessionPreview";
 import { RoutingSettings, confirmLeaveRouting } from "./RoutingSettings";
 import { MACHINES, Machines } from "./Machines";
 import { Providers } from "./Providers";
@@ -976,6 +977,7 @@ export default function App() {
   });
 
   const [missions, setMissions] = createSignal<Mission[]>([]);
+  const [previewContext, setPreviewContext] = createSignal<{id: string; pct: number | null} | null>(null);
   const [openMission, setOpenMission] = createSignal<Mission | null>(null);
   /** Only missions still doing something: the sidebar is a place to act,
    * not a history. Everything else lives under its project. */
@@ -1118,6 +1120,26 @@ export default function App() {
     if (!p) return [] as { id: string; name: string; text: string }[];
     return p.folders.flatMap((f) => f.files.map((file) => ({ id: `f:${p.id}:${f.id}:${file.id}`, name: `${f.name}/${file.name}`, text: file.text })));
   });
+  const sessionPreview = createMemo<SessionPreviewData>(() => {
+    const id = currentMissionId() ?? "";
+    const mission = openMission()?.id === id ? openMission() : missions().find(m => m.id === id);
+    const binding = localBinding(id);
+    const local = !!binding || !!mission?.tags?.includes("placement:client");
+    const backend = mission?.backend || binding?.harness;
+    const choice = harnessChoices().find(c => c.backend.id === backend);
+    const model = mission?.model_override || binding?.model;
+    const modelLabel = choice?.models.find(m => m.value === model)?.label;
+    const effort = normalizeEffort(mission?.model_effort, backend);
+    return { id, title: displayTitle(mission?.title) || "Mission", local,
+      destination: local ? "This computer" : missionDestination(mission ?? null, recalledLaunch(id)),
+      directory: binding?.cwd || mission?.working_directory,
+      project: liveProjects().find(p => p.slug === mission?.project)?.title || mission?.project,
+      harness: choice?.backend.name || backend,
+      model: modelLabel ? shortModelLabel(modelLabel) : model || undefined,
+      effort: effort ? effortLabel(effort) : undefined,
+      context: previewContext()?.id === id ? previewContext()?.pct : null };
+  });
+
   const onSettings = () => selected() === "settings" || selected() === "routing";
   const openSettings = () => {
     open("settings");
@@ -1576,8 +1598,7 @@ export default function App() {
               {(id) => (
                 <>
                   <Show when={missionGoal(missions().find((m) => m.id === id()) ?? openMission())}><GoalTag /></Show>
-                  <span>{displayTitle((openMission()?.id === id() ? openMission()?.title : undefined) ?? missions().find((m) => m.id === id())?.title) || "Mission"}</span>
-                  <Ic.CloudIcon class="dim" />
+                  <SessionPreview data={sessionPreview()} />
                 </>
               )}
             </Match>
@@ -1633,7 +1654,7 @@ export default function App() {
           <Match when={currentMissionId()}>
             {(id) => (
               <Show when={id()} keyed>
-                {(mid) => <MissionView id={mid} initial={missions().find(m => m.id === mid)} onMission={setOpenMission} onFork={m => { setMissions(ms => [m, ...ms.filter(x => x.id !== m.id)]); bumpProjects(); open(`m:${m.id}`); }} />}
+                {(mid) => <MissionView id={mid} initial={missions().find(m => m.id === mid)} onMission={setOpenMission} onContext={(id, pct) => setPreviewContext({id, pct})} onFork={m => { setMissions(ms => [m, ...ms.filter(x => x.id !== m.id)]); bumpProjects(); open(`m:${m.id}`); }} />}
               </Show>
             )}
           </Match>
@@ -2164,7 +2185,7 @@ function MissionDock(p: {
   );
 }
 
-function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: Mission | null) => void; onFork?: (mission: Mission) => void }) {
+function MissionView(p: { id: string; onContext?: (id: string, pct: number | null) => void; initial?: Mission; onMission?: (mission: Mission | null) => void; onFork?: (mission: Mission) => void }) {
   const receipt = recalledLaunch(p.id);
   const cached = peekReadyTranscript(p.id);
   const [mission, setMission] = createSignal<Mission | null>(p.initial ?? null);
@@ -2317,6 +2338,9 @@ function MissionView(p: { id: string; initial?: Mission; onMission?: (mission: M
     // assistant_message finalizer.
     return withLive.map((i) => (i.kind === "text" && i.live ? { ...i, live: false } : i));
   };
+
+  const titleContext = createMemo(() => awaiting() ? null : contextPct(estimateTokens(viewItems()), contextWindow(mission()?.backend)));
+  createEffect(() => p.onContext?.(p.id, titleContext()));
 
   // Retrying an uncertain network result reuses the original message identity.
   // A different draft/selection, or a definitive rejection, starts a new attempt.

@@ -281,3 +281,5 @@ export const CoreServerIcon = (p: P) => (
 export const ComputeNodeIcon = (p: P) => (
   <I {...p}><rect x="2.5" y="3.5" width="11" height="9" rx="1.5" /><path d="M5 6.5h.01M8 6.5h3M5 9.5h6" /></I>
 );
+
+export const BranchIcon = (p: P) => <I {...p}><circle cx="4" cy="3" r="1.5" /><circle cx="12" cy="3" r="1.5" /><circle cx="4" cy="13" r="1.5" /><path d="M4 4.5v7M12 4.5v1c0 3-8 1-8 4" /></I>;

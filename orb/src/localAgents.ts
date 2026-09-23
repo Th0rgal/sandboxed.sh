@@ -396,3 +396,8 @@ export async function followLocal(id: string, onText: (text: string) => void): P
     return state;
   } catch(error) {await reconcileLocalRun(id);recordLocalFailure(id,error);throw error;}
 }
+
+export async function localSessionGit(cwd: string): Promise<{ repository: string; branch?: string | null } | null> {
+  const invoke = tauriInvoke();
+  return invoke ? await invoke("local_session_git", { cwd }) as { repository: string; branch?: string | null } | null : null;
+}

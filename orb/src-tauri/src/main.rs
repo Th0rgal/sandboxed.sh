@@ -6,6 +6,7 @@ mod local_agents;
 mod local_stream;
 mod machine_metrics;
 mod uploads;
+mod session_preview;
 mod voice;
 
 use tauri::{Manager, Theme, WebviewWindow};
@@ -87,6 +88,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             paloma_ssh_pubkey,
+            session_preview::local_session_git,
             uploads::pick_upload_files,
             uploads::read_upload_file,
             browse_local_files,

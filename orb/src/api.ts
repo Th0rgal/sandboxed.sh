@@ -157,6 +157,7 @@ export interface RemoteJob {
 }
 
 export interface Mission {
+  working_directory?: string | null;
   id: string;
   status: string;
   title: string | null;
