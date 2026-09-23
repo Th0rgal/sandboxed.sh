@@ -4,7 +4,7 @@
   --bg-sidebar: #121313;
   --sidebar-opacity: 86%;
   --surface-opacity: 96%;
-  --dock-fade-opacity: 35%;
+  --composer-shadow: 0 3px 16px rgb(0 0 0 / 12%);
   --bg-elev: #212121;
   --bg-hover: #1e1e1e;
   --bg-active: #2a2a2a;
@@ -59,7 +59,7 @@
   --bg-sidebar: #f6f6f4;
   --sidebar-opacity: 70%;
   --surface-opacity: 98%;
-  --dock-fade-opacity: 35%;
+  --composer-shadow: 0 3px 16px rgb(0 0 0 / 6%);
   --bg-elev: #f1f0ed;
   --bg-hover: #efeee9;
   --bg-active: #e4e3de;
@@ -576,14 +576,9 @@ code {
 .pf-state { font-size: 12px; color: var(--fg-3); }
 
 /* ---------- dock / composer ---------- */
-/* Composer dock: breathing room below the input (Cursor keeps ~16px) and a
-   soft fade so the transcript scrolling underneath reads as intentional. */
+/* Keep separation around the rounded input, not a dark strip across the transcript. */
 .dock { flex: none; padding: 10px 34px 16px; position: relative; }
-.dock::before {
-  content: ""; position: absolute; left: 0; right: 0; top: -12px; height: 12px;
-  background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--bg) var(--dock-fade-opacity), transparent));
-  pointer-events: none;
-}
+.dock .composer { box-shadow: var(--composer-shadow); }
 .actions { display: flex; gap: 4px; margin-bottom: 8px; }
 .pill {
   height: 28px; padding: 0 10px; border-radius: 14px;
