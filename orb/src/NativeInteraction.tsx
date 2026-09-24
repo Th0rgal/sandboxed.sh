@@ -66,8 +66,8 @@ export function NativeInteraction(p:{mission:string;active:boolean;remote?:boole
   <Show when={r().method==='plan'||r().method==='permission'} fallback={<For each={r().params.questions}>{(q,i)=>{
    const key=()=>q.id??String(i());
    return <fieldset disabled={sending()}><legend>{q.question}</legend>
-    <For each={q.options}>{(option,index)=><label class="native-choice"><input type={q.multiSelect?'checkbox':'radio'} name={`question-${key()}`} checked={answers()[key()]?.includes(option.label)??false} onChange={e=>setAnswers(prev=>({...prev,[key()]:q.multiSelect?(e.currentTarget.checked?[...(prev[key()]??[]),option.label]:(prev[key()]??[]).filter(v=>v!==option.label)):[option.label]}))}/><span class="native-choice-key" aria-hidden="true">{String.fromCharCode(65+index())}</span><span>{option.label}<small>{option.description}</small></span></label>}</For>
-    <input class="s-input" aria-label={`Other answer: ${q.question}`} placeholder="Other…" onInput={e=>setAnswers(prev=>({...prev,[key()]:[e.currentTarget.value]}))}/>
+    <For each={q.options}>{(option,index)=><label class="native-choice"><input type={q.multiSelect?'checkbox':'radio'} name={`question-${key()}`} checked={answers()[key()]?.includes(option.label)??false} onChange={e=>setAnswers(prev=>({...prev,[key()]:q.multiSelect?(e.currentTarget.checked?[...(prev[key()]??[]),option.label]:(prev[key()]??[]).filter(v=>v!==option.label)):[option.label]}))}/><span class="native-choice-key" aria-hidden="true">{String.fromCharCode(65+index())}</span><span class="native-choice-copy"><span class="native-choice-title">{option.label}</span><Show when={option.description}><small>{option.description}</small></Show></span><span class="native-choice-check" aria-hidden="true">✓</span></label>}</For>
+    <input class="s-input" aria-label={`Other answer: ${q.question}`} placeholder="Other…" value={answers()[key()]?.filter(v=>!q.options?.some(o=>o.label===v)).join(", ")??""} onInput={e=>setAnswers(prev=>({...prev,[key()]:[e.currentTarget.value]}))}/>
    </fieldset>;
   }}</For>}>
    <Show when={r().params.plan}><div class="native-plan"><MdView compact text={r().params.plan!}/></div></Show>

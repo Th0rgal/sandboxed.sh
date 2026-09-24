@@ -85,3 +85,28 @@ processes in the workspace, including descendants left behind by an Orb crash.
 Unknown process state, network failure, authorization failure, transfer conflicts
 and stale-generation responses keep the server fence intact. A surviving process
 must be stopped before recovery can proceed. No prompt is automatically replayed.
+
+### Background-agent completion (2026-09-24)
+
+A Claude SDK `result` finishes a turn, not necessarily the mission. Orb keeps
+stdin and stdout open while non-ambient background tasks remain, using
+`background_tasks_changed` snapshots (with task-start/notification fallback for
+older CLIs). Otherwise later AskUserQuestion and ExitPlanMode requests fail with
+`AbortError: Stream closed`, and the UI loses the eventual plan. Background task
+activity now has its own description and lifetime, separate from the Agent tool
+call that merely started it.
+
+Validation: 60 native tests, including an intermediate-result → background task
+completion → question → plan approval → implementation fixture. A real local
+Claude Code 2.1.281 question/approval/implementation roundtrip also passed.
+
+Orb's activity view separates live background work from earlier tool calls.
+Task IDs deduplicate snapshots/start/progress events; the spawning tool call is
+hidden when linked by `tool_use_id`. A snapshot removal means “Finished”; only a
+terminal notification supplies success, failure or cancellation. Details show
+reported summaries/commands, and elapsed time is omitted when the start event
+was missed. Failed background tasks stay visible; completed work is expandable.
+Old native builds remain readable without invented durations or results.
+
+Regression coverage: `agent-activity.test.tsx`, `agent-activity.browser.spec.ts`
+(WebKit desktop/mobile), and native `local_stream` lifecycle tests.

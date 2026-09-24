@@ -5,6 +5,8 @@ test('native question survives reload and the plan waits for explicit approval',
  await expect(page.getByText('Where should settings be saved?')).toBeVisible();
  await page.reload();
  await page.getByRole('radio',{name:'Locally'}).check();
+ await expect(page.getByRole('radio',{name:'Locally'})).toBeChecked();
+ await page.screenshot({path:'/tmp/orb-native-questions-ui.png'});
  await page.getByRole('button',{name:'Continue'}).click();
  await expect(page.getByRole('button',{name:'Implement plan'})).toBeVisible();
  await expect(page.getByRole('button',{name:'Request changes'})).toBeDisabled();

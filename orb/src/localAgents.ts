@@ -63,7 +63,12 @@ const [liveText, setLiveText] = createSignal<Record<string, string>>({});
 
 export const localInstalled = installed;
 export const localRunActive = (id: string) => !!running()[id];
-export interface LocalActivity { id: string; label: string; done: boolean; failed: boolean }
+export interface LocalActivity {
+  id: string; label: string; done: boolean; failed: boolean;
+  kind?: string; background?: boolean; tool_use_id?: string | null;
+  detail?: string | null; status?: string; started_at?: number;
+  updated_at?: number; finished_at?: number | null;
+}
 const [activities, setActivities] = createSignal<Record<string, LocalActivity[]>>({});
 export const localActivities = (id: string) => activities()[id] ?? [];
 export const localLiveText = (id: string) => liveText()[id] ?? "";

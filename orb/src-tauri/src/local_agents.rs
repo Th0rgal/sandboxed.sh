@@ -528,12 +528,14 @@ fn spawn_claude(
                 )?;
                 let mut implement_after_result = false;
                 let mut claude_text = ClaudeText::default();
+                let mut background = ClaudeBackground::default();
                 for line in BufReader::new(stdout).lines() {
                     let line = line.map_err(|e| e.to_string())?;
                     let Ok(event) = serde_json::from_str::<Value>(&line) else {
                         continue;
                     };
                     output.claude_activity(&event);
+                    background.consume(&event);
                     if implement_after_result
                         && event["type"] == "assistant"
                         && event["message"]["content"]
@@ -606,6 +608,11 @@ fn spawn_claude(
                                 .as_str()
                                 .unwrap_or("Claude ended with an error")
                                 .to_owned());
+                        }
+                        // A result ends one turn, not the session: background agents
+                        // can trigger more turns and permission requests afterwards.
+                        if background.running() {
+                            continue;
                         }
                         if implement_after_result {
                             implement_after_result = false;
@@ -1065,6 +1072,46 @@ fn write_line(stdin: &mut impl Write, line: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     stdin.write_all(b"\n").map_err(|e| e.to_string())?;
     stdin.flush().map_err(|e| e.to_string())
+}
+
+/// Prefer the CLI's authoritative live task snapshot; older CLIs expose edges.
+#[derive(Default)]
+struct ClaudeBackground {
+    tasks: std::collections::HashSet<String>,
+    has_snapshot: bool,
+}
+impl ClaudeBackground {
+    fn consume(&mut self, event: &Value) {
+        if event["type"] != "system" {
+            return;
+        }
+        match event["subtype"].as_str() {
+            Some("background_tasks_changed") => {
+                if let Some(tasks) = event["tasks"].as_array() {
+                    self.has_snapshot = true;
+                    self.tasks = tasks
+                        .iter()
+                        .filter(|t| t["ambient"] != true)
+                        .filter_map(|t| t["task_id"].as_str().map(str::to_owned))
+                        .collect();
+                }
+            }
+            Some("task_started") if !self.has_snapshot && event["ambient"] != true => {
+                if let Some(id) = event["task_id"].as_str() {
+                    self.tasks.insert(id.into());
+                }
+            }
+            Some("task_notification") if !self.has_snapshot => {
+                if let Some(id) = event["task_id"].as_str() {
+                    self.tasks.remove(id);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn running(&self) -> bool {
+        !self.tasks.is_empty()
+    }
 }
 
 /// Text deltas have no separator between independent Claude messages. Preserve
@@ -1614,6 +1661,86 @@ printf '%s\n' '{"type":"result"}'
             serde_json::from_str(&std::fs::read_to_string(dir.path().join("answer.json")).unwrap())
                 .unwrap();
         assert_eq!(answer["response"]["response"]["behavior"], "allow");
+        runs().lock().unwrap().remove(&id);
+    }
+
+    #[test]
+    fn claude_background_snapshots_replace_edges_and_ignore_ambient_tasks() {
+        let mut state = ClaudeBackground::default();
+        state.consume(&json!({"type":"system","subtype":"task_started","task_id":"old"}));
+        assert!(state.running());
+        state.consume(&json!({"type":"system","subtype":"task_notification","task_id":"old"}));
+        assert!(!state.running());
+        state.consume(&json!({"type":"system","subtype":"task_started","task_id":"stale"}));
+        state.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"watch","ambient":true}]}));
+        assert!(!state.running());
+        state.consume(&json!({"type":"system","subtype":"task_started","task_id":"stale"}));
+        assert!(!state.running());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_background_result_keeps_question_and_plan_channel_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude-fixture");
+        std::fs::write(&bin, r#"#!/bin/sh
+read -r init
+read -r prompt
+printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"a","description":"Explore"}'
+printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a"}]}'
+printf '%s\n' '{"type":"result","result":"Waiting for agent"}'
+sleep 0.05
+printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"a","status":"completed"}'
+printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+printf '%s\n' '{"type":"control_request","request_id":"q","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[]}}}'
+read -r answer || exit 21
+printf '%s\n' '{"type":"control_request","request_id":"p","request":{"subtype":"can_use_tool","tool_name":"ExitPlanMode","input":{"plan":"The plan"}}}'
+read -r answer || exit 22
+printf '%s\n' '{"type":"result"}'
+read -r mode || exit 23
+read -r execute || exit 24
+printf '%s\n' '{"type":"assistant","message":{"id":"final","content":[{"type":"text","text":"Implemented"}]}}'
+printf '%s\n' '{"type":"result"}'
+"#).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let id = format!("claude-background-{}", uuid_like());
+        local_agents_start(StartRequest {
+            id: id.clone(),
+            harness: "claudecode".into(),
+            bin: bin.to_string_lossy().into_owned(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            prompt: "/plan Explore with background agents".into(),
+            model: None,
+            session_id: None,
+            image_paths: vec![],
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut methods = Vec::new();
+        loop {
+            if let Some(request) = crate::interactions::local_interaction(id.clone()).unwrap() {
+                methods.push(request.method.clone());
+                crate::interactions::local_interaction_answer(
+                    id.clone(),
+                    request.id,
+                    if request.method == "plan" {
+                        json!({"action":"accept"})
+                    } else {
+                        json!({"answers":{}})
+                    },
+                )
+                .unwrap();
+            }
+            let state = local_agents_poll(id.clone()).unwrap();
+            if state.done {
+                assert!(state.text.contains("Implemented"), "{}", state.text);
+                break;
+            }
+            assert!(Instant::now() < deadline, "Claude did not finish");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(methods, vec!["claude_questions", "plan"]);
         runs().lock().unwrap().remove(&id);
     }
 

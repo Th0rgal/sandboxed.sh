@@ -1,6 +1,6 @@
 import type {DraftImage} from "./imageAttachments";
 import type { UploadedFile } from "./uploads";
-export interface ComposerDraft { mode?: "goal" | "plan" | null; text:string; images:DraftImage[]; uploads?: UploadedFile[]; }
+export interface ComposerDraft { mode?: "goal" | "plan" | "btw" | null; text:string; images:DraftImage[]; uploads?: UploadedFile[]; }
 let database: Promise<IDBDatabase> | undefined;
 function db(): Promise<IDBDatabase> {
  return database ??= new Promise((resolve,reject)=>{

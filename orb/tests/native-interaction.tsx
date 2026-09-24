@@ -3,7 +3,7 @@ import {NativeInteraction} from '../src/NativeInteraction';
 import {ModeChip} from '../src/goal';
 import '../src/styles.css';
 document.documentElement.dataset.theme='dark';
-const question={id:'question-1',method:'questions',params:{questions:[{id:'storage',question:'Where should settings be saved?',options:[{label:'Locally',description:'Keep settings on this computer.'},{label:'Account',description:'Synchronize across devices.'}]}]}};
+const question={id:'question-1',method:'questions',params:{questions:[{id:'storage',question:'Where should settings be saved?',options:[{label:'Locally',description:'Keep settings on this computer. Preserve the existing configuration and verify that reloading the application restores the selected settings.'},{label:'Account',description:'Synchronize across devices, while keeping a local copy available when the connection is unavailable.'}]}]}};
 let request=JSON.parse(sessionStorage.getItem('pending')??JSON.stringify(question));
 (window as any).__TAURI_INTERNALS__={invoke:async(cmd:string,args:any)=>{
  if(cmd==='local_interaction')return request;

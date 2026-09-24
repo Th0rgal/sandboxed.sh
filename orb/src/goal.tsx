@@ -67,7 +67,7 @@ export function GoalTag(p: { detail?: string; class?: string }) {
 /** Native `/goal` loop — same harness ids as `native_loops.rs`. */
 export const GOAL_HARNESSES = new Set(["claudecode", "codex", "grok", "opencode"]);
 
-export type ComposerMode = "goal" | "plan";
+export type ComposerMode = "goal" | "plan" | "btw";
 
 export type SlashItem = {
   id: ComposerMode;
@@ -103,23 +103,25 @@ export function absorbGoalPrefix(text: string): string | null {
 export function modePrompt(mode: ComposerMode | null, visible: string): string {
   const body = visible.trim();
   if (mode === "goal") return body ? goalPrompt(body) : "/goal";
+  if (mode === "btw") return body ? `/btw ${body}` : "/btw";
   if (mode === "plan") return body ? `/plan ${body}` : "/plan";
   return body;
 }
 
 /** In-input Cursor-style mode chip: icon, name, dismiss. */
 export function ModeChip(p: { mode: ComposerMode; onClear: () => void }) {
+  const label = () => p.mode === "btw" ? "Side question" : p.mode === "plan" ? "Plan" : "Goal";
   return (
     <span
       class={`mode-chip ${p.mode}-mode`}
       role="status"
       aria-live="polite"
-      aria-label={p.mode === "plan" ? "Plan mode" : "Goal mode"}
-      title={p.mode === "plan" ? "Plan before making changes" : "Keep iterating until the objective is met"}
+      aria-label={`${label()} mode`}
+      title={p.mode === "btw" ? "Ask without interrupting the agent" : p.mode === "plan" ? "Plan before making changes" : "Keep iterating until the objective is met"}
     >
       {p.mode === "plan" ? <Ic.PlanIcon size={12} /> : <Ic.TargetIcon size={12} />}
-      <span class="mode-chip-label">{p.mode === "plan" ? "Plan" : "Goal"}</span>
-      <button type="button" class="mode-chip-x" tabIndex={-1} title={`Remove ${p.mode === "plan" ? "Plan" : "Goal"}`} aria-label={`Remove ${p.mode === "plan" ? "Plan" : "Goal"}`} onClick={(e) => { e.preventDefault(); e.stopPropagation(); p.onClear(); }}>
+      <span class="mode-chip-label">{label()}</span>
+      <button type="button" class="mode-chip-x" tabIndex={-1} title={`Remove ${label()}`} aria-label={`Remove ${label()}`} onClick={(e) => { e.preventDefault(); e.stopPropagation(); p.onClear(); }}>
         <Ic.CloseIcon size={10} />
       </button>
     </span>

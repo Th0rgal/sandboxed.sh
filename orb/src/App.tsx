@@ -1,3 +1,5 @@
+import { SideQuestions, type SideQuestionsHandle } from "./SideQuestionPanel";
+import { AgentActivity } from "./AgentActivity";
 import { startLocalOrigin } from "./localAgents";
 import { ChangeMachine } from "./ChangeMachine";
 import { adoptTransferredWorkspace, machineLabel } from "./machineTransfer";
@@ -272,7 +274,9 @@ function OptimisticMessage(p: {draft:{text:string; images:DraftImage[]}}) {
 }
 
 export function Composer(p: {
-  revision?: { text: string };
+  revision?: { text: string; append?: boolean };
+  onBtw?: (question: string) => boolean;
+  onOpenBtw?: () => void;
   placeholder: string;
   busy: boolean;
   onSend: (t: string, images: DraftImage[]) => void | boolean | Promise<void | boolean>;
@@ -411,7 +415,7 @@ export function Composer(p: {
   createEffect(() => {
     if (p.uploadTarget === "local") void refreshLocalAgents(false);
   });
-  const modes = createMemo(() => composerModes(backend(), p.uploadTarget === "local" ? !!localInstalled().find(h=>h.id===backend())?.plan_supported : p.uploadTarget === "core" && !!harnessChoices().find(h=>h.backend.id===backend())?.backend.native_plan));
+  const modes = createMemo(() => [...composerModes(backend(), p.uploadTarget === "local" ? !!localInstalled().find(h=>h.id===backend())?.plan_supported : p.uploadTarget === "core" && !!harnessChoices().find(h=>h.backend.id===backend())?.backend.native_plan), ...(p.onBtw ? [{id:"btw" as const, section:"Modes" as const,label:"Side question",title:"Ask without interrupting the agent"}] : [])]);
   const slash = createMemo(() => {
     if (mode() || voiceActive() || slashOff()) return null;
     const q = slashQuery(text());
@@ -474,7 +478,7 @@ export function Composer(p: {
     ta.style.minHeight = "";
   };
 
-  createEffect(() => { const revision = p.revision; if (revision) { setText(revision.text); queueMicrotask(() => { resize(); ta?.focus(); }); } });
+  createEffect(() => { const revision = p.revision; if (revision) { setMode(null); setText(current => { const next = revision.append && current ? `${current}\n\n${revision.text}` : revision.text; ta.value = next; return next; }); queueMicrotask(() => { resize(); ta?.focus(); }); } });
   const draftOf = (visible: string, m = mode()) => modePrompt(m, visible);
   const write = (visible: string, nextMode = mode()) => {
     ta.value = visible;
@@ -514,6 +518,15 @@ export function Composer(p: {
     if ((!payload && !images().length) || sending() || uploading() || readingImages()) return;
     if ((mode() === "plan" || /^\/plan(?:\s|$)/.test(payload)) && !modes().some(m => m.id === "plan")) {
       setUploadError("Plan mode is not supported by this harness on this machine. Your draft is kept.");
+      return;
+    }
+    if (mode() === "btw" || /^\/btw(?:\s|$)/.test(payload)) {
+      if (!p.onBtw) { setUploadError("Side questions require an existing conversation."); return; }
+      if (images().length || uploaded.length) { setUploadError("Side questions use the conversation only. Remove attachments or send a normal message."); return; }
+      const question = payload.replace(/^\/btw\s*/, "").trim();
+      if (!question) { p.onOpenBtw?.(); return; }
+      if (p.onBtw(question)) { setText(""); ta.value=""; setMode(null); setUploadError(null); resize(); }
+      else setUploadError("A side question is already running, or the question is too long. Your draft is kept.");
       return;
     }
     const sentImages = images();
@@ -793,8 +806,9 @@ export function Composer(p: {
   // beside it. A draft still sends — the backend queues it for the next turn.
   const sendBtn = (
     <div class="send-slot">
+      <Show when={p.onBtw}><button type="button" class={`btw-toggle ${mode()==='btw'?'on':''}`} aria-label="Side question mode" aria-pressed={mode()==='btw'} title="Ask a side question (/btw)" onClick={e=>{e.stopPropagation();if(mode()==='btw')clearMode();else enterMode('btw',text());}}>btw</button></Show>
       <Show when={(text().trim() || images().length) && !slash() && !voiceActive()}>
-        <button class="send" disabled={uploading() || sending() || readingImages()} onClick={send} title={p.busy ? "Queue for next turn" : "Send"}>
+        <button class="send" disabled={uploading() || sending() || readingImages()} onClick={send} title={mode()==="btw" ? "Ask side question" : p.busy ? "Queue for next turn" : "Send"}>
           <Ic.ArrowUpIcon size={14} />
         </button>
       </Show>
@@ -889,12 +903,13 @@ export function Composer(p: {
           ref={ta}
           onPaste={event => void pasteImages(event)}
           rows={1}
-          placeholder={mode() === "goal" ? "Describe the objective" : mode() === "plan" ? "Plan before making changes…" : p.placeholder}
+          placeholder={mode() === "btw" ? "Ask without interrupting…" : mode() === "goal" ? "Describe the objective" : mode() === "plan" ? "Plan before making changes…" : p.placeholder}
           onInput={(e) => {
             const next = e.currentTarget.value;
             setSlashOff(false);
             setAtOff(false);
             setCaret(e.currentTarget.selectionStart ?? next.length);
+            if (!mode() && /^\/btw(?:\s|$)/.test(next) && p.onBtw) { enterMode('btw', next.replace(/^\/btw\s*/,'')); return; }
             if (!mode() && /^\/plan(?:\s|$)/.test(next) && modes().some(m=>m.id==='plan')) {
               enterMode('plan', next.replace(/^\/plan\s*/,'')); return;
             }
@@ -2197,6 +2212,8 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
   const [queueError, setQueueError] = createSignal<string | null>(cached?.queueError ?? null);
   const [sendError, setSendError] = createSignal<string | null>(null);
   const [optimistic, setOptimistic] = createSignal<{text:string; images:DraftImage[]} | null>(null);
+  let sideQuestions: SideQuestionsHandle | undefined;
+  const [sideRevision,setSideRevision] = createSignal<{text:string;append:boolean}>();
   const [followAttach, setFollowAttach] = createSignal<AttachChip[]>([]);
   let scroller: HTMLDivElement | undefined;
   let nearBottom = true;
@@ -2340,6 +2357,7 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
 
   /** Anything the agent has actually said or done in this turn. */
   const activity = () => {
+    if (localRunActive(p.id) && localActivities(p.id).length > 0) return true;
     const list = viewItems();
     const lastUser = list.reduce((last, item, index) => item.kind === "user" && !item.queued ? index : last, -1);
     return list.slice(lastUser + 1).some(i => ["text", "tool", "think"].includes(i.kind));
@@ -2501,10 +2519,7 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
             <LaunchStatus submitting={localRunActive(p.id)} destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={activity()} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
             <Transcript items={viewItems().filter(i => i.kind !== "user" || !i.queued)} pending={pending()} onSend={sendEditedPrompt} />
             <Show when={clientPlaced() && localActivities(p.id).length}>
-              <details class="local-activity">
-                <summary>{localRunActive(p.id) ? (localActivities(p.id).filter(a => !a.done).at(-1)?.label ?? "Agent is working") : "Agent activity"} · {localActivities(p.id).length} events</summary>
-                <For each={localActivities(p.id)}>{entry => <div class="local-activity-row"><span>{entry.label}</span><span>{entry.failed ? "Failed" : entry.done ? "Done" : localRunActive(p.id) ? "In progress" : "No result recorded"}</span></div>}</For>
-              </details>
+              <AgentActivity items={localActivities(p.id)} running={localRunActive(p.id)} />
             </Show>
             <NativeInteraction mission={p.id} active={clientPlaced() ? localRunActive(p.id) : busy()} remote={!clientPlaced()} items={viewItems()} />
             <Show when={!sendError()}>
@@ -2526,7 +2541,11 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
               <ol><For each={items().filter((i): i is Extract<StreamItem, { kind: "user" }> => i.kind === "user" && i.queued === true)}>{item => <li data-message-id={item.messageId}><UserTurn text={item.text} attached={item.attached} /></li>}</For></ol>
             </section>
           </Show>
+          <SideQuestions mission={p.id} items={viewItems()} ref={handle=>sideQuestions=handle} onTransfer={text=>setSideRevision({text,append:true})}/>
           <Composer
+            revision={sideRevision()}
+            onBtw={question=>sideQuestions?.ask(question)??false}
+            onOpenBtw={()=>sideQuestions?.open()}
             placeholder="Send follow-up"
             picker={false}
             busy={busy()}

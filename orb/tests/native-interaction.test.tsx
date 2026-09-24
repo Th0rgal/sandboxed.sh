@@ -32,6 +32,18 @@ describe('native plan interactions',()=>{
    expect(invoke.mock.calls.filter(([cmd])=>cmd==='local_interaction_answer')).toHaveLength(1);
   }finally{cleanup();host.__TAURI_INTERNALS__=previous;}
  });
+ it('switching from a custom answer to an option clears the custom field',async()=>{
+  const invoke=vi.fn(async()=>({id:'custom',method:'questions',params:{questions:[{id:'q',question:'Where?',options:[{label:'Locally'}]}]}}));
+  const host=window as any;const previous=host.__TAURI_INTERNALS__;host.__TAURI_INTERNALS__={invoke};
+  try{
+   render(()=><NativeInteraction mission="mission" active/>);
+   const input=await screen.findByRole('textbox',{name:'Other answer: Where?'});
+   fireEvent.input(input,{target:{value:'Elsewhere'}});
+   expect((input as HTMLInputElement).value).toBe('Elsewhere');
+   fireEvent.click(screen.getByRole('radio'));
+   expect((input as HTMLInputElement).value).toBe('');
+  }finally{cleanup();host.__TAURI_INTERNALS__=previous;}
+ });
  it('does not accept a plan until explicitly clicked',async()=>{
   const invoke=vi.fn(async(cmd:string)=>cmd==='local_interaction'?{id:'plan-1',method:'plan',params:{plan:'Create hello.txt'}}:null);
   const host=window as any;const previous=host.__TAURI_INTERNALS__;host.__TAURI_INTERNALS__={invoke};

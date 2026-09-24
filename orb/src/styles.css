@@ -1988,7 +1988,17 @@ select.orb-select-native:disabled { cursor: default; }
 .native-question { margin: 12px 0; padding: 12px; background: var(--bg-sidebar); }
 .native-question-heading { color: var(--fg-2); font-weight: 400; font-size: 12px; margin-bottom: 14px; }
 .native-question legend { font-weight: 500; color: var(--fg); margin-bottom: 10px; }
-.native-question .native-choice { position: relative; align-items: center; padding: 8px 6px; border-radius: 6px; cursor: pointer; }
+.native-question .native-choice { position: relative; align-items: flex-start; gap: 10px; padding: 10px; margin: 3px 0; border: 1px solid transparent; border-radius: 8px; cursor: pointer; }
+.native-question fieldset + fieldset { border-top: 1px solid var(--stroke); padding-top: 16px; margin-top: 16px; }
+.native-choice-copy { flex: 1; min-width: 0; }
+.native-choice-title { display: block; line-height: 1.4; }
+.native-choice-check { flex: none; width: 16px; color: #e9b96e; visibility: hidden; line-height: 1.4; }
+.native-choice:has(input:checked) .native-choice-check { visibility: visible; }
+.native-question .native-choice:has(input:checked) { border-color: color-mix(in srgb, #e9b96e 30%, transparent); background: color-mix(in srgb, #e9b96e 5%, var(--bg-sidebar)); }
+.native-question .native-choice-key { margin-top: 1px; }
+.native-choice-copy small { line-height: 1.5; margin-top: 4px; }
+.native-question .native-choice:has(input:checked) .native-choice-key { background: color-mix(in srgb, #e9b96e 18%, var(--bg-sidebar)); color: #e9b96e; }
+.native-question .s-input { padding-left: 10px; }
 .native-choice:hover, .native-choice:has(input:checked) { background: var(--bg-elev); }
 .native-choice:has(input:focus-visible) { outline: 1px solid var(--focus-border); }
 .native-choice input { position: absolute; opacity: 0; width: 1px; height: 1px; }
@@ -2037,3 +2047,51 @@ select.orb-select-native:disabled { cursor: default; }
 .context-comparison pre { white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;max-height:32vh;overflow:auto; }
 .context-comparison img { max-width:100%;max-height:32vh;object-fit:contain; }
 @media (max-width:600px) { .context-comparison { grid-template-columns:1fr; } }
+
+/* Live work stays visible; completed actions are quiet, expandable history. */
+.agent-activity { margin: 18px 10px; font-size: 12px; color: var(--fg-2); }
+.agent-activity-heading { display: flex; justify-content: space-between; padding: 6px 0; color: var(--fg); }
+.agent-activity-heading > span { color: var(--fg-3); font-size: 11px; }
+.agent-task { border-bottom: 1px solid var(--stroke); }
+.agent-task > summary { display: flex; align-items: center; gap: 10px; padding: 9px 2px; cursor: pointer; list-style: none; }
+.agent-task > summary::-webkit-details-marker { display: none; }
+.agent-task > summary:hover { color: var(--fg); }
+.agent-task > summary:focus-visible { outline: 1px solid var(--focus-border); outline-offset: 2px; border-radius: 4px; }
+.agent-task-icon { width: 20px; flex: none; color: var(--fg-3); font-family: ui-monospace, monospace; }
+.agent-task.is-running .agent-task-icon { color: #e9b96e; }
+.agent-task-name { flex: 1; min-width: 0; }
+.agent-task-name > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-task-name small { display: block; font-size: 10px; margin-top: 3px; color: var(--fg-3); }
+.agent-task-state, .agent-task-time { flex: none; color: var(--fg-3); font-size: 11px; }
+.agent-task-time { font-variant-numeric: tabular-nums; }
+.agent-task-time:empty { display: none; }
+.agent-task.is-failed .agent-task-state, .agent-activity-failed { color: var(--danger, #d68c8c); }
+.agent-task-chevron { color: var(--fg-3); transition: transform 120ms; }
+.agent-task[open] > summary .agent-task-chevron { transform: rotate(90deg); }
+.agent-task-detail { padding: 4px 2px 12px 32px; }
+.agent-task-detail pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.6 ui-monospace, monospace; max-height: 240px; overflow: auto; }
+.agent-task-empty { color: var(--fg-3); font-size: 11px; }
+.agent-activity-history { margin: 8px 0; }
+.agent-activity-history > summary { cursor: pointer; color: var(--fg-3); padding: 4px 0; }
+@media(max-width: 480px) { .agent-task > summary { gap: 6px; } .agent-task-state { max-width: 80px; } }
+.agent-activity-history:not([open]) > :not(summary), .agent-task:not([open]) > .agent-task-detail { display: none; }
+
+@media(max-width: 480px) { .agent-task-name > span { white-space: normal; overflow-wrap: anywhere; } }
+
+/* Side questions are a separate, compact conversation above the composer. */
+.btw-toggle { border:0; background:transparent; color:var(--dim,#888); padding:5px 7px; font:inherit; font-size:12px; border-radius:6px; cursor:pointer; }
+.btw-toggle:hover,.btw-toggle.on { color:#e1bd78; background:#e1bd7814; }
+.btw-panel { border:1px solid #383838; border-radius:12px; background:#191919; margin:0 0 10px; overflow:hidden; box-shadow:0 12px 36px #0004; }
+.btw-panel header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px; border-bottom:1px solid #ffffff0c; }
+.btw-panel header strong { display:block; font-weight:500; font-size:14px; color:#e1bd78; }
+.btw-panel header span { display:block; color:#888; font-size:11px; margin-top:3px; }
+.btw-thread { max-height:min(40vh,360px); overflow:auto; padding:0 16px; overscroll-behavior:contain; }
+.btw-thread article { padding:12px 0; border-bottom:1px solid #ffffff0b; font-size:13px; }
+.btw-question { font-weight:500; margin:0 0 10px; white-space:pre-wrap; }
+.btw-transfer,.btw-reopen { border:0; background:transparent; color:#aaa; font:inherit; font-size:12px; cursor:pointer; padding:6px 0; }
+.btw-transfer:hover,.btw-reopen:hover { color:#e1bd78; }
+.btw-panel form { display:flex; gap:10px; padding:12px 16px; align-items:flex-end; }
+.btw-panel textarea { resize:vertical; max-height:120px; min-width:0; flex:1; background:transparent; color:inherit; font:inherit; font-size:13px; border:0; outline:none; }
+.btw-panel form button { border:0; border-radius:50%; width:28px; height:28px; flex:none; background:#d5bd8e; color:#181818; display:grid; place-items:center; cursor:pointer; }
+.btw-panel form button:disabled { opacity:.4; cursor:default; }
+.btw-panel button:focus-visible,.btw-toggle:focus-visible { outline:2px solid #d5bd8e; outline-offset:2px; }

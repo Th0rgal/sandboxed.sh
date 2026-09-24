@@ -24,6 +24,91 @@ pub struct Activity {
     pub label: String,
     pub done: bool,
     pub failed: bool,
+    pub kind: String,
+    pub background: bool,
+    pub tool_use_id: Option<String>,
+    pub detail: Option<String>,
+    pub status: String,
+    pub started_at: u64,
+    pub updated_at: u64,
+    pub finished_at: Option<u64>,
+}
+fn activity_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+impl Activity {
+    fn new(id: String, label: String, kind: &str, background: bool) -> Self {
+        let now = activity_now();
+        Self {
+            id,
+            label,
+            kind: kind.into(),
+            background,
+            done: false,
+            failed: false,
+            tool_use_id: None,
+            detail: None,
+            status: "running".into(),
+            started_at: now,
+            updated_at: now,
+            finished_at: None,
+        }
+    }
+    fn finish(&mut self, status: &str) {
+        self.done = true;
+        self.failed = matches!(status, "failed" | "stopped");
+        self.status = status.into();
+        self.updated_at = activity_now();
+        self.finished_at.get_or_insert(self.updated_at);
+    }
+}
+fn task_kind(value: &serde_json::Value) -> &'static str {
+    if value["task_type"]
+        .as_str()
+        .is_some_and(|s| s.contains("agent"))
+        || value["subagent_type"].is_string()
+    {
+        "agent"
+    } else {
+        "command"
+    }
+}
+fn upsert_task<'a>(
+    activities: &'a mut Vec<Activity>,
+    value: &serde_json::Value,
+) -> Option<&'a mut Activity> {
+    let id = format!("task:{}", value["task_id"].as_str()?);
+    let existing = activities.iter().position(|a| a.id == id);
+    let index = existing.unwrap_or_else(|| {
+        activities.push(Activity::new(
+            id,
+            "Background task".into(),
+            task_kind(value),
+            true,
+        ));
+        activities.len() - 1
+    });
+    let activity = &mut activities[index];
+    // A recovered snapshot has no reliable start timestamp.
+    if value["subtype"] != "task_started" && existing.is_none() {
+        activity.started_at = 0;
+    } else if value["subtype"] == "task_started" && activity.started_at == 0 {
+        activity.started_at = activity_now();
+    }
+    if let Some(label) = value["description"].as_str().filter(|s| !s.is_empty()) {
+        activity.label = label.chars().take(240).collect();
+    }
+    if value["task_type"].is_string() || value["subagent_type"].is_string() {
+        activity.kind = task_kind(value).into();
+    }
+    if let Some(id) = value["tool_use_id"].as_str() {
+        activity.tool_use_id = Some(id.into());
+    }
+    activity.updated_at = activity_now();
+    Some(activity)
 }
 #[derive(Default)]
 pub struct Output(Mutex<State>, AtomicUsize, Mutex<Vec<Activity>>);
@@ -40,6 +125,59 @@ impl Output {
     }
     pub fn claude_activity(&self, value: &serde_json::Value) {
         let mut activities = self.2.lock().unwrap();
+        if value["type"] == "system" {
+            match value["subtype"].as_str() {
+                Some("task_started" | "task_progress") => {
+                    if let Some(activity) = upsert_task(&mut activities, value) {
+                        if let Some(tool) = value["last_tool_name"].as_str() {
+                            activity.detail = Some(format!("Latest tool: {tool}"));
+                        }
+                    }
+                }
+                Some("task_notification") => {
+                    if let Some(activity) = upsert_task(&mut activities, value) {
+                        activity.finish(value["status"].as_str().unwrap_or("finished"));
+                        if let Some(summary) = value["summary"].as_str().filter(|s| !s.is_empty()) {
+                            activity.detail = Some(summary.chars().take(8000).collect());
+                        }
+                    }
+                }
+                Some("background_tasks_changed") => {
+                    if let Some(tasks) = value["tasks"].as_array() {
+                        for task in tasks {
+                            upsert_task(&mut activities, task);
+                        }
+                        for activity in activities.iter_mut().filter(|a| a.background && !a.done) {
+                            if !tasks
+                                .iter()
+                                .any(|t| t["task_id"].as_str() == activity.id.strip_prefix("task:"))
+                            {
+                                // Removal says it finished, not whether it succeeded.
+                                activity.finish("finished");
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if value["type"] == "assistant" {
+            if let Some(blocks) = value["message"]["content"].as_array() {
+                for block in blocks.iter().filter(|b| b["type"] == "tool_use") {
+                    if let Some(activity) = activities
+                        .iter_mut()
+                        .find(|a| Some(a.id.as_str()) == block["id"].as_str())
+                    {
+                        if let Some(label) = block["input"]["description"].as_str() {
+                            activity.label = label.chars().take(240).collect();
+                        }
+                        if let Some(command) = block["input"]["command"].as_str() {
+                            activity.detail = Some(command.chars().take(8000).collect());
+                        }
+                    }
+                }
+            }
+        }
         let event = &value["event"];
         if value["type"] == "stream_event" && event["type"] == "content_block_start" {
             let block = &event["content_block"];
@@ -51,16 +189,25 @@ impl Output {
                     block["id"].as_str().unwrap_or("").to_owned()
                 };
                 if !activities.iter().any(|a| a.id == id) {
-                    activities.push(Activity {
+                    let name = block["name"].as_str().unwrap_or("Tool");
+                    activities.push(Activity::new(
                         id,
-                        label: if thinking {
+                        if thinking {
                             "Thinking".into()
                         } else {
-                            block["name"].as_str().unwrap_or("Tool").into()
+                            name.into()
                         },
-                        done: false,
-                        failed: false,
-                    });
+                        if thinking {
+                            "thinking"
+                        } else if name == "Agent" {
+                            "agent"
+                        } else if name == "Bash" {
+                            "command"
+                        } else {
+                            "tool"
+                        },
+                        false,
+                    ));
                 }
             }
         }
@@ -69,7 +216,7 @@ impl Output {
                 .last_mut()
                 .filter(|a| a.id.starts_with("thinking:"))
             {
-                last.done = true;
+                last.finish("completed");
             }
         }
         if value["type"] == "user" {
@@ -80,8 +227,11 @@ impl Output {
                             .iter_mut()
                             .find(|a| Some(a.id.as_str()) == block["tool_use_id"].as_str())
                         {
-                            activity.done = true;
-                            activity.failed = block["is_error"].as_bool().unwrap_or(false);
+                            activity.finish(if block["is_error"] == true {
+                                "failed"
+                            } else {
+                                "completed"
+                            });
                         }
                     }
                 }
@@ -204,6 +354,39 @@ impl CodexText {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn background_snapshot_recovers_task_and_notification_reports_failure() {
+        let output = Output::default();
+        output.claude_activity(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a","task_type":"local_agent","description":"Inspect importer"}]}));
+        assert_eq!(output.activities()[0].kind, "agent");
+        assert!(!output.activities()[0].done);
+        output.claude_activity(
+            &json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"spawn"}),
+        );
+        assert_eq!(output.activities().len(), 1);
+        output.claude_activity(
+            &json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}),
+        );
+        assert_eq!(output.activities()[0].status, "finished");
+        output.claude_activity(&json!({"type":"system","subtype":"task_notification","task_id":"a","status":"failed","summary":"Build exited with code 1"}));
+        let task = output.activities().remove(0);
+        assert!(task.failed);
+        assert_eq!(task.tool_use_id.as_deref(), Some("spawn"));
+        assert_eq!(task.detail.as_deref(), Some("Build exited with code 1"));
+        assert!(task.finished_at.unwrap() >= task.started_at);
+    }
+    #[test]
+    fn background_agent_remains_active_after_spawn_tool_returns() {
+        let output = Output::default();
+        output.claude_activity(&json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"t","description":"Explore importer"}));
+        output.claude_activity(&json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t"}]}}));
+        assert!(!output.activities()[0].done);
+        assert_eq!(output.activities()[0].label, "Explore importer");
+        output.claude_activity(
+            &json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}),
+        );
+        assert!(output.activities()[0].done);
+    }
     #[test]
     fn claude_activity_tracks_thinking_and_tool_results() {
         let output = Output::default();

@@ -923,6 +923,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/missions/:id/parallel",
             post(control::start_mission_parallel),
         )
+        .route(
+            "/api/control/missions/:id/btw",
+            post(crate::api::ask::btw::send),
+        )
         // Ask assistant (non-interrupting sidecar co-pilot)
         .route(
             "/api/control/missions/:id/ask",
