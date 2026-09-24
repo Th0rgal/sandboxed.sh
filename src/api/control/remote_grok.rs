@@ -1322,18 +1322,22 @@ pub(crate) async fn continue_on_node(
     if session_id.is_none() && !transferred {
         return Err((
             StatusCode::CONFLICT,
-            "Mission has no recorded native session".into(),
+            format!("{REMOTE_RESUME_REQUIRES_REPLACEMENT}: mission {mission_id} has no recorded native session; create a remote replacement with supersedes_mission_id={mission_id}"),
         ));
     }
-    let prompt = content
-        .clone()
-        .unwrap_or_else(|| super::INTERRUPTED_RESUME_PROMPT.to_string());
+    let prompt = content.clone().unwrap_or_else(|| {
+        if mission.goal_mode {
+            "/goal resume".to_string()
+        } else {
+            super::INTERRUPTED_RESUME_PROMPT.to_string()
+        }
+    });
     let history_prompt = prompt.clone();
     let prompt =
         super::machine_transfer::context(&store, mission_id, prompt, session_id.as_deref())
             .await
             .map_err(internal)?;
-    if let Some(objective) = super::parse_goal_objective(&prompt) {
+    if let Some(objective) = super::parse_goal_objective(&history_prompt) {
         if objective == "clear" {
             store
                 .update_mission_goal(mission.id, false, None)

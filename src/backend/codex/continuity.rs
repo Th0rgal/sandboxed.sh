@@ -223,9 +223,3 @@ impl Lease {
         Ok(())
     }
 }
-
-impl Drop for Lease {
-    fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self._file);
-    }
-}
