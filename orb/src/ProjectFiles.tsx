@@ -37,6 +37,7 @@ import {
   type ProjectSummary,
   projectsVersion,
   getProjectController,
+  controllerAction,
   type ControllerView as ControllerData,
 } from "./api";
 import { CronGlyph, untilLabel } from "./Controller";
@@ -235,6 +236,7 @@ export function LiveProjectsSection(p: {
   const [cronDefaults, setCronDefaults] = createSignal<import("./api").ProjectCronDefaults | null>(null);
   const [defaultsError, setDefaultsError] = createSignal<string | null>(null);
   const [crons, setCrons] = createStore<Record<string, import("./api").ControllerJob[]>>({});
+  const [controllerMenu, setControllerMenu] = createSignal<{x:number;y:number;slug:string;archived:boolean} | null>(null);
   const [actionMenu, setActionMenu] = createSignal<{ x: number; y: number; slug: string; path: string } | null>(null);
   const [newFolder, setNewFolder] = createSignal<{ slug: string; path: string } | null>(null);
   const [folderName, setFolderName] = createSignal("");
@@ -572,6 +574,16 @@ export function LiveProjectsSection(p: {
     );
     return items;
   };
+  const archiveController = async (slug: string, archived: boolean) => {
+    const version = connectionVersion();
+    setActionError(null);
+    try {
+      const view = await controllerAction(slug, archived ? "restore" : "archive");
+      if (version !== connectionVersion()) return;
+      setControllers(slug, view);
+      bumpProjects();
+    } catch (e) { if (version === connectionVersion()) setActionError(String(e)); }
+  };
   const archiveConversation = async (mission: Mission) => {
     setActionError(null);
     try {
@@ -698,7 +710,10 @@ export function LiveProjectsSection(p: {
     out.push(...liveOf(slug).filter(m => missionFolder(m) === path).map(m => missionNode(slug, m)));
     const done = doneOf(slug).filter(m => missionFolder(m) === path);
     const key = path ? `${slug}:${path}` : slug;
-    if (done.length) out.push({ id: `finished:${key}`, data: { kind: "finished", slug, path, label: `${done.length} finished` }, expanded: !!showDone[key], children: done.map(m => missionNode(slug, m)) });
+    const archivedJob = !path && controllers[slug]?.job?.archived ? controllers[slug]?.job : null;
+    const finishedNodes = done.map(m => missionNode(slug, m));
+    if (archivedJob) finishedNodes.unshift({id: `c:${slug}`, data: {kind: "cron", slug, label: archivedJob.name, job: archivedJob, controller: true}});
+    if (finishedNodes.length) out.push({ id: `finished:${key}`, data: { kind: "finished", slug, path, label: `${finishedNodes.length} finished` }, expanded: !!showDone[key], children: finishedNodes });
     return out;
   };
   const fileNodes = (slug: string, path: string): Node[] => {
@@ -728,7 +743,7 @@ export function LiveProjectsSection(p: {
     const children: Node[] = [];
     if (open) {
       const job = controllers[slug]?.job;
-      if (job) children.push({ id: `c:${slug}`, data: { kind: "cron", slug, label: job.name, job, controller: true } });
+      if (job && !job.archived) children.push({ id: `c:${slug}`, data: { kind: "cron", slug, label: job.name, job, controller: true } });
       if (cronUnsupported() || cronErrors[slug]) children.push({ id: `crons-error:${slug}`, data: { kind: "cron-error", slug, label: "Crons unavailable" } });
 
       if (missions[slug] === undefined) children.push({ id: `loading-missions:${slug}`, data: { kind: "note", slug, label: "Loading missions…" } });
@@ -774,7 +789,12 @@ export function LiveProjectsSection(p: {
     </div>;
     if (d.kind === "cron") {
       const ticking = () => d.controller && (controllers[d.slug]?.runs ?? []).some(r => r.status === "running" || r.status === "claimed");
-      return <button class={`row agent cron ${p.selected() === row.id ? "active" : ""}`} {...rowTip.bind(rowDetail(d.label, [d.controller ? "Controller" : "Cron"]))} onClick={() => p.open(row.id)}>
+      return <button class={`row agent cron ${p.selected() === row.id ? "active" : ""}`} {...rowTip.bind(rowDetail(d.label, [d.controller ? "Controller" : "Cron"]))} onClick={() => p.open(row.id)} onContextMenu={e => {
+        if (!d.controller) return;
+        e.preventDefault(); e.stopPropagation();
+        setActionMenu(null); setMissionMenu(null);
+        setControllerMenu({x:e.clientX,y:e.clientY,slug:d.slug,archived:!!d.job?.archived});
+      }}>
         <span class="row-ico glyph"><CronGlyph job={d.job!} running={!!ticking()} /></span><span class="row-label">{d.label}</span>
         <span class="row-machine"><Show when={!d.job!.enabled || d.job!.state === "paused"} fallback={<span class="row-machine-name cron-next">{ticking() ? "ticking" : untilLabel(d.job!.next_run_at, Date.now())}</span>}>
           <span class="cron-paused-indicator" role="img" aria-label="Paused" title={ticking() ? "Paused · current run finishing" : "Paused"}><Ic.PauseIcon size={14} /></span>
@@ -806,6 +826,9 @@ export function LiveProjectsSection(p: {
       <Show when={projects().length === 0 && !error()}>
         <div class="row note">No projects on the core backend.</div>
       </Show>
+      <Show when={controllerMenu()}>{menu => <PopupMenu x={menu().x} y={menu().y} focus={false} items={[
+        {kind:"item",label:menu().archived ? "Restore" : "Archive",icon:menu().archived ? Ic.ReopenIcon : Ic.ArchiveIcon,onClick:()=>void archiveController(menu().slug,menu().archived)}
+      ]} onClose={()=>setControllerMenu(null)} />}</Show>
       <Show when={actionMenu()}>
         {(menu) => <PopupMenu {...menu()} focus={actionFocus()} items={menuItems(menu().slug, menu().path)} onClose={() => setActionMenu(null)} />}
       </Show>

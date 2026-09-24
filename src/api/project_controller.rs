@@ -42,6 +42,7 @@ pub struct ControllerJob {
     pub name: String,
     pub schedule: Option<String>,
     pub enabled: bool,
+    pub archived: bool,
     /// Hermes job state: `scheduled`, `running`, `paused`, …
     pub state: Option<String>,
     pub paused_reason: Option<String>,
@@ -237,6 +238,7 @@ fn find_job<'a>(
 fn job_view(job: &serde_json::Value) -> Option<ControllerJob> {
     let id = str_field(job, "id")?;
     Some(ControllerJob {
+        archived: false,
         name: str_field(job, "name").unwrap_or_else(|| id.clone()),
         id,
         schedule: str_field(job, "schedule_display").or_else(|| {
@@ -693,6 +695,17 @@ pub(crate) async fn snapshot_view(
         .ok()
 }
 
+fn annotate_archive(
+    store: &super::projects_store::ProjectsStore,
+    slug: &str,
+    view: &mut ControllerView,
+) -> Result<(), ApiError> {
+    if let Some(job) = view.job.as_mut() {
+        job.archived = store.controller_archived(slug, &job.id).map_err(internal)?;
+    }
+    Ok(())
+}
+
 async fn get_controller(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(slug): AxumPath<String>,
@@ -704,9 +717,12 @@ async fn get_controller(
     let slug = super::projects_overview::canonicalize_project_slug(&slug);
     let recorded = recorded_controller_id(&state, &slug);
     let limit = query.limit.unwrap_or(DEFAULT_RUNS).clamp(1, MAX_RUNS);
-    let view = tokio::task::spawn_blocking(move || controller_view_sync(&slug, recorded, limit))
-        .await
-        .map_err(internal)?;
+    let view_slug = slug.clone();
+    let mut view =
+        tokio::task::spawn_blocking(move || controller_view_sync(&slug, recorded, limit))
+            .await
+            .map_err(internal)?;
+    annotate_archive(&state.projects, &view_slug, &mut view)?;
     Ok(Json(view))
 }
 
@@ -801,10 +817,12 @@ async fn update_controller(
     args.push(job_id);
     run_hermes_cron(&home, &args).await?;
 
-    let view =
+    let view_slug = slug.clone();
+    let mut view =
         tokio::task::spawn_blocking(move || controller_view_sync(&slug, recorded, DEFAULT_RUNS))
             .await
             .map_err(internal)?;
+    annotate_archive(&state.projects, &view_slug, &mut view)?;
     Ok(Json(view))
 }
 
@@ -817,19 +835,32 @@ async fn controller_action(
         return Err((StatusCode::BAD_REQUEST, "invalid project slug".to_string()));
     }
     let verb = match req.action.as_str() {
-        "pause" => "pause",
+        "pause" | "archive" | "restore" => "pause",
         "resume" => "resume",
         "run" | "trigger" => "run",
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                format!("unknown action '{other}'; expected pause, resume or run"),
+                format!(
+                    "unknown action '{other}'; expected pause, resume, run, archive or restore"
+                ),
             ))
         }
     };
     let slug = super::projects_overview::canonicalize_project_slug(&slug);
     let recorded = recorded_controller_id(&state, &slug);
     let (_, job_id) = resolve_controller(slug.clone(), recorded.clone()).await?;
+    if matches!(verb, "resume" | "run")
+        && state
+            .projects
+            .controller_archived(&slug, &job_id)
+            .map_err(internal)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Restore this controller before running it".into(),
+        ));
+    }
 
     // The CLI's `run` executes synchronously and can return exit 0 after
     // skipping a paused job. The gateway queues the explicit wake atomically,
@@ -849,10 +880,19 @@ async fn controller_action(
         return Err((status, String::from_utf8_lossy(&body).into_owned()));
     }
 
-    let view =
+    if matches!(req.action.as_str(), "archive" | "restore") {
+        state
+            .projects
+            .set_controller_archived(&slug, &job_id, req.action == "archive")
+            .map_err(internal)?;
+    }
+
+    let view_slug = slug.clone();
+    let mut view =
         tokio::task::spawn_blocking(move || controller_view_sync(&slug, recorded, DEFAULT_RUNS))
             .await
             .map_err(internal)?;
+    annotate_archive(&state.projects, &view_slug, &mut view)?;
     Ok(Json(view))
 }
 
@@ -918,6 +958,9 @@ pub async fn wake_controller_for_slug(state: Arc<super::routes::AppState>, slug:
         let project = state.projects.get_project(&lookup_slug).ok().flatten()?;
         let home = hermes_home()?;
         let id = automatic_wake_job(&project, &load_jobs(&home))?;
+        if state.projects.controller_archived(&lookup_slug, &id).ok()? {
+            return None;
+        }
         Some((home, id))
     })
     .await

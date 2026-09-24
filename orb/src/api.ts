@@ -453,6 +453,7 @@ export async function listProjects(): Promise<ProjectSummary[]> {
 
 /** A project's controller: the Hermes cron job that drives it. */
 export interface ControllerJob {
+  archived?: boolean;
   folder?: string;
   id: string;
   name: string;
@@ -548,7 +549,7 @@ export async function getProjectController(slug: string, limit = 40): Promise<Co
   return normalizeControllerView(await api<HermesControllerView>(`/api/projects/${encodeURIComponent(slug)}/controller?limit=${limit}`));
 }
 
-export async function controllerAction(slug: string, action: "pause" | "resume" | "run"): Promise<ControllerView> {
+export async function controllerAction(slug: string, action: "pause" | "resume" | "run" | "archive" | "restore"): Promise<ControllerView> {
   const view = normalizeControllerView(await api<HermesControllerView>(`/api/projects/${encodeURIComponent(slug)}/controller/action`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

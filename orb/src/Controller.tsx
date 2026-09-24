@@ -300,6 +300,7 @@ export function ControllerView(p: { slug: string; id?: string }) {
                     </div>
                   </div>
                   <div class="cr-actions">
+                    <Show when={job()?.archived}><span class="dim">Archived · restore from the sidebar</span></Show>
                     <Show
                       when={state() === "paused"}
                       fallback={
@@ -308,11 +309,11 @@ export function ControllerView(p: { slug: string; id?: string }) {
                         </button>
                       }
                     >
-                      <button class="s-btn sm quiet" disabled={!!busy()} onClick={() => act("resume")}>
+                      <button class="s-btn sm quiet" disabled={!!busy() || job()?.archived} onClick={() => act("resume")}>
                         {busy() === "resume" ? "Resuming…" : "Resume"}
                       </button>
                     </Show>
-                    <button class="s-btn sm" disabled={!!busy() || running()} onClick={() => act("run")}>
+                    <button class="s-btn sm" disabled={!!busy() || running() || job()?.archived} onClick={() => act("run")}>
                       {busy() === "run" ? "Starting…" : "Run now"}
                     </button>
                   </div>

@@ -147,6 +147,12 @@ CREATE TABLE IF NOT EXISTS projects (
 -- Project ownership is local control-plane data. Hermes owns the job itself;
 -- this only records which Hermes job ids Orb is allowed to surface under a
 -- project (and deliberately does not replace controller_cron_id).
+CREATE TABLE IF NOT EXISTS controller_archives (
+    slug TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    PRIMARY KEY (slug, job_id)
+);
+
 CREATE TABLE IF NOT EXISTS project_crons (
     slug TEXT NOT NULL REFERENCES projects(slug) ON DELETE CASCADE,
     job_id TEXT NOT NULL,
@@ -1189,6 +1195,33 @@ impl ProjectsStore {
         self.connection
             .lock()
             .map_err(|_| "projects database lock poisoned".to_string())
+    }
+
+    pub fn controller_archived(&self, slug: &str, job_id: &str) -> Result<bool, String> {
+        self.lock()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM controller_archives WHERE slug=?1 AND job_id=?2)",
+                params![slug, job_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn set_controller_archived(
+        &self,
+        slug: &str,
+        job_id: &str,
+        archived: bool,
+    ) -> Result<(), String> {
+        let sql = if archived {
+            "INSERT OR IGNORE INTO controller_archives(slug,job_id) VALUES(?1,?2)"
+        } else {
+            "DELETE FROM controller_archives WHERE slug=?1 AND job_id=?2"
+        };
+        self.lock()?
+            .execute(sql, params![slug, job_id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn bind_project_cron(&self, slug: &str, job_id: &str) -> Result<(), String> {
@@ -7581,6 +7614,25 @@ mod tests {
             normalize_track_key("ux1"),
             normalize_track_key("ux1-pr229-cert")
         );
+    }
+
+    #[test]
+    fn controller_archives_are_scoped_and_restorable() {
+        let store = ProjectsStore::open_in_memory().unwrap();
+        assert!(!store.controller_archived("verity", "job1").unwrap());
+        store
+            .set_controller_archived("verity", "job1", true)
+            .unwrap();
+        store
+            .set_controller_archived("verity", "job1", true)
+            .unwrap();
+        assert!(store.controller_archived("verity", "job1").unwrap());
+        assert!(!store.controller_archived("verity", "job2").unwrap());
+        assert!(!store.controller_archived("other", "job1").unwrap());
+        store
+            .set_controller_archived("verity", "job1", false)
+            .unwrap();
+        assert!(!store.controller_archived("verity", "job1").unwrap());
     }
 
     #[test]
