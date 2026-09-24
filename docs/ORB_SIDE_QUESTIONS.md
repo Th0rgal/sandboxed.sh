@@ -1,6 +1,6 @@
 # Orb side questions
 
-In an existing mission, type `/btw question` or select **btw** beside Send.
+In an existing mission, type `/btw question`.
 The question opens a separate panel above the composer. Follow-ups stay in that
 panel; the main composer returns to normal. Closing the panel preserves its
 thread during this Orb session. Cancel stops only the side request. **Use in

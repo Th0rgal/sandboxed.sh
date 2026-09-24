@@ -806,7 +806,6 @@ export function Composer(p: {
   // beside it. A draft still sends — the backend queues it for the next turn.
   const sendBtn = (
     <div class="send-slot">
-      <Show when={p.onBtw}><button type="button" class={`btw-toggle ${mode()==='btw'?'on':''}`} aria-label="Side question mode" aria-pressed={mode()==='btw'} title="Ask a side question (/btw)" onClick={e=>{e.stopPropagation();if(mode()==='btw')clearMode();else enterMode('btw',text());}}>btw</button></Show>
       <Show when={(text().trim() || images().length) && !slash() && !voiceActive()}>
         <button class="send" disabled={uploading() || sending() || readingImages()} onClick={send} title={mode()==="btw" ? "Ask side question" : p.busy ? "Queue for next turn" : "Send"}>
           <Ic.ArrowUpIcon size={14} />

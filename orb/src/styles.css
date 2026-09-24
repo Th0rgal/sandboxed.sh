@@ -586,7 +586,7 @@ code {
 .dock .error-notice { position: relative; z-index: 1; }
 /* Fade the transcript beneath the controls without darkening the space above
    the composer. Use the surface color so this also works in light themes. */
-.dock .under { position: relative; isolation: isolate; z-index: 2; }
+.dock .under { position: relative; }
 .dock .under::before {
   content: "";
   position: absolute;
@@ -2079,8 +2079,6 @@ select.orb-select-native:disabled { cursor: default; }
 @media(max-width: 480px) { .agent-task-name > span { white-space: normal; overflow-wrap: anywhere; } }
 
 /* Side questions are a separate, compact conversation above the composer. */
-.btw-toggle { border:0; background:transparent; color:var(--fg-3); padding:5px 7px; font:inherit; font-size:12px; border-radius:6px; cursor:pointer; }
-.btw-toggle:hover,.btw-toggle.on { color:var(--amber); background:var(--bg-hover); }
 .btw-panel { border:1px solid var(--stroke-strong); border-radius:12px; background:var(--menu-bg); color:var(--fg); margin:0 0 10px; overflow:hidden; box-shadow:0 12px 36px #0004; }
 .btw-panel header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px; border-bottom:1px solid var(--stroke-soft); }
 .btw-panel header strong { display:block; font-weight:500; font-size:14px; color:var(--amber); }
@@ -2094,4 +2092,4 @@ select.orb-select-native:disabled { cursor: default; }
 .btw-panel textarea { resize:vertical; max-height:120px; min-width:0; flex:1; background:transparent; color:inherit; font:inherit; font-size:13px; border:0; outline:none; }
 .btw-panel form button { border:0; border-radius:50%; width:28px; height:28px; flex:none; background:#d5bd8e; color:#181818; display:grid; place-items:center; cursor:pointer; }
 .btw-panel form button:disabled { opacity:.4; cursor:default; }
-.btw-panel button:focus-visible,.btw-toggle:focus-visible { outline:2px solid #d5bd8e; outline-offset:2px; }
+.btw-panel button:focus-visible { outline:2px solid #d5bd8e; outline-offset:2px; }
