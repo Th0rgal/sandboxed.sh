@@ -52,7 +52,7 @@ export function ProjectPicker(p: {
   </div>;
 }
 
-export function ProjectCreation(p:{existingIds: string[];onCreate:(title:string,slug:string)=>Promise<void>;onClose:()=>void}) {
+export function ProjectCreation(p:{anchor?:HTMLElement;existingIds: string[];onCreate:(title:string,slug:string)=>Promise<void>;onClose:()=>void}) {
   const [name,setName]=createSignal("");
   const slug=()=>slugify(name());
   const [busy,setBusy]=createSignal(false);
@@ -68,5 +68,5 @@ export function ProjectCreation(p:{existingIds: string[];onCreate:(title:string,
     catch(e){setError(e instanceof Error?e.message:String(e));}
     finally{setBusy(false);}
   };
-  return <PromptSheet class="project-creation" title="New project" label="Project name" placeholder="Name your project…" value={name()} onInput={v=>{setName(v);setError(null);}} action={busy()?"Creating…":"Create project"} busy={busy()} disabled={!name().trim()} error={error()} onAction={()=>void submit()} onClose={close} />;
+  return <PromptSheet anchor={p.anchor} class="project-creation" title="New project" label="Project name" placeholder="Name your project…" value={name()} onInput={v=>{setName(v);setError(null);}} action={busy()?"Creating…":"Create project"} busy={busy()} disabled={!name().trim()} error={error()} onAction={()=>void submit()} onClose={close} />;
 }

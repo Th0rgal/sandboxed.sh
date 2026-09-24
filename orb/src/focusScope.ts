@@ -1,5 +1,5 @@
 /** Nested dialogs own keyboard focus in stack order, including portalled popovers. */
-type Scope = { root: HTMLElement; previous: HTMLElement | null };
+type Scope = { root: HTMLElement; previous: HTMLElement | null; parent?: () => HTMLElement | undefined };
 const scopes: Scope[] = [];
 export const hasFocusScope = () => scopes.length > 0;
 
@@ -18,12 +18,15 @@ function focusable(root: HTMLElement): HTMLElement[] {
   });
 }
 
-export function trapFocus(root: HTMLElement, onEscape: () => void): () => void {
-  const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  const scope = { root, previous };
-  const childIndex = scopes.findIndex((child) => root.contains(child.root));
+export function trapFocus(root: HTMLElement, onEscape: () => void, options: { parent?: () => HTMLElement | undefined; initialFocus?: () => HTMLElement | undefined; returnFocus?: HTMLElement | null } = {}): () => void {
+  const previous = options.returnFocus !== undefined ? options.returnFocus : document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const scope: Scope = { root, previous, parent: options.parent };
+  const childIndex = scopes.findIndex((child) => root.contains(child.root) || child.parent?.() === root);
   if (childIndex < 0) scopes.push(scope);
-  else scopes.splice(childIndex, 0, scope);
+  else {
+    scope.previous = scopes[childIndex].previous;
+    scopes.splice(childIndex, 0, scope);
+  }
   const top = () => scopes.at(-1) === scope;
   const first = () => focusable(root)[0] ?? root;
   const key = (event: KeyboardEvent) => {
@@ -47,7 +50,12 @@ export function trapFocus(root: HTMLElement, onEscape: () => void): () => void {
   };
   root.addEventListener('keydown', key);
   document.addEventListener('focusin', keepFocus);
-  if (top()) (focusable(root).find((el) => el.hasAttribute('autofocus')) ?? first()).focus();
+  if (top()) {
+    const items = focusable(root);
+    const requested = options.initialFocus?.();
+    (requested && (requested === root || items.includes(requested))
+      ? requested : items.find(el => el.hasAttribute('autofocus')) ?? first()).focus();
+  }
   return () => {
     const wasTop = top();
     scopes.splice(scopes.indexOf(scope), 1);
@@ -58,10 +66,18 @@ export function trapFocus(root: HTMLElement, onEscape: () => void): () => void {
     root.removeEventListener('keydown', key);
     document.removeEventListener('focusin', keepFocus);
     if (wasTop) {
-      const parent = scopes.at(-1)?.root;
-      const target = scope.previous;
-      if (target?.isConnected && (!parent || parent.contains(target))) target.focus();
-      else if (parent) (focusable(parent)[0] ?? parent).focus();
+      const parentScope = scopes.at(-1);
+      const restore = () => {
+        // A new modal may have opened before a deferred restore runs.
+        if (scopes.at(-1) !== parentScope) return;
+        const parent = parentScope?.root;
+        const target = scope.previous;
+        if (target?.isConnected && (!parent || parent.contains(target))) target.focus();
+        else if (parent) (focusable(parent)[0] ?? parent).focus();
+      };
+      // Solid flushes the parent's inert binding after the child's cleanup.
+      if (parentScope?.root.inert) queueMicrotask(restore);
+      else restore();
     }
   };
 }

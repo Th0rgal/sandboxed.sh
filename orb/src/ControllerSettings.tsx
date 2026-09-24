@@ -1,3 +1,5 @@
+import { Select } from "./Select";
+import { ConfirmDialog } from "./Dialog";
 import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createEffect, createMemo, createSignal, on, onCleanup, type JSX } from "solid-js";
 import { createStore } from "solid-js/store";
@@ -84,6 +86,7 @@ export function CronForm(p: {
   try { restored = JSON.parse(sessionStorage.getItem(storageKey) ?? "null"); } catch { /* unavailable storage */ }
   const initialDraft = () => ({ ...draftOf(p.view), ...(p.creating ? { deliver: p.view.settings?.deliver ?? `project:${p.view.slug}` } : {}) });
   const [draft, setDraft] = createStore<CronDraft>(restored?.draft ?? initialDraft());
+  const [confirmDiscard, setConfirmDiscard] = createSignal(false);
   const [base, setBase] = createSignal<CronDraft>(restored?.base ?? initialDraft());
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
@@ -292,9 +295,9 @@ export function CronForm(p: {
         </Row>
         <Row title="Failure delivery"><input class="s-input cs-input" placeholder="Same as delivery" aria-label="Failure delivery" value={draft.failure_deliver} onInput={(e) => setDraft("failure_deliver", e.currentTarget.value)} /></Row>
         <Row title="Working directory"><input class="s-input cs-input" placeholder="Hermes default" aria-label="Working directory" value={draft.workdir} onInput={(e) => setDraft("workdir", e.currentTarget.value)} /></Row>
-        <Row title="Reasoning"><select aria-label="Reasoning" class="s-input cs-input" value={draft.reasoning_effort} onChange={(e) => setDraft("reasoning_effort", e.currentTarget.value)}>
+        <Row title="Reasoning"><Select aria-label="Reasoning" class="s-input cs-input" value={draft.reasoning_effort} onChange={(e) => setDraft("reasoning_effort", e.currentTarget.value)}>
           <option value="">Hermes default</option><For each={["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]}>{(effort) => <option value={effort}>{effort}</option>}</For>
-        </select></Row>
+        </Select></Row>
         <Row title="Continuity" desc="Keep context across runs when supported by Hermes."><input aria-label="Continuity" type="checkbox" checked={draft.continuity} onChange={(e) => setDraft("continuity", e.currentTarget.checked)} /></Row>
       </Section>
       </details>
@@ -306,8 +309,10 @@ export function CronForm(p: {
           <div class="cs-savebar">
           <span>{`${dirtyCount()} unsaved change${dirtyCount() === 1 ? "" : "s"}`}</span>
           <span class="dlg-spacer" />
-          <Show when={p.onClose}><button class="s-btn sm quiet" disabled={saving()} onClick={() => {
-            if (!(dirtyCount() || skillInput().trim()) || window.confirm("Discard this cron draft?")) { discard(); p.onClose?.(); }
+          <Show when={p.onClose}><button class="s-btn sm quiet" disabled={saving()} onClick={(event) => {
+            event.currentTarget.focus();
+            if (dirtyCount() || skillInput().trim()) setConfirmDiscard(true);
+            else { discard(); p.onClose?.(); }
           }}>Cancel</button></Show>
           <button class="s-btn sm quiet" disabled={saving()} onClick={discard}>
             Discard
@@ -318,6 +323,9 @@ export function CronForm(p: {
           </div>
         </div>
       </Show>
+      <Show when={confirmDiscard()}><ConfirmDialog title="Discard this cron draft?"
+        description="Your unsaved changes will be discarded." action="Discard draft" cancelLabel="Keep editing" destructive
+        onClose={() => setConfirmDiscard(false)} onConfirm={() => { setConfirmDiscard(false); discard(); p.onClose?.(); }} /></Show>
     </div>
   );
 }

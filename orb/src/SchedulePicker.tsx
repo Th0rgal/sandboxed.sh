@@ -1,3 +1,4 @@
+import { Select } from "./Select";
 import { For, Match, Show, Switch, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
 
 import { trapFocus } from "./focusScope";
@@ -172,9 +173,9 @@ export function SchedulePicker(p: { value: string; onChange: (v: string) => void
       <Show when={open()}>
       <SchedulePopover position={position} onEscape={() => close(true)}>
       <label class="sp-mode">Schedule
-        <select class="s-input" aria-label="Schedule type" value={mode()} onChange={(e) => switchTo(e.currentTarget.value as Parsed["mode"])}>
+        <Select class="s-input" aria-label="Schedule type" value={mode()} onChange={(e) => switchTo(e.currentTarget.value as Parsed["mode"])}>
           <For each={MODES}>{(m) => <option value={m.id}>{m.label}</option>}</For>
-        </select>
+        </Select>
       </label>
       <div class={`sp-fields sp-fields-${mode()}`}>
 
@@ -189,9 +190,9 @@ export function SchedulePicker(p: { value: string; onChange: (v: string) => void
               if (n > 0) emit({ ...interval(), n });
             }}
           />
-          <select class="s-input" aria-label="Interval unit" value={interval().unit} onChange={(e) => emit({ ...interval(), unit: e.currentTarget.value as "m" | "h" | "d" })}>
+          <Select class="s-input" aria-label="Interval unit" value={interval().unit} onChange={(e) => emit({ ...interval(), unit: e.currentTarget.value as "m" | "h" | "d" })}>
             <option value="m">minutes</option><option value="h">hours</option><option value="d">days</option>
-          </select>
+          </Select>
         </Match>
 
         <Match when={mode() === "days"}>

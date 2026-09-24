@@ -1,7 +1,7 @@
 import { api, type Mission } from "./api";
 import { writeLocalFiles } from "./localAgents";
 
-export interface DraftImage { id: string; name: string; type: string; dataUrl: string; }
+export interface DraftImage { id: string; name: string; type: string; dataUrl: string; reference?: number; }
 export const IMAGE_LIMIT = 10 * 1024 * 1024;
 export const IMAGE_COUNT = 8;
 const extensions: Record<string,string> = { "image/png":"png", "image/jpeg":"jpg", "image/webp":"webp", "image/gif":"gif" };
@@ -17,8 +17,8 @@ export async function readImage(file: File): Promise<DraftImage> {
   const id = crypto.randomUUID();
   return { id, name: `image-${id}.${extensions[file.type]}`, type: file.type, dataUrl };
 }
-export function imagePrompt(text: string, paths: string[]): string {
-  return [text, ...paths.map(path => `[Uploaded: ${path}]`)].filter(Boolean).join("\n\n");
+export function imagePrompt(text: string, paths: string[], images: DraftImage[] = []): string {
+  return [text, ...paths.map((path, index) => `${images[index]?.reference ? `[Image #${images[index].reference}] ` : ""}[Uploaded: ${path}]`)].filter(Boolean).join("\n\n");
 }
 export async function stageLocalImages(root: string, images: DraftImage[]): Promise<string[]> {
   if (!images.length) return [];
@@ -47,4 +47,46 @@ export async function stageRemoteImages(images: DraftImage[], mission?: Mission 
     paths.push(result.path);
   }
   return paths;
+}
+
+// Parse inert clipboard HTML: never mount pasted markup or execute its scripts.
+export async function readImagePaste(html: string, plain: string, files: File[], firstReference: number) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  doc.querySelectorAll("script,style,template").forEach(node => node.remove());
+  const embedded = Array.from(doc.querySelectorAll("img, [data-proton-embedded]"));
+  const images: DraftImage[] = [];
+  const remaining = [...files];
+  const add = async (file: File) => {
+    if (images.length >= IMAGE_COUNT) throw new Error(`Attach up to ${IMAGE_COUNT} images at a time.`);
+    const image = await readImage(file);
+    image.reference = firstReference + images.length;
+    images.push(image);
+    return `[Image #${image.reference}]`;
+  };
+  for (const element of embedded) {
+    const src = element.getAttribute("src") ?? "";
+    let file: File | undefined;
+    // Clipboard files accompany cid:/file: images; prefer those bytes when available.
+    if (remaining.length) file = remaining.shift();
+    else if (/^(data:image\/|https?:\/\/|blob:)/i.test(src)) {
+      const response = await fetch(src, {credentials: "omit", signal: AbortSignal.timeout(10000)});
+      if (!response.ok) throw new Error("Couldn’t read an embedded image. Copy the image itself or attach it separately.");
+      const blob = await response.blob();
+      file = new File([blob], "pasted-image", {type: blob.type});
+    }
+    if (!file) throw new Error(element.hasAttribute("data-proton-embedded")
+      ? "Proton Mail copied a placeholder instead of the image. Copy the image itself or attach it separately."
+      : "The clipboard didn’t include the embedded image’s bytes. Copy the image itself or attach it separately.");
+    element.replaceWith(doc.createTextNode(await add(file)));
+  }
+  const render = (node: Node): string => {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+    if (!(node instanceof Element)) return "";
+    if (node.tagName === "BR") return "\n";
+    const content = Array.from(node.childNodes).map(render).join("");
+    return /^(P|DIV|LI|TR|H[1-6]|BLOCKQUOTE|PRE)$/.test(node.tagName) ? content + "\n" : content;
+  };
+  let text = embedded.length ? render(doc.body).replace(/\n{3,}/g, "\n\n").trim() : plain;
+  for (const file of remaining) text += `${text ? "\n" : ""}${await add(file)}`;
+  return {text, images};
 }

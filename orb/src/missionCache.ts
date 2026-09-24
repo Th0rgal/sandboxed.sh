@@ -57,6 +57,12 @@ async function fetchTranscript(id: string): Promise<TranscriptSnap> {
   return { items: buildTranscript([...stream, ...queueEvents]), stream, fromLog: true, queueError };
 }
 
+export async function refreshTranscript(id: string): Promise<TranscriptSnap> {
+  const snap = await fetchTranscript(id);
+  putTranscript(id, snap);
+  return snap;
+}
+
 export function loadTranscript(id: string): Promise<TranscriptSnap> {
   return cacheLoad(key(id), () => fetchTranscript(id));
 }

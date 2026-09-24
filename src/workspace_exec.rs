@@ -1307,6 +1307,41 @@ impl WorkspaceExec {
         Self { workspace }
     }
 
+    /// Bind only the project's files into the live container namespace.
+    pub async fn mount_project_context(
+        &self,
+        source: &Path,
+        project: &str,
+    ) -> anyhow::Result<String> {
+        if !use_nspawn_for_workspace(&self.workspace) {
+            return Ok(source.to_string_lossy().into_owned());
+        }
+        anyhow::ensure!(
+            !project.is_empty()
+                && project
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+            "Invalid context project"
+        );
+        let leader = self
+            .ensure_persistent_container_leader(&self.build_env(HashMap::new()))
+            .await?;
+        let output = Command::new("python3")
+            .arg("-c")
+            .arg(include_str!("../shared/mount_project_context.py"))
+            .arg(source)
+            .arg(&leader)
+            .arg(project)
+            .output()
+            .await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "Context mount failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(format!("/run/sandboxed-context/{project}"))
+    }
+
     /// Translate a host path to a container-relative path.
     ///
     /// For container workspaces using nspawn/nsenter, paths must be relative to the container

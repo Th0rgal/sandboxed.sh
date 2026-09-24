@@ -10,7 +10,9 @@ describe('native plan interactions',()=>{
   for(const harness of ['codex','claudecode','opencode','grok','gemini','chatgpt']) {
    expect(composerModes(harness).some(m=>m.id==='plan')).toBe(false);
   }
-  expect(composerModes('codex',true).some(m=>m.id==='plan')).toBe(true);
+  for (const harness of ['codex', 'claudecode']) {
+   expect(composerModes(harness,true).some(m=>m.id==='plan')).toBe(true);
+  }
   expect(modePrompt('plan','Build it')).toBe('/plan Build it');
  });
  it('recovers a pending question and sends its native request identity only once',async()=>{
@@ -25,8 +27,8 @@ describe('native plan interactions',()=>{
    render(()=><NativeInteraction mission="mission" active/>);
    await screen.findByText('Which greeting?');
    fireEvent.click(screen.getByRole('radio'));
-   fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
-   await waitFor(()=>expect(screen.queryByRole('button',{name:'Send answer'})).toBeNull());
+   fireEvent.click(screen.getByRole('button',{name:'Continue'}));
+   await waitFor(()=>expect(screen.queryByRole('button',{name:'Continue'})).toBeNull());
    expect(invoke.mock.calls.filter(([cmd])=>cmd==='local_interaction_answer')).toHaveLength(1);
   }finally{cleanup();host.__TAURI_INTERNALS__=previous;}
  });

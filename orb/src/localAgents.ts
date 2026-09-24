@@ -1,3 +1,4 @@
+import { rememberClientRunReceipt, type ClientRunReceipt } from "./clientRuns";
 /**
  * Local harnesses: the CLIs installed on this computer, not a sandboxed.sh
  * runner. Detection and process control go through Tauri. Mention rewriting
@@ -6,7 +7,7 @@
 import { bufferedOutput, type OutputEvent } from "./localStream";
 import { createSignal } from "solid-js";
 import { mentionText, scanMentions, type AttachChip } from "./attach";
-import { listProjectFiles, readProjectFile, getProjectController } from "./api";
+import { getApiUrl, getJwt, listProjectFiles, readProjectFile, getProjectController } from "./api";
 
 function savedLocalFailures(): Record<string,string> {
   try { return JSON.parse(localStorage.getItem("orb.localFailures") ?? "{}"); } catch { return {}; }
@@ -56,11 +57,15 @@ export interface LocalFile {
 
 const [installed, setInstalled] = createSignal<ScanRow[]>([]);
 const runVersions = new Map<string,number>();
+const launching = new Set<string>();
 const [running, setRunning] = createSignal<Record<string, boolean>>({});
 const [liveText, setLiveText] = createSignal<Record<string, string>>({});
 
 export const localInstalled = installed;
 export const localRunActive = (id: string) => !!running()[id];
+export interface LocalActivity { id: string; label: string; done: boolean; failed: boolean }
+const [activities, setActivities] = createSignal<Record<string, LocalActivity[]>>({});
+export const localActivities = (id: string) => activities()[id] ?? [];
 export const localLiveText = (id: string) => liveText()[id] ?? "";
 
 export function pathOverrides(): Record<string, string> {
@@ -117,29 +122,38 @@ export async function restoreLocalBindings() {
   const invoke = tauriInvoke();
   if (!invoke) return;
   const stored = await invoke("local_bindings") as Record<string, LocalBinding>;
-  const cached = JSON.parse(localStorage.getItem(BIND_KEY) || "{}") as Record<string, LocalBinding>;
-  // Older installations only had web storage. Migrate those entries once.
+  let cached: Record<string, LocalBinding> = {};
+  try { cached = JSON.parse(localStorage.getItem(BIND_KEY) || "{}"); } catch { /* Native storage remains authoritative. */ }
+  if (!cached || typeof cached !== "object" || Array.isArray(cached)) cached = {};
+  // Restore before migrating unrelated legacy entries that could fail.
+  localStorage.setItem(BIND_KEY, JSON.stringify({...cached, ...stored}));
   for (const [id, binding] of Object.entries(cached)) {
     if (!stored[id]) await invoke("local_bindings", {id, binding});
   }
-  localStorage.setItem(BIND_KEY, JSON.stringify({...cached, ...stored}));
 }
 
-export async function refreshLocalAgents(): Promise<ScanRow[]> {
-  await restoreLocalBindings().catch(console.error);
-  const invoke = tauriInvoke();
-  if (!invoke) {
-    setInstalled([]);
-    return [];
-  }
-  try {
-    const rows = (await invoke("local_agents_scan", { request: { overrides: pathOverrides() } })) as ScanRow[];
-    setInstalled(Array.isArray(rows) ? rows : []);
-    return installed();
-  } catch {
-    setInstalled([]);
-    return [];
-  }
+const [scanning, setScanning] = createSignal(false);
+export const localAgentsScanning = scanning;
+let scanPromise: Promise<ScanRow[]> | undefined;
+let scannedAt = 0;
+let scannedPaths = "";
+export function refreshLocalAgents(force = true): Promise<ScanRow[]> {
+  if (scanPromise) return scanPromise;
+  const paths = pathOverrides();
+  const key = JSON.stringify(paths);
+  if (!force && key === scannedPaths && Date.now() - scannedAt < 60_000) return Promise.resolve(installed());
+  setScanning(true);
+  scanPromise = (async () => {
+    const invoke = tauriInvoke();
+    if (!invoke) { setInstalled([]); return []; }
+    try {
+      const rows = await invoke("local_agents_scan", { request: { overrides: paths } }) as ScanRow[];
+      setInstalled(Array.isArray(rows) ? rows : []);
+      scannedAt = Date.now(); scannedPaths = key;
+      return installed();
+    } catch { return installed(); }
+  })().finally(() => { setScanning(false); scanPromise = undefined; });
+  return scanPromise;
 }
 
 export function installedIds(): string[] {
@@ -203,12 +217,28 @@ export async function materializeMentions(
   readFile: (path: string) => Promise<string> = (path) => readProjectFile(slug, path),
   listDir: (path: string) => Promise<Array<{ name: string; kind: string }>> = async (path) => listProjectFiles(slug, path),
 ): Promise<MaterializeResult> {
-  const mentions = scanMentions(text);
+  const mentions = scanMentions(text).map(m=>{
+    if(m.raw.startsWith('@"'))return m;
+    const value=m.value.replace(/[.,;:!?]+$/,"");
+    return (value==="context"||value.startsWith("context/"))?{...m,value,raw:m.raw.slice(0,m.raw.length-(m.value.length-value.length))}:m;
+  });
   const files: LocalFile[] = [];
   const replacements: Array<{ raw: string; absolute: string }> = [];
+  const contextMentions = mentions.filter(m => m.value === "context" || m.value.startsWith("context/"));
+  let contextRoot: string | undefined;
+  if (contextMentions.length) {
+    const invoke = tauriInvoke();
+    if (!invoke) throw new Error("Shared context requires the Orb desktop app on this computer.");
+    const result = await invoke("project_context_prepare", {request:{endpoint:getApiUrl(),token:getJwt()??"",project:slug,paths:contextMentions.map(m=>m.value.slice(7).replace(/\/$/,""))}}) as {root:string;state:{error?:string}};
+    contextRoot=result.root;
+  }
   let folderBytes = 0;
   for (const mention of mentions) {
     const bare = mention.value.replace(/\/$/, "");
+    if (contextRoot && (bare === "context" || bare.startsWith("context/"))) {
+      replacements.push({raw:mention.raw,absolute:`${contextRoot}${bare === "context" ? "" : "/"+bare.slice(8)}`});
+      continue;
+    }
     const chip = chips.find((item) => {
       if (item.kind === "controller") return bare.toLowerCase() === "controller";
       return item.path?.replace(/\/$/, "") === bare;
@@ -266,7 +296,7 @@ export async function materializeMentions(
     }
     replacements.push({ raw: mention.raw, absolute: `.paloma/attach/${path}` });
   }
-  const prompt = rewritePrompt(text, replacements.map((row) => ({ ...row, absolute: `__ROOT__/${row.absolute}` })));
+  const prompt = rewritePrompt(text, replacements.map((row) => ({ ...row, absolute: row.absolute.startsWith("/") ? row.absolute : `__ROOT__/${row.absolute}` })));
   return {
     prompt,
     files,
@@ -306,34 +336,36 @@ export interface StartLocal {
   sessionId?: string;
 }
 
-export async function startLocal(req: StartLocal): Promise<void> {
+export async function startLocal(req: StartLocal): Promise<ClientRunReceipt> {
+  if (localRunActive(req.id)) throw new Error("This mission is still running locally. Stop it before sending another message.");
   const invoke = tauriInvoke();
   if (!invoke) throw new Error("Local agents run in the Orb desktop app.");
+  launching.add(req.id);
   runVersions.set(req.id,(runVersions.get(req.id) ?? 0)+1);
   recordLocalFailure(req.id, null);
   setRunning((prev) => ({ ...prev, [req.id]: true }));
   setLiveText((prev) => ({ ...prev, [req.id]: "" }));
+  setActivities(prev => ({ ...prev, [req.id]: [] }));
   try {
-    await invoke("local_agents_start", {
-      request: {
-        id: req.id,
-        harness: req.harness,
-        bin: req.bin,
-        cwd: req.cwd,
-        prompt: req.prompt,
-        model: req.model,
-        session_id: req.sessionId,
-        image_paths: req.imagePaths,
-      },
-    });
+    const receipt = await invoke("local_run_launch", {
+      connection: { api_url: getApiUrl(), token: getJwt() },
+      request: { ...req, session_id: req.sessionId, image_paths: req.imagePaths ?? [] },
+    }) as ClientRunReceipt;
+    rememberClientRunReceipt(req.id, receipt);
+    return receipt;
   } catch (e) {
+    // An uncertain native start keeps the lease until polling proves it stopped.
+    launching.delete(req.id);
     await reconcileLocalRun(req.id);
     recordLocalFailure(req.id, e);
     throw e;
+  } finally {
+    launching.delete(req.id);
   }
 }
 
 export interface PollLocal {
+  activities?: LocalActivity[];
   text: string;
   done: boolean;
   exit_code?: number | null;
@@ -350,19 +382,28 @@ export async function pollLocal(id: string): Promise<PollLocal> {
 
 /** The native runner survives webview reloads; frontend flags do not. */
 export async function reconcileLocalRun(id: string): Promise<void> {
+  if (launching.has(id)) return;
   const version=runVersions.get(id);
   try {
     const state = await pollLocal(id);
     if (runVersions.get(id)!==version) return;
     setRunning(prev => ({ ...prev, [id]: !state.done }));
     setLiveText(prev => ({ ...prev, [id]: state.text }));
+    setActivities(prev => ({ ...prev, [id]: state.activities ?? [] }));
     if (state.session_id) {
       const binding = localBinding(id);
       if (binding) rememberBinding(id, { ...binding, sessionId: state.session_id });
     }
   } catch (error) {
     // A transport error does not mean the process stopped.
-    if (runVersions.get(id)===version && /no local run/i.test(String(error))) setRunning(prev => ({ ...prev, [id]: false }));
+    if (runVersions.get(id)===version && /no local run/i.test(String(error))) {
+      setRunning(prev => ({ ...prev, [id]: false }));
+      if (localBinding(id)) {
+        await tauriInvoke()?.("local_run_reconcile", { id, connection: { api_url: getApiUrl(), token: getJwt() } }).catch(() => {});
+        // A failed recovery keeps the server fence. A deliberate send surfaces
+        // the exact error; background polling must not produce unhandled errors.
+      }
+    }
   }
 }
 
@@ -387,6 +428,7 @@ export async function followLocal(id: string, onText: (text: string) => void): P
     for(;;){
       const state=await pollLocal(id);
       if(state.text!==last){last=state.text;publish(last)}
+      setActivities(prev => ({ ...prev, [id]: state.activities ?? [] }));
       if(state.done)return state;
       await new Promise(resolve=>setTimeout(resolve,400));
     }
@@ -406,6 +448,7 @@ export async function followLocal(id: string, onText: (text: string) => void): P
         state=await pollUntilDone();
       }
     } else {state=await pollUntilDone();}
+    setActivities(prev => ({ ...prev, [id]: state.activities ?? [] }));
     if(state.session_id){const binding=localBinding(id);if(binding)rememberBinding(id,{...binding,sessionId:state.session_id});}
     setRunning(prev=>({...prev,[id]:false}));
     return state;
@@ -415,4 +458,15 @@ export async function followLocal(id: string, onText: (text: string) => void): P
 export async function localSessionGit(cwd: string): Promise<{ repository: string; branch?: string | null } | null> {
   const invoke = tauriInvoke();
   return invoke ? await invoke("local_session_git", { cwd }) as { repository: string; branch?: string | null } | null : null;
+}
+
+/** Initial runs have a native-generated identity and a durable synchronization journal. */
+export async function startLocalOrigin(request: Omit<StartLocal,"id">, draft: {key:string;title:string;project:string;prompt:string;tags:string[]}): Promise<import("./api").Mission> {
+ const invoke=tauriInvoke();if(!invoke)throw new Error("Open Orb desktop to start on this computer.");
+ let mission:import("./api").Mission;
+ try{mission=await invoke("local_origin_launch",{request:{...request,id:"",session_id:null,image_paths:request.imagePaths??[]},draft,connection:{api_url:getApiUrl(),token:getJwt()}}) as import("./api").Mission;}
+ catch(error){if(/unknown command|command .*not found/i.test(String(error)))throw new Error("Update Orb desktop to enable local launches with offline support. Your draft is kept.");throw error;}
+ rememberBinding(mission.id,{harness:request.harness,bin:request.bin,cwd:mission.working_directory ?? request.cwd,model:request.model});
+ await reconcileLocalRun(mission.id);
+ return mission;
 }

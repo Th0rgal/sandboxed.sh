@@ -77,6 +77,38 @@ it("a rejected receipt preserves the follow-up draft and attachments", async () 
   vi.stubGlobal("fetch", fetcher);
   const attachments = [{kind: "file" as const, path: "notes/test.md"}];
   await expect(sendMissionMessage("mission", "same text", attachments)).rejects.toThrow("not accepted");
-  expect(JSON.parse(fetcher.mock.calls[0][1]!.body as string)).toEqual({mission_id: "mission", content: "same text", attachments, client_message_id: expect.any(String)});
+  expect(JSON.parse(fetcher.mock.calls[1][1]!.body as string)).toEqual({mission_id: "mission", content: "same text", attachments, client_message_id: expect.any(String)});
   expect(attachments).toHaveLength(1);
+});
+
+
+it("replies with the current writer identity without retagging PR references", async () => {
+  const identity = { project: "verity-pareto", track: "mission-47d203db", github_pr: null };
+  const fetcher = vi.fn(async (_url: string, init?: RequestInit) => new Response(JSON.stringify(
+    init?.method === "POST" ? { id: "reply", queued: true } : { id: "mission", ...identity }
+  )));
+  vi.stubGlobal("fetch", fetcher);
+  await sendMissionMessage("mission", "Et la PR #2441 ?", undefined, "reply");
+  expect(JSON.parse(fetcher.mock.calls[1][1]!.body as string)).toEqual({
+    mission_id: "mission", content: "Et la PR #2441 ?", client_message_id: "reply", continue_identity: identity,
+  });
+});
+
+it("keeps remote-node replies on the content-only continuation contract", async () => {
+  const fetcher = vi.fn(async (_url: string, init?: RequestInit) => new Response(JSON.stringify(
+    init?.method === "POST" ? { id: "reply", queued: true } : { id: "mission", track: "track", remote_node_id: "ashur" }
+  )));
+  vi.stubGlobal("fetch", fetcher);
+  await sendMissionMessage("mission", "Continue", undefined, "reply");
+  expect(JSON.parse(fetcher.mock.calls[1][1]!.body as string)).not.toHaveProperty("continue_identity");
+});
+
+it("keeps the project/model catalog available offline, without crossing accounts",async()=>{
+ const {listProjects,listBackendModels}=await import('../src/api');
+ setConnection('http://offline.test','account-a');
+ vi.stubGlobal('fetch',vi.fn(async(input:string)=>new Response(JSON.stringify(input.includes('backend-models')?{backends:{codex:[{value:'model',label:'Model'}]}}:{projects:[{slug:'notes',title:'Notes'}]}))));
+ expect((await listProjects())[0].slug).toBe('notes');await listBackendModels();
+ vi.stubGlobal('fetch',vi.fn(async()=>{throw new TypeError('offline');}));
+ expect((await listProjects())[0].slug).toBe('notes');expect((await listBackendModels()).codex[0].value).toBe('model');
+ setConnection('http://offline.test','account-b');await expect(listProjects()).rejects.toThrow('offline');
 });

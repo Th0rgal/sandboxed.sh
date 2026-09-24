@@ -34,6 +34,8 @@ export function dockModelLabel(harnessName: string, modelLabel: string): string 
   return rest || modelLabel;
 }
 export function missionDestination(mission: Mission | null, receipt?: LaunchReceipt) {
+  const destination = mission?.machine_transfer?.destination;
+  if (destination) return destination.kind === "core" ? "Core" : destination.kind === "client" ? "This computer" : nodeLabel(destination.id);
   if (mission?.tags?.includes("placement:client") || receipt?.nodeId === "local") return "This computer";
   // Server-owned remote placement or the accepted selection takes precedence
   // over workspace_name, which can still name the host's bookkeeping workspace.
@@ -223,7 +225,7 @@ export function phaseIsQuiet(phase: { label: string; failed?: boolean; moving?: 
  */
 export function LaunchStatus(p: { destination: string; mission?: Mission | null; activity?: boolean; submitting?: boolean; goal?: string | null; failureInTranscript?: boolean }) {
   const phase = () => p.submitting ? {label:"Starting",moving:true,detail:"Submitting your request…",failed:false} : missionPhase(p.mission ?? null, !!p.activity);
-  return <Show when={!phase().failed && !(phase().label === "Queued" && !p.mission?.remote_job && !p.mission?.remote_node_id) && !phaseIsQuiet(phase()) && !(p.activity && phase().label === "Remote job accepted")}>
+  return <Show when={!phase().failed && !(phase().label === "Queued" && !p.mission?.remote_job && !p.mission?.remote_node_id) && (!phaseIsQuiet(phase()) || (!p.activity && !p.submitting && phase().label === "Starting")) && !(p.activity && phase().label === "Remote job accepted")}>
     <div class={`launch-status ${phase().failed ? "failed" : ""}`} role="status" aria-live="polite">
       <div><Show when={phase().moving}><span class="launch-pulse" aria-hidden="true" /></Show><Show when={p.goal}><GoalTag class="small" /></Show><span>{phase().label} on {p.destination}</span></div>
       <Show when={phase().detail}><p>{phase().detail}</p></Show>
@@ -246,5 +248,5 @@ export function MissionFailure(p: { mission?: Mission | null; error?: string; ac
  * animation on their prompt.
  */
 export function MissionPending(p: { destination: string; label: string }) {
-  return <span class="sr-only" role="status" aria-live="polite">{p.label} on {p.destination}</span>;
+  return <div class="agent-wait-status" role="status" aria-live="polite">{p.label === "Starting" ? "Starting agent" : p.label}…</div>;
 }

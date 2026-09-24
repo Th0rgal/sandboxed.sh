@@ -76,11 +76,11 @@ for (const theme of ["light", "dark"]) {
     await page.getByLabel("Date and time").focus(); await page.keyboard.press("Escape");
     await expect(schedule).toBeFocused();
     await expect(page.getByRole("dialog", { name: "New cron", exact: true })).toBeVisible();
-    await page.getByLabel("Name", { exact: true }).focus();
+    await page.getByRole("button", { name: "Close", exact: true }).focus();
     await page.keyboard.press("Shift+Tab");
     await expect(page.getByRole("button", { name: "Create", exact: true })).toBeFocused();
     await page.keyboard.press("Tab");
-    await expect(page.getByLabel("Name", { exact: true })).toBeFocused();
+    await expect(page.getByRole("button", { name: "Close", exact: true })).toBeFocused();
     await page.getByRole("button", { name: "Create", exact: true }).click();
     await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeVisible();
     await expect(project).toHaveAttribute("aria-expanded", "true");

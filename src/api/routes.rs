@@ -577,6 +577,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // `/api/remote-nodes` and dispatch decisions read cached statuses
     // (REMOTE_NODE_MONITOR_SECS, default 15s, 0 disables). Only spawned when
     // remote nodes are enabled and configured.
+    super::project_files::start_context_observer(config.working_dir.clone());
     if config.remote_nodes.enabled && !config.remote_nodes.nodes.is_empty() {
         crate::remote_node::spawn_fleet_monitor(
             Arc::clone(&state.fleet),
@@ -979,6 +980,21 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/missions/:id/automation-executions",
             get(control::get_mission_automation_executions),
         )
+        .route(
+            "/api/control/missions/:id/machine-transfer",
+            get(control::machine_transfer::inspect)
+                .post(control::machine_transfer::operate)
+                .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/api/control/missions/:id/client-run",
+            post(control::machine_transfer::client_run),
+        )
+        .route(
+            "/api/control/local-origins",
+            post(control::machine_transfer::local_origin)
+                .layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
+        )
         // Mission portability — export a mission for transfer to another
         // instance, and import one coming from elsewhere. The import route
         // gets its own body limit layer because mission bundles routinely
@@ -1191,6 +1207,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/tools/:name/toggle", post(mcp_api::toggle_tool))
         // Provider management endpoints
         .route("/api/providers", get(super::providers::list_providers))
+        .route(
+            "/api/providers/discovery",
+            get(super::providers::model_discovery_status),
+        )
+        .route(
+            "/api/providers/snapshots",
+            get(super::providers::export_model_snapshots),
+        )
         .route(
             "/api/providers/backend-models",
             get(super::providers::list_backend_model_options),

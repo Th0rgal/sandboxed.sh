@@ -60,10 +60,10 @@ export interface FileOp {
   offset?: number;
 }
 export const fileScopeKey = (s: FileScope) =>
-  `${getApiUrl()}:${s.mission?.id ?? `project:${s.project ?? ""}:controller:${s.controller ?? ""}`}`;
+  `${getApiUrl()}:${s.mission?.id ?? `project:${s.project ?? ""}:controller:${s.controller ?? ""}`}${s.mission?.machine_transfer ? `:transfer:${s.mission.machine_transfer.id}` : ""}`;
 export function createFileClient(scope: FileScope) {
   const project = scope.mission?.project ?? scope.project;
-  const binding = scope.mission ? localBinding(scope.mission.id) : undefined;
+  const binding = scope.mission && (!scope.mission.machine_transfer || scope.mission.machine_transfer.destination.kind === "client") ? localBinding(scope.mission.id) : undefined;
   const server = (source: string, op: FileOp) =>
     api<FileReply>("/api/file-resources", {
       method: "POST",

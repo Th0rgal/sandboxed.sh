@@ -178,6 +178,7 @@ pub const FILE_BYTE_CAP: usize = 512 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentKind {
+    Context,
     File,
     Folder,
     Controller,
@@ -324,6 +325,23 @@ fn prepare(
 
     for attachment in &payload.attachments {
         match attachment.kind {
+            AttachmentKind::Context => {
+                let written = attachment.path.as_deref().unwrap_or("context");
+                let relative = written
+                    .strip_prefix("context/")
+                    .unwrap_or("")
+                    .trim_end_matches('/');
+                if !relative.is_empty() {
+                    crate::project_context::valid_path(relative)?;
+                }
+                let source = project_files_root.join(relative);
+                if !source.exists() {
+                    return Err(format!("context path does not exist: {written}"));
+                }
+                manifest.push_str(
+                    "- Shared context paths in the message are writable and synchronized.\n",
+                );
+            }
             AttachmentKind::Controller => {
                 let body = payload.controller_md.as_deref().unwrap_or(
                     "# Controller snapshot\n\nNo controller snapshot was available when this mission started.\n",
@@ -448,7 +466,16 @@ pub fn validate(payload: &MissionPayload) -> Result<(), String> {
         return Err("invalid attachment project".into());
     }
     for attachment in &payload.attachments {
-        if attachment.kind != AttachmentKind::Controller {
+        if attachment.kind == AttachmentKind::Context {
+            let path = attachment.path.as_deref().unwrap_or("context");
+            if path != "context" && path != "context/" {
+                crate::project_context::valid_path(
+                    path.strip_prefix("context/")
+                        .ok_or("invalid context reference")?
+                        .trim_end_matches('/'),
+                )?;
+            }
+        } else if attachment.kind != AttachmentKind::Controller {
             let path = attachment.path.as_deref().unwrap_or("");
             safe_rel(path)?;
             if path.len() > 4096 {
@@ -629,9 +656,15 @@ pub fn materialize_turn(
                 .as_deref()
                 .ok_or("attachments require a project")?;
             materialize(cwd, &project_files_root(working_dir, project), &payload)?;
+            content = rewrite_context(
+                &content,
+                &project_files_root(working_dir, project),
+                &payload,
+            )?;
             content.push_str("\n\nRead attached context in `.paloma/attach.md`.");
         }
     }
+    let mut contexts = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for part in content.split(SNAPSHOT_MARKER).skip(1) {
         let id = part
@@ -646,6 +679,7 @@ pub fn materialize_turn(
             return Err("too many attachment references in one turn".into());
         }
         let snapshot = read_message_snapshot(working_dir, mission_id, id)?;
+        contexts.push(snapshot.payload.clone());
         let dest = cwd.join(format!(".paloma/messages/{id}"));
         for (path, encoded) in snapshot.files {
             let path = safe_rel(&path)?;
@@ -658,7 +692,49 @@ pub fn materialize_turn(
             safe_write(&dest.join(path), &bytes)?;
         }
     }
+    for payload in contexts {
+        if let Some(project) = &payload.project {
+            content = rewrite_context(
+                &content,
+                &project_files_root(working_dir, project),
+                &payload,
+            )?;
+        }
+    }
     Ok(content)
+}
+
+fn rewrite_context(content: &str, root: &Path, payload: &MissionPayload) -> Result<String, String> {
+    let pattern = regex::Regex::new(r#"(^|[\s(])@(?:"([^"]+)"|([^\s)\]},;]+))"#)
+        .map_err(|e| e.to_string())?;
+    Ok(pattern
+        .replace_all(content, |captures: &regex::Captures| {
+            let value = captures
+                .get(2)
+                .or_else(|| captures.get(3))
+                .unwrap()
+                .as_str();
+            let path = value.trim_end_matches('/');
+            if payload.attachments.iter().any(|item| {
+                item.kind == AttachmentKind::Context
+                    && item
+                        .path
+                        .as_deref()
+                        .unwrap_or("context")
+                        .trim_end_matches('/')
+                        == path
+            }) {
+                let relative = path.strip_prefix("context/").unwrap_or("");
+                format!(
+                    "{}{}",
+                    &captures[1],
+                    serde_json::to_string(&root.join(relative).to_string_lossy()).unwrap()
+                )
+            } else {
+                captures[0].to_string()
+            }
+        })
+        .into_owned())
 }
 
 #[derive(Debug, Clone, Default)]

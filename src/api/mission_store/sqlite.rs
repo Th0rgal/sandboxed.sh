@@ -1,4 +1,8 @@
 //! SQLite-based mission store with full event logging.
+#[path = "sqlite_transfer.rs"]
+mod machine_transfer;
+#[path = "sqlite_local_origin.rs"]
+mod sqlite_local_origin;
 
 use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, AwaitingKind, BoardOutboxItem,
@@ -1057,6 +1061,8 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to set busy_timeout: {}", e))?;
 
             // Run schema
+            conn.execute_batch(machine_transfer::SCHEMA)
+                .map_err(|e| e.to_string())?;
             conn.execute_batch(SCHEMA)
                 .map_err(|e| format!("Failed to run schema: {}", e))?;
 
@@ -2965,6 +2971,12 @@ fn read_project_columns(
 
 #[async_trait]
 impl MissionStore for SqliteMissionStore {
+    async fn sync_local_origin(
+        &self,
+        snapshot: crate::local_origin::Snapshot,
+    ) -> Result<(), String> {
+        sqlite_local_origin::sync(self, snapshot).await
+    }
     fn is_persistent(&self) -> bool {
         true
     }
@@ -3453,6 +3465,17 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn machine_transfers(&self, id: Uuid) -> Result<Vec<super::transfer::Transfer>, String> {
+        machine_transfer::list(self, id).await
+    }
+    async fn save_machine_transfer(
+        &self,
+        action: super::transfer::Transfer,
+        expected: Option<u64>,
+    ) -> Result<super::transfer::Transfer, String> {
+        machine_transfer::save(self, action, expected).await
+    }
+
     async fn begin_mission_run(
         &self,
         mission_id: Uuid,
@@ -3465,6 +3488,10 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let mut conn = conn.blocking_lock();
             let tx = conn.transaction().map_err(|error| error.to_string())?;
+            machine_transfer::guard_start(&tx, mission_id)?;
+            machine_transfer::guard_placement(&tx,mission_id,&owner_actor_id,scope_unit.as_deref())?;
+            let cwd=scope_unit.as_deref().and_then(|s|s.strip_prefix("orb-cwd:"));
+            machine_transfer::guard_workspace(&tx,mission_id,cwd)?;
             let mission_status = tx
                 .query_row(
                     "SELECT status FROM missions WHERE id = ?1",
@@ -3481,7 +3508,7 @@ impl MissionStore for SqliteMissionStore {
                     "acknowledged mission {mission_id} cannot acquire a non-terminal run"
                 ));
             }
-            if !matches!(mission_status.as_str(), "pending" | "active") {
+            if !owner_actor_id.starts_with("orb-client:") && !matches!(mission_status.as_str(), "pending" | "active") {
                 return Err(format!(
                     "mission {mission_id} has status {mission_status}; activate it before acquiring a non-terminal run"
                 ));
@@ -3500,6 +3527,9 @@ impl MissionStore for SqliteMissionStore {
                     "mission {mission_id} already has non-terminal run {} generation {}",
                     existing.run_id, existing.generation
                 ));
+            }
+            if owner_actor_id.starts_with("orb-client:") {
+                tx.execute("UPDATE missions SET status='active',updated_at=?2,working_directory=COALESCE(?3,working_directory) WHERE id=?1",params![mission_id.to_string(),now_string(),cwd]).map_err(|e|e.to_string())?;
             }
             let generation = tx
                 .query_row(

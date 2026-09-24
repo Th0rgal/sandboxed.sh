@@ -7,6 +7,12 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tokio = { version = "1", features = ["time"] }
+sha2 = "0.10"
+fs2 = "0.4"
+uuid = { version = "1", features = ["v4", "serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 base64 = "0.22"
 tauri = { version = "2", features = ["macos-private-api"] }
 window-vibrancy = "0.6"
@@ -21,3 +27,6 @@ lto = true
 opt-level = "s"
 codegen-units = 1
 strip = true
+
+[dev-dependencies]
+tempfile = "3"

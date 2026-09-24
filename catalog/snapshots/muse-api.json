@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "provider_id": "muse",
+  "access_profile": "api",
+  "source": "curated",
+  "observed_at": null,
+  "completeness": "partial",
+  "models": [
+    {
+      "id": "muse-spark-1.3-contributor",
+      "name": "Muse Spark 1.3 Contributor",
+      "description": "Spark 1.3, data-sharing tier (~12x cheaper). Default."
+    },
+    {
+      "id": "muse-spark-1.3",
+      "name": "Muse Spark 1.3",
+      "description": "Spark 1.3, no-training tier"
+    },
+    {
+      "id": "muse-spark-1.2",
+      "name": "Muse Spark 1.2",
+      "description": "Coding-focused Spark 1.2"
+    },
+    {
+      "id": "muse-spark-1.1",
+      "name": "Muse Spark 1.1",
+      "description": null
+    },
+    {
+      "id": "muse-spark-1.2-contributor",
+      "name": "Muse Spark 1.2 Contributor",
+      "description": "Lower-cost Spark 1.2 tier"
+    }
+  ]
+}

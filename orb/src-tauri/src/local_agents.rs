@@ -84,6 +84,7 @@ pub struct StartRequest {
 
 #[derive(Debug, Serialize, Clone)]
 pub struct PollState {
+    pub activities: Vec<crate::local_stream::Activity>,
     pub text: String,
     pub done: bool,
     pub exit_code: Option<i32>,
@@ -94,6 +95,8 @@ pub struct PollState {
 
 #[derive(Clone)]
 struct Run {
+    generation: String,
+    cwd: PathBuf,
     child: Arc<Mutex<Child>>,
     text: Arc<Output>,
     done: Arc<AtomicBool>,
@@ -109,7 +112,14 @@ fn runs() -> &'static Mutex<HashMap<String, Run>> {
 }
 
 #[tauri::command]
-pub fn local_agents_scan(request: ScanRequest) -> Vec<ScanRow> {
+pub async fn local_agents_scan(request: ScanRequest) -> Result<Vec<ScanRow>, String> {
+    // CLI discovery launches subprocesses; never block the desktop event loop.
+    tauri::async_runtime::spawn_blocking(move || scan_local_agents(request))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn scan_local_agents(request: ScanRequest) -> Vec<ScanRow> {
     HARNESSES
         .iter()
         .map(|(id, bin)| {
@@ -260,6 +270,8 @@ pub fn local_agents_start(request: StartRequest) -> Result<(), String> {
     map.insert(
         request.id,
         Run {
+            generation: uuid::Uuid::new_v4().to_string(),
+            cwd,
             child,
             text,
             done,
@@ -309,6 +321,7 @@ pub fn local_agents_poll(id: String) -> Result<PollState, String> {
     let run = map.get(&id).ok_or_else(|| "no local run".to_string())?;
     let snapshot = PollState {
         text: run.text.snapshot(),
+        activities: run.text.activities(),
         done: run.done.load(Ordering::SeqCst),
         exit_code: *run.exit_code.lock().map_err(|e| e.to_string())?,
         session_id: run.session_id.lock().map_err(|e| e.to_string())?.clone(),
@@ -337,6 +350,7 @@ pub fn local_agents_subscribe(
         }
         let state = PollState {
             text: run.text.snapshot(),
+            activities: run.text.activities(),
             done: true,
             exit_code: *run.exit_code.lock().unwrap(),
             session_id: run.session_id.lock().unwrap().clone(),
@@ -355,17 +369,35 @@ pub fn local_agents_subscribe(
 
 #[tauri::command]
 pub fn local_agents_stop(id: String) -> Result<(), String> {
-    crate::interactions::cancel(&id);
-    let mut map = runs().lock().map_err(|e| e.to_string())?;
-    if let Some(run) = map.remove(&id) {
-        if let Ok(mut child) = run.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+    stop_generation(&id, None)
+}
+pub fn stop_generation(id: &str, expected: Option<&str>) -> Result<(), String> {
+    let map = runs().lock().map_err(|e| e.to_string())?;
+    if let Some(run) = map.get(id) {
+        if expected.is_some_and(|token| token != run.generation) {
+            return Ok(());
         }
-        // A cancelled tool can leave an inherited pipe open. Do not block Stop.
-        let deadline = Instant::now() + Duration::from_millis(500);
+        crate::interactions::cancel(id);
+        let mut child = run.child.lock().map_err(|e| e.to_string())?;
+        // Completed runs stay cached for their transcript. Their old process
+        // group ID may have been reused, so never signal it after completion.
+        #[cfg(unix)]
+        if !run.done.load(Ordering::SeqCst) {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+        }
+        if child.try_wait().map_err(|e| e.to_string())?.is_none() {
+            child.kill().map_err(|e| e.to_string())?;
+        }
+        child.wait().map_err(|e| e.to_string())?;
+        drop(child);
+        let deadline = Instant::now() + Duration::from_secs(2);
         while !run.text.drained() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
+        }
+        if !run.text.drained() {
+            return Err("Local output is still draining; retry Stop before moving".into());
         }
         run.done.store(true, Ordering::SeqCst);
     }
@@ -389,7 +421,11 @@ fn spawn_harness(
 }
 
 fn grok_args(prompt: &str) -> Vec<String> {
-    vec!["--prompt".into(), prompt.to_string()]
+    vec![
+        "--always-approve".into(),
+        "--prompt".into(),
+        prompt.to_string(),
+    ]
 }
 
 fn opencode_args(request: &StartRequest) -> Vec<String> {
@@ -433,14 +469,21 @@ fn spawn_claude(
     let mut cmd = Command::new(&request.bin);
     if plan.is_some() {
         cmd.args([
+            "--allow-dangerously-skip-permissions",
             "--permission-mode",
             "plan",
-            "--input-format",
-            "stream-json",
-            "--permission-prompt-tool",
-            "stdio",
         ]);
+    } else {
+        cmd.arg("--dangerously-skip-permissions");
     }
+    // Every turn needs a live permission channel, including resumed sessions.
+    // Print mode otherwise denies tool requests that need user approval.
+    cmd.args([
+        "--input-format",
+        "stream-json",
+        "--permission-prompt-tool",
+        "stdio",
+    ]);
     cmd.current_dir(&request.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -466,11 +509,12 @@ fn spawn_claude(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to start Claude Code: {e}"))?;
-    if let Some(plan) = plan {
+    {
         let mut stdin = child.stdin.take().ok_or("Claude stdin missing")?;
         let stdout = child.stdout.take().ok_or("Claude stdout missing")?;
         let mission_id = crate::interactions::session(&request.id);
-        let prompt = plan.to_owned();
+        let prompt = plan.unwrap_or(&request.prompt).to_owned();
+        let mut execution_approved = plan.is_none();
         let output = Arc::clone(text);
         let failures = Arc::clone(error);
         let guard = text.reader();
@@ -483,11 +527,13 @@ fn spawn_claude(
                     &json!({"type":"user","message":{"role":"user","content":prompt}}).to_string(),
                 )?;
                 let mut implement_after_result = false;
+                let mut claude_text = ClaudeText::default();
                 for line in BufReader::new(stdout).lines() {
                     let line = line.map_err(|e| e.to_string())?;
                     let Ok(event) = serde_json::from_str::<Value>(&line) else {
                         continue;
                     };
+                    output.claude_activity(&event);
                     if implement_after_result
                         && event["type"] == "assistant"
                         && event["message"]["content"]
@@ -506,7 +552,7 @@ fn spawn_claude(
                         && event["response"]["subtype"] == "error"
                     {
                         return Err(format!(
-                            "Native plan request failed: {}",
+                            "Claude control request failed: {}",
                             event["response"]["error"]
                         ));
                     }
@@ -529,10 +575,13 @@ fn spawn_claude(
                                 crate::interactions::ask(&mission_id, "plan", input.clone())?;
                             if answer["action"] == "accept" {
                                 implement_after_result = true;
+                                execution_approved = true;
                                 json!({"behavior":"allow","updatedInput":input})
                             } else {
                                 json!({"behavior":"deny","message":answer["feedback"].as_str().unwrap_or("Please revise the plan.")})
                             }
+                        } else if execution_approved {
+                            json!({"behavior":"allow","updatedInput":input})
                         } else {
                             {
                                 let answer = crate::interactions::ask(
@@ -549,14 +598,23 @@ fn spawn_claude(
                         };
                         write_line(&mut stdin,&json!({"type":"control_response","response":{"subtype":"success","request_id":event["request_id"],"response":response}}).to_string())?;
                     } else if event["type"] == "result" {
+                        if let Some(piece) = claude_text.consume(&event) {
+                            output.append(&piece);
+                        }
+                        if event["is_error"] == true {
+                            return Err(event["result"]
+                                .as_str()
+                                .unwrap_or("Claude ended with an error")
+                                .to_owned());
+                        }
                         if implement_after_result {
                             implement_after_result = false;
-                            write_line(&mut stdin,&json!({"type":"control_request","request_id":"orb-execute","request":{"subtype":"set_permission_mode","mode":"acceptEdits"}}).to_string())?;
+                            write_line(&mut stdin,&json!({"type":"control_request","request_id":"orb-execute","request":{"subtype":"set_permission_mode","mode":"bypassPermissions"}}).to_string())?;
                             write_line(&mut stdin,&json!({"type":"user","message":{"role":"user","content":"Implement the approved plan."}}).to_string())?;
                             continue;
                         }
                         break;
-                    } else if let Some(piece) = extract_text(&line) {
+                    } else if let Some(piece) = claude_text.consume(&event) {
                         output.append(&piece);
                     }
                 }
@@ -570,15 +628,6 @@ fn spawn_claude(
         pipe_output(None, child.stderr.take(), text, error, true);
         return Ok(child);
     }
-    if let Some(mut stdin) = child.stdin.take() {
-        let prompt = request.prompt.clone();
-        thread::spawn(move || {
-            let _ = stdin.write_all(prompt.as_bytes());
-            let _ = stdin.flush();
-        });
-    }
-    pipe_output(child.stdout.take(), child.stderr.take(), text, error, true);
-    Ok(child)
 }
 
 fn spawn_piped(
@@ -589,10 +638,18 @@ fn spawn_piped(
     parse_json: bool,
 ) -> Result<Child, String> {
     let mut command = Command::new(&request.bin);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     // Share the user's provider credentials/config, but not a database whose
     // schema may belong to a different OpenCode build (e.g. the desktop app).
     if request.harness == "opencode" && std::env::var_os("OPENCODE_DB").is_none() {
         command.env("OPENCODE_DB", "orb-local.db");
+    }
+    if request.harness == "opencode" {
+        command.env("OPENCODE_PERMISSION", r#"{"*":"allow"}"#);
     }
     command.env("NO_COLOR", "1");
     let mut child = command
@@ -1010,6 +1067,90 @@ fn write_line(stdin: &mut impl Write, line: &str) -> Result<(), String> {
     stdin.flush().map_err(|e| e.to_string())
 }
 
+/// Text deltas have no separator between independent Claude messages. Preserve
+/// protocol boundaries without inserting whitespace between token fragments.
+#[derive(Default)]
+struct ClaudeText {
+    emitted: bool,
+    boundary: bool,
+    message_emitted: bool,
+    message_id: Option<String>,
+}
+
+impl ClaudeText {
+    fn consume(&mut self, value: &Value) -> Option<String> {
+        if value["type"] == "result" && value["is_error"] != true && !self.emitted {
+            let text = value["result"]
+                .as_str()
+                .filter(|text| !text.trim().is_empty())?;
+            self.emitted = true;
+            return Some(text.to_owned());
+        }
+        let id = if value["type"] == "assistant" {
+            value["message"]["id"].as_str()
+        } else {
+            value["event"]["message"]["id"].as_str()
+        };
+        if let Some(id) = id {
+            if self.message_id.as_deref() != Some(id) {
+                self.message_id = Some(id.to_owned());
+                self.message_emitted = false;
+            }
+        }
+        if value["type"] == "assistant" && !self.message_emitted {
+            let text = value["message"]["content"]
+                .as_array()?
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if text.is_empty() {
+                return None;
+            }
+            let result = if self.emitted {
+                format!("\n\n{text}")
+            } else {
+                text
+            };
+            self.emitted = true;
+            self.message_emitted = true;
+            self.boundary = false;
+            return Some(result);
+        }
+        if value["type"] != "stream_event" {
+            return None;
+        }
+        let event = &value["event"];
+        match event["type"].as_str() {
+            Some("message_start") => {
+                self.boundary = self.emitted;
+                self.message_emitted = false;
+            }
+            Some("content_block_start") if event["content_block"]["type"] == "text" => {
+                self.boundary = self.emitted;
+            }
+            _ => {}
+        }
+        if event["delta"]["type"] != "text_delta" {
+            return None;
+        }
+        let text = event["delta"]["text"].as_str()?;
+        if text.is_empty() {
+            return None;
+        }
+        let result = if self.boundary {
+            format!("\n\n{text}")
+        } else {
+            text.to_owned()
+        };
+        self.boundary = false;
+        self.emitted = true;
+        self.message_emitted = true;
+        Some(result)
+    }
+}
+
 // Consume only protocol events representing new assistant output. Recursive
 // text extraction also captures user items, tool arguments and final snapshots.
 fn extract_text(line: &str) -> Option<String> {
@@ -1183,6 +1324,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn claude_final_result_fills_missing_stream_without_duplicates() {
+        let mut text = ClaudeText::default();
+        let result = json!({"type":"result","is_error":false,"result":"Recovered final"});
+        assert_eq!(text.consume(&result).as_deref(), Some("Recovered final"));
+        assert!(text.consume(&result).is_none());
+        let mut failed = ClaudeText::default();
+        assert!(failed
+            .consume(&json!({"type":"result","is_error":true,"result":"Rate limited"}))
+            .is_none());
+    }
+
+    #[test]
+    fn claude_snapshot_without_deltas_is_not_lost() {
+        let mut text = ClaudeText::default();
+        let event = json!({"type":"assistant","message":{"id":"a","content":[{"type":"text","text":"Final answer"}]}});
+        assert_eq!(text.consume(&event).as_deref(), Some("Final answer"));
+        assert!(text.consume(&event).is_none());
+        let next = json!({"type":"assistant","message":{"id":"b","content":[{"type":"text","text":"Next answer"}]}});
+        assert_eq!(text.consume(&next).as_deref(), Some("\n\nNext answer"));
+    }
+
+    #[test]
+    fn claude_text_preserves_tokens_and_separates_message_blocks() {
+        let mut text = ClaudeText::default();
+        let mut output = String::new();
+        for event in [
+            json!({"type":"message_start"}),
+            json!({"type":"content_block_start","content_block":{"type":"text"}}),
+            json!({"delta":{"type":"text_delta","text":"Bon"}}),
+            json!({"delta":{"type":"text_delta","text":"jour."}}),
+            json!({"type":"content_block_start","content_block":{"type":"tool_use"}}),
+            json!({"type":"message_start"}),
+            json!({"type":"content_block_start","content_block":{"type":"text"}}),
+            json!({"delta":{"type":"text_delta","text":""}}),
+            json!({"delta":{"type":"text_delta","text":"La suite."}}),
+            json!({"type":"content_block_start","content_block":{"type":"text"}}),
+            json!({"delta":{"type":"text_delta","text":"```rust\nfn main() {}\n```"}}),
+        ] {
+            if let Some(piece) = text.consume(&json!({"type":"stream_event","event":event})) {
+                output.push_str(&piece);
+            }
+        }
+        assert_eq!(
+            output,
+            "Bonjour.\n\nLa suite.\n\n```rust\nfn main() {}\n```"
+        );
+        assert!(text.consume(&json!({"type":"assistant","message":{"content":[{"type":"text","text":"duplicate"}]}})).is_none());
+    }
+
+    #[test]
     fn rejects_parent_and_secret_paths() {
         assert!(safe_rel("../etc/passwd").is_err());
         assert!(safe_rel("/abs").is_err());
@@ -1209,7 +1400,11 @@ mod tests {
     fn grok_and_opencode_args_match_the_pinned_flags() {
         assert_eq!(
             grok_args("hello"),
-            vec!["--prompt".to_string(), "hello".to_string()]
+            vec![
+                "--always-approve".to_string(),
+                "--prompt".to_string(),
+                "hello".to_string()
+            ]
         );
         let fresh = StartRequest {
             image_paths: vec![],
@@ -1380,6 +1575,48 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_claude_turn_allows_tools_without_prompting() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude-fixture");
+        std::fs::write(&bin, r#"#!/bin/sh
+read -r init
+read -r prompt
+printf '%s\n' '{"type":"control_request","request_id":"permission-1","request":{"subtype":"can_use_tool","tool_name":"Read","input":{"file_path":"/outside/AGENTS.md"}}}'
+read -r answer
+printf '%s' "$answer" > answer.json
+printf '%s\n' '{"type":"result"}'
+"#).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let id = format!("claude-permission-{}", uuid_like());
+        local_agents_start(StartRequest {
+            id: id.clone(),
+            harness: "claudecode".into(),
+            bin: bin.to_string_lossy().into_owned(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            prompt: "Read the repository instructions".into(),
+            model: None,
+            session_id: Some("existing-session".into()),
+            image_paths: vec![],
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !local_agents_poll(id.clone()).unwrap().done {
+            assert!(crate::interactions::local_interaction(id.clone())
+                .unwrap()
+                .is_none());
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        let answer: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("answer.json")).unwrap())
+                .unwrap();
+        assert_eq!(answer["response"]["response"]["behavior"], "allow");
+        runs().lock().unwrap().remove(&id);
+    }
+
     #[test]
     fn pasted_image_bytes_are_written_without_text_conversion() {
         let root = std::env::temp_dir().join(format!("orb-image-{}", uuid_like()));
@@ -1431,6 +1668,34 @@ mod tests {
         }
         local_agents_start(request.clone()).expect("a finished run must not block a new turn");
         local_agents_stop(request.id).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_transfer_heartbeat_cannot_stop_a_new_native_generation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("agent");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 10\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let id = format!("generation-test-{}", uuid_like());
+        local_agents_start(StartRequest {
+            id: id.clone(),
+            harness: "grok".into(),
+            bin: bin.to_string_lossy().into_owned(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            prompt: "test".into(),
+            model: None,
+            session_id: None,
+            image_paths: vec![],
+        })
+        .unwrap();
+        let generation = native_generation(&id).unwrap();
+        stop_generation(&id, Some("old-generation")).unwrap();
+        assert!(!local_agents_poll(id.clone()).unwrap().done);
+        stop_generation(&id, Some(&generation)).unwrap();
+        assert!(local_agents_poll(id.clone()).unwrap().done);
+        runs().lock().unwrap().remove(&id);
     }
 
     #[test]
@@ -1522,4 +1787,23 @@ mod plan_smoke {
             "approved plan did not execute"
         );
     }
+}
+
+pub fn workspace_busy(root: &std::path::Path) -> Result<bool, String> {
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    Ok(runs()
+        .lock()
+        .map_err(|e| e.to_string())?
+        .values()
+        .any(|run| {
+            !run.done.load(Ordering::SeqCst) && run.cwd.canonicalize().ok().as_ref() == Some(&root)
+        }))
+}
+
+pub fn native_generation(id: &str) -> Option<String> {
+    runs()
+        .lock()
+        .ok()?
+        .get(id)
+        .map(|run| run.generation.clone())
 }

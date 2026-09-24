@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "provider_id": "cerebras",
+  "access_profile": "api",
+  "source": "curated",
+  "observed_at": null,
+  "completeness": "partial",
+  "models": [
+    {
+      "id": "zai-glm-4.7",
+      "name": "GLM-4.7 (Cerebras)",
+      "description": "Most capable Cerebras-hosted model"
+    },
+    {
+      "id": "gpt-oss-120b",
+      "name": "GPT-OSS 120B",
+      "description": "Open-weight reasoning model, ultra-fast"
+    }
+  ]
+}

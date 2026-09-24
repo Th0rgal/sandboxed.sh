@@ -1,3 +1,7 @@
+import { ContextBadge } from "./ContextBadge";
+import { ContextHistory } from "./ContextHistory";
+import { readProjectFileVersion } from "./projectContext";
+import { cutMission, readCutMission, moveMission } from "./missionMove";
 import { ForkMission } from "./ForkMission";
 import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createSignal, onCleanup, onMount, createEffect, on } from "solid-js";
@@ -9,12 +13,16 @@ import { displayTitle } from "./goal";
 import { missionDestination, nodeLabel } from "./missionLaunch";
 import {
   isConnected,
+  getApiUrl,
   ApiError,
   connectionVersion,
   listProjectFiles,
   listProjectMissions,
   listProjects,
   updateProject,
+  renameMission,
+  archiveMission,
+  reopenMission,
   archiveProject,
   bumpProjects,
   createProjectCron,
@@ -32,7 +40,7 @@ import {
   type ControllerView as ControllerData,
 } from "./api";
 import { CronGlyph, untilLabel } from "./Controller";
-import { Dialog, PromptSheet } from "./Dialog";
+import { Dialog, DialogButton, PromptSheet } from "./Dialog";
 import { PopupMenu, type MenuEntry } from "./Menu";
 import { copyText } from "./clipboard";
 import { CronForm } from "./ControllerSettings";
@@ -203,14 +211,14 @@ export function LiveProjectsSection(p: {
   /** "+" on a project row: start a new agent in that project. */
   onNewAgent: (slug: string, path?: string) => void;
   /** "+" on the section header: create a project (opens the picker flow). */
-  onNewProject: () => void;
+  onNewProject: (anchor: HTMLButtonElement) => void;
 }) {
   const [projects, setProjects] = createSignal<ProjectSummary[]>([]);
   const [error, setError] = createSignal<string | null>(null);
   const [expanded, setExpanded] = createStore<Record<string, boolean>>({});
   /** Per project: whether finished missions are unfolded (default folded). */
   const [showDone, setShowDone] = createStore<Record<string, boolean>>({});
-  const LIVE = new Set(["active", "pending", "queued", "awaiting_user", "resuming", "running", "starting"]);
+  const LIVE = new Set(["active", "pending", "queued", "awaiting_user", "resuming", "running", "starting", "blocked", "paused", "waiting_background"]);
   const liveOf = (slug: string) => (missions[slug] ?? []).filter((m) => LIVE.has(m.status));
   const doneOf = (slug: string) => (missions[slug] ?? []).filter((m) => !LIVE.has(m.status));
   // Missions per project slug; file listings per `${slug}:${dirPath}`.
@@ -244,7 +252,7 @@ export function LiveProjectsSection(p: {
   const [cronFolder, setCronFolder] = createSignal("");
   const [newCron, setNewCron] = createSignal<string | null>(null);
   const [actionFocus, setActionFocus] = createSignal(true);
-  const [rename, setRename] = createSignal<{ slug: string; title: string } | null>(null);
+  const [rename, setRename] = createSignal<({ slug: string; title: string } | { missionId: string; title: string }) | null>(null);
   const [renameValue, setRenameValue] = createSignal("");
   const [renameError, setRenameError] = createSignal<string | null>(null);
   const [renaming, setRenaming] = createSignal(false);
@@ -344,6 +352,10 @@ export function LiveProjectsSection(p: {
         loadMissions(project.slug);
         loadController(project.slug);
         loadCrons(project.slug);
+        void loadDir(project.slug,"",true);
+        for (const key of Object.keys(expanded)) {
+          if(expanded[key] && key.startsWith(`${project.slug}:`))void loadDir(project.slug,key.slice(project.slug.length+1),true);
+        }
       }
     }, 10000);
     onCleanup(stop);
@@ -496,6 +508,13 @@ export function LiveProjectsSection(p: {
     setRenameValue(title);
     setRenameError(null);
   };
+  const beginMissionRename = (mission: Mission) => {
+    setMissionMenu(null);
+    setForkTarget(null);
+    setRename({ missionId: mission.id, title: mission.title ?? "" });
+    setRenameValue(mission.title ?? "");
+    setRenameError(null);
+  };
   const saveRename = async () => {
     const target = rename();
     const title = renameValue().trim();
@@ -504,7 +523,14 @@ export function LiveProjectsSection(p: {
     setRenaming(true);
     setRenameError(null);
     try {
-      await updateProject({ slug: target.slug, title });
+      if ("missionId" in target) {
+        await renameMission(target.missionId, title);
+        for (const slug of Object.keys(missions)) {
+          setMissions(slug, m => m.id === target.missionId, "title", title);
+        }
+      } else {
+        await updateProject({ slug: target.slug, title });
+      }
       bumpProjects();
       setRename(null);
     } catch (e) {
@@ -534,6 +560,10 @@ export function LiveProjectsSection(p: {
       ...(path ? [{ kind: "item" as const, label: "New file", icon: Ic.FileIcon, onClick: () => beginFile(slug, path) }] : []),
       { kind: "item", label: "New folder", icon: Ic.FolderIcon, onClick: () => beginFolder(slug, path) },
     ];
+    if (cutId()) items.push(
+      { kind: "sep" },
+      { kind: "item", label: "Move here", icon: Ic.PasteIcon, onClick: () => pasteMission(slug, path, true) },
+    );
     if (!path) items.push(
       { kind: "sep" },
       { kind: "item", label: "Project settings", icon: Ic.SlidersIcon, onClick: () => { setActionMenu(null); p.open(`ps:${slug}`); } },
@@ -542,10 +572,39 @@ export function LiveProjectsSection(p: {
     );
     return items;
   };
+  const archiveConversation = async (mission: Mission) => {
+    setActionError(null);
+    try {
+      await archiveMission(mission.id);
+      for (const slug of Object.keys(missions)) {
+        setMissions(slug, m => m.id === mission.id, "status", "acknowledged");
+      }
+      bumpProjects();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+    }
+  };
+  const reopenConversation = async (mission: Mission) => {
+    setActionError(null);
+    const version = connectionVersion();
+    try {
+      await reopenMission(mission.id);
+      if (version !== connectionVersion()) return;
+      for (const slug of Object.keys(missions)) setMissions(slug, m => m.id === mission.id, "status", "paused");
+      bumpProjects();
+    } catch (e) { setActionError(e instanceof Error ? e.message : String(e)); }
+  };
   /** Fork the clicked mission without changing the currently open conversation. */
   const missionMenuItems = (mission: Mission, x: number, y: number): MenuEntry[] => [
     { kind: "item", label: "Fork conversation", icon: Ic.BranchIcon, openOnHover: true, onClick: anchor => { const rect = anchor?.parentElement?.getBoundingClientRect(); setForkTarget({ mission, x: rect ? rect.right + 3 : x, y: anchor?.getBoundingClientRect().top ?? y }); } },
+    ...(["completed", "failed", "interrupted", "acknowledged", "cancelled"].includes(mission.status)
+      ? [{ kind: "item" as const, label: "Reopen", icon: Ic.ReopenIcon, onClick: () => void reopenConversation(mission) }] : []),
+    { kind: "item", label: "Move", icon: Ic.CutIcon, onClick: () => beginMove(mission.id) },
+    { kind: "item", label: "Rename", icon: Ic.PencilIcon, onClick: () => beginMissionRename(mission) },
     { kind: "item", label: "Copy mission ID", icon: Ic.CopyIcon, onClick: () => void copyMissionId(mission) },
+    ...(["awaiting_user", "blocked", "paused", "interrupted", "failed", "completed"].includes(mission.status)
+      ? [{ kind: "item" as const, label: "Archive", icon: Ic.ArchiveIcon, onClick: () => void archiveConversation(mission) }]
+      : []),
   ];
   /** Right-click handler shared by every agent row. Suppresses the native menu
    * and the sidebar-wide one without activating the row, so the open agent and
@@ -581,6 +640,58 @@ export function LiveProjectsSection(p: {
     job?: import("./api").ControllerJob; controller?: boolean;
   };
   type Node = TreeNode<RowData>;
+  const [cutId, setCutId] = createSignal<string | null>(null);
+  let moving = false;
+  let consumedCut = "";
+  let cutClipboard = "";
+  const beginMove = (id: string) => {
+    if (moving) return;
+    const version = connectionVersion();
+    void cutMission(id).then(text => {
+      if (version !== connectionVersion()) return;
+      cutClipboard = text; setCutId(id); setActionError(null);
+    }).catch(e => setActionError(String(e)));
+  };
+  const pasteMission = (slug: string, path: string, fromMenu = false) => {
+    if (moving) return;
+    moving = true;
+    const version = connectionVersion();
+    void (async () => {
+      const clipboard = fromMenu ? cutClipboard : await navigator.clipboard.readText();
+      if (clipboard === consumedCut) return;
+      const missionId = readCutMission(clipboard, getApiUrl());
+      if (!missionId || version !== connectionVersion()) return;
+      await moveMission(missionId, slug, path);
+      if (version !== connectionVersion()) return;
+      consumedCut = clipboard; cutClipboard = "";
+      setCutId(null); setActionError(null);
+      for (const source of Object.keys(missions)) setMissions(source, list => list.filter(m => m.id !== missionId));
+      setExpanded(slug, true);
+      if (path) setExpanded(`${slug}:${path}`, true);
+      setShowDone(path ? `${slug}:${path}` : slug, true);
+      await loadMissions(slug);
+      bumpProjects();
+    })().catch(e => setActionError(`Couldn’t move conversation: ${String(e)}`)).finally(() => { moving = false; });
+  };
+  const moveKey = (event: KeyboardEvent) => {
+    if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return;
+    const target = event.target as HTMLElement;
+    if (target.closest('input, textarea, [contenteditable="true"]')) return;
+    const id = target.closest<HTMLElement>('.tree-entry')?.dataset.treeId;
+    if (!id) return;
+    const find = (nodes: Node[]): RowData | undefined => {
+      for (const node of nodes) { if (node.id === id) return node.data; const child = node.children && find(node.children); if (child) return child; }
+    };
+    const row = find(tree());
+    if (!row) return;
+    if (event.key.toLowerCase() === 'x' && row.mission) {
+      event.preventDefault(); event.stopPropagation();
+      beginMove(row.mission.id);
+    } else if (event.key.toLowerCase() === 'v' && (row.kind === 'project' || row.kind === 'folder')) {
+      event.preventDefault(); event.stopPropagation();
+      pasteMission(row.slug, row.path ?? '');
+    } else if (event.key.toLowerCase() === 'c') setCutId(null);
+  };
   const missionFolder = (mission: Mission) => mission.tags?.find(t => t.startsWith("orb-folder:"))?.slice("orb-folder:".length) ?? "";
   const workNodes = (slug: string, path: string): Node[] => {
     const out: Node[] = (crons[slug] ?? []).filter(job => (job.folder ?? "") === path).map(job => ({ id: `pc:${slug}:${job.id}`, data: { kind: "cron", slug, label: job.name, job } }));
@@ -638,6 +749,7 @@ export function LiveProjectsSection(p: {
         <span class="row-ico"><Show when={row.expanded} fallback={<Ic.FolderIcon />}><Ic.FolderOpenIcon /></Show></span>
         <span class="row-label">{d.label}</span>
       </button>
+      <Show when={row.expanded}><ContextBadge slug={d.slug}/></Show>
       <button class="row-action" aria-label={`Project actions for ${d.label}`} title="Project actions"
         onPointerDown={e => setActionFocus(e.pointerType !== "mouse")}
         onKeyDown={e => { if (e.key === "Enter" || e.key === " ") setActionFocus(true); }}
@@ -648,7 +760,7 @@ export function LiveProjectsSection(p: {
       <Ic.BellIcon size={12} /><button class="cron-status-label" onClick={() => setCronInfo(d.slug)}>{cronUnsupported() ? "Crons need backend update" : cronRetryable[d.slug] ? "Crons temporarily unavailable" : "Crons unavailable"}</button>
       <Show when={!cronUnsupported() && cronRetryable[d.slug]}><button class="cron-retry" aria-label="Retry crons" title="Retry crons" onClick={() => void loadCrons(d.slug, true)}>↻</button></Show>
     </div>;
-    if (d.kind === "finished") return <button class="row done-toggle" aria-expanded={row.expanded} onClick={() => setShowDone(d.path ? `${d.slug}:${d.path}` : d.slug, !showDone[d.path ? `${d.slug}:${d.path}` : d.slug])}>
+    if (d.kind === "finished") return <button class="row done-toggle" title="Inactive conversations, including completed, failed, interrupted and archived missions" aria-expanded={row.expanded} onClick={() => setShowDone(d.path ? `${d.slug}:${d.path}` : d.slug, !showDone[d.path ? `${d.slug}:${d.path}` : d.slug])}>
       <span class="row-ico"><Show when={row.expanded} fallback={<Ic.FinishedIcon />}><Ic.FinishedOpenIcon /></Show></span><span class="row-label">{d.label}</span>
     </button>;
     if (d.kind === "folder") return <div class="row folder" onContextMenu={contextMenu}>
@@ -669,8 +781,8 @@ export function LiveProjectsSection(p: {
         </Show></span>
       </button>;
     }
-    const tip = rowTip.bind(rowDetail(d.label, [d.mission ? missionMachine(d.mission) : undefined]));
-    return <button class={`row ${d.kind === "mission" ? "agent" : "file"} ${d.mission && !LIVE.has(d.mission.status) ? "done" : ""} ${p.selected() === row.id ? "active" : ""}`} {...tip}
+    const tip = rowTip.bind(rowDetail(d.label, [d.mission ? missionMachine(d.mission) : undefined, d.mission?.backend, d.mission?.model_override, d.mission?.id]));
+    return <button class={`row ${d.kind === "mission" ? "agent" : "file"} ${d.mission && !LIVE.has(d.mission.status) ? "done" : ""} ${d.mission?.id === cutId() ? "mission-cut" : ""} ${p.selected() === row.id ? "active" : ""}`} {...tip}
       onPointerEnter={e => { tip.onPointerEnter(e); if (d.mission) void loadTranscript(d.mission.id).catch(() => {}); else cachePrefetch(row.id, () => readProjectFile(d.slug, d.path!).then(text => cachePut(row.id, text))); }} onContextMenu={e => { if (d.mission) onMissionContext(e, d.mission); }} onClick={() => p.open(row.id)}>
       <span class="row-ico glyph"><Show when={d.mission} fallback={<Ic.FileIcon />}>{m => <p.StatusGlyph agent={{ status: p.missionGlyph(m().status) }} busy={false} />}</Show></span>
       <span class="row-label">{d.label}</span><MachineBadge name={d.mission ? missionMachine(d.mission) : undefined} />
@@ -681,7 +793,7 @@ export function LiveProjectsSection(p: {
     <>
       <div class="section section-row">
         <span>Projects</span>
-        <button class="section-add" title="New project" onClick={() => p.onNewProject()}>
+        <button class="section-add" title="New project" onClick={e => { e.currentTarget.focus(); p.onNewProject(e.currentTarget); }}>
           <Ic.PlusIcon size={13} />
         </button>
       </div>
@@ -690,7 +802,7 @@ export function LiveProjectsSection(p: {
       </Show>
       <Show when={cronWarning()}><ErrorNotice error={cronWarning()!} /></Show>
       <Show when={actionError()}><ErrorNotice error={actionError()!} /></Show>
-      <SidebarTree nodes={tree()} label="Projects" selected={p.selected()} render={renderRow} />
+      <div onKeyDown={moveKey}><SidebarTree nodes={tree()} label="Projects" selected={p.selected()} render={renderRow} /></div>
       <Show when={projects().length === 0 && !error()}>
         <div class="row note">No projects on the core backend.</div>
       </Show>
@@ -698,7 +810,7 @@ export function LiveProjectsSection(p: {
         {(menu) => <PopupMenu {...menu()} focus={actionFocus()} items={menuItems(menu().slug, menu().path)} onClose={() => setActionMenu(null)} />}
       </Show>
       <Show when={missionMenu()}>
-        {(menu) => <PopupMenu x={menu().x} y={menu().y} focus={false} items={missionMenuItems(menu().mission, menu().x, menu().y)} onClose={() => { setForkTarget(null); setMissionMenu(null); }}>
+        {(menu) => <PopupMenu x={menu().x} y={menu().y} focus={false} items={missionMenuItems(menu().mission, menu().x, menu().y)} onDismissSubmenu={() => setForkTarget(null)} onClose={() => { setForkTarget(null); setMissionMenu(null); }}>
           <Show when={forkTarget()}>{target =>
             <ForkMission mission={target().mission} choices={p.harnessChoices} destination={missionDestination(target().mission)}
               position={{ x: target().x, y: target().y }} onClose={() => setForkTarget(null)}
@@ -718,9 +830,9 @@ export function LiveProjectsSection(p: {
         {(target) => (
           <PromptSheet
             title="Rename"
-            hint={target().slug}
-            label="Project name"
-            placeholder="Project name"
+            hint={"slug" in target() ? (target() as { slug: string }).slug : undefined}
+            label={"missionId" in target() ? "Mission name" : "Project name"}
+            placeholder={"missionId" in target() ? "Mission name" : "Project name"}
             value={renameValue()}
             onInput={setRenameValue}
             action="Save"
@@ -769,11 +881,11 @@ export function LiveProjectsSection(p: {
           />
         )}
       </Show>
-      <Show when={cronInfo()}>{(slug) => <Dialog title="Project crons" onClose={() => setCronInfo(null)} footer={<><button class="s-btn sm" onClick={() => setCronInfo(null)}>Close</button><button class="s-btn sm" disabled={cronChecking()} onClick={async () => { if (!isConnected()) return; const version = connectionVersion(); setCronChecking(true); await loadCrons(slug(), true); if (!currentConnection(version)) return; setCronChecking(false); if (!cronUnsupported() && !cronErrors[slug()]) setCronInfo(null); }}>Check again</button></>}>
+      <Show when={cronInfo()}>{(slug) => <Dialog title="Project crons" onClose={() => setCronInfo(null)} footer={<><DialogButton disabled={cronChecking()} onClick={async () => { if (!isConnected()) return; const version = connectionVersion(); setCronChecking(true); await loadCrons(slug(), true); if (!currentConnection(version)) return; setCronChecking(false); if (!cronUnsupported() && !cronErrors[slug()]) setCronInfo(null); }}>Check again</DialogButton></>}>
         <p>{cronUnsupported() ? "This backend does not support project crons yet. Update the connected backend, then choose Check again. Your canonical controller and existing project content remain available." : cronRetryable[slug()] ? "Project crons could not refresh. Previously loaded jobs are retained. Try again when the scheduler is available." : "The backend rejected this cron request. Check backend access and configuration, then check again. Previously loaded jobs are retained."}</p>
       </Dialog>}</Show>
       <Show when={newCron()}>
-        {(slug) => <Dialog wide title={cronFolder() ? `New cron · ${cronFolder()}` : "New cron"} onClose={() => !makingCron() && setNewCron(null)} footer={<span>Unfinished drafts are kept until saved or discarded.</span>}>
+        {(slug) => <Dialog size="wide" busy={makingCron()} title={cronFolder() ? `New cron · ${cronFolder()}` : "New cron"} onClose={() => !makingCron() && setNewCron(null)} footer={<span>Unfinished drafts are kept until saved or discarded.</span>}>
           <CronForm creating deliveryRoute={{ ready: cronDefaults()?.route_ready ?? false, loading: !cronDefaults() && !defaultsError(), error: defaultsError() }} onBusyChange={setMakingCron} draftKey={`create:${slug()}:${cronFolder()}`} view={{ slug: slug(), job: { id: "", name: "", schedule: "every 1h", enabled: true, failure_streak: 0 }, runs: [] }}
             save={async (draft) => getProjectCronFromJob(slug(), await createProjectCron(slug(), { ...draft, folder: cronFolder() }))}
             onClose={() => setNewCron(null)} onSaved={(view, warning) => {
@@ -804,38 +916,41 @@ export function ProjectFileView(p: { slug: string; path: string }) {
   const setEditing = setMdSource;
   const [state, setState] = createSignal<"loading" | "saved" | "saving" | "error">(cached != null ? "saved" : "loading");
   const [error, setError] = createSignal<string | null>(null);
+  let revision: number | undefined;
+  let saving = false;
+  let halted = false;
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   cacheRemember(fileKey());
 
+  let editVersion=0;
+  const reload = () => {const version=editVersion;return readProjectFileVersion(p.slug,p.path).then(row=>{if(version!==editVersion || pending!==null || saving)return;revision=row.revision;setText(row.content);cachePut(fileKey(),row.content);setState("saved");setError(null);halted=false;}).catch(e=>{setError(String(e));setState("error");});};
   onMount(() => {
-    cacheLoad(fileKey(), () => readProjectFile(p.slug, p.path))
-      .then((content) => {
-        setText(content);
-        setState("saved");
-      })
-      .catch((e) => {
-        setError(e instanceof Error ? e.message : String(e));
-        setState("error");
-      });
+    void reload();
+    const timer=setInterval(()=>{if(pending===null&&!saving&&!halted&&!editing())void reload();},5000);
+    onCleanup(()=>clearInterval(timer));
   });
   let pending: string | null = null;
   const flush = () => {
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = undefined;
-    if (pending === null) return;
+    if (pending === null || saving || halted) return;
+    saving = true;
     const t = pending;
     pending = null;
-    writeProjectFile(p.slug, p.path, t)
-      .then(() => { cachePut(fileKey(), t); setState("saved"); })
+    writeProjectFile(p.slug, p.path, t, revision)
+      .then(result => { revision=result.revision; cachePut(fileKey(), t); setState(pending === null ? "saved" : "saving"); })
       .catch((e) => {
+        halted = true;
+        if (pending === null) pending = t;
         setError(e instanceof Error ? e.message : String(e));
         setState("error");
-      });
+      }).finally(() => { saving=false; if (pending !== null && !halted) flush(); });
   };
   // Don't lose a debounced edit when the user switches files mid-save.
   onCleanup(flush);
 
   const onInput = (t: string) => {
+    editVersion++;
     setText(t);
     setState("saving");
     pending = t;
@@ -849,7 +964,9 @@ export function ProjectFileView(p: { slug: string; path: string }) {
     <>
       <div class="pf-bar">
         <span class="pf-path">{p.slug}/{p.path}</span>
+        <ContextBadge slug={p.slug}/>
         <span class="dlg-spacer" />
+        <ContextHistory slug={p.slug} path={p.path} onRestore={() => { if(pending===null&&!saving) void reload(); }}/>
         <Show when={state() === "saving"}>
           <span class="pf-state">Saving…</span>
         </Show>
@@ -876,6 +993,7 @@ export function ProjectFileView(p: { slug: string; path: string }) {
         }
       >
         <div class="file-view">
+          <Show when={state() === "error"}><ErrorNotice error={error()!}/></Show>
           <Show when={text() !== null} fallback={<p class="s-lead shimmer">Loading {name()}…</p>}>
             <MdSource text={text() ?? ""} onInput={onInput} />
           </Show>

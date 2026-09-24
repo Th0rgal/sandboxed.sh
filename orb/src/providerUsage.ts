@@ -20,8 +20,18 @@ export function usageWindows(u: ProviderUsage) {
 }
 
 export function effectiveProviderStatus(a: AIProvider, usage?: ProviderUsage) {
-  if (usage?.status === "needs_reauth") return "needs_reauth";
+  if (a.status.type === "needs_reauth" || usage?.status === "needs_reauth") return "needs_reauth";
   if (usage?.error) return "error";
   if (usage && usageWindows(usage).some(window => window.used >= 1)) return "quota_exhausted";
   return a.status.type;
+}
+
+/** Match the data actually rendered in UsageDetail, not an empty cache object. */
+export function hasProviderUsageDetails(u?: ProviderUsage): boolean {
+  if (!u) return false;
+  return !!(u.error || u.status === "needs_reauth" || u.account_email || u.account_name || u.organization || u.unified_status
+    || (u.provider_type === "anthropic" && (u.unified_5h_utilization != null || u.unified_7d_utilization != null))
+    || (u.provider_type === "openai" && ((u.codex_primary_used_percent != null && u.codex_primary_window_minutes !== 0) || u.requests_limit != null))
+    || (u.provider_type === "minimax" && u.model_usage?.length)
+    || (u.provider_type === "zai" && u.zai_tokens_percentage != null));
 }

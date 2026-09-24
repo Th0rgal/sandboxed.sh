@@ -1,6 +1,7 @@
+import { contextManifest } from "./projectContext";
 import { getProjectController, listProjectFiles, type MissionAttachment } from "./api";
 
-export type AttachKind = "file" | "folder" | "controller";
+export type AttachKind = "file" | "folder" | "controller" | "context";
 
 export interface AttachChip {
   id: string;
@@ -12,7 +13,7 @@ export interface AttachChip {
 export interface AttachItem {
   id: string;
   kind: AttachKind;
-  section: "Files" | "Folders" | "Controller";
+  section: "Files" | "Folders" | "Controller" | "Context";
   path?: string;
   label: string;
 }
@@ -27,9 +28,9 @@ export function atQuery(text: string, caret: number): { open: boolean; query: st
 }
 
 export function filterAttach(items: AttachItem[], query: string): AttachItem[] {
-  if (!query) return items;
+  if (!query) return items.slice(0,100);
   const q = query.replace(/^@/, "");
-  return items.filter((it) => it.label.toLowerCase().includes(q) || (it.path ?? "").toLowerCase().includes(q));
+  return items.filter((it) => it.label.toLowerCase().includes(q) || (it.path ?? "").toLowerCase().includes(q)).slice(0,100);
 }
 
 export function chipToAttachment(chip: AttachChip): MissionAttachment {
@@ -100,11 +101,15 @@ export function mentionedChips(text: string, items: AttachItem[]): AttachChip[] 
   const chips: AttachChip[] = [];
   const seen = new Set<string>();
   for (const mention of scanMentions(text)) {
-    const bare = mention.value.replace(/\/$/, "");
+    const bare = (mention.raw.startsWith('@"') ? mention.value : trimBare(mention.value)).replace(/\/$/, "");
     const item =
       bare.toLowerCase() === CONTROLLER_MENTION && controller
         ? controller
         : byPath.get(bare) ?? byPath.get(trimBare(bare).replace(/\/$/, ""));
+    if (bare === "context" || bare.startsWith("context/")) {
+      if (!seen.has(bare)) { seen.add(bare); chips.push({id:`context:${bare}`,kind:"context",path:bare,label:bare}); }
+      continue;
+    }
     // An unknown `@word` is ordinary prose, not a silent attachment.
     if (!item || seen.has(item.id)) continue;
     seen.add(item.id);
@@ -134,6 +139,11 @@ export function insertMention(
 
 export async function loadAttachItems(slug: string): Promise<AttachItem[]> {
   const items: AttachItem[] = [];
+  let context: AttachItem[] = [];
+  try {
+    const manifest=await contextManifest(slug);
+    context=[{id:"context:root",kind:"context",path:"context",label:"context/",section:"Context"},...Object.entries(manifest.entries).map(([path,entry])=>({id:`context:${path}`,kind:"context" as const,path:`context/${path}`,label:`context/${path}${entry.directory?"/":""}`,section:"Context" as const}))];
+  } catch { /* Older servers do not advertise synchronized context. */ }
   try {
     const controller = await getProjectController(slug, 1);
     if (controller.job) {
@@ -148,7 +158,7 @@ export async function loadAttachItems(slug: string): Promise<AttachItem[]> {
     /* no cron */
   }
   await walkFiles(slug, "", items, 0);
-  return items;
+  return [...context,...items];
 }
 
 async function walkFiles(slug: string, path: string, items: AttachItem[], depth: number) {

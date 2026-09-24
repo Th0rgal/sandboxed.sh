@@ -14,6 +14,7 @@ pub(crate) mod dispatch_admission;
 pub(crate) mod dispatch_admission_tests;
 pub(crate) mod execution_ownership;
 pub mod fork;
+pub(crate) mod machine_transfer;
 mod remote_grok;
 #[cfg(test)]
 use dispatch_admission::admit_dispatch;
@@ -5123,6 +5124,9 @@ pub async fn post_message(
     }
     let control = control_for_user(&state, &user).await;
     if let Some(mid) = target_mission_id {
+        machine_transfer::guard(&control.mission_store, mid)
+            .await
+            .map_err(internal_error)?;
         if mission_is_client_placed(&control, mid)
             .await
             .map_err(internal_error)?
@@ -5137,7 +5141,10 @@ pub async fn post_message(
                 .await
                 .map_err(internal_error)?
         {
-            if req.attachments.as_ref().is_some_and(|a| !a.is_empty()) {
+            if req.attachments.as_ref().is_some_and(|a| {
+                a.iter()
+                    .any(|item| item.kind != crate::api::mission_payload::AttachmentKind::Context)
+            }) {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     "remote follow-up attachments are not supported".into(),
@@ -6465,7 +6472,7 @@ pub async fn list_missions(
         user_wait_starts_for_runs(control.mission_store.as_ref(), active_runs.values()).await;
     let (remote_handles, remote_outcomes) = remote_job_projection_inputs(&state).await;
     let now = chrono::Utc::now();
-    let values = missions
+    let mut values: Vec<serde_json::Value> = missions
         .into_iter()
         .map(|mission| {
             let value = serde_json::to_value(&mission).unwrap_or(serde_json::Value::Null);
@@ -6489,6 +6496,16 @@ pub async fn list_missions(
             )
         })
         .collect();
+    for value in &mut values {
+        if let Some(id) = value["id"].as_str().and_then(|s| Uuid::parse_str(s).ok()) {
+            if let Some(t) = machine_transfer::committed(&control.mission_store, id)
+                .await
+                .map_err(internal_error)?
+            {
+                machine_transfer::project(value, &t);
+            }
+        }
+    }
     Ok(Json(values))
 }
 
@@ -7499,6 +7516,12 @@ pub async fn get_mission(
                     chrono::Utc::now(),
                 ),
             );
+            if let Some(t) = machine_transfer::committed(&control.mission_store, id)
+                .await
+                .map_err(internal_error)?
+            {
+                machine_transfer::project(&mut value, &t);
+            }
             let host_configured =
                 state.config.spark_arbiter_url.is_some() || state.config.spark_ssh_target.is_some();
             let enabled = workspace
@@ -10372,7 +10395,11 @@ pub async fn create_mission(
     }
 
     if let Some(attachments) = req.attachments.as_ref().filter(|a| !a.is_empty()) {
-        if req.remote_node_id.is_some() {
+        if req.remote_node_id.is_some()
+            && attachments
+                .iter()
+                .any(|item| item.kind != crate::api::mission_payload::AttachmentKind::Context)
+        {
             return Err((
                 StatusCode::BAD_REQUEST,
                 "remote launch attachments are not supported".into(),
@@ -13271,8 +13298,32 @@ async fn submit_leased_remote_job(
     job_id: Uuid,
     plan: &RemoteHarnessPlan,
 ) -> Result<Mission, String> {
+    let mut resolved_plan = plan.clone();
+    let prompt = match &mut resolved_plan {
+        RemoteHarnessPlan::Codex { prompt, .. }
+        | RemoteHarnessPlan::Grok { prompt, .. }
+        | RemoteHarnessPlan::ClaudeCode { prompt, .. }
+        | RemoteHarnessPlan::OpenCode { prompt, .. } => Some(prompt),
+        RemoteHarnessPlan::Raw { .. } => None,
+    };
+    if let Some(prompt) = prompt {
+        if super::context_execution::has_mentions(prompt) {
+            let project = mission
+                .project
+                .project
+                .as_deref()
+                .ok_or("Context references require a project")?;
+            *prompt = super::context_execution::remote(state, project, &node, prompt).await?;
+        }
+    }
+    let plan = &resolved_plan;
     let workspace_prefix =
-        fork::workspace_prefix(control, mission, &node.id, &state.config.working_dir).await?;
+        if let Some(t) = machine_transfer::committed(&control.mission_store, mission.id).await? {
+            let root = t.destination_root.ok_or("Transferred workspace missing")?;
+            format!("cd -- {} || exit 78; ", shell_single_quote(&root))
+        } else {
+            fork::workspace_prefix(control, mission, &node.id, &state.config.working_dir).await?
+        };
     if let RemoteHarnessPlan::Grok {
         new_session_id: Some(session_id),
         resume_session_id: None,
@@ -15202,6 +15253,8 @@ async fn mission_is_client_placed(control: &ControlState, id: Uuid) -> Result<bo
 
 #[derive(Debug, Deserialize)]
 pub struct ClientTranscriptRequest {
+    pub run_id: Option<Uuid>,
+    pub generation: Option<u64>,
     pub id: Uuid,
     /// `user` or `assistant`.
     pub role: String,
@@ -15210,6 +15263,8 @@ pub struct ClientTranscriptRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct ClientStatusRequest {
+    pub run_id: Option<Uuid>,
+    pub generation: Option<u64>,
     pub status: String,
 }
 
@@ -15236,6 +15291,7 @@ pub async fn append_client_transcript(
             "transcript append is only for client-placed missions".into(),
         ));
     }
+    machine_transfer::check_client_receipt(&control, id, req.run_id, req.generation).await?;
     let event = match req.role.as_str() {
         "user" => AgentEvent::UserMessage {
             id: req.id,
@@ -15245,7 +15301,7 @@ pub async fn append_client_transcript(
             source: Some(format!("orb-client:{}", user.id)),
         },
         "assistant" => AgentEvent::AssistantMessage {
-            id: req.id,
+            id: req.run_id.unwrap_or(req.id),
             content,
             success: true,
             cost_cents: 0,
@@ -15303,11 +15359,20 @@ pub async fn set_client_mission_status(
             "status updates of this kind are only for client-placed missions".into(),
         ));
     }
+    let run =
+        machine_transfer::check_client_receipt(&control, id, req.run_id, req.generation).await?;
     control
         .mission_store
         .update_mission_status_with_reason(id, status, Some("client_runner"))
         .await
         .map_err(internal_error)?;
+    if let Some(run) = run {
+        control
+            .mission_store
+            .finish_mission_run(run.run_id, run.generation, Some("client_runner"))
+            .await
+            .map_err(internal_error)?;
+    }
     let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
         completion: None,
         execution: None,
@@ -16591,6 +16656,18 @@ pub async fn cancel_mission(
     let (tx, rx) = oneshot::channel();
 
     let control = control_for_user(&state, &user).await;
+    if mission_is_client_placed(&control, mission_id)
+        .await
+        .map_err(internal_error)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Stop this mission on its Orb computer so termination can be confirmed".into(),
+        ));
+    }
+    machine_transfer::guard(&control.mission_store, mission_id)
+        .await
+        .map_err(internal_error)?;
     control
         .cmd_tx
         .send(ControlCommand::CancelMission {
@@ -16618,6 +16695,9 @@ async fn finish_detached_run_for_cancel(
     let Some(run) = mission_store.get_active_mission_run(mission_id).await? else {
         return Ok(false);
     };
+    if run.owner_actor_id.starts_with("orb-client:") {
+        return Err("Orb must confirm native termination before releasing this run".into());
+    }
     mission_store
         .heartbeat_mission_run(
             run.run_id,
@@ -16659,6 +16739,15 @@ pub async fn pause_mission(
 ) -> Result<Json<Mission>, (StatusCode, String)> {
     let actor = resolve_actor(body.and_then(|b| b.0.actor), &user);
     let control = control_for_user(&state, &user).await;
+    if mission_is_client_placed(&control, mission_id)
+        .await
+        .map_err(internal_error)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Stop this mission on its Orb computer".into(),
+        ));
+    }
     let mission = control
         .mission_store
         .get_mission(mission_id)
@@ -16917,6 +17006,9 @@ pub async fn resume_mission(
     let actor = resolve_actor(request.actor.clone(), &user);
 
     let control = control_for_user(&state, &user).await;
+    machine_transfer::guard(&control.mission_store, mission_id)
+        .await
+        .map_err(internal_error)?;
     if mission_is_client_placed(&control, mission_id)
         .await
         .map_err(internal_error)?
@@ -21168,6 +21260,11 @@ async fn control_actor_loop(
     // below re-drives task-mode missions (assistant-mode missions remain idle).
     if let Ok(inherited_runs) = mission_store.list_active_mission_runs().await {
         for run in inherited_runs {
+            // Orb owns this native process. A Core restart cannot prove it
+            // stopped; retain its fence until the computer confirms termination.
+            if run.owner_actor_id.starts_with("orb-client:") {
+                continue;
+            }
             if run.execution_state == MissionExecutionState::WaitingRemoteJob {
                 let mission_status = match mission_store.get_mission(run.mission_id).await {
                     Ok(Some(mission)) => mission.status,

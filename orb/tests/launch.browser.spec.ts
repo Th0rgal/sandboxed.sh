@@ -59,6 +59,11 @@ async function setup(page:Page, options:{reject?:boolean;legacy?:boolean;remoteS
  });
  await page.goto("/");
  await expect(page.getByRole("button",{name:"Grok",exact:true})).toBeVisible();
+ // These scenarios exercise the named project's context; new sessions now default to Default.
+ if (!options.failed) {
+  await page.getByRole("button",{name:"Choose project",exact:true}).click();
+  await page.getByRole("option",{name:"Test",exact:true}).click();
+ }
  return {posts,attachmentReads,releasePost,releaseHistory,setSuccess:()=>{fail=false;},listReads:()=>listReads,fleetReads:()=>fleetReads};
 }
 async function chooseRemote(page:Page){await page.getByRole("button",{name:/Core \(agent-core\)/}).click();await page.getByRole("button",{name:/dgx-spark online/}).click();}
@@ -426,4 +431,23 @@ test("disk refusal stays below the draft with readable details and a dismiss act
  await page.getByRole("button", {name:"Close sidebar", exact:true}).click();
  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
  await alert.getByRole("button",{name:"Dismiss error"}).click();await expect(alert).toHaveCount(0);await expect(input).toHaveValue("Summarize the Pareto audit progress");
+});
+
+test('follow-up composer does not alternate layouts while typing wrapped text',async({page})=>{
+ const state=await setup(page);state.releasePost();
+ await composerInput(page).fill('hello');await composerInput(page).press('Enter');
+ const input=page.getByPlaceholder('Send follow-up');await expect(input).toBeVisible();
+ const shapes=await input.evaluate((el)=>{
+  const ta=el as HTMLTextAreaElement, box=ta.closest('.composer')!;
+  const result:boolean[]=[];
+  for(let i=1;i<=280;i++){
+   ta.value='suggest a message to send him about the properties '.repeat(8).slice(0,i);
+   ta.dispatchEvent(new Event('input',{bubbles:true}));
+   result.push(box.classList.contains('tall'));
+  }
+  return result;
+ });
+ const first=shapes.indexOf(true);expect(first).toBeGreaterThan(0);
+ expect(shapes.slice(first).every(Boolean)).toBe(true);
+ await input.fill('short');await expect(page.locator('.composer.tall')).toHaveCount(0);
 });

@@ -10,7 +10,7 @@ import { ControllerSkeleton } from "./Skeleton";
  * page: the two are enforced by different code paths, and raising this one does
  * not clear a project's "too many unfinished agents" refusal.
  */
-export function ExecutionSettings(p: { onOpenPage?: (id: string) => void }) {
+export function ExecutionSettings(p: { onOpenPage?: (id: string) => void; inline?: boolean }) {
   const [settings, setSettings] = createSignal<GlobalSettings | null>(null);
   const [loaded, setLoaded] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
@@ -70,26 +70,24 @@ export function ExecutionSettings(p: { onOpenPage?: (id: string) => void }) {
   };
 
   return (
-    <div class="scroll">
-      <div class="col ps-page">
-        <div class="page-head">
+    <div class={p.inline ? "execution-inline" : "scroll"}>
+      <div class={p.inline ? "" : "col ps-page"}>
+        <Show when={!p.inline}><div class="page-head">
           <h2>Execution</h2>
         </div>
-        <p class="s-lead">Limits that apply to the whole backend, across every project.</p>
+        <p class="s-lead">Limits that apply to the whole backend, across every project.</p></Show>
         <Show when={error()}>
           <ErrorNotice error={error()!} />
         </Show>
         <Show when={loaded()} fallback={<ControllerSkeleton />}>
-          <section class="s-sec">
-            <h3>Concurrency</h3>
-            <div class="s-card">
+          <section class={p.inline ? "" : "s-sec"}>
+            <Show when={!p.inline}><h3>Concurrency</h3></Show>
+            <div class={p.inline ? "" : "s-card"}>
               <div class="s-row">
                 <div class="s-row-text">
                   <div class="s-row-title">Maximum agents across all projects</div>
                   <div class="s-row-desc">
-                    How many agents the backend runs at once in total. Each project can also have its own, lower
-                    limit on its settings page — when a project refuses to start another agent, that project's
-                    limit is the one to change, not this.
+                    Total agents running across the backend. Each project can set a lower limit in its own settings.
                   </div>
                 </div>
                 <div class="s-row-ctrl ps-cap-ctrl">

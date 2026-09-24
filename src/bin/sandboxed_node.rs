@@ -148,8 +148,16 @@ async fn main() -> anyhow::Result<()> {
         runner,
         managed_auth,
     });
+    sandboxed_sh::node::project_context::start(state.work_root.clone());
     let app = Router::new()
+        .route("/project-context/prepare", post(prepare_project_context))
         .route("/heartbeat", get(heartbeat))
+        .route("/machine-transfer/capabilities", get(transfer_capabilities))
+        .route("/machine-transfer/browse", post(transfer_browse))
+        .route(
+            "/machine-transfer/files",
+            post(transfer_files).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
         .route(
             "/uploads",
             post(upload_file).layer(DefaultBodyLimit::max(sandboxed_sh::uploads::MAX_BODY_BYTES)),
@@ -624,6 +632,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn machine_transfer_node_protocol_copies_and_browses_the_verified_workspace() {
+        use sandboxed_sh::machine_transfer::{Manifest, Operation};
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().into()).await;
+        let mid = Uuid::new_v4();
+        let tid = Uuid::new_v4();
+        let root = dir.path().join(mid.to_string());
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("proof.txt"), "complete proof").unwrap();
+        let request = |side: &str, operation| TransferFilesRequest {
+            mission_id: mid,
+            transfer_id: tid,
+            source_transfer: None,
+            source_mission_id: None,
+            side: side.into(),
+            operation,
+        };
+        assert!(transfer_files(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(request("source", Operation::Snapshot))
+        )
+        .await
+        .is_err());
+        let m = transfer_files(
+            State(state.clone()),
+            auth_headers("node-secret"),
+            Json(request("source", Operation::Snapshot)),
+        )
+        .await
+        .unwrap()
+        .0;
+        let manifest: Manifest = serde_json::from_value(m).unwrap();
+        transfer_files(
+            State(state.clone()),
+            auth_headers("node-secret"),
+            Json(request("destination", Operation::Stage { manifest })),
+        )
+        .await
+        .unwrap();
+        let data = transfer_files(
+            State(state.clone()),
+            auth_headers("node-secret"),
+            Json(request(
+                "source",
+                Operation::Read {
+                    path: "proof.txt".into(),
+                    offset: 0,
+                },
+            )),
+        )
+        .await
+        .unwrap()
+        .0["data"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        transfer_files(
+            State(state.clone()),
+            auth_headers("node-secret"),
+            Json(request(
+                "destination",
+                Operation::Write {
+                    path: "proof.txt".into(),
+                    offset: 0,
+                    data,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        transfer_files(
+            State(state.clone()),
+            auth_headers("node-secret"),
+            Json(request("destination", Operation::Verify)),
+        )
+        .await
+        .unwrap();
+        let browse = TransferBrowseRequest {
+            transfer_id: tid,
+            operation: sandboxed_sh::file_browser::Request {
+                action: "read".into(),
+                path: "proof.txt".into(),
+                ..Default::default()
+            },
+        };
+        let read = transfer_browse(
+            State(state.clone()),
+            auth_headers("node-secret"),
+            Json(browse),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(read["content"], "complete proof");
+        state
+            .jobs
+            .create(Uuid::new_v4(), mid, "{}".into(), "unused".into())
+            .await
+            .unwrap();
+        assert!(transfer_files(
+            State(state),
+            auth_headers("node-secret"),
+            Json(request("source", Operation::Snapshot))
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
     async fn check_auth_accepts_current_and_previous_tokens() {
         let work_root = tempfile::tempdir().expect("tempdir");
         let state = test_state(work_root.path().to_path_buf()).await;
@@ -991,4 +1109,121 @@ async fn upload_file(
     .map_err(|e| internal_error(e.into()))?
     .map(Json)
     .map_err(|e| (StatusCode::BAD_REQUEST, e))
+}
+
+#[derive(serde::Deserialize)]
+struct TransferFilesRequest {
+    mission_id: Uuid,
+    transfer_id: Uuid,
+    source_transfer: Option<Uuid>,
+    source_mission_id: Option<Uuid>,
+    side: String,
+    operation: sandboxed_sh::machine_transfer::Operation,
+}
+async fn transfer_capabilities(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    let mut harnesses = Vec::new();
+    for bin in ["grok", "codex", "opencode"] {
+        let found = std::env::var_os("PATH")
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join(bin).is_file()));
+        if found && (bin != "grok" || state.managed_auth.advertised().iter().any(|p| p == "grok")) {
+            harnesses.push(bin);
+        }
+    }
+    Ok(Json(serde_json::json!({"version":1,"harnesses":harnesses})))
+}
+async fn transfer_files(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    Json(req): Json<TransferFilesRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    if !matches!(req.side.as_str(), "source" | "destination") {
+        return Err((StatusCode::BAD_REQUEST, "Invalid side".into()));
+    }
+    if state
+        .jobs
+        .mission_has_live_jobs(req.mission_id)
+        .await
+        .map_err(internal_error)?
+        || state
+            .jobs
+            .mission_has_live_jobs(req.source_mission_id.unwrap_or(req.mission_id))
+            .await
+            .map_err(internal_error)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Source execution has not terminated".into(),
+        ));
+    }
+    let area = state
+        .work_root
+        .join(".transfers")
+        .join(req.transfer_id.to_string())
+        .join(&req.side);
+    let source = req
+        .source_transfer
+        .map(|id| {
+            state
+                .work_root
+                .join(".transfers")
+                .join(id.to_string())
+                .join("destination/workspace")
+        })
+        .unwrap_or_else(|| {
+            state
+                .work_root
+                .join(req.source_mission_id.unwrap_or(req.mission_id).to_string())
+        });
+    let value = tokio::task::spawn_blocking(move || {
+        sandboxed_sh::machine_transfer::operate(&area, Some(&source), req.operation)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::CONFLICT, e))?;
+    Ok(Json(value))
+}
+
+#[derive(serde::Deserialize)]
+struct TransferBrowseRequest {
+    transfer_id: Uuid,
+    operation: sandboxed_sh::file_browser::Request,
+}
+async fn transfer_browse(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    Json(req): Json<TransferBrowseRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    let area = state
+        .work_root
+        .join(".transfers")
+        .join(req.transfer_id.to_string())
+        .join("destination");
+    if !area.join("verified").is_file() {
+        return Err((StatusCode::CONFLICT, "Workspace is not verified".into()));
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        sandboxed_sh::file_browser::execute(&area.join("workspace"), &req.operation)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::CONFLICT, e))?;
+    Ok(Json(result))
+}
+
+async fn prepare_project_context(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    Json(request): Json<sandboxed_sh::node::project_context::Request>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    sandboxed_sh::node::project_context::prepare(&state.work_root, request)
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))
 }

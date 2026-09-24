@@ -53,6 +53,105 @@ fn files_root(state: &super::routes::AppState, slug: &str) -> Result<PathBuf, Ap
         .join(slug))
 }
 
+fn context_store(
+    state: &super::routes::AppState,
+    slug: &str,
+) -> Result<crate::project_context::Store, ApiError> {
+    let root = files_root(state, slug)?;
+    Ok(crate::project_context::Store::new(
+        root,
+        state
+            .config
+            .working_dir
+            .join(".sandboxed-sh/project-context-state")
+            .join(slug),
+    ))
+}
+
+async fn context_manifest(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<crate::project_context::Manifest>, ApiError> {
+    let store = context_store(&state, &slug)?;
+    tokio::task::spawn_blocking(move || store.manifest())
+        .await
+        .map_err(internal)?
+        .map(Json)
+        .map_err(internal)
+}
+async fn context_history(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<Vec<crate::project_context::Change>>, ApiError> {
+    let store = context_store(&state, &slug)?;
+    tokio::task::spawn_blocking(move || store.history())
+        .await
+        .map_err(internal)?
+        .map(Json)
+        .map_err(internal)
+}
+async fn context_conflicts(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<std::collections::BTreeMap<String, crate::project_context::Operation>>, ApiError> {
+    let store = context_store(&state, &slug)?;
+    tokio::task::spawn_blocking(move || store.conflicts())
+        .await
+        .map_err(internal)?
+        .map(Json)
+        .map_err(internal)
+}
+async fn context_apply(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(slug): AxumPath<String>,
+    Json(operation): Json<crate::project_context::Operation>,
+) -> Result<Json<crate::project_context::Receipt>, ApiError> {
+    let store = context_store(&state, &slug)?;
+    tokio::task::spawn_blocking(move || store.apply(operation))
+        .await
+        .map_err(internal)?
+        .map(Json)
+        .map_err(bad_request)
+}
+async fn context_resolve(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath((slug, id)): AxumPath<(String, String)>,
+    Json(operation): Json<crate::project_context::Operation>,
+) -> Result<Json<crate::project_context::Receipt>, ApiError> {
+    let store = context_store(&state, &slug)?;
+    tokio::task::spawn_blocking(move || store.resolve(&id, operation))
+        .await
+        .map_err(internal)?
+        .map(Json)
+        .map_err(bad_request)
+}
+async fn context_blob(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath((slug, hash)): AxumPath<(String, String)>,
+) -> Result<impl axum::response::IntoResponse, ApiError> {
+    let store = context_store(&state, &slug)?;
+    let bytes = tokio::task::spawn_blocking(move || store.blob(&hash))
+        .await
+        .map_err(internal)?
+        .map_err(not_found)?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    ))
+}
+async fn context_upload(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(slug): AxumPath<String>,
+    bytes: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = context_store(&state, &slug)?;
+    let hash = tokio::task::spawn_blocking(move || store.put_blob(&bytes))
+        .await
+        .map_err(internal)?
+        .map_err(bad_request)?;
+    Ok(Json(serde_json::json!({"hash":hash})))
+}
+
 /// Reject absolute paths, parent traversal and anything that is not a plain
 /// relative path of normal components.
 fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, ApiError> {
@@ -132,24 +231,35 @@ async fn read_file(
     AxumPath(slug): AxumPath<String>,
     Query(q): Query<PathQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let root = files_root(&state, &slug)?;
-    let path = safe_join(&root, &q.path)?;
-    let meta = std::fs::metadata(&path).map_err(|_| not_found("file not found"))?;
-    if !meta.is_file() {
-        return Err(bad_request("path is not a file"));
-    }
-    if meta.len() > MAX_READ_BYTES {
-        return Err(bad_request(format!(
-            "file is {} bytes, over the {} byte read cap",
-            meta.len(),
-            MAX_READ_BYTES
-        )));
-    }
-    let bytes = std::fs::read(&path).map_err(internal)?;
-    let content = String::from_utf8(bytes).map_err(|_| bad_request("file is not valid UTF-8"))?;
-    Ok(Json(
-        serde_json::json!({ "path": q.path, "content": content }),
-    ))
+    let store = context_store(&state, &slug)?;
+    tokio::task::spawn_blocking(move || {
+        let manifest = store.manifest().map_err(internal)?;
+        let entry = manifest
+            .entries
+            .get(&q.path)
+            .ok_or_else(|| not_found("file not found"))?;
+        if entry.directory {
+            return Err(bad_request("path is not a file"));
+        }
+        if entry.size > MAX_READ_BYTES {
+            return Err(bad_request("file exceeds text preview limit"));
+        }
+        let bytes = store
+            .blob(
+                entry
+                    .hash
+                    .as_deref()
+                    .ok_or_else(|| bad_request("missing content"))?,
+            )
+            .map_err(internal)?;
+        let content =
+            String::from_utf8(bytes).map_err(|_| bad_request("file is not valid UTF-8"))?;
+        Ok(Json(
+            serde_json::json!({"path":q.path,"content":content,"revision":entry.revision}),
+        ))
+    })
+    .await
+    .map_err(internal)?
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -157,6 +267,8 @@ struct WriteRequest {
     path: String,
     #[serde(default)]
     content: String,
+    #[serde(default)]
+    expected_revision: Option<u64>,
 }
 
 async fn write_file(
@@ -174,15 +286,33 @@ async fn write_file(
             MAX_WRITE_BYTES
         )));
     }
-    let root = files_root(&state, &slug)?;
-    let path = safe_join(&root, &req.path)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(internal)?;
+    let store = context_store(&state, &slug)?;
+    let result = tokio::task::spawn_blocking(move || {
+        let manifest = store.manifest()?;
+        let base = req
+            .expected_revision
+            .or_else(|| manifest.entries.get(&req.path).map(|entry| entry.revision));
+        let hash = store.put_blob(req.content.as_bytes())?;
+        store.apply(crate::project_context::Operation {
+            id: uuid::Uuid::new_v4().to_string(),
+            path: req.path,
+            base,
+            hash: Some(hash),
+            directory: false,
+            delete: false,
+            source: "orb".into(),
+        })
+    })
+    .await
+    .map_err(internal)?
+    .map_err(bad_request)?;
+    if result.conflict {
+        return Err((
+            StatusCode::CONFLICT,
+            "The file changed since it was opened. Your edit was preserved as a conflict.".into(),
+        ));
     }
-    std::fs::write(&path, &req.content).map_err(internal)?;
-    Ok(Json(
-        serde_json::json!({ "path": req.path, "bytes": req.content.len() }),
-    ))
+    Ok(Json(serde_json::json!({"revision":result.revision})))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -198,10 +328,37 @@ async fn mkdir(
     if req.path.trim().is_empty() {
         return Err(bad_request("path is required"));
     }
-    let root = files_root(&state, &slug)?;
-    let path = safe_join(&root, &req.path)?;
-    std::fs::create_dir_all(&path).map_err(internal)?;
-    Ok(Json(serde_json::json!({ "path": req.path })))
+    let store = context_store(&state, &slug)?;
+    tokio::task::spawn_blocking(move || {
+        let mut path = String::new();
+        crate::project_context::valid_path(&req.path).map_err(bad_request)?;
+        for part in req.path.split('/') {
+            if !path.is_empty() {
+                path.push('/');
+            }
+            path.push_str(part);
+            let receipt = store
+                .apply(crate::project_context::Operation {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    path: path.clone(),
+                    base: None,
+                    hash: None,
+                    directory: true,
+                    delete: false,
+                    source: "orb".into(),
+                })
+                .map_err(bad_request)?;
+            if receipt.conflict {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "A file already exists at this path".into(),
+                ));
+            }
+        }
+        Ok(Json(serde_json::json!({"path":req.path})))
+    })
+    .await
+    .map_err(internal)?
 }
 
 async fn delete_file(
@@ -212,15 +369,40 @@ async fn delete_file(
     if q.path.trim().is_empty() {
         return Err(bad_request("refusing to delete the project root"));
     }
-    let root = files_root(&state, &slug)?;
-    let path = safe_join(&root, &q.path)?;
-    let meta = std::fs::metadata(&path).map_err(|_| not_found("path not found"))?;
-    if meta.is_dir() {
-        std::fs::remove_dir_all(&path).map_err(internal)?;
-    } else {
-        std::fs::remove_file(&path).map_err(internal)?;
-    }
-    Ok(Json(serde_json::json!({ "deleted": q.path })))
+    let store = context_store(&state, &slug)?;
+    tokio::task::spawn_blocking(move || {
+        crate::project_context::valid_path(&q.path).map_err(bad_request)?;
+        let manifest = store.manifest().map_err(internal)?;
+        let prefix = format!("{}/", q.path);
+        let mut entries: Vec<_> = manifest
+            .entries
+            .iter()
+            .filter(|(path, _)| *path == &q.path || path.starts_with(&prefix))
+            .collect();
+        entries.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
+        for (path, entry) in entries {
+            let receipt = store
+                .apply(crate::project_context::Operation {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    path: path.clone(),
+                    base: Some(entry.revision),
+                    hash: None,
+                    directory: false,
+                    delete: true,
+                    source: "orb".into(),
+                })
+                .map_err(bad_request)?;
+            if receipt.conflict {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "A file changed during deletion; the remaining files were kept".into(),
+                ));
+            }
+        }
+        Ok(Json(serde_json::json!({"deleted":q.path})))
+    })
+    .await
+    .map_err(internal)?
 }
 
 /// Lightweight roster for clients that only need slug + title + status (the
@@ -344,6 +526,18 @@ fn dedupe_roster(
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
     Router::new()
         .route("/", get(list_projects))
+        .route("/:slug/context/manifest", get(context_manifest))
+        .route("/:slug/context/history", get(context_history))
+        .route("/:slug/context/conflicts", get(context_conflicts))
+        .route("/:slug/context/conflicts/:id", post(context_resolve))
+        .route("/:slug/context/operations", post(context_apply))
+        .route("/:slug/context/blobs/:hash", get(context_blob))
+        .route(
+            "/:slug/context/blobs",
+            post(context_upload).layer(axum::extract::DefaultBodyLimit::max(
+                crate::project_context::FILE_LIMIT,
+            )),
+        )
         .route("/:slug/files", get(list_files))
         .route("/:slug/file", get(read_file))
         .route("/:slug/file", put(write_file))
@@ -425,4 +619,35 @@ mod tests {
     fn merged_projects_router_builds() {
         let _ = crate::api::projects_overview::routes();
     }
+}
+
+/// Observe direct harness writes even while no UI is polling.
+pub fn start_context_observer(working_dir: PathBuf) {
+    tokio::spawn(async move {
+        loop {
+            let working_dir = working_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let root = working_dir.join(".sandboxed-sh/project-files");
+                if let Ok(projects) = std::fs::read_dir(root) {
+                    for project in projects.flatten() {
+                        let Some(slug) = project.file_name().to_str().map(str::to_owned) else {
+                            continue;
+                        };
+                        if !super::projects_overview::is_plain_key(&slug) {
+                            continue;
+                        }
+                        let metadata = working_dir
+                            .join(".sandboxed-sh/project-context-state")
+                            .join(&slug);
+                        let store = crate::project_context::Store::new(project.path(), metadata);
+                        if let Err(error) = store.manifest() {
+                            tracing::warn!(project=%slug,%error,"Context reconciliation deferred");
+                        }
+                    }
+                }
+            })
+            .await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
 }

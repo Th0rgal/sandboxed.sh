@@ -42,7 +42,7 @@ fn denied(path: &Path) -> bool {
             || n.ends_with(".key")
     })
 }
-fn resolve(root: &Path, raw: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve(root: &Path, raw: &str) -> Result<PathBuf, String> {
     let input = Path::new(raw);
     let relative = if input.is_absolute() {
         input
@@ -74,7 +74,7 @@ fn resolve(root: &Path, raw: &str) -> Result<PathBuf, String> {
 }
 /// Walk from a directory descriptor: no checked-path/open race through symlinks.
 #[cfg(unix)]
-fn open_beneath(root: &Path, path: &Path) -> Result<fs::File, String> {
+pub(crate) fn open_beneath(root: &Path, path: &Path) -> Result<fs::File, String> {
     use std::os::{
         fd::{AsRawFd, FromRawFd},
         unix::ffi::OsStrExt,
@@ -106,7 +106,7 @@ fn open_beneath(root: &Path, path: &Path) -> Result<fs::File, String> {
     Ok(dir)
 }
 #[cfg(not(unix))]
-fn open_beneath(root: &Path, path: &Path) -> Result<fs::File, String> {
+pub(crate) fn open_beneath(root: &Path, path: &Path) -> Result<fs::File, String> {
     if !path
         .canonicalize()
         .map_err(|_| "File unavailable")?
@@ -187,11 +187,11 @@ pub fn execute(root: &Path, req: &Request) -> Result<Value, String> {
                         index
                             .get_or_insert_with(|| scan(&root, "", 20000).0)
                             .iter()
-                            .cloned()
                             .filter(|e| {
                                 let s = e["path"].as_str().unwrap_or("");
                                 s == p || s.ends_with(&format!("/{p}"))
                             })
+                            .cloned()
                             .collect()
                     } else {
                         vec![]

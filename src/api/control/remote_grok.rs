@@ -360,9 +360,10 @@ impl GrokStream {
                             updates.push(StreamUpdate::ThinkingSnapshot(self.thinking.clone()));
                         }
                     }
-                    Some("command_execution" | "file_change" | "mcp_tool_call" | "web_search") => {
-                        if kind != "item.updated" {
-                            updates.push(StreamUpdate::Tool {
+                    Some("command_execution" | "file_change" | "mcp_tool_call" | "web_search")
+                        if kind != "item.updated" =>
+                    {
+                        updates.push(StreamUpdate::Tool {
                                 update: serde_json::json!({
                                     "toolCallId": item["id"], "name": item["type"],
                                     "rawInput": item, "output": item["aggregated_output"],
@@ -370,7 +371,6 @@ impl GrokStream {
                                 }),
                                 completed: kind == "item.completed",
                             });
-                        }
                     }
                     _ => {}
                 }
@@ -1029,6 +1029,26 @@ pub(crate) async fn placement(
     store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
 ) -> Result<Option<RemotePlacement>, String> {
+    if let Some(t) = super::machine_transfer::committed(store, mission_id).await? {
+        match t.destination {
+            crate::api::mission_store::transfer::Machine::Node { id } => {
+                let run = store.get_latest_mission_run(mission_id).await?;
+                let job = run
+                    .as_ref()
+                    .filter(|r| r.generation > t.generation)
+                    .and_then(|r| r.owner_actor_id.strip_prefix("remote-job:"))
+                    .and_then(|s| Uuid::parse_str(s).ok());
+                return Ok(Some(RemotePlacement {
+                    node_id: id,
+                    job_id: job.unwrap_or(Uuid::nil()),
+                    live: run.is_some_and(|r| {
+                        r.generation > t.generation && !r.execution_state.is_terminal()
+                    }),
+                }));
+            }
+            _ => return Ok(None),
+        }
+    }
     use remote_node::job_ledger::JobHandleKind;
     let handles = remote_node::job_ledger::load(ledger_dir)
         .await
@@ -1140,6 +1160,9 @@ pub(crate) async fn continue_on_node(
         .await
         .map_err(internal)?;
     let store = control.mission_store.clone();
+    super::machine_transfer::guard(&store, mission_id)
+        .await
+        .map_err(internal)?;
     let mission = store
         .get_mission(mission_id)
         .await
@@ -1265,7 +1288,12 @@ pub(crate) async fn continue_on_node(
     // Jobs launched before OpenCode streaming was enabled have a placeholder
     // session id. Recover the native identity from that exact job's log.
     let mut native_session = mission.session_id.clone();
-    if mission.backend == "opencode"
+    let transferred = super::machine_transfer::committed(&store, mission_id)
+        .await
+        .map_err(internal)?
+        .is_some();
+    if !transferred
+        && mission.backend == "opencode"
         && !native_session
             .as_deref()
             .is_some_and(|s| s.starts_with("ses_"))
@@ -1290,18 +1318,21 @@ pub(crate) async fn continue_on_node(
         }
         native_session = stream.session_id;
     }
-    let session_id = native_session.as_deref().map(str::trim)
-        .filter(|s| !s.is_empty()).map(str::to_string)
-        .ok_or_else(|| (StatusCode::CONFLICT, format!(
-            "{REMOTE_RESUME_REQUIRES_REPLACEMENT}: mission {mission_id} has no recorded native session; create a remote replacement with supersedes_mission_id={mission_id}"
-        )))?;
-    let prompt = content.clone().unwrap_or_else(|| {
-        if mission.goal_mode {
-            "/goal resume".to_string()
-        } else {
-            super::INTERRUPTED_RESUME_PROMPT.to_string()
-        }
-    });
+    let session_id = native_session.filter(|s| !s.trim().is_empty());
+    if session_id.is_none() && !transferred {
+        return Err((
+            StatusCode::CONFLICT,
+            "Mission has no recorded native session".into(),
+        ));
+    }
+    let prompt = content
+        .clone()
+        .unwrap_or_else(|| super::INTERRUPTED_RESUME_PROMPT.to_string());
+    let history_prompt = prompt.clone();
+    let prompt =
+        super::machine_transfer::context(&store, mission_id, prompt, session_id.as_deref())
+            .await
+            .map_err(internal)?;
     if let Some(objective) = super::parse_goal_objective(&prompt) {
         if objective == "clear" {
             store
@@ -1331,7 +1362,7 @@ pub(crate) async fn continue_on_node(
                 )
             })?,
             prompt: prompt.clone(),
-            resume_session_id: Some(session_id),
+            resume_session_id: session_id.clone(),
         }
     } else if mission.backend == "opencode" {
         RemoteHarnessPlan::OpenCode {
@@ -1340,14 +1371,18 @@ pub(crate) async fn continue_on_node(
                 .as_deref()
                 .map(|m| m.strip_prefix("builtin/").unwrap_or(m).to_string()),
             prompt: prompt.clone(),
-            resume_session_id: Some(session_id),
+            resume_session_id: session_id.clone(),
         }
     } else {
         RemoteHarnessPlan::Grok {
             model: mission_model(&mission),
             prompt: prompt.clone(),
-            resume_session_id: Some(session_id),
-            new_session_id: None,
+            resume_session_id: session_id.clone(),
+            new_session_id: if session_id.is_none() {
+                Some(Uuid::new_v4().to_string())
+            } else {
+                None
+            },
         }
     };
     require_node_managed_auth(state, &placement.node_id, &plan)
@@ -1389,7 +1424,7 @@ pub(crate) async fn continue_on_node(
                 return Err((StatusCode::CONFLICT, message));
             }
         };
-    persist_turn_prompt(&owner, mission.id, &prompt, &source, message_id).await;
+    persist_turn_prompt(&owner, mission.id, &history_prompt, &source, message_id).await;
     Ok(resumed)
 }
 

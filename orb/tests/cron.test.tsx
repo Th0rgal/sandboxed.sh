@@ -155,9 +155,9 @@ describe("schedule and menu interaction", () => {
     const close = vi.fn();
     render(() => <PopupMenu x={20} y={20} onClose={close} items={[{ kind: "item", label: "Folder", onClick: () => {} }, { kind: "item", label: "Cron", onClick: () => {} }]} />);
     expect(document.activeElement?.textContent).toBe("Folder");
-    fireEvent.keyDown(window, { key: "ArrowDown" });
+    fireEvent.keyDown(document.activeElement!, { key: "ArrowDown" });
     expect(document.activeElement?.textContent).toBe("Cron");
-    fireEvent.keyDown(window, { key: "Escape" });
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
     expect(close).toHaveBeenCalled(); expect(document.activeElement).toBe(trigger); trigger.remove();
   });
 });

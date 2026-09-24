@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Portable model catalog snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "provider_id", "access_profile", "source", "observed_at", "completeness", "models"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "provider_id": {"type": "string", "pattern": "^[a-zA-Z0-9_-]+$", "maxLength": 99},
+    "access_profile": {"type": "string", "pattern": "^[a-zA-Z0-9_-]+$", "maxLength": 99},
+    "source": {"enum": ["curated", "discovery"]},
+    "observed_at": {"type": ["string", "null"], "format": "date-time"},
+    "completeness": {"enum": ["complete", "partial"]},
+    "models": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["id", "name"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 256},
+          "name": {"type": "string"},
+          "description": {"type": ["string", "null"]}
+        }
+      }
+    }
+  }
+}

@@ -1,4 +1,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod local_origin;
+#[path = "../../../shared/local_origin.rs"]
+mod local_origin_wire;
+#[path = "../../../shared/project_context.rs"]
+mod project_context_store;
+mod run_recovery;
+// Shared replica code uses the same module name in both binaries.
+use project_context_store as project_context;
+#[path = "../../../shared/context_replica.rs"]
+mod context_replica;
+#[path = "project_context.rs"]
+mod context_service;
 
 #[path = "../../../shared/file_browser.rs"]
 mod file_browser;
@@ -7,6 +19,7 @@ mod local_agents;
 mod local_stream;
 mod machine_metrics;
 mod session_preview;
+mod transfers;
 mod uploads;
 mod voice;
 
@@ -86,6 +99,9 @@ fn local_bindings(
 }
 
 fn main() {
+    if context_service::worker_entry() {
+        return;
+    }
     tauri::Builder::default()
         .manage(voice::VoiceState::new())
         .setup(|app| {
@@ -116,6 +132,11 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             local_bindings,
+            local_origin::local_origin_launch,
+            local_origin::local_origin_list,
+            local_origin::local_origin_disconnect,
+            run_recovery::local_run_launch,
+            run_recovery::local_run_reconcile,
             interactions::local_interaction,
             interactions::local_interaction_answer,
             paloma_ssh_pubkey,
@@ -131,10 +152,16 @@ fn main() {
             voice::voice_transcribe,
             voice::voice_cancel,
             voice::voice_release,
+            context_service::project_context_file,
+            context_service::project_context_prepare,
+            context_service::project_context_status,
+            context_service::project_context_disconnect,
             local_agents::local_agents_scan,
             local_agents::local_agents_workspace,
             local_agents::local_agents_write,
-            local_agents::local_agents_start,
+            transfers::local_agents_start_authorized,
+            transfers::local_machine_transfer,
+            transfers::local_machine_identity,
             local_agents::local_agents_poll,
             local_agents::local_agents_subscribe,
             local_agents::local_agents_stop
@@ -149,6 +176,29 @@ async fn browse_local_files(
     request: file_browser::Request,
 ) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        if request.action == "reveal" {
+            let root = std::path::Path::new(&root)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let path = file_browser::resolve(&root, &request.path)?;
+            #[cfg(target_os = "macos")]
+            let status = std::process::Command::new("open")
+                .arg("-R")
+                .arg(&path)
+                .status();
+            #[cfg(target_os = "windows")]
+            let status = std::process::Command::new("explorer")
+                .arg(format!("/select,{}", path.display()))
+                .status();
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            let status = std::process::Command::new("xdg-open")
+                .arg(path.parent().unwrap_or(&root))
+                .status();
+            if !status.map_err(|e| e.to_string())?.success() {
+                return Err("Could not reveal this file".into());
+            }
+            return Ok(serde_json::json!({}));
+        }
         file_browser::execute(std::path::Path::new(&root), &request)
     })
     .await

@@ -2836,6 +2836,35 @@ impl MissionRunner {
         let run = mission_store
             .begin_mission_run(self.mission_id, owner_actor_id, None)
             .await?;
+        // A retained idle runner may predate a move away and back. Refresh the
+        // authoritative workspace after acquiring the generation, before spawn.
+        if super::control::machine_transfer::committed(mission_store, self.mission_id)
+            .await?
+            .is_some()
+        {
+            match mission_store.get_mission(self.mission_id).await {
+                Ok(Some(mission)) => {
+                    self.workspace_id = mission.workspace_id;
+                    self.working_directory = mission.working_directory;
+                    self.session_id = mission.session_id;
+                    self.backend_id = mission.backend;
+                    self.model_override = mission.model_override;
+                    self.model_effort = mission.model_effort;
+                    self.config_profile = mission.config_profile;
+                    self.agent_override = mission.agent;
+                }
+                _ => {
+                    let _ = mission_store
+                        .finish_mission_run(
+                            run.run_id,
+                            run.generation,
+                            Some("transfer_workspace_unavailable"),
+                        )
+                        .await;
+                    return Err("Transferred workspace could not be resolved".into());
+                }
+            }
+        }
         let alive = mission_store
             .heartbeat_mission_run(
                 run.run_id,
@@ -3616,6 +3645,20 @@ async fn run_mission_turn(
     {
         return result;
     }
+    let mission_working_directory = if let Some(store) = mission_store.as_ref() {
+        match super::control::machine_transfer::committed(store, mission_id).await {
+            Ok(Some(action)) => {
+                if action.destination != crate::api::mission_store::transfer::Machine::Core {
+                    return AgentResult::failure("Mission execution moved away from Core", 0);
+                }
+                action.destination_root
+            }
+            Ok(None) => mission_working_directory,
+            Err(error) => return AgentResult::failure(error, 0),
+        }
+    } else {
+        mission_working_directory
+    };
     let mut config = config;
     // Operator-note bridge: flush any pending Ask-assistant writes into this
     // turn's message so the working agent learns about out-of-band edits it
@@ -3898,6 +3941,51 @@ async fn run_mission_turn(
         mission_work_dir
     };
 
+    let user_message = if super::context_execution::has_mentions(&user_message) {
+        let project = if let Some(store) = mission_store.as_ref() {
+            store
+                .get_mission(mission_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|mission| mission.project.project)
+        } else {
+            None
+        };
+        let Some(project) = project else {
+            return AgentResult::failure("Context references require a project", 0);
+        };
+        if !super::projects_overview::is_plain_key(&project) {
+            return AgentResult::failure("Invalid context project", 0);
+        }
+        let root = super::mission_payload::project_files_root(&config.working_dir, &project);
+        let metadata = config
+            .working_dir
+            .join(".sandboxed-sh/project-context-state")
+            .join(&project);
+        let manifest = match crate::project_context::Store::new(root.clone(), metadata).manifest() {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                return AgentResult::failure(format!("Prepare shared context: {error}"), 0)
+            }
+        };
+        let visible = match crate::workspace_exec::WorkspaceExec::new(workspace.clone())
+            .mount_project_context(&root, &project)
+            .await
+        {
+            Ok(path) => path,
+            Err(error) => return AgentResult::failure(format!("Mount shared context: {error}"), 0),
+        };
+        match super::context_execution::resolve(&user_message, Path::new(&visible), &manifest) {
+            Ok(message) => message,
+            Err(error) => {
+                return AgentResult::failure(format!("Prepare shared context: {error}"), 0)
+            }
+        }
+    } else {
+        user_message
+    };
+
     let user_message = match crate::api::mission_payload::materialize_turn(
         &config.working_dir,
         &mission_work_dir,
@@ -3948,6 +4036,22 @@ async fn run_mission_turn(
         .filter(|(role, _)| role == "assistant")
         .count();
     let should_rotate = turn_count > 0 && turn_count % SESSION_ROTATION_INTERVAL == 0;
+
+    let user_message = if let Some(store) = mission_store.as_ref() {
+        match super::control::machine_transfer::context(
+            store,
+            mission_id,
+            user_message,
+            session_id.as_deref(),
+        )
+        .await
+        {
+            Ok(prompt) => prompt,
+            Err(error) => return AgentResult::failure(error, 0),
+        }
+    } else {
+        user_message
+    };
 
     // Prepare user message and session ID (potentially with rotation)
     let (mut user_message, mut session_id) = (user_message, session_id);

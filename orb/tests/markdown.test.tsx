@@ -86,3 +86,15 @@ it("renders nested quotes, lists and fenced code within a quote",()=>{
  expect(container.querySelector('blockquote pre')?.textContent).toBe('code');
  expect(container.querySelector(':scope > .md > p')?.textContent).toBe('Outside');
 });
+
+it("links bare URLs without swallowing surrounding punctuation", () => {
+ const {container}=render(()=><MdView text={'**Verity** : https://github.com/lfglabs-dev/verity/pull/2438, puis (https://example.com/page). https://example.com/a_(b).'}/>);
+ expect(Array.from(container.querySelectorAll('a')).map(a=>a.getAttribute('href'))).toEqual(['https://github.com/lfglabs-dev/verity/pull/2438','https://example.com/page','https://example.com/a_(b)']);
+ expect(container.textContent).toContain('2438, puis (https://example.com/page).');
+});
+it("does not autolink code or nest anchors inside Markdown links", () => {
+ const {container}=render(()=><MdView text={'`https://example.com/code` [https://example.com/label](https://example.com/target)\n\n```\nhttps://example.com/fenced\n```'}/>);
+ expect(container.querySelectorAll('a')).toHaveLength(1);
+ expect(container.querySelector('a')?.getAttribute('href')).toBe('https://example.com/target');
+ expect(container.querySelector('a a')).toBeNull();
+});

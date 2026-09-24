@@ -285,3 +285,15 @@ export const ComputeNodeIcon = (p: P) => (
 export const BranchIcon = (p: P) => <I {...p}><circle cx="4" cy="3" r="1.5" /><circle cx="12" cy="3" r="1.5" /><circle cx="4" cy="13" r="1.5" /><path d="M4 4.5v7M12 4.5v1c0 3-8 1-8 4" /></I>;
 
 export const PlanIcon = (p: P) => (<I {...p}><circle cx="3" cy="4" r="1"/><circle cx="3" cy="8" r="1"/><circle cx="3" cy="12" r="1"/><path d="M7 4h6M7 8h6M7 12h4"/></I>);
+
+export const CutIcon = (p: P) => <I {...p}>
+  <circle cx="4" cy="4" r="2" /><circle cx="4" cy="12" r="2" />
+  <path d="m5.5 5.5 8 8M5.5 10.5l8-8" />
+</I>;
+export const PasteIcon = (p: P) => <I {...p}>
+  <path d="M5.5 3H4a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1h-1.5" />
+  <rect x="5.5" y="1.5" width="5" height="3" rx="1" /><path d="M5.5 8h5M5.5 11h3" />
+</I>;
+export const ReopenIcon = (p: P) => <I {...p}>
+  <path d="M3 6a5 5 0 1 1 0 4M3 2v4h4" />
+</I>;

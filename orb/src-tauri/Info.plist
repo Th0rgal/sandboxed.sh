@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>CFBundleIconName</key>
+  <string>Orb</string>
+  <key>CFBundleIconFile</key>
+  <string>Orb.icns</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Orb uses the microphone to dictate prompts. Audio is transcribed on this Mac and never leaves it.</string>
 </dict>

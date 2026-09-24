@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, type JSX } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, type JSX } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { visibleTree, type TreeNode, type TreeRow } from "./treeModel";
 
@@ -13,6 +13,7 @@ export function TreeConnectors(p: { row: TreeRow<unknown> }) {
 }
 
 export function SidebarTree<T>(p: { nodes: TreeNode<T>[]; label: string; selected: string | null; render: (row: TreeRow<T>) => JSX.Element }) {
+  const [pointerFocus, setPointerFocus] = createSignal(false);
   const visible = createMemo(() => visibleTree(p.nodes));
   const [rows, setRows] = createStore<TreeRow<T>[]>([]);
   createEffect(() => setRows(reconcile(visible(), { key: "id" })));
@@ -45,7 +46,15 @@ export function SidebarTree<T>(p: { nodes: TreeNode<T>[]; label: string; selecte
     e.preventDefault();
     next?.querySelector<HTMLButtonElement>("button")?.focus();
   };
-  return <div class="sidebar-tree" role="tree" aria-label={p.label} onKeyDown={keydown}>
+  return <div class="sidebar-tree" role="tree" aria-label={p.label} data-pointer-focus={pointerFocus() ? "true" : undefined}
+    onPointerDown={() => setPointerFocus(true)}
+    onKeyDown={e => { if (["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End", "Tab"].includes(e.key)) setPointerFocus(false); keydown(e); }}
+    onClick={e => {
+      // WebKit on macOS does not focus buttons on click. Keep keyboard actions
+      // (including cut/paste) attached to the row the user just selected.
+      const button = (e.target as HTMLElement).closest<HTMLButtonElement>(".tree-entry button");
+      if (button && e.currentTarget.contains(button)) button.focus({ preventScroll: true });
+    }}>
     <For each={rows}>{row => <div class="tree-entry" data-tree-id={row.id} data-depth={row.depth}
       role="treeitem" aria-level={row.depth + 1} aria-posinset={row.position} aria-setsize={row.size}
       aria-expanded={row.expanded} aria-selected={p.selected === row.id}

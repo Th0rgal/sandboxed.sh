@@ -71,3 +71,21 @@ pub use settings::{Settings, SettingsStore};
 
 #[path = "../shared/file_browser.rs"]
 pub mod file_browser;
+
+#[path = "../shared/machine_transfer.rs"]
+pub mod machine_transfer;
+
+pub mod model_catalog;
+pub mod model_discovery;
+
+#[path = "../shared/project_context.rs"]
+pub mod project_context;
+
+#[path = "../shared/context_replica.rs"]
+pub mod context_replica;
+
+#[cfg(test)]
+mod context_replica_tests;
+
+#[path = "../shared/local_origin.rs"]
+pub mod local_origin;

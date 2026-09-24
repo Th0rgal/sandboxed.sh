@@ -2,10 +2,12 @@ import { render, screen, fireEvent, waitFor } from "@solidjs/testing-library";
 import { beforeEach, afterEach, describe, it, expect, vi } from "vitest";
 import { RoutingSettings, confirmLeaveRouting } from "../src/RoutingSettings";
 import { setConnection, clearConnection } from "../src/api";
+import { listChains, routingCatalog } from "../src/routingApi";
 import type { ModelChain } from "../src/routingApi";
 let chains: ModelChain[];
 let writes: { path: string; method: string; body: any }[];
 let failSave = false;
+let responseModel: string | undefined = "actual-fallback-model";
 const chain = (): ModelChain => ({
   id: "test/chain",
   name: "Test chain",
@@ -40,6 +42,7 @@ beforeEach(() => {
   chains = [chain()];
   writes = [];
   failSave = false;
+  responseModel = "actual-fallback-model";
   setConnection("https://routing.test", "test");
   vi.stubGlobal(
     "fetch",
@@ -70,7 +73,7 @@ beforeEach(() => {
         return response({
           ok: true,
           status: 200,
-          response: { choices: [{ message: { content: "pong" } }] },
+          response: { model: responseModel, choices: [{ message: { content: "pong" } }] },
         });
       if (path.endsWith("/clear")) return response({ cleared: true });
       if (path.endsWith("/chains")) return response(chains);
@@ -118,14 +121,14 @@ afterEach(() => {
 });
 async function mount() {
   render(() => <RoutingSettings onOpenClient={() => {}} />);
-  await screen.findByRole("button", { name: /Test chain test\/chain/ });
+  await screen.findByRole("button", { name: /Test chain/ });
   await screen.findByRole("button", { name: "Refresh", exact: true });
 }
 describe("Routing settings", () => {
   it("keeps unknown IDs, input focus and edited order on save", async () => {
     await mount();
     fireEvent.click(
-      screen.getByRole("button", { name: /Test chain test\/chain/ }),
+      screen.getByRole("button", { name: /Test chain/ }),
     );
     const input = screen.getByLabelText("Model 1") as HTMLInputElement;
     input.focus();
@@ -157,8 +160,9 @@ describe("Routing settings", () => {
   it("preserves a draft across refresh and save failure and guards leaving", async () => {
     await mount();
     fireEvent.click(
-      screen.getByRole("button", { name: /Test chain test\/chain/ }),
+      screen.getByRole("button", { name: /Test chain/ }),
     );
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
     fireEvent.input(screen.getByLabelText("Name"), {
       target: { value: "Draft name" },
     });
@@ -190,14 +194,16 @@ describe("Routing settings", () => {
     ])
       fireEvent.input(screen.getByLabelText(label), { target: { value } });
     fireEvent.click(screen.getByRole("button", { name: "Save", exact: true }));
-    await screen.findByRole("button", { name: /New fallback new/ });
+    await screen.findByRole("button", { name: /New fallback/ });
+    await waitFor(() => expect(screen.getByRole("button", { name: "New chain", exact: true })).toHaveProperty("disabled", false));
+    fireEvent.click(screen.getByRole("button", { name: /New fallback/ }));
     await waitFor(() =>
       expect(
-        screen.getAllByRole("button", { name: "Set as default" })[0],
+        screen.getByRole("button", { name: "Set as default" }),
       ).toHaveProperty("disabled", false),
     );
     fireEvent.click(
-      screen.getAllByRole("button", { name: "Set as default" })[0],
+      screen.getByRole("button", { name: "Set as default" }),
     );
     await waitFor(() =>
       expect(writes.some((w) => w.body?.is_default)).toBe(true),
@@ -205,32 +211,43 @@ describe("Routing settings", () => {
   });
   it("shows separate accounts, exhaustion, resolution and explicit inference", async () => {
     await mount();
+    fireEvent.click(screen.getByRole("button", { name: "Provider Health", exact: true }));
+    await screen.findByText("First account");
     expect(screen.getByText("First account")).toBeTruthy();
     expect(screen.getByText("Second account")).toBeTruthy();
-    expect(screen.getByText(/→ Chain exhausted/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Recent Fallback Events", exact: true }));
+    await screen.findByText(/→ Chain exhausted/);
+    fireEvent.click(screen.getByRole("button", { name: "Fallback Chains", exact: true }));
+    fireEvent.click(screen.getByRole("button", { name: /Test chain/ }));
     expect(writes).toHaveLength(0);
     fireEvent.click(screen.getByRole("button", { name: "Resolve" }));
+    fireEvent.click(await screen.findByText("0 eligible accounts"));
     await screen.findByText("No eligible accounts.");
     await waitFor(() =>
       expect(
-        screen.getByRole("button", { name: "Test request" }),
+        screen.getByRole("button", { name: "Test chain" }),
       ).toHaveProperty("disabled", false),
     );
-    fireEvent.click(screen.getByRole("button", { name: "Test request" }));
+    fireEvent.click(screen.getByRole("button", { name: "Test chain" }));
     await screen.findByText("pong");
+    expect(screen.getByText("actual-fallback-model")).toBeTruthy();
+  });
+  it("does not guess the model when the provider omits it", async () => {
+    responseModel = undefined;
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: /Test chain/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Test chain" }));
+    await screen.findByText("Not reported by provider");
   });
   it("requires an integrated confirmation before deletion", async () => {
     await mount();
-    fireEvent.click(
-      screen.getByRole("button", { name: "Delete", exact: true }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: /Test chain/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete", exact: true }));
     expect(screen.getByRole("dialog", { name: "Delete chain?" })).toBeTruthy();
     expect(writes).toHaveLength(0);
     fireEvent.click(screen.getByRole("button", { name: "Cancel deletion" }));
     expect(writes).toHaveLength(0);
-    fireEvent.click(
-      screen.getByRole("button", { name: "Delete", exact: true }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "Delete", exact: true }));
     fireEvent.click(
       screen.getByRole("button", { name: "Delete chain", exact: true }),
     );
@@ -246,8 +263,9 @@ describe("Routing settings", () => {
   it("keeps a draft or runs the requested navigation after explicit discard", async () => {
     await mount();
     fireEvent.click(
-      screen.getByRole("button", { name: /Test chain test\/chain/ }),
+      screen.getByRole("button", { name: /Test chain/ }),
     );
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
     fireEvent.input(screen.getByLabelText("Name"), {
       target: { value: "Draft" },
     });
@@ -263,10 +281,14 @@ describe("Routing settings", () => {
   });
   it("filters fallback events and clears one account cooldown", async () => {
     await mount();
+    fireEvent.click(screen.getByRole("button", { name: "Recent Fallback Events", exact: true }));
+    await screen.findByText(/→ Chain exhausted/);
     fireEvent.change(screen.getByLabelText("Chain"), {
       target: { value: "test/chain" },
     });
     expect(screen.getByText(/→ Chain exhausted/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Provider Health", exact: true }));
+    await screen.findByText("First account");
     fireEvent.click(
       screen.getAllByRole("button", {
         name: "Clear cooldown",
@@ -292,8 +314,9 @@ describe("Routing settings", () => {
   it("clears server data and drafts on disconnect", async () => {
     await mount();
     fireEvent.click(
-      screen.getByRole("button", { name: /Test chain test\/chain/ }),
+      screen.getByRole("button", { name: /Test chain/ }),
     );
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
     fireEvent.input(screen.getByLabelText("Name"), {
       target: { value: "Old server draft" },
     });
@@ -301,5 +324,43 @@ describe("Routing settings", () => {
     await screen.findByText("Connect to a backend to configure routing.");
     expect(screen.queryByText("First account")).toBeNull();
     expect(confirmLeaveRouting()).toBe(true);
+  });
+});
+
+
+describe("Routing loading", () => {
+  it("loads only chains on entry and fetches suggestions when editing", async () => {
+    await mount();
+    const paths = () => vi.mocked(fetch).mock.calls.map(([url]) => new URL(String(url)).pathname);
+    expect(paths()).toEqual(["/api/model-routing/chains"]);
+    fireEvent.click(screen.getByRole("button", { name: /Test chain/ }));
+    expect(screen.getByLabelText("Model 1")).toBeTruthy();
+    await waitFor(() => expect(paths()).toContain("/api/providers"));
+    expect(paths()).not.toContain("/api/model-routing/events");
+    expect(paths()).not.toContain("/api/model-routing/health");
+  });
+  it("caches reads, supports explicit refresh and scopes results to the connection", async () => {
+    await listChains();
+    await listChains();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    await listChains(true);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    setConnection("https://other.test", "other");
+    await listChains();
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(String(vi.mocked(fetch).mock.calls[2][0])).toContain("https://other.test/");
+  });
+  it("deduplicates concurrent catalog reads and retries failed requests", async () => {
+    vi.mocked(fetch).mockRejectedValueOnce(new Error("offline"));
+    await expect(routingCatalog()).rejects.toThrow("offline");
+    await Promise.all([routingCatalog(), routingCatalog()]);
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+  it("expires cached chains after 30 seconds", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1000);
+    await listChains();
+    now.mockReturnValue(32000);
+    await listChains();
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 });

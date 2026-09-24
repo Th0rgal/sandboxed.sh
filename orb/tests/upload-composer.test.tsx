@@ -53,3 +53,20 @@ it("removes the pending bubble once acknowledged and leaves the composer empty",
  await waitFor(()=>expect(screen.queryByLabelText('Pending message')).toBeNull());
  expect(input.value).toBe('');
 });
+it("hands the optimistic message to the transcript immediately without a duplicate composer bubble", async () => {
+  let finish!: (accepted: boolean) => void;
+  const pending = vi.fn();
+  const send = vi.fn(() => new Promise<boolean>(resolve => { finish = resolve; }));
+  render(() => <Composer placeholder="Task" busy={false} onPending={pending} onSend={send} onStop={() => {}} />);
+  const input = screen.getByPlaceholderText("Task") as HTMLTextAreaElement;
+  fireEvent.input(input, { target: { value: "Optimistic turn" } });
+  fireEvent.keyDown(input, { key: "Enter" });
+  expect(pending).toHaveBeenCalledWith({ text: "Optimistic turn", images: [] });
+  expect(screen.queryByLabelText("Pending message")).toBeNull();
+  expect(input.value).toBe("");
+  fireEvent.keyDown(input, { key: "Enter" });
+  await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+  finish(false);
+  await waitFor(() => expect(input.value).toBe("Optimistic turn"));
+  expect(pending).toHaveBeenLastCalledWith(null);
+});

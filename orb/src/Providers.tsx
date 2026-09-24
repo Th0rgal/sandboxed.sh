@@ -1,15 +1,18 @@
-import { codexWindowLabel, effectiveProviderStatus, usageWindows } from "./providerUsage";
+import { Dynamic } from "solid-js/web";
+import { codexWindowLabel, effectiveProviderStatus, hasProviderUsageDetails, usageWindows } from "./providerUsage";
 import { ProviderLogo } from "./ProviderLogo";
 import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import * as Ic from "./icons";
-import { Dialog, Field } from "./Dialog";
+import { Dialog, DialogButton, Field } from "./Dialog";
 import { Toggle } from "./Settings";
 import {
   getAllProviderUsage,
   getProviderUsage,
   getCliProxyLogin,
+  startProviderOAuth,
+  completeProviderOAuth,
   isConnected,
   listProviders,
   openExternalUrl,
@@ -344,9 +347,13 @@ function LiveProviders(p: { list: AIProvider[]; onRefresh: () => void }) {
             provider={a()}
             onClose={() => setReauth(null)}
             onDone={() => {
+              const id = a().id;
               setReauth(null);
+              setUsage(previous => { const next = { ...previous }; delete next[id]; return next; });
               p.onRefresh();
-              void refreshUsage().catch(() => {});
+              void getProviderUsage(id, true).then(value => {
+                if (!disposed) setUsage(previous => ({ ...previous, [id]: value }));
+              }).catch(() => {});
             }}
           />
         )}
@@ -354,6 +361,9 @@ function LiveProviders(p: { list: AIProvider[]; onRefresh: () => void }) {
     </div>
   );
 }
+
+const LEGACY_OAUTH_TYPES = new Set(["anthropic", "openai", "google"]);
+const reconnectable = (a: AIProvider) => cliProxyReconnectable(a) || (a.uses_oauth && a.credential_owner === "sandboxed_sh" && LEGACY_OAUTH_TYPES.has(a.provider_type));
 
 const CLIPROXY_LOGIN_TYPES = new Set(["anthropic", "openai", "xai", "kimi"]);
 
@@ -385,7 +395,9 @@ function UsageSummary(p: { usage: ProviderUsage }) {
 }
 
 function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: () => void }) {
-  const [session, setSession] = createSignal<{ id: string; url: string; flow?: string } | null>(null);
+  const [session, setSession] = createSignal<{ id: string; url: string; flow?: string; instructions?: string } | null>(null);
+  const proxy = cliProxyReconnectable(p.provider);
+  let disposed = false;
   const [phase, setPhase] = createSignal<"starting" | "awaiting" | "finishing" | "failed">("starting");
   const [error, setError] = createSignal<string | null>(null);
   const [paste, setPaste] = createSignal("");
@@ -395,83 +407,91 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = undefined;
   };
-  onCleanup(stopPolling);
+  onCleanup(() => { disposed = true; stopPolling(); });
 
   const startPolling = (id: string) => {
     stopPolling();
     pollTimer = setInterval(() => {
       getCliProxyLogin(id)
         .then((st) => {
+          if (disposed) return;
           if (st.status === "completed") {
             stopPolling();
             p.onDone();
           } else if (st.status === "failed") {
             stopPolling();
-            setPhase("failed");
             setError(st.message ?? "login failed");
+            setPhase("failed");
           }
         })
         .catch((e: Error) => {
           stopPolling();
-          setPhase("failed");
           setError(e.message);
+          setPhase("failed");
         });
     }, 2000);
   };
 
   onMount(() => {
-    startCliProxyLogin(p.provider.provider_type)
+    const start = proxy
+      ? startCliProxyLogin(p.provider.provider_type).then(s => ({ id: s.session_id, url: s.auth_url, flow: s.flow, instructions: undefined as string | undefined }))
+      : startProviderOAuth(p.provider.id).then(s => ({ id: p.provider.id, url: s.url, flow: s.method, instructions: s.instructions }));
+    start
       .then((s) => {
-        setSession({ id: s.session_id, url: s.auth_url, flow: s.flow });
+        if (disposed) return;
+        setSession(s);
         setPhase("awaiting");
-        startPolling(s.session_id);
-        void openExternalUrl(s.auth_url);
+        if (proxy) startPolling(s.id);
+        void openExternalUrl(s.url).catch(e => setError(String(e)));
       })
       .catch((e: Error) => {
-        setPhase("failed");
         setError(e.message);
+        setPhase("failed");
       });
   });
 
   const submitPaste = () => {
     const s = session();
     const url = paste().trim();
-    if (!s || !url) return;
+    if (!s || !url || phase() === "finishing") return;
     setPhase("finishing");
     setError(null);
-    submitCliProxyLoginCallback(s.id, url)
-      .then((st) => {
+    const submit = proxy ? submitCliProxyLoginCallback(s.id, url)
+      : completeProviderOAuth(p.provider.id, url).then(() => ({ status: "completed" as const, message: undefined }));
+    submit.then((st) => {
+        if (disposed) return;
+        if (st.status === "completed") { stopPolling(); p.onDone(); return; }
         if (st.status === "failed") {
-          setPhase("failed");
           setError(st.message ?? "callback rejected");
+          setPhase("failed");
         } else {
           setPhase("awaiting");
         }
       })
       .catch((e: Error) => {
-        setPhase("failed");
         setError(e.message);
+        setPhase("failed");
       });
   };
 
   return (
     <Dialog
       title={`Reconnect ${p.provider.name}`}
+      busy={phase() === "finishing"}
       onClose={p.onClose}
       footer={
         <>
-          <span class="dlg-spacer" />
-          <button class="s-btn sm quiet" onClick={p.onClose}>
-            {phase() === "failed" ? "Close" : "Cancel"}
-          </button>
+          <DialogButton disabled={phase() === "finishing"} onClick={p.onClose}>
+            {phase() === "failed" ? "Close login" : "Cancel"}
+          </DialogButton>
         </>
       }
     >
       <Show when={phase() === "starting"}>
-        <p class="s-lead">Starting the CLIProxyAPI login on the server…</p>
+        <p class="s-lead">Starting the account login…</p>
       </Show>
       <Show when={phase() === "failed"}>
-        <p class="s-lead">Could not start the login flow.</p>
+        <p class="s-lead">Could not complete the login.</p>
         <ErrorNotice error={error()!} />
         <Show when={/^(404|405)\b/.test(error() ?? "")}>
           <p class="s-row-desc">This backend build does not expose the login endpoints yet — deploy the updated sandboxed.sh first.</p>
@@ -479,24 +499,25 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
       </Show>
       <Show when={phase() === "awaiting" || phase() === "finishing"}>
         <p class="s-lead">
-          {session()?.flow === "device"
+          {session()?.instructions ?? (session()?.flow === "device"
             ? "Authorize in the browser window that just opened and enter the code shown — the login completes automatically."
-            : "Authorize in the browser window that just opened. The redirect to localhost will fail — copy the full URL from the address bar and paste it here."}
+            : "Authorize in the browser window that just opened. The redirect to localhost will fail — copy the full URL from the address bar and paste it here.")}
         </p>
         <div class="field">
+          <Show when={p.provider.account_email}><p>Sign in as {p.provider.account_email} to reconnect this account.</p></Show>
           <span>Auth URL</span>
           <div class="p-url">
             <code>{session()?.url}</code>
-            <button class="s-btn sm" onClick={() => session() && void openExternalUrl(session()!.url)}>
+            <DialogButton onClick={() => session() && void openExternalUrl(session()!.url)}>
               Open
-            </button>
+            </DialogButton>
           </div>
         </div>
         <Show when={session()?.flow !== "device"}>
-          <Field label="Redirect URL (http://localhost:…)">
+          <Field label={proxy ? "Redirect URL (http://localhost:…)" : "Authorization code or redirect URL"}>
             <input
               type="text"
-              placeholder="http://localhost:54545/callback?code=…&state=…"
+              placeholder={proxy ? "http://localhost:54545/callback?code=…&state=…" : "Paste the code or full redirect URL"}
               value={paste()}
               onInput={(e) => setPaste(e.currentTarget.value)}
               onKeyDown={(e) => e.key === "Enter" && submitPaste()}
@@ -508,9 +529,9 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
         </Show>
         <Show when={session()?.flow !== "device"}>
           <div class="p-acc-actions">
-            <button class="s-btn sm primary" disabled={phase() === "finishing" || !paste().trim()} onClick={submitPaste}>
+            <DialogButton variant="primary" disabled={phase() === "finishing" || !paste().trim()} onClick={submitPaste}>
               {phase() === "finishing" ? "Submitting…" : "Submit callback"}
-            </button>
+            </DialogButton>
           </div>
         </Show>
       </Show>
@@ -550,14 +571,14 @@ function DetailBar(p: { label: string; usedPct: number; reset?: string }) {
   );
 }
 
-function UsageDetail(p: { usage: ProviderUsage }) {
+function UsageDetail(p: { usage: ProviderUsage; headerEmail?: string; planInHeader?: boolean }) {
   const u = () => p.usage;
   const type = () => u().provider_type;
   return (
     <div class="p-detail">
       <Show when={u().status === "needs_reauth"}><p class="s-row-desc c-red">Reconnect this account to check its quota and use it for new requests.</p></Show>
       <div class="p-detail-meta">
-        <Show when={u().account_email}><span>{u().account_email}</span></Show>
+        <Show when={u().account_email && u().account_email !== p.headerEmail}><span>{u().account_email}</span></Show>
         <Show when={u().account_name}><span>{u().account_name}</span></Show>
         <Show when={u().organization}><span>{u().organization}</span></Show>
         <Show when={u().unified_status}>
@@ -573,7 +594,7 @@ function UsageDetail(p: { usage: ProviderUsage }) {
       </Show>
 
       <Show when={type() === "openai" && u().codex_primary_used_percent != null && u().codex_primary_window_minutes !== 0}>
-        <Show when={u().codex_plan_type}>
+        <Show when={u().codex_plan_type && !p.planInHeader}>
           <div class="p-detail-meta"><span>plan: {u().codex_plan_type}</span></div>
         </Show>
         <DetailBar label={codexWindowLabel(u().codex_primary_window_minutes, "Primary window")} usedPct={u().codex_primary_used_percent ?? 0} reset={u().codex_primary_reset_at ? `reset ${fmtResetEpoch(u().codex_primary_reset_at!)}` : undefined} />
@@ -619,11 +640,12 @@ function LiveRow(p: { a: AIProvider; usage?: ProviderUsage; onReconnect: () => v
   const status = () => effectiveProviderStatus(a, p.usage);
   const stClass = () => status() === "connected" ? "connected" : ["needs_reauth", "error", "quota_exhausted"].includes(status()) ? "needs_reauth" : "not_configured";
   const stLabel = () => ({ connected: "Connected", needs_reauth: "Reconnect", quota_exhausted: "Quota exhausted", needs_auth: "Needs auth", error: "Error" }[status()] ?? "Unknown");
-  const canCliProxyLogin = () => cliProxyReconnectable(a);
+  const canReconnect = () => reconnectable(a);
+  const expandable = () => canReconnect() || hasProviderUsageDetails(p.usage) || !!a.status.reason || !!a.status.message;
   const [open, setOpen] = createSignal(false);
   return (
     <div class="p-acc-wrap">
-      <button class="s-row p-acc p-acc-btn" aria-expanded={open()} onClick={() => setOpen(!open())}>
+      <Dynamic component={expandable() ? "button" : "div"} class={`s-row p-acc ${expandable() ? "p-acc-btn" : ""}`} aria-expanded={expandable() ? open() : undefined} onClick={expandable() ? () => setOpen(!open()) : undefined}>
         <ProviderLogo type={a.provider_type} name={a.name} />
         <div class="s-row-text">
           <div class="s-row-title">
@@ -632,7 +654,10 @@ function LiveRow(p: { a: AIProvider; usage?: ProviderUsage; onReconnect: () => v
           </div>
           <div class="s-row-desc">
             <span class={`p-st ${stClass()}`}>{stLabel()}</span>
-            <Show when={a.account_email}>
+            <Show when={p.usage?.codex_plan_type}>
+              <span class="p-dot">·</span><span>{p.usage!.codex_plan_type} plan</span>
+            </Show>
+            <Show when={a.account_email && !a.name.includes(a.account_email)}>
               <span class="p-dot">·</span>
               {a.account_email}
             </Show>
@@ -641,14 +666,15 @@ function LiveRow(p: { a: AIProvider; usage?: ProviderUsage; onReconnect: () => v
         <Show when={!open() && p.usage && !p.usage!.error}>
           <UsageSummary usage={p.usage!} />
         </Show>
-        <span class={`chev p-acc-chev ${open() ? "open" : ""}`}>›</span>
-      </button>
-      <Show when={open()}>
+        <Show when={expandable()}><span class={`chev p-acc-chev ${open() ? "open" : ""}`}>›</span></Show>
+      </Dynamic>
+      <Show when={open() && expandable()}>
         <div class="p-acc-body">
-          <Show when={p.usage} fallback={<p class="s-row-desc">Usage not available yet. Refresh to check this account.</p>}>
-            <UsageDetail usage={p.usage!} />
+          <Show when={hasProviderUsageDetails(p.usage)}>
+            <UsageDetail usage={p.usage!} headerEmail={a.account_email ?? (p.usage?.account_email && a.name.includes(p.usage.account_email) ? p.usage.account_email : undefined)} planInHeader />
           </Show>
-          <Show when={canCliProxyLogin()}>
+          <Show when={!p.usage?.error && (a.status.reason || a.status.message)}><p class="s-row-desc c-red">{a.status.reason || a.status.message}</p></Show>
+          <Show when={canReconnect()}>
             <div class="p-acc-actions">
               <button class="s-btn" onClick={p.onReconnect}>
                 {stClass() === "connected" ? "Re-auth" : "Reconnect"}

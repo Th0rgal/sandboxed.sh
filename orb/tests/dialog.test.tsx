@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { createSignal, Show } from "solid-js";
-import { fireEvent, render, screen } from "@solidjs/testing-library";
-import { Dialog } from "../src/Dialog";
+import { fireEvent, render, screen, waitFor } from "@solidjs/testing-library";
+import { ConfirmDialog, Dialog, PromptSheet } from "../src/Dialog";
 import { SchedulePicker } from "../src/SchedulePicker";
 import { hasFocusScope } from "../src/focusScope";
 
@@ -42,12 +42,13 @@ describe("dialog focus ownership", () => {
     render(() => <NestedSchedule />); fireEvent.click(screen.getByText("Open creation"));
     const first = screen.getByLabelText("Name");
     expect(document.activeElement).toBe(first);
-    fireEvent.keyDown(first, { key: "Tab", shiftKey: true });
+    const close = screen.getByRole("button", { name: "Close" }); close.focus();
+    fireEvent.keyDown(close, { key: "Tab", shiftKey: true });
     expect(document.activeElement).toBe(screen.getByText("Save cron"));
     fireEvent.keyDown(document.activeElement!, { key: "Tab" });
-    expect(document.activeElement).toBe(first);
+    expect(document.activeElement).toBe(close);
     screen.getByText("Open creation").focus(); // Programmatic focus escape is contained too.
-    expect(document.activeElement).toBe(first);
+    expect(document.activeElement).toBe(close);
     fireEvent.click(screen.getByRole("button", { name: "Schedule" }));
     const mode = screen.getByLabelText("Schedule type");
     fireEvent.keyDown(mode, { key: "Tab", shiftKey: true });
@@ -65,7 +66,7 @@ describe("dialog focus ownership", () => {
     expect(closeInner).toHaveBeenCalledTimes(1); expect(closeOuter).not.toHaveBeenCalled();
   });
   it("focuses the modal itself when it has no available controls", () => {
-    render(() => <Dialog title="Busy" onClose={() => {}} footer={<button disabled>Saving</button>}>Please wait</Dialog>);
+    render(() => <Dialog title="Busy" busy onClose={() => {}} footer={<button disabled>Saving</button>}>Please wait</Dialog>);
     const dialog = screen.getByRole("dialog");
     expect(document.activeElement).toBe(dialog);
     fireEvent.keyDown(dialog, { key: "Tab" }); expect(document.activeElement).toBe(dialog);
@@ -75,10 +76,79 @@ describe("dialog focus ownership", () => {
       <input aria-label="First" /><details><summary>Advanced</summary><input aria-label="Hidden override" /></details>
     </Dialog>);
     const first=screen.getByLabelText("First");
-    fireEvent.keyDown(first,{key:"Tab",shiftKey:true});
+    const close = screen.getByRole("button", { name: "Close" }); close.focus();
+    fireEvent.keyDown(close,{key:"Tab",shiftKey:true});
     expect(document.activeElement).toBe(screen.getByText("Advanced"));
     fireEvent.keyDown(document.activeElement!,{key:"Tab"});
-    expect(document.activeElement).toBe(first);
+    expect(document.activeElement).toBe(close);
   });
 
+});
+
+describe("shared modal behavior", () => {
+  it("requires a complete outside pointer gesture and blocks dismissal while busy", () => {
+    const close = vi.fn();
+    const [busy, setBusy] = createSignal(false);
+    render(() => <Dialog title="Saving" busy={busy()} onClose={close}>Content</Dialog>);
+    const panel = screen.getByRole("dialog");
+    const backdrop = panel.parentElement!;
+    fireEvent.pointerDown(panel); fireEvent.pointerUp(backdrop);
+    expect(close).not.toHaveBeenCalled();
+    fireEvent.pointerDown(backdrop); fireEvent.pointerUp(panel);
+    expect(close).not.toHaveBeenCalled();
+    fireEvent.pointerDown(backdrop); fireEvent.pointerUp(backdrop);
+    expect(close).toHaveBeenCalledTimes(1);
+    setBusy(true);
+    fireEvent.pointerDown(backdrop); fireEvent.pointerUp(backdrop);
+    fireEvent.keyDown(panel, { key: "Escape" });
+    expect((screen.getByRole("button", { name: "Close" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a rejected naming form open and allows one retry after busy clears", () => {
+    const action = vi.fn(() => setBusy(true));
+    const [busy, setBusy] = createSignal(false);
+    const [error, setError] = createSignal<string | null>(null);
+    const [value, setValue] = createSignal("Notes");
+    render(() => <PromptSheet title="Rename" value={value()} onInput={setValue} action="Save"
+      busy={busy()} error={error()} onAction={action} onClose={() => {}} />);
+    const input = screen.getByRole("textbox");
+    expect(document.activeElement).toBe(input);
+    fireEvent.submit(input.closest("form")!); fireEvent.submit(input.closest("form")!);
+    expect(action).toHaveBeenCalledTimes(1);
+    setBusy(false); setError("Try again");
+    expect(screen.getByRole("alert").textContent).toContain("Try again");
+    expect((input as HTMLInputElement).value).toBe("Notes");
+    fireEvent.submit(input.closest("form")!);
+    expect(action).toHaveBeenCalledTimes(2);
+  });
+
+  it("stacks confirmations without double dimming and restores both focus and scrolling", async () => {
+    const originalOverflow = document.body.style.overflow;
+    document.body.style.overflow = "auto";
+    function Nested() {
+      const [open, setOpen] = createSignal(false);
+      const [confirm, setConfirm] = createSignal(false);
+      return <><button onClick={() => setOpen(true)}>Open</button>
+        <Show when={open()}><Dialog title="Form" onClose={() => setOpen(false)}>
+          <button onClick={() => setConfirm(true)}>Discard</button>
+          <Show when={confirm()}><ConfirmDialog title="Discard?" description="Unsaved changes" action="Discard draft"
+            destructive onConfirm={() => setOpen(false)} onClose={() => setConfirm(false)} /></Show>
+        </Dialog></Show></>;
+    }
+    render(() => <Nested />);
+    const opener = screen.getByText("Open"); opener.focus(); fireEvent.click(opener);
+    const discard = screen.getByText("Discard"); discard.focus(); fireEvent.click(discard);
+    expect(document.activeElement).toBe(screen.getByText("Cancel"));
+    expect(document.querySelectorAll(".dlg-back-dim")).toHaveLength(1);
+    expect(screen.getByRole("dialog", { name: "Form" }).inert).toBe(true);
+    expect(document.body.style.overflow).toBe("hidden");
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    await waitFor(() => expect(document.activeElement).toBe(discard));
+    expect(screen.getByRole("dialog", { name: "Form" }).inert).toBe(false);
+    fireEvent.keyDown(discard, { key: "Escape" });
+    expect(document.activeElement).toBe(opener);
+    expect(document.body.style.overflow).toBe("auto");
+    document.body.style.overflow = originalOverflow;
+  });
 });

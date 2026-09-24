@@ -552,6 +552,17 @@ export function FilePanelProvider(p: {
       </For>
     );
   }
+  const isLocalFile = () => sources().some(s => s.id === selected()?.source && s.local);
+  async function revealFile() {
+    const ref = selected();
+    if (!ref) return;
+    setError(undefined);
+    try {
+      await client.call(ref.source, { action: "reveal", path: ref.path });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
   async function download() {
     const ref = selected();
     if (!ref) return;
@@ -731,9 +742,9 @@ export function FilePanelProvider(p: {
                   </button>
                   <button
                     disabled={!selected()}
-                    onClick={() => void download()}
+                    onClick={() => void (isLocalFile() ? revealFile() : download())}
                   >
-                    Download
+                    {isLocalFile() ? "Reveal in Finder" : "Download"}
                   </button>
                 </div>
               </details>{" "}
@@ -884,14 +895,14 @@ export function FilePanelProvider(p: {
                       </div>
                       <Show when={data().truncated}>
                         <p class="file-muted">
-                          Preview limited to 1 MiB. Download for the full file.
+                          Preview limited to 1 MiB. {isLocalFile() ? "Reveal in Finder to access the full file." : "Download for the full file."}
                         </p>
                       </Show>
                       <Show
                         when={!data().binary}
                         fallback={
                           <p class="file-muted">
-                            Binary file. Use Download to open it.
+                            {isLocalFile() ? <>Open this file from Finder. <button class="s-btn" onClick={() => void revealFile()}>Reveal in Finder</button></> : "Binary file. Use Download to open it."}
                           </p>
                         }
                       >

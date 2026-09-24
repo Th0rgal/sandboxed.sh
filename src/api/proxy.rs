@@ -214,7 +214,7 @@ static KIMI_CONCURRENCY: std::sync::LazyLock<tokio::sync::Semaphore> =
 ///
 /// Returns `None` for providers that don't have an OpenAI-compatible API
 /// (e.g., Google Gemini uses a different format).
-fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
+pub(crate) fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
     match provider_type {
         ProviderType::OpenAI => Some("https://api.openai.com/v1"),
         ProviderType::Xai => Some("https://api.x.ai/v1"),
@@ -2001,7 +2001,10 @@ pub(crate) async fn chat_completions_inner(
             let rewrite_result = if provider_type == ProviderType::Kimi {
                 rewrite_model_for_kimi(&body, &entry.model_id)
             } else {
-                rewrite_model(&body, &entry.model_id)
+                rewrite_model(
+                    &body,
+                    canonical_upstream_model(provider_type, &entry.model_id),
+                )
             };
             let upstream_body = match rewrite_result {
                 Ok(b) => b,
@@ -3347,6 +3350,16 @@ async fn enqueue_deferred_request(
         }),
     )
         .into_response()
+}
+
+// Older catalogs advertised this client-side context hint as an API model ID.
+// Z.ai exposes the same 1M context under the canonical glm-5.3 ID.
+fn canonical_upstream_model(provider: ProviderType, model: &str) -> &str {
+    if provider == ProviderType::Zai && model == "glm-5.3[1m]" {
+        "glm-5.3"
+    } else {
+        model
+    }
 }
 
 /// Rewrite the `model` field in the JSON request body.
@@ -6497,9 +6510,10 @@ mod tests {
 
         let anthropic_cli = protocol_capabilities(ProviderType::Anthropic, false, true);
         assert!(!anthropic_cli.anthropic_messages);
-        let anthropic_oauth_token_hoisted_as_key =
-            protocol_capabilities(ProviderType::Anthropic, true, true);
-        assert!(!anthropic_oauth_token_hoisted_as_key.anthropic_messages);
+        // A directly resolved credential remains usable when an OAuth account
+        // also exists; the resolver owns credential validation.
+        let anthropic_key_with_oauth = protocol_capabilities(ProviderType::Anthropic, true, true);
+        assert!(anthropic_key_with_oauth.anthropic_messages);
 
         let kimi = protocol_capabilities(ProviderType::Kimi, true, false);
         assert!(kimi.chat_completions && kimi.reasoning_content_replay);
@@ -7061,6 +7075,22 @@ mod tests {
         assert!(parse_kimi_bare_model_entry("kimi/k3-256k").is_none());
         assert!(parse_kimi_bare_model_entry("grok-4.5").is_none());
         assert!(parse_kimi_bare_model_entry("smart").is_none());
+    }
+
+    #[test]
+    fn zai_context_hint_is_not_an_upstream_model_id() {
+        assert_eq!(
+            canonical_upstream_model(ProviderType::Zai, "glm-5.3[1m]"),
+            "glm-5.3"
+        );
+        assert_eq!(
+            canonical_upstream_model(ProviderType::Zai, "glm-5.3"),
+            "glm-5.3"
+        );
+        assert_eq!(
+            canonical_upstream_model(ProviderType::Custom, "glm-5.3[1m]"),
+            "glm-5.3[1m]"
+        );
     }
 
     #[test]

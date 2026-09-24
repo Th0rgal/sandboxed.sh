@@ -1,4 +1,3 @@
-import { Portal } from "solid-js/web";
 import { messageImages } from "./messageImages";
 import { imagePrompt } from "./imageAttachments";
 import { Dialog } from "./Dialog";
@@ -102,7 +101,7 @@ function MessageImage(p: {path:string; index:number}) {
       <Show when={url()} fallback={<Ic.FileIcon size={22}/>}>{src=><img src={src()} alt={`Image #${p.index}`} onError={()=>setUrl(null)}/>}</Show>
       <span>#{p.index}</span>
     </button>
-    <Show when={expanded() && url()}><Portal><Dialog title={`Image #${p.index}`} wide onClose={()=>setExpanded(false)} footer={<button class="s-btn" onClick={()=>setExpanded(false)}>Close</button>}><img class="message-image-preview" src={url()!} alt={`Image #${p.index}`}/></Dialog></Portal></Show>
+    <Show when={expanded() && url()}><Dialog title={`Image #${p.index}`} size="wide" onClose={()=>setExpanded(false)}><img class="message-image-preview" src={url()!} alt={`Image #${p.index}`}/></Dialog></Show>
   </>;
 }
 

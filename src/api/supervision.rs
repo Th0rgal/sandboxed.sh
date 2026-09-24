@@ -523,7 +523,10 @@ async fn mission_has_detached_durable_run(
     Ok(mission_store
         .get_active_mission_run(mission_id)
         .await?
-        .is_some_and(|run| detached_run_proves_durable_liveness(run.execution_state)))
+        .is_some_and(|run| {
+            run.owner_actor_id.starts_with("orb-client:")
+                || detached_run_proves_durable_liveness(run.execution_state)
+        }))
 }
 
 /// Same as [`mission_has_detached_durable_run`] but a lease owned by a raw
@@ -540,8 +543,9 @@ async fn mission_has_detached_durable_run_excluding_remote_jobs(
         .get_active_mission_run(mission_id)
         .await?
         .is_some_and(|run| {
-            detached_run_proves_durable_liveness(run.execution_state)
-                && !is_remote_mission_job_owner(&run.owner_actor_id)
+            run.owner_actor_id.starts_with("orb-client:")
+                || (detached_run_proves_durable_liveness(run.execution_state)
+                    && !is_remote_mission_job_owner(&run.owner_actor_id))
         }))
 }
 

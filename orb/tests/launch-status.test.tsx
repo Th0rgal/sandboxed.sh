@@ -63,3 +63,13 @@ it('does not claim a native run is idle based on stale backend status',()=>{
  const {container}=render(()=><LaunchStatus destination="This computer" mission={mission} activity submitting/>);
  expect(container.querySelector('.launch-status')).toBeNull();
 });
+
+
+it("shows waiting for first output instead of a silent prompt-only active mission", () => {
+  const [activity, setActivity] = createSignal(false);
+  const mission = { id: "stalled", status: "active" } as Mission;
+  const { container } = render(() => <LaunchStatus destination="Core" mission={mission} activity={activity()} />);
+  expect(container.textContent).toContain("Waiting for the first output");
+  setActivity(true);
+  expect(container.querySelector(".launch-status")).toBeNull();
+});

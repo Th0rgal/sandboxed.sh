@@ -50,12 +50,17 @@ pub async fn operate(
                 .join(slug),
         ));
     }
+    let transfer = mission
+        .as_ref()
+        .and_then(|m| m.get("machine_transfer"))
+        .filter(|t| t["destination"]["kind"] == "node");
     let remote = mission
         .as_ref()
         .and_then(|m| m.get("remote_job"))
         .filter(|j| j.is_object());
     if let (Some(m), Some(id)) = (&mission, req.mission_id) {
         if remote.is_none()
+            && transfer.is_none()
             && !m["tags"]
                 .as_array()
                 .is_some_and(|t| t.iter().any(|t| t == "placement:client"))
@@ -88,12 +93,44 @@ pub async fn operate(
     }
     if req.operation.action == "roots" {
         let mut sources:Vec<Value>=roots.iter().map(|(id,label,path)|json!({"id":id,"label":label,"path":path,"available":path.is_dir()})).collect();
-        if let Some(remote) = remote {
+        if let Some(t) = transfer {
+            sources.insert(0,json!({"id":"workspace","label":"Workspace","machine":t["destination"]["id"],"available":true}));
+        } else if let Some(remote) = remote {
             sources.insert(0,json!({"id":"workspace","label":"Workspace","machine":remote["node_id"],"available":true}));
         }
         return Ok(Json(json!({"sources":sources})));
     }
     if req.source == "workspace" {
+        if let Some(t) = transfer {
+            let node = t["destination"]["id"]
+                .as_str()
+                .and_then(|id| state.config.remote_nodes.node(id))
+                .ok_or((StatusCode::CONFLICT, "Destination unavailable".into()))?;
+            let token = std::env::var(&node.token_env).map_err(|_| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Destination authentication unavailable".into(),
+                )
+            })?;
+            let response = state
+                .http_client
+                .post(format!("{}/machine-transfer/browse", node.base_url))
+                .bearer_auth(token)
+                .timeout(std::time::Duration::from_secs(15))
+                .json(&json!({"transfer_id":t["id"],"operation":req.operation}))
+                .send()
+                .await
+                .map_err(|_| (StatusCode::BAD_GATEWAY, "Destination unreachable".into()))?;
+            if !response.status().is_success() {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "Transferred workspace unavailable".into(),
+                ));
+            }
+            return Ok(Json(response.json().await.map_err(|_| {
+                (StatusCode::BAD_GATEWAY, "Invalid workspace response".into())
+            })?));
+        }
         if let Some(remote) = remote {
             let node = remote["node_id"]
                 .as_str()

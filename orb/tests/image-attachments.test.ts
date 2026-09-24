@@ -27,3 +27,37 @@ it("routes pasted images to the chosen node instead of writing them on Core", as
  expect(await stageRemoteImages([image], undefined, "ashur")).toEqual(["/node/uploads/image.png"]);
  expect(api).toHaveBeenCalledWith("/api/uploads", expect.objectContaining({method:"POST",body:JSON.stringify({node_id:"ashur",name:image.name,data_base64:image.dataUrl.split(",")[1]})}));
 });
+
+it("keeps embedded images in text order and maps references to uploaded paths", async () => {
+ const {readImagePaste} = await import("../src/imageAttachments");
+ const result = await readImagePaste('<p>Before</p><p><img src="cid:one"></p><p>Between<img src="cid:two">After</p>', 'Before Between After', [new File(['one'], '1.png', {type:'image/png'}), new File(['two'], '2.png', {type:'image/png'})], 3);
+ expect(result.text).toBe('Before\n[Image #3]\nBetween[Image #4]After');
+ expect(result.images.map(image => image.reference)).toEqual([3,4]);
+ expect(imagePrompt(result.text, ['/one.png','/two.png'], result.images)).toContain('[Image #4] [Uploaded: /two.png]');
+});
+it("keeps plain text alongside a binary clipboard image", async () => {
+ const {readImagePaste} = await import("../src/imageAttachments");
+ const result = await readImagePaste('', 'Look at this', [new File(['one'], '1.png', {type:'image/png'})], 1);
+ expect(result.text).toBe('Look at this\n[Image #1]');
+});
+it("extracts data images without executing clipboard markup", async () => {
+ const {readImagePaste} = await import("../src/imageAttachments");
+ const fetcher = vi.spyOn(globalThis, 'fetch').mockResolvedValue({ok:true, blob:async () => new Blob(['one'], {type:'image/png'})} as Response);
+ try {
+  const result = await readImagePaste('<script>bad()</script><div>Hello<br><img src="data:image/png;base64,b25l">end</div>', '', [], 1);
+  expect(result.text).toBe('Hello\n[Image #1]end');
+  expect(result.images).toHaveLength(1);
+ } finally {fetcher.mockRestore();}
+});
+it("reports inaccessible embedded images instead of silently losing them", async () => {
+ const {readImagePaste} = await import("../src/imageAttachments");
+ await expect(readImagePaste('<img src="cid:missing">', '', [], 1)).rejects.toThrow('bytes');
+});
+it("recognizes Proton Mail placeholders from the real clipboard format", async () => {
+ const {readImagePaste} = await import("../src/imageAttachments");
+ const html = '<div>Before</div><div><span class="proton-image-anchor" data-proton-embedded="embedded-33741" style="max-width: 526px;"></span></div><div>After</div>';
+ await expect(readImagePaste(html, 'Before\nAfter', [], 1)).rejects.toThrow('Proton Mail copied a placeholder');
+ const result = await readImagePaste(html, 'Before\nAfter', [new File(['image'], 'image.png', {type:'image/png'})], 1);
+ expect(result.text).toBe('Before\n[Image #1]\nAfter');
+ expect(result.images).toHaveLength(1);
+});

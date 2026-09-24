@@ -18,8 +18,16 @@ struct State {
     next: u64,
     listeners: Vec<(u64, Channel<Event>)>,
 }
+#[derive(Debug, Clone, Serialize)]
+pub struct Activity {
+    pub id: String,
+    pub label: String,
+    pub done: bool,
+    pub failed: bool,
+}
 #[derive(Default)]
-pub struct Output(Mutex<State>, AtomicUsize);
+pub struct Output(Mutex<State>, AtomicUsize, Mutex<Vec<Activity>>);
+
 pub struct ReaderGuard(Arc<Output>);
 impl Drop for ReaderGuard {
     fn drop(&mut self) {
@@ -27,6 +35,59 @@ impl Drop for ReaderGuard {
     }
 }
 impl Output {
+    pub fn activities(&self) -> Vec<Activity> {
+        self.2.lock().unwrap().clone()
+    }
+    pub fn claude_activity(&self, value: &serde_json::Value) {
+        let mut activities = self.2.lock().unwrap();
+        let event = &value["event"];
+        if value["type"] == "stream_event" && event["type"] == "content_block_start" {
+            let block = &event["content_block"];
+            let thinking = block["type"] == "thinking";
+            if thinking || block["type"] == "tool_use" {
+                let id = if thinking {
+                    format!("thinking:{}", activities.len())
+                } else {
+                    block["id"].as_str().unwrap_or("").to_owned()
+                };
+                if !activities.iter().any(|a| a.id == id) {
+                    activities.push(Activity {
+                        id,
+                        label: if thinking {
+                            "Thinking".into()
+                        } else {
+                            block["name"].as_str().unwrap_or("Tool").into()
+                        },
+                        done: false,
+                        failed: false,
+                    });
+                }
+            }
+        }
+        if value["type"] == "stream_event" && event["type"] == "content_block_stop" {
+            if let Some(last) = activities
+                .last_mut()
+                .filter(|a| a.id.starts_with("thinking:"))
+            {
+                last.done = true;
+            }
+        }
+        if value["type"] == "user" {
+            if let Some(blocks) = value["message"]["content"].as_array() {
+                for block in blocks {
+                    if block["type"] == "tool_result" {
+                        if let Some(activity) = activities
+                            .iter_mut()
+                            .find(|a| Some(a.id.as_str()) == block["tool_use_id"].as_str())
+                        {
+                            activity.done = true;
+                            activity.failed = block["is_error"].as_bool().unwrap_or(false);
+                        }
+                    }
+                }
+            }
+        }
+    }
     pub fn reader(self: &Arc<Self>) -> ReaderGuard {
         self.1.fetch_add(1, Ordering::SeqCst);
         ReaderGuard(self.clone())
@@ -143,6 +204,25 @@ impl CodexText {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn claude_activity_tracks_thinking_and_tool_results() {
+        let output = Output::default();
+        output.claude_activity(&json!({"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"thinking"}}}));
+        assert!(!output.activities()[0].done);
+        output
+            .claude_activity(&json!({"type":"stream_event","event":{"type":"content_block_stop"}}));
+        output.claude_activity(&json!({"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"t1","name":"Bash"}}}));
+        output
+            .claude_activity(&json!({"type":"stream_event","event":{"type":"content_block_stop"}}));
+        assert!(output.activities()[0].done);
+        assert!(!output.activities()[1].done); // End of arguments is not tool completion.
+        output.claude_activity(&json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"failed"}]}}));
+        assert!(output.activities()[1].done);
+        assert!(output.activities()[1].failed);
+        assert_eq!(output.activities()[1].label, "Bash");
+        assert_eq!(output.snapshot(), ""); // No arguments/results mixed into assistant prose.
+    }
+
     #[test]
     fn final_items_reconcile_without_duplication() {
         let output = Output::default();

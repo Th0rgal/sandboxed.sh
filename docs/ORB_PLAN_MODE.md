@@ -69,3 +69,19 @@ pnpm exec playwright test native-interaction.browser.spec.ts
 Protocol references: [Codex app-server](https://developers.openai.com/codex/app-server/),
 [Claude user input](https://platform.claude.com/docs/en/agent-sdk/user-input),
 [OpenCode ACP](https://opencode.ai/v2/docs/cli/acp/).
+
+## Local run recovery
+
+Orb reconciles a selected local conversation on reload and before starting a new
+turn. The native launch holds a per-mission OS file lock across inspection,
+recovery, admission and the running process. Other Orb instances cannot recover
+or launch that same mission concurrently. Waiting for a Plan approval keeps the
+native run and lock alive; no age-based expiration is used.
+
+Recovery reads the current receipt from the server using the stable machine ID,
+then closes only that run ID and generation through the existing client-status
+API. It requires the native run to have stopped and checks for surviving
+processes in the workspace, including descendants left behind by an Orb crash.
+Unknown process state, network failure, authorization failure, transfer conflicts
+and stale-generation responses keep the server fence intact. A surviving process
+must be stopped before recovery can proceed. No prompt is automatically replayed.

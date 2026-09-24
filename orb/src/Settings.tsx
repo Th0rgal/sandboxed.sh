@@ -1,3 +1,5 @@
+import { ExecutionSettings } from "./ExecutionSettings";
+import { Select } from "./Select";
 import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createSignal, type JSX } from "solid-js";
 import * as Ic from "./icons";
@@ -23,35 +25,6 @@ export function Toggle(p: { on: boolean; onClick?: () => void }) {
   );
 }
 
-function Select(p: { value: string; options: string[]; onChange?: (v: string) => void }) {
-  const [v, setV] = createSignal(p.value);
-  const [open, setOpen] = createSignal(false);
-  return (
-    <div class="s-select" onPointerDown={(e) => e.stopPropagation()}>
-      <button class="s-btn" onClick={() => setOpen(!open())}>
-        {v()} <Ic.ChevronDown size={12} />
-      </button>
-      <Show when={open()}>
-        <div class="menu s-menu">
-          <For each={p.options}>
-            {(o) => (
-              <button
-                class={`menu-item ${o === v() ? "on" : ""}`}
-                onClick={() => {
-                  setV(o);
-                  setOpen(false);
-                  p.onChange?.(o);
-                }}
-              >
-                {o}
-              </button>
-            )}
-          </For>
-        </div>
-      </Show>
-    </div>
-  );
-}
 
 function Row(p: { title: string; desc?: string; children?: JSX.Element }) {
   return (
@@ -89,7 +62,7 @@ function LocalAgentsCard() {
       setBusy(false);
     }
   };
-  void scan();
+  if (!localInstalled().length) void scan();
   const row = (id: string) => localInstalled().find((item) => item.id === id);
   const label: Record<string, string> = {
     claudecode: "Claude Code",
@@ -201,31 +174,32 @@ function BackendTab() {
 }
 
 export function Settings(p: { onOpenPage?: (id: string) => void } = {}) {
+  const [executionMounted, setExecutionMounted] = createSignal(false);
   return (
-    <div class="s-body">
+    <div class="s-body settings-body">
       <div class="s-inner">
         <h2>Client</h2>
         <BackendTab />
         <LocalAgentsCard />
-        <Show when={isConnected() && p.onOpenPage}>
-          <Card title="Execution">
-            <Row
-              title="Concurrency limits"
-              desc="Backend-wide mission and task concurrency. A project's own parallel-mission cap lives on that project's settings page."
-            >
-              <button class="s-btn" onClick={() => p.onOpenPage?.("execution")}>
-                Open
-              </button>
-            </Row>
-          </Card>
+        <Show when={isConnected()}>
+          <section class="s-sec">
+            <h3>Execution</h3>
+            <details class="s-card execution-disclosure" onToggle={e => { if (e.currentTarget.open) setExecutionMounted(true); }}>
+              <summary class="s-row">
+                <span class="s-row-text"><span class="s-row-title">Concurrency limits</span><span class="s-row-desc">Agent and task limits across all projects.</span></span>
+                <Ic.ChevronDown size={14} />
+              </summary>
+              <Show when={executionMounted()}><ExecutionSettings inline /></Show>
+            </details>
+          </section>
         </Show>
         <Card title="Appearance">
           <Row title="Theme" desc="Auto follows your desktop appearance.">
             <Select
               value={THEME_LABELS[getThemePref()]}
-              options={["Auto", "Light", "Dark"]}
-              onChange={(v) => setThemePref(THEME_PREFS[v])}
-            />
+              aria-label="Theme"
+              onChange={(e) => setThemePref(THEME_PREFS[e.currentTarget.value])}
+            ><option>Auto</option><option>Light</option><option>Dark</option></Select>
           </Row>
         </Card>
       </div>

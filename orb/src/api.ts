@@ -1,3 +1,4 @@
+import type { ClientRunReceipt } from "./clientRuns";
 import { createSignal } from "solid-js";
 import { getProjectCronFromJob, hermesPatch, normalizeControllerView, type HermesControllerView, type HermesJob } from "./cronSchema";
 
@@ -21,7 +22,14 @@ const [connected, setConnected] = createSignal(!!getJwt());
 export const isConnected = connected;
 export const [connectionVersion, bumpConnectionVersion] = createSignal(0);
 
+function disconnectNativeSync(){
+  const invoke=(window as any).__TAURI_INTERNALS__?.invoke ?? (window as any).__TAURI__?.core?.invoke;
+  if(!invoke||!getJwt())return;
+  void invoke("project_context_disconnect",{request:{endpoint:getApiUrl(),token:getJwt(),project:"disconnect"}}).catch(()=>{});
+  void invoke("local_origin_disconnect",{connection:{api_url:getApiUrl(),token:getJwt()}}).catch(()=>{});
+}
 export function setConnection(url: string, token: string) {
+  if(getJwt() && (url.replace(/\/+$/,"")!==getApiUrl() || token!==getJwt()))disconnectNativeSync();
   setApiUrl(url);
   localStorage.setItem(JWT_KEY, token);
   setConnected(true);
@@ -29,6 +37,7 @@ export function setConnection(url: string, token: string) {
 }
 
 export function clearConnection() {
+  disconnectNativeSync();
   const hadConnection = connected() || !!getJwt();
   localStorage.removeItem(JWT_KEY);
   setConnected(false);
@@ -157,6 +166,9 @@ export interface RemoteJob {
 }
 
 export interface Mission {
+  local_sync_pending?: boolean;
+  local_sync_error?: string | null;
+  machine_transfer?: import("./machineTransfer").TransferAction;
   working_directory?: string | null;
   id: string;
   status: string;
@@ -177,6 +189,8 @@ export interface Mission {
   /** Reasoning effort in force for the next turn. Absent means backend default. */
   model_effort?: string | null;
   project?: string | null;
+  track?: string | null;
+  github_pr?: string | null;
   tags?: string[];
   created_at: string;
   updated_at: string;
@@ -205,7 +219,7 @@ export interface CreateMissionBody {
   placement?: "client";
 }
 
-export type MissionAttachmentKind = "file" | "folder" | "controller";
+export type MissionAttachmentKind = "file" | "folder" | "controller" | "context";
 export interface MissionAttachment {
   kind: MissionAttachmentKind;
   path?: string;
@@ -230,13 +244,26 @@ export interface HarnessChoice {
   models: BackendModelOption[];
 }
 
+/** Small read-only catalogs keep local launch available across offline restarts. */
+async function cachedCatalog<T>(path:string):Promise<T>{
+ const version=connectionVersion(),token=getJwt();
+ let hash=2166136261;for(const c of `${getApiUrl()}:${token??""}`)hash=Math.imul(hash^c.charCodeAt(0),16777619);
+ const key=`orb.catalog:${hash>>>0}:${path}`;
+ try{const value=await api<T>(path,{signal:AbortSignal.timeout(3000)});if(version===connectionVersion())try{localStorage.setItem(key,JSON.stringify(value));}catch{}return value;}
+ catch(error){
+  if(version!==connectionVersion()||getJwt()!==token||error instanceof ApiError)throw error;
+  const stored=localStorage.getItem(key);if(stored){try{return JSON.parse(stored) as T;}catch{}}
+  throw error;
+ }
+}
+
 export async function listBackends(): Promise<BackendInfo[]> {
-  const data = await api<BackendInfo[] | { backends?: BackendInfo[] }>("/api/backends");
+  const data = await cachedCatalog<BackendInfo[] | { backends?: BackendInfo[] }>("/api/backends");
   return Array.isArray(data) ? data : (data.backends ?? []);
 }
 
 export async function listBackendModels(): Promise<Record<string, BackendModelOption[]>> {
-  const data = await api<{ backends?: Record<string, BackendModelOption[]> }>("/api/providers/backend-models");
+  const data = await cachedCatalog<{ backends?: Record<string, BackendModelOption[]> }>("/api/providers/backend-models");
   return data.backends ?? {};
 }
 
@@ -317,8 +344,8 @@ export interface ProviderUsage {
   zai_mcp_reset?: number;
 }
 
-export async function getProviderUsage(id: string): Promise<ProviderUsage> {
-  return api(`/api/ai/providers/${encodeURIComponent(id)}/usage`);
+export async function getProviderUsage(id: string, force = false): Promise<ProviderUsage> {
+  return api(`/api/ai/providers/${encodeURIComponent(id)}/usage${force ? "?force=true" : ""}`);
 }
 
 export async function getAllProviderUsage(): Promise<Record<string, ProviderUsage>> {
@@ -418,7 +445,7 @@ export async function archiveProject(slug: string): Promise<void> {
 }
 
 export async function listProjects(): Promise<ProjectSummary[]> {
-  const data = await api<{ projects?: ProjectSummary[] }>("/api/projects");
+  const data = await cachedCatalog<{ projects?: ProjectSummary[] }>("/api/projects");
   return (data.projects ?? []).filter(
     (p) => p.status !== "archived" && p.status !== "deleted" && !archivedSlugs.has(p.slug),
   );
@@ -590,10 +617,12 @@ export function slugify(title: string): string {
 
 /** Missions tagged with this project (exact slug match on the backend). */
 export async function listProjectMissions(slug: string): Promise<Mission[]> {
-  return api(`/api/control/missions?project=${encodeURIComponent(slug)}&limit=100&all=true`);
+  const local=(await import("./localOrigins").then(m=>m.localOrigins())).filter(m=>m.project===slug);
+  try{const remote=await api<Mission[]>(`/api/control/missions?project=${encodeURIComponent(slug)}&limit=100&all=true`);const pending=local.filter(m=>m.local_sync_pending||m.status==="active");return [...pending,...remote.filter(m=>!pending.some(l=>l.id===m.id))];}catch(error){if(local.length)return local;throw error;}
 }
 
 export async function listProjectFiles(slug: string, path: string): Promise<ProjectFileEntry[]> {
+  const local=await import("./projectContext").then(m=>m.localContextFile<{entries:ProjectFileEntry[]}>(slug,"list",path));if(local)return local.entries;
   const data = await api<{ entries?: ProjectFileEntry[] }>(
     `/api/projects/${encodeURIComponent(slug)}/files?path=${encodeURIComponent(path)}`,
   );
@@ -607,15 +636,17 @@ export async function readProjectFile(slug: string, path: string): Promise<strin
   return data.content ?? "";
 }
 
-export async function writeProjectFile(slug: string, path: string, content: string): Promise<void> {
-  await api(`/api/projects/${encodeURIComponent(slug)}/file`, {
+export async function writeProjectFile(slug: string, path: string, content: string, expectedRevision?: number): Promise<{revision?: number}> {
+  const local=await import("./projectContext").then(m=>m.localContextFile<{revision?:number}>(slug,"write",path,content,expectedRevision));if(local)return local;
+  return api(`/api/projects/${encodeURIComponent(slug)}/file`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path, content }),
+    body: JSON.stringify({ path, content, expected_revision: expectedRevision }),
   });
 }
 
 export async function mkdirProjectFile(slug: string, path: string): Promise<void> {
+  const local=await import("./projectContext").then(m=>m.localContextFile(slug,"mkdir",path));if(local)return;
   await api(`/api/projects/${encodeURIComponent(slug)}/file/mkdir`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -624,17 +655,22 @@ export async function mkdirProjectFile(slug: string, path: string): Promise<void
 }
 
 export async function deleteProjectFile(slug: string, path: string): Promise<void> {
+  const local=await import("./projectContext").then(m=>m.localContextFile(slug,"delete",path));if(local)return;
   await api(`/api/projects/${encodeURIComponent(slug)}/file?path=${encodeURIComponent(path)}`, {
     method: "DELETE",
   });
 }
 
 export async function listMissions(): Promise<Mission[]> {
-  return api("/api/control/missions");
+  const local = await import("./localOrigins").then(m=>m.localOrigins());
+  try { const remote = await api<Mission[]>("/api/control/missions", {signal:AbortSignal.timeout(3000)}); const pending=local.filter(row=>row.local_sync_pending||row.status==="active"); return [...pending,...remote.filter(row=>!pending.some(item=>item.id===row.id))]; }
+  catch(error){if(local.length)return local;throw error;}
 }
 
 export async function getMission(id: string): Promise<Mission> {
-  return api(`/api/control/missions/${id}`);
+  const local = (await import("./localOrigins").then(m=>m.localOrigins())).find(row=>row.id===id);
+  if(local?.local_sync_pending || local?.status==="active")return local;
+  try{return await api(`/api/control/missions/${id}`);}catch(error){if(local)return local;throw error;}
 }
 
 export async function createMission(body: CreateMissionBody): Promise<Mission> {
@@ -673,10 +709,19 @@ export async function sendMissionMessage(
   attachments?: MissionAttachment[],
   clientMessageId: string = crypto.randomUUID(),
 ): Promise<{ id: string; queued: boolean; message_accepted?: boolean }> {
+  const version = connectionVersion();
+  const mission = await getMission(id);
+  if (connectionVersion() !== version) throw new Error("Connection changed. Your draft is kept.");
+  // A reply continues the selected conversation. Send the exact current identity
+  // so mentions of other PRs are not mistaken for silently retasking a writer.
+  // Remote-node continuation currently accepts content only.
+  const continue_identity = mission.track?.trim() && !mission.remote_node_id && !mission.remote_job
+    ? { project: mission.project ?? null, track: mission.track, github_pr: mission.github_pr ?? null }
+    : undefined;
   const receipt = await api<{ id: string; queued: boolean; message_accepted?: boolean }>("/api/control/message", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content: text, mission_id: id, client_message_id: clientMessageId, ...(attachments?.length ? { attachments } : {}) }),
+    body: JSON.stringify({ content: text, mission_id: id, client_message_id: clientMessageId, ...(continue_identity ? { continue_identity } : {}), ...(attachments?.length ? { attachments } : {}) }),
   });
   if (receipt.message_accepted === false) throw new MessageRejectedError("Message was not accepted. Your draft is kept.");
   if (typeof receipt.id !== "string" || !receipt.id || typeof receipt.queued !== "boolean") throw new Error("Invalid message receipt. Your draft is kept.");
@@ -711,19 +756,55 @@ export async function addProjectSteer(slug: string, body: string, origin = "orb"
   });
 }
 
-export async function appendClientTranscript(id: string, role: "user" | "assistant", content: string, eventId = crypto.randomUUID()): Promise<void> {
+export async function appendClientTranscript(id: string, role: "user" | "assistant", content: string, eventId = crypto.randomUUID(), receipt?: ClientRunReceipt): Promise<void> {
   await api(`/api/control/missions/${id}/client-transcript`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id: eventId, role, content }),
+    body: JSON.stringify({ id: eventId, role, content, ...(receipt ?? await import("./clientRuns").then(m => m.clientRunReceipt(id))) }),
   });
 }
 
-export async function setClientMissionStatus(id: string, status: "completed" | "failed" | "interrupted" | "awaiting_user"): Promise<void> {
+export async function setClientMissionStatus(id: string, status: "completed" | "failed" | "interrupted" | "awaiting_user", receipt?: ClientRunReceipt): Promise<void> {
   await api(`/api/control/missions/${id}/client-status`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ status }),
+    body: JSON.stringify({ status, ...(receipt ?? await import("./clientRuns").then(m => m.clientRunReceipt(id))) }),
+  });
+}
+
+/** Acknowledge an idle conversation, retaining its transcript in Finished. */
+export async function archiveMission(id: string): Promise<void> {
+  const version = connectionVersion();
+  const mission = await getMission(id);
+  if (connectionVersion() !== version) throw new Error("Connection changed. Try again.");
+  if (!["awaiting_user", "blocked", "paused", "interrupted", "failed", "completed"].includes(mission.status)
+    || mission.execution?.state === "running") throw new Error("Wait for the mission to stop before archiving it.");
+  await api(`/api/control/missions/${encodeURIComponent(id)}/status`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status: "acknowledged" }),
+  });
+}
+
+/** Reopen for manual follow-up without dispatching a runner or autoresuming work. */
+export async function reopenMission(id: string): Promise<void> {
+  const version = connectionVersion();
+  const mission = await getMission(id);
+  if (connectionVersion() !== version) throw new Error("Connection changed. Try again.");
+  if (!["completed", "failed", "interrupted", "acknowledged", "cancelled"].includes(mission.status)
+    || mission.execution?.state === "running") throw new Error("This mission is no longer finished. Refresh its status before reopening it.");
+  await api(`/api/control/missions/${encodeURIComponent(id)}/status`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status: "paused" }),
+  });
+}
+
+/** Rename the conversation without changing its execution settings. */
+export async function renameMission(id: string, title: string): Promise<void> {
+  await api(`/api/control/missions/${encodeURIComponent(id)}/title`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title }),
   });
 }
 
@@ -852,4 +933,15 @@ export async function forkMission(id: string, body: { backend: string; model_ove
     if (e instanceof ApiError && [404, 405].includes(e.status)) throw new Error("This backend needs the conversation-fork update. The original mission has not been changed.");
     throw e;
   }
+}
+
+export function startProviderOAuth(id: string) {
+  return api<{ url: string; instructions: string; method: string }>(`/api/ai/providers/${encodeURIComponent(id)}/oauth/authorize`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ method_index: 0 }),
+  });
+}
+export function completeProviderOAuth(id: string, code: string) {
+  return api<AIProvider>(`/api/ai/providers/${encodeURIComponent(id)}/oauth/callback`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ method_index: 0, code }),
+  });
 }

@@ -21,13 +21,35 @@ export function safeHref(raw: string): string | null {
   return /^(https?:|mailto:)/i.test(raw.trim()) ? raw.trim() : null;
 }
 
-function inline(text: string): JSX.Element[] {
+function plainInline(text: string, links: boolean): JSX.Element[] {
+  if (!links) return [<FileReferenceText text={text}/>];
+  const result: JSX.Element[] = [];
+  const pattern = /https?:\/\/[^\s<>"`]+/gi;
+  let last = 0;
+  for (const match of text.matchAll(pattern)) {
+    let href = match[0].replace(/[.,;:!?\u2026'’»]+$/, "");
+    for (const [open, close] of [["(", ")"], ["[", "]"], ["{", "}"]]) {
+      while (href.endsWith(close) && href.split(close).length > href.split(open).length) href = href.slice(0, -1);
+    }
+    href = href.replace(/[.,;:!?\u2026'’»]+$/, "");
+    try { if (!new URL(href).hostname) continue; } catch { continue; }
+    const start = match.index!;
+    if (start > last) result.push(<FileReferenceText text={text.slice(last, start)}/>);
+    const target = href;
+    result.push(<a href={target} onClick={event => {event.preventDefault();void openExternalUrl(target);}}>{target}</a>);
+    last = start + href.length;
+  }
+  if (last < text.length) result.push(<FileReferenceText text={text.slice(last)}/>);
+  return result;
+}
+
+function inline(text: string, links = true): JSX.Element[] {
   const out: JSX.Element[] = [];
   const re = /\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\(([^)]+)\)/g;
   let last = 0;
   for (let m = re.exec(text); m; m = re.exec(text)) {
-    if (m.index > last) out.push(<FileReferenceText text={text.slice(last, m.index)} />);
-    if (m[1] !== undefined) out.push(<strong>{inline(m[1])}</strong>);
+    if (m.index > last) out.push(...plainInline(text.slice(last, m.index), links));
+    if (m[1] !== undefined) out.push(<strong>{inline(m[1], links)}</strong>);
     else if (m[2] !== undefined) out.push(<FileReference raw={m[2]}><code>{m[2]}</code></FileReference>);
     else if (!safeHref(m[4])) out.push(<FileReference raw={m[4]}>{m[3]}</FileReference>);
     else
@@ -40,12 +62,12 @@ function inline(text: string): JSX.Element[] {
             if (href) void openExternalUrl(href);
           }}
         >
-          {inline(m[3])}
+          {inline(m[3], false)}
         </a>,
       );
     last = m.index + m[0].length;
   }
-  if (last < text.length) out.push(<FileReferenceText text={text.slice(last)} />);
+  if (last < text.length) out.push(...plainInline(text.slice(last), links));
   return out;
 }
 

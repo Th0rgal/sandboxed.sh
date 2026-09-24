@@ -1,3 +1,5 @@
+import { Select } from "./Select";
+import { RoutingPicker } from "./RoutingPicker";
 import {
   For,
   Index,
@@ -6,6 +8,7 @@ import {
   createMemo,
   createSignal,
   onCleanup,
+  untrack,
 } from "solid-js";
 import {
   connectionVersion,
@@ -15,8 +18,9 @@ import {
   type AIProvider,
 } from "./api";
 import * as R from "./routingApi";
+import * as Ic from "./icons";
 import { ErrorNotice } from "./ErrorNotice";
-import { Dialog } from "./Dialog";
+import { ConfirmDialog } from "./Dialog";
 
 const [dirty, setDirty] = createSignal(false);
 const [leaveRequest, setLeaveRequest] = createSignal<(() => void) | null>(null);
@@ -40,6 +44,11 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
     connectionVersion();
     return getApiUrl();
   });
+  const [tab, setTab] = createSignal<"chains" | "health" | "events">("chains");
+  const [catalogLoading, setCatalogLoading] = createSignal(false);
+  const [copiedId, setCopiedId] = createSignal("");
+  let copyFeedbackTimer: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => clearTimeout(copyFeedbackTimer));
   const [chains, setChains] = createSignal<R.ModelChain[]>([]);
   const [health, setHealth] = createSignal<R.AccountHealthSnapshot[]>([]);
   const [events, setEvents] = createSignal<R.FallbackEvent[]>([]);
@@ -51,6 +60,8 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
   const [updated, setUpdated] = createSignal<string>();
   const [loading, setLoading] = createSignal(false);
   const [busy, setBusy] = createSignal(false);
+  const [expanded, setExpanded] = createSignal<string | null>(null);
+  const [renaming, setRenaming] = createSignal(false);
   const [editing, setEditing] = createSignal<string | null>(null);
   const [draft, setDraft] = createSignal<R.ChainDraft>(emptyDraft());
   const [deleteTarget, setDeleteTarget] = createSignal<R.ModelChain | null>(
@@ -71,6 +82,7 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
   let generation = 0;
   let fetching = false;
   let queuedFullRefresh = false;
+  let queuedForceRefresh = false;
   let dragged = -1;
   const accountName = (id: string) => {
     const account = accounts().find((a) => a.id === id);
@@ -88,10 +100,11 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
       else delete next[key];
       return next;
     });
-  async function refresh(full = false) {
+  async function refresh(full = false, force = false) {
     if (!isConnected()) return;
     if (fetching) {
       queuedFullRefresh ||= full;
+      queuedForceRefresh ||= force;
       return;
     }
     fetching = true;
@@ -113,15 +126,13 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
       }
     };
     await Promise.all([
-      read("Provider Health", R.listHealth, setHealth),
-      read("Recent Fallback Events", R.listEvents, setEvents),
-      ...(full
-        ? [
-            read("Fallback Chains", R.listChains, setChains),
-            read("Model catalog", R.routingCatalog, setCatalog),
-            read("Accounts", listProviders, setAccounts),
-          ]
-        : []),
+      ...(full ? [read("Fallback Chains", () => R.listChains(force), setChains)] : []),
+      ...(tab() === "health" ? [
+        read("Provider Health", R.listHealth, setHealth),
+        ...(full ? [read("Accounts", listProviders, setAccounts)] : []),
+
+      ] : []),
+      ...(tab() === "events" ? [read("Recent Fallback Events", R.listEvents, setEvents)] : []),
     ]);
     if (epoch === generation) {
       setUpdated(new Date().toISOString());
@@ -129,7 +140,9 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
       fetching = false;
       if (queuedFullRefresh) {
         queuedFullRefresh = false;
-        void refresh(true);
+        const force = queuedForceRefresh;
+        queuedForceRefresh = false;
+        void refresh(true, force);
       }
     }
   }
@@ -139,6 +152,7 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
     generation++;
     fetching = false;
     queuedFullRefresh = false;
+    queuedForceRefresh = false;
     setChains([]);
     setHealth([]);
     setEvents([]);
@@ -150,6 +164,7 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
     setExpandedHealth(new Set<string>());
     setUpdated(undefined);
     setEditing(null);
+    setExpanded(null);
     setDirty(false);
     setResult(undefined);
     setChainFilter("");
@@ -157,13 +172,14 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
     setReasonFilter("");
     setBusy(false);
     setActionError("");
-    if (connected) void refresh(true);
+    setCatalogLoading(false);
+    if (connected) untrack(() => void refresh(true));
   });
   const poll = setInterval(() => {
-    if (document.visibilityState !== "hidden") void refresh();
+    if (document.visibilityState !== "hidden" && tab() !== "chains") void refresh();
   }, 10000);
   const onVisibility = () => {
-    if (document.visibilityState !== "hidden") void refresh();
+    if (document.visibilityState !== "hidden" && tab() !== "chains") void refresh();
   };
   const beforeUnload = (e: BeforeUnloadEvent) => {
     if (dirty()) {
@@ -181,9 +197,31 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
     setDirty(false);
     setLeaveRequest(null);
   });
+  function selectTab(next: "chains" | "health" | "events") {
+    if (!confirmLeaveRouting(() => selectTab(next))) return;
+    setEditing(null);
+    setTab(next);
+    void refresh(true);
+  }
+  const [discovery, setDiscovery] = createSignal<R.ModelDiscovery>();
+  async function loadCatalog(force = false) {
+    const epoch = generation;
+    setCatalogLoading(true);
+    try {
+      if (force) await R.refreshModelDiscovery();
+      const [value, evidence] = await Promise.all([R.routingCatalog(force), R.modelDiscovery().catch(() => undefined)]);
+      if (epoch === generation) setDiscovery(evidence);
+      if (epoch === generation) { setCatalog(value); clearError("Model catalog"); }
+    } catch (error) {
+      if (epoch === generation) clearError("Model catalog", message(error));
+    } finally { if (epoch === generation) setCatalogLoading(false); }
+  }
   function edit(chain?: R.ModelChain) {
     if (busy() || !confirmLeaveRouting(() => edit(chain))) return;
+    void loadCatalog();
+    setExpanded(chain?.id ?? null);
     setEditing(chain?.id ?? "");
+    setRenaming(false);
     setDraft(
       chain
         ? {
@@ -224,7 +262,7 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
       await fn();
       if (epoch === generation) {
         done?.();
-        await refresh(true);
+        await refresh(true, true);
       }
     } catch (e) {
       if (epoch === generation) setActionError(message(e));
@@ -262,12 +300,16 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
       () => {
         setDirty(false);
         setEditing(null);
+        setExpanded(null);
       },
     );
   }
   async function inspect(id: string, test: boolean) {
     const epoch = generation;
     await action(async () => {
+      if (!test) {
+        try { const rows = await listProviders(); if (epoch === generation) setAccounts(rows); } catch { /* Resolution still works with account IDs. */ }
+      }
       const value = test
         ? { id, test: await R.testChain(id) }
         : { id, resolved: await R.resolveChain(id) };
@@ -295,24 +337,107 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
       )
       .sort((a, b) => b.timestamp.localeCompare(a.timestamp)),
   );
+  const ChainTools = (props: { chain: R.ModelChain }) => {
+    return <div class="routing-actions routing-diagnostics">
+      <button type="button" class="s-btn" disabled={busy() || dirty()} title="Test the saved chain with a small inference request" onClick={() => void inspect(props.chain.id, true)}>Test chain</button>
+      <button type="button" class="s-btn" disabled={busy()} onClick={() => {
+        setRenaming(true);
+        queueMicrotask(() => document.getElementById("routing-chain-name")?.focus());
+      }}>Rename</button>
+      <button type="button" class="s-btn" disabled={busy() || dirty()} onClick={() => void inspect(props.chain.id, false)}>Resolve</button>
+      <Show when={!props.chain.is_default}>
+        <button type="button" class="s-btn" disabled={busy() || dirty()} onClick={() => void action(() => R.setDefaultChain(props.chain.id))}>Set as default</button>
+        <Show when={!props.chain.id.startsWith("builtin/")}>
+          <button type="button" class="s-btn" disabled={busy() || dirty()} onClick={() => setDeleteTarget(props.chain)}>Delete</button>
+        </Show>
+      </Show>
+    </div>;
+  };
+  const ChainResult = (props: { chain: R.ModelChain }) => { const chain = props.chain; return <>
+                  <Show when={result()?.id === chain.id}>
+                    <div class="routing-result">
+                      <Show when={result()?.resolved}>
+                        {(resolved) => (
+                          <>
+                            <details class="routing-resolved">
+                            <summary>{resolved().length} eligible accounts</summary>
+                            <p class="routing-muted">No inference request sent.</p>
+                            <Show
+                              when={resolved().length}
+                              fallback={<p>No eligible accounts.</p>}
+                            >
+                              <For each={resolved()}>
+                                {(e) => (
+                                  <p>
+                                    {e.provider_id} / {e.model_id} ·{" "}
+                                    {accountName(e.account_id)} · {e.auth_kind === "api_key" ? "API key" : e.auth_kind === "oauth" ? "OAuth" : "No credentials"}
+                                    {e.has_credentials
+                                      ? ""
+                                      : " · Missing credentials"}
+                                  </p>
+                                )}
+                              </For>
+                            </Show>
+                            <For each={chain.entries.filter(entry => !resolved().some(r => r.provider_id === entry.provider_id && r.model_id === entry.model_id))}>
+                              {entry => <p class="routing-muted">{entry.provider_id} / {entry.model_id} — No eligible account. The server did not provide an exclusion reason.</p>}
+                            </For>
+                            </details>
+                          </>
+                        )}
+                      </Show>
+                      <Show when={result()?.test}>
+                        {(test) => (
+                          <>
+                            <p role="status">
+                              {test().ok
+                                ? "Request succeeded"
+                                : "Request failed"}{" "}
+                              · HTTP {test().status}
+                            </p>
+                            <Show when={test().ok}>
+                              <p class="routing-test-model">
+                                Model used: <strong>{typeof test().response.model === "string" && test().response.model!.trim()
+                                  ? test().response.model
+                                  : "Not reported by provider"}</strong>
+                              </p>
+                            </Show>
+                            <p>
+                              {test().response.error?.message ||
+                                test().response.choices?.[0]?.message.content ||
+                                "No response text."}
+                            </p>
+                            <p class="routing-muted">
+                              This tests the saved chain, not every fallback
+                              entry.
+                            </p>
+                          </>
+                        )}
+                      </Show>
+                    </div>
+                  </Show>
+  </>; };
   const Editor = () => (
     <form
-      class="s-card routing-editor"
+      class="routing-editor"
       onSubmit={(e) => {
         e.preventDefault();
         save();
       }}
     >
-      <h3>{editing() === "" ? "New chain" : `Edit ${editing()}`}</h3>
+      <Show when={editing() === ""}><h3>New chain</h3></Show>
       <fieldset disabled={busy()}>
+        <Show when={editing() === "" || renaming()}>
         <label>
           Name
           <input
             class="s-input"
+            id="routing-chain-name"
             value={draft().name}
             onInput={(e) => change({ name: e.currentTarget.value })}
           />
         </label>
+        </Show>
+        <Show when={editing() === ""}>
         <label>
           Chain ID
           <input
@@ -323,22 +448,18 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
             placeholder="my-chain"
           />
         </label>
-        <p class="routing-muted">
-          Entries are tried in order. Drag an entry or use the arrow buttons.
-        </p>
-        <datalist id="routing-provider-options">
-          <For each={catalog().providers}>
-            {(provider) => <option value={provider.id}>{provider.name}</option>}
-          </For>
-        </datalist>
+        </Show>
+        <p class="routing-muted">Tried from top to bottom. Drag to reorder.</p>
+        <div class="routing-actions routing-catalog-status">
+          <span class="routing-muted">Suggestions prioritize connected accounts. Listing does not verify inference.</span>
+          <button type="button" class="s-btn" disabled={catalogLoading()} onClick={() => void loadCatalog(true)}>Refresh models</button>
+        </div>
+        <Show when={catalogLoading()}><p class="routing-muted" role="status">Loading model suggestions…</p></Show>
+        <div class="routing-entry-head" aria-hidden="true"><span /><span>Provider</span><span>Model</span><span /></div>
         <Index each={draft().entries}>
           {(e, index) => (
             <div
               class="routing-entry"
-              draggable
-              onDragStart={() => {
-                dragged = index;
-              }}
               onDragOver={(event) => event.preventDefault()}
               onDrop={(event) => {
                 event.preventDefault();
@@ -349,41 +470,12 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
                 dragged = -1;
               }}
             >
-              <span class="routing-muted">{index + 1}</span>
-              <label>
-                Provider
-                <input
-                  class="s-input"
-                  aria-label={`Provider ${index + 1}`}
-                  list="routing-provider-options"
-                  value={e().provider_id}
-                  onInput={(event) =>
-                    entry(index, { provider_id: event.currentTarget.value })
-                  }
-                />
-              </label>
-              <label>
-                Model
-                <input
-                  class="s-input"
-                  aria-label={`Model ${index + 1}`}
-                  list={`routing-models-${index}`}
-                  value={e().model_id}
-                  onInput={(event) =>
-                    entry(index, { model_id: event.currentTarget.value })
-                  }
-                />
-                <datalist id={`routing-models-${index}`}>
-                  <For
-                    each={
-                      catalog().providers.find((p) => p.id === e().provider_id)
-                        ?.models ?? []
-                    }
-                  >
-                    {(model) => <option value={model.id}>{model.name}</option>}
-                  </For>
-                </datalist>
-              </label>
+              <span class="routing-grip" draggable title="Drag to reorder" onDragStart={e => { dragged = index; e.dataTransfer?.setData("text/plain", String(index)); if (e.dataTransfer) e.dataTransfer.effectAllowed = "move"; }}>⠿</span>
+              <RoutingPicker label={`Provider ${index + 1}`} value={e().provider_id} options={catalog().providers}
+                onInput={value => entry(index, { provider_id: value })} />
+              <RoutingPicker label={`Model ${index + 1}`} value={e().model_id}
+                options={(catalog().providers.find(p => p.id === e().provider_id)?.models ?? []).map(m => ({ ...m, detail: R.modelEvidence(discovery(), e().provider_id, m.id) }))}
+                onInput={value => entry(index, { model_id: value })} />
               <div class="routing-actions">
                 <button
                   type="button"
@@ -392,7 +484,7 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
                   disabled={index === 0}
                   onClick={() => move(index, index - 1)}
                 >
-                  ↑
+                  <span class="routing-up"><Ic.ArrowUpIcon size={13} /></span>
                 </button>
                 <button
                   type="button"
@@ -401,7 +493,7 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
                   disabled={index === draft().entries.length - 1}
                   onClick={() => move(index, index + 1)}
                 >
-                  ↓
+                  <span class="routing-down"><Ic.ArrowUpIcon size={13} /></span>
                 </button>
                 <button
                   type="button"
@@ -413,7 +505,7 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
                     })
                   }
                 >
-                  Remove
+                  <Ic.CloseIcon size={13} />
                 </button>
               </div>
               <Show
@@ -437,23 +529,20 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
             })
           }
         >
-          Add entry
+          <Ic.PlusIcon size={13} /> Add fallback
         </button>
-        <details class="routing-advanced">
-          <summary>Advanced</summary>
-          <label class="routing-check">
-            <input
-              type="checkbox"
-              checked={draft().strip_thinking}
-              onChange={(e) =>
-                change({ strip_thinking: e.currentTarget.checked })
-              }
-            />
-            Strip thinking blocks from responses
-          </label>
-        </details>
-        <div class="routing-actions">
-          <button class="s-btn primary" type="submit">
+        <div class="routing-option-row">
+          <div><div id="strip-thinking-label">Strip thinking blocks</div><p id="strip-thinking-help">Remove reasoning blocks from model responses.</p></div>
+          <button type="button" class={`toggle ${draft().strip_thinking ? "on" : ""}`} role="switch" aria-labelledby="strip-thinking-label" aria-describedby="strip-thinking-help"
+            aria-checked={draft().strip_thinking} onClick={() => change({ strip_thinking: !draft().strip_thinking })} />
+        </div>
+        <Show when={chains().find(c => c.id === editing())}>{chain => <ChainResult chain={chain()} />}</Show>
+        <div class="routing-actions routing-savebar">
+          <Show when={chains().find(c => c.id === editing())}>{chain => <ChainTools chain={chain()} />}</Show>
+          <Show when={dirty() || editing() === ""}>
+          <div class="routing-actions routing-save-actions">
+          <Show when={dirty()}><span class="routing-save-status">Unsaved changes</span></Show>
+          <button class="s-btn primary" type="submit" disabled={!dirty()}>
             Save
           </button>
           <button
@@ -463,10 +552,12 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
               if (
                 confirmLeaveRouting(() => {
                   setEditing(null);
+                  setExpanded(null);
                   setActionError("");
                 })
               ) {
                 setEditing(null);
+                setExpanded(null);
                 setDirty(false);
                 setActionError("");
               }
@@ -474,31 +565,28 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
           >
             Cancel
           </button>
-          <Show when={dirty()}>
-            <span class="routing-muted">Unsaved changes</span>
+          </div>
           </Show>
         </div>
       </fieldset>
     </form>
   );
   return (
-    <div class="s-body">
+    <div class="s-body settings-body">
       <div class="s-inner routing-page">
         <div class="routing-heading">
           <h2>Routing</h2>
           <button
             class="s-btn"
             disabled={loading() || !isConnected()}
-            onClick={() => void refresh(true)}
+            onClick={() => void refresh(true, true)}
           >
             {loading() ? "Refreshing…" : "Refresh"}
           </button>
         </div>
         <p class="s-lead">
-          {serverUrl()}
-          <br />
-          Routes requests through this server’s proxy. Local agents using
-          providers directly keep their own configuration.
+          Choose the order models are tried when a provider is unavailable.
+          <span class="routing-server" title="Applies to this server’s proxy. Direct local providers keep their own configuration.">{serverUrl()}</span>
         </p>
         <Show
           when={isConnected()}
@@ -511,19 +599,15 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
             </>
           }
         >
-          <p class="routing-muted" role="status">
-            {updated()
-              ? `Last refresh ${time(updated()!)}${Object.keys(errors()).length ? " · Some data could not be refreshed" : ""}`
-              : "Loading routing…"}
-          </p>
-          <nav class="routing-jumps" aria-label="Routing sections">
-            <a href="#routing-chains">Fallback Chains</a>
-            <a href="#routing-health">Provider Health</a>
-            <a href="#routing-events">Recent Fallback Events</a>
+          <nav class="routing-tabs" aria-label="Routing sections">
+            <button aria-current={tab() === "chains" ? "page" : undefined} onClick={() => selectTab("chains")}>Fallback Chains</button>
+            <button aria-current={tab() === "health" ? "page" : undefined} onClick={() => selectTab("health")}>Provider Health</button>
+            <button aria-current={tab() === "events" ? "page" : undefined} onClick={() => selectTab("events")}>Recent Fallback Events</button>
           </nav>
           <For each={Object.entries(errors())}>
             {([key, error]) => <ErrorNotice error={`${key}: ${error}`} />}
           </For>
+          <Show when={tab() === "chains"}>
           <section class="s-sec" id="routing-chains">
             <div class="routing-heading">
               <h3>Fallback Chains</h3>
@@ -543,114 +627,33 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
             <For each={chains()}>
               {(chain) => (
                 <article class="s-card routing-chain">
+                  <div class="routing-chain-heading">
                   <button
                     class="routing-chain-summary"
-                    aria-expanded={editing() === chain.id}
-                    onClick={() => edit(chain)}
+                    aria-expanded={expanded() === chain.id}
+                    onClick={() => {
+                      const next = expanded() === chain.id ? null : chain.id;
+                      const apply = () => { if (next) edit(chain); else { setEditing(null); setExpanded(null); } };
+                      if (confirmLeaveRouting(apply)) apply();
+                    }}
                   >
-                    <strong>{chain.name}</strong> <code>{chain.id}</code>
+                    <strong>{chain.is_default ? chain.name.replace(/\s*\(Default\)\s*$/i, "") : chain.name}</strong>
+                    <code>{chain.id}</code>
                     <Show when={chain.is_default}>
-                      <span class="routing-badge">Default</span>
+                      <span class="routing-badge" title="Default chain metadata; conversations and proxy requests keep their explicitly selected model">Default</span>
                     </Show>
-                    <span class="routing-order">
+                    <span class="routing-edit-icon"><Ic.ChevronDown size={14} /></span>
+                    <Show when={expanded() !== chain.id}><span class="routing-order">
                       {chain.entries
-                        .map((e) => `${e.provider_id} / ${e.model_id}`)
+                        .map((e) => e.model_id)
                         .join(" → ")}
-                    </span>
+                    </span></Show>
                   </button>
-                  <div class="routing-actions">
-                    <button
-                      class="s-btn"
-                      disabled={busy()}
-                      onClick={() => void inspect(chain.id, false)}
-                    >
-                      Resolve
-                    </button>
-                    <button
-                      class="s-btn"
-                      disabled={busy() || dirty()}
-                      title="Sends a small inference request using the saved chain; may consume provider quota"
-                      onClick={() => void inspect(chain.id, true)}
-                    >
-                      Test request
-                    </button>
-                    <Show when={!chain.is_default}>
-                      <button
-                        class="s-btn"
-                        disabled={busy() || dirty()}
-                        onClick={() =>
-                          void action(() => R.setDefaultChain(chain.id))
-                        }
-                      >
-                        Set as default
-                      </button>
-                    </Show>
-                    <Show when={!chain.id.startsWith("builtin/")}>
-                      <button
-                        class="s-btn"
-                        disabled={busy() || dirty() || chain.is_default}
-                        title={
-                          chain.is_default
-                            ? "Choose another default before deleting"
-                            : "Delete chain"
-                        }
-                        onClick={() => setDeleteTarget(chain)}
-                      >
-                        Delete
-                      </button>
-                    </Show>
+                  <button type="button" class="routing-copy" aria-label={`Copy model ID ${chain.id}`} title={copiedId() === chain.id ? "Copied!" : "Copy model ID"}
+                    onClick={async () => { try { await navigator.clipboard.writeText(chain.id); setCopiedId(chain.id); clearTimeout(copyFeedbackTimer); copyFeedbackTimer = setTimeout(() => setCopiedId(""), 1800); } catch { setActionError("Could not copy model ID."); } }}>
+                    <Show when={copiedId() === chain.id} fallback={<Ic.CopyIcon size={13} />}><span aria-live="polite">✓</span></Show>
+                  </button>
                   </div>
-                  <Show when={result()?.id === chain.id}>
-                    <div class="routing-result">
-                      <Show when={result()?.resolved}>
-                        {(resolved) => (
-                          <>
-                            <p>
-                              Currently eligible accounts · no inference request
-                              sent
-                            </p>
-                            <Show
-                              when={resolved().length}
-                              fallback={<p>No eligible accounts.</p>}
-                            >
-                              <For each={resolved()}>
-                                {(e) => (
-                                  <p>
-                                    {e.provider_id} / {e.model_id} ·{" "}
-                                    {accountName(e.account_id)} · {e.auth_kind}
-                                    {e.has_credentials
-                                      ? ""
-                                      : " · Missing credentials"}
-                                  </p>
-                                )}
-                              </For>
-                            </Show>
-                          </>
-                        )}
-                      </Show>
-                      <Show when={result()?.test}>
-                        {(test) => (
-                          <>
-                            <p role="status">
-                              {test().ok
-                                ? "Request succeeded"
-                                : "Request failed"}{" "}
-                              · HTTP {test().status}
-                            </p>
-                            <p>
-                              {test().response.error?.message ||
-                                test().response.choices?.[0]?.message.content ||
-                                "No response text."}
-                            </p>
-                            <p class="routing-muted">
-                              This tests the saved chain, not every fallback
-                              entry.
-                            </p>
-                          </>
-                        )}
-                      </Show>
-                    </div>
-                  </Show>
                   <Show when={editing() === chain.id}>
                     <Editor />
                   </Show>
@@ -661,6 +664,8 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
               <ErrorNotice error={actionError()} />
             </Show>
           </section>
+          </Show>
+          <Show when={tab() === "health"}>
           <section class="s-sec" id="routing-health">
             <h3>Provider Health</h3>
             <p class="routing-muted">
@@ -773,6 +778,8 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
               </For>
             </Show>
           </section>
+          </Show>
+          <Show when={tab() === "events"}>
           <section class="s-sec" id="routing-events">
             <h3>Recent Fallback Events</h3>
             <p class="routing-muted">
@@ -782,7 +789,8 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
             <div class="routing-filters">
               <label>
                 Chain
-                <select
+                <Select
+                  aria-label="Chain"
                   value={chainFilter()}
                   onChange={(e) => setChainFilter(e.currentTarget.value)}
                 >
@@ -797,11 +805,12 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
                   >
                     {(id) => <option value={id}>{id}</option>}
                   </For>
-                </select>
+                </Select>
               </label>
               <label>
                 Provider
-                <select
+                <Select
+                  aria-label="Provider"
                   value={providerFilter()}
                   onChange={(e) => setProviderFilter(e.currentTarget.value)}
                 >
@@ -809,11 +818,12 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
                   <For each={eventProviders()}>
                     {(id) => <option>{id}</option>}
                   </For>
-                </select>
+                </Select>
               </label>
               <label>
                 Reason
-                <select
+                <Select
+                  aria-label="Reason"
                   value={reasonFilter()}
                   onChange={(e) => setReasonFilter(e.currentTarget.value)}
                 >
@@ -825,7 +835,7 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
                       </option>
                     )}
                   </For>
-                </select>
+                </Select>
               </label>
             </div>
             <Show
@@ -883,75 +893,24 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
               </For>
             </Show>
           </section>
+          </Show>
+          <p class="routing-updated" role="status">{loading() ? "Refreshing…" : updated() ? `Updated ${time(updated()!)}` : "Loading routing…"}</p>
         </Show>
         <Show when={leaveRequest()}>
           {(callback) => (
-            <Dialog
-              title="Discard unsaved changes?"
-              onClose={() => setLeaveRequest(null)}
-              footer={
-                <>
-                  <button class="s-btn" onClick={() => setLeaveRequest(null)}>
-                    Keep editing
-                  </button>
-                  <button
-                    class="s-btn"
-                    onClick={() => {
-                      const next = callback();
-                      setDirty(false);
-                      setLeaveRequest(null);
-                      next();
-                    }}
-                  >
-                    Discard changes
-                  </button>
-                </>
-              }
-            >
-              <p>Your routing changes have not been saved.</p>
-            </Dialog>
+            <ConfirmDialog title="Discard unsaved changes?" description="Your routing changes have not been saved."
+              action="Discard changes" cancelLabel="Keep editing" destructive onClose={() => setLeaveRequest(null)}
+              onConfirm={() => { const next = callback(); setDirty(false); setLeaveRequest(null); next(); }} />
           )}
         </Show>
         <Show when={deleteTarget()}>
           {(chain) => (
-            <Dialog
-              title="Delete chain?"
-              onClose={() => {
-                if (!busy()) setDeleteTarget(null);
-              }}
-              footer={
-                <>
-                  <button
-                    class="s-btn"
-                    disabled={busy()}
-                    onClick={() => setDeleteTarget(null)}
-                  >
-                    Cancel deletion
-                  </button>
-                  <button
-                    class="s-btn"
-                    disabled={busy()}
-                    onClick={() => {
-                      const id = chain().id;
-                      void action(
-                        () => R.deleteChain(id),
-                        () => {
-                          setDeleteTarget(null);
-                          if (editing() === id) setEditing(null);
-                        },
-                      );
-                    }}
-                  >
-                    Delete chain
-                  </button>
-                </>
-              }
-            >
-              <p>Delete “{chain().name}”? This cannot be undone.</p>
-              <Show when={actionError()}>
-                <ErrorNotice error={actionError()} />
-              </Show>
-            </Dialog>
+            <ConfirmDialog title="Delete chain?" description={`Delete “${chain().name}”? This cannot be undone.`}
+              action="Delete chain" cancelLabel="Cancel deletion" destructive busy={busy()} error={actionError()}
+              onClose={() => setDeleteTarget(null)} onConfirm={() => {
+                const id = chain().id;
+                void action(() => R.deleteChain(id), () => { setDeleteTarget(null); if (editing() === id) setEditing(null); });
+              }} />
           )}
         </Show>
       </div>

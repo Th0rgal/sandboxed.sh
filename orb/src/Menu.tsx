@@ -4,7 +4,7 @@ export type MenuEntry =
   | { kind: "sep" }
   | { kind: "item"; label: string; icon?: (p: { size?: number }) => JSX.Element; danger?: boolean; openOnHover?: boolean; onClick: (anchor?: HTMLButtonElement) => void };
 
-export function MenuList(p: { items: MenuEntry[]; onPick?: () => void }) {
+export function MenuList(p: { items: MenuEntry[]; onPick?: () => void; onDismissSubmenu?: () => void }) {
   let hoverTimer: ReturnType<typeof setTimeout> | undefined;
   const clearHover = () => { clearTimeout(hoverTimer); hoverTimer = undefined; };
   const pick = (it: Extract<MenuEntry, { kind: "item" }>, anchor: HTMLButtonElement) => {
@@ -23,8 +23,9 @@ export function MenuList(p: { items: MenuEntry[]; onPick?: () => void }) {
             role="menuitem"
             class={`menu-item ${it.danger ? "danger" : ""}`}
             aria-haspopup={it.openOnHover ? "menu" : undefined}
-            onMouseEnter={e => { clearHover(); const anchor = e.currentTarget; if (it.openOnHover) hoverTimer = setTimeout(() => pick(it, anchor), 180); }}
+            onMouseEnter={e => { clearHover(); const anchor = e.currentTarget; if (!it.openOnHover) p.onDismissSubmenu?.(); if (it.openOnHover) hoverTimer = setTimeout(() => pick(it, anchor), 180); }}
             onMouseLeave={clearHover}
+            onFocus={() => { if (!it.openOnHover) p.onDismissSubmenu?.(); }}
             onKeyDown={e => { if (it.openOnHover && e.key === "ArrowRight") { e.preventDefault(); pick(it, e.currentTarget); } }}
             onClick={e => pick(it, e.currentTarget)}
           >
@@ -38,7 +39,10 @@ export function MenuList(p: { items: MenuEntry[]; onPick?: () => void }) {
   );
 }
 
-export function PopupMenu(p: { x: number; y: number; items: MenuEntry[]; onClose: () => void; focus?: boolean; children?: JSX.Element }) {
+export function PopupMenu(p: { x: number; y: number; items: MenuEntry[]; onClose: () => void; focus?: boolean; onDismissSubmenu?: () => void; children?: JSX.Element }) {
+  let dismissTimer: ReturnType<typeof setTimeout> | undefined;
+  const cancelDismiss = () => clearTimeout(dismissTimer);
+  onCleanup(cancelDismiss);
   let el!: HTMLDivElement;
   let trigger: HTMLElement | null = null;
   onMount(() => {
@@ -84,9 +88,11 @@ export function PopupMenu(p: { x: number; y: number; items: MenuEntry[]; onClose
       role="menu"
       class="menu popup-menu"
       style={{ left: `${p.x}px`, top: `${p.y}px` }}
+      onMouseEnter={cancelDismiss}
+      onMouseLeave={() => { cancelDismiss(); dismissTimer = setTimeout(() => p.onDismissSubmenu?.(), 180); }}
       onPointerDown={(e) => e.stopPropagation()}
     >
-      <MenuList items={p.items} onPick={() => { p.onClose(); trigger?.focus(); }} />
+      <MenuList items={p.items} onDismissSubmenu={p.onDismissSubmenu} onPick={() => { p.onClose(); trigger?.focus(); }} />
       {p.children}
     </div>
   );

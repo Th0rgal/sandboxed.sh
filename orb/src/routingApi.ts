@@ -1,4 +1,4 @@
-import { api } from "./api";
+import { api, connectionVersion } from "./api";
 
 export interface ChainEntry {
   provider_id: string;
@@ -80,6 +80,7 @@ export interface ChainTestResult {
   ok: boolean;
   status: number;
   response: {
+    model?: string;
     choices?: { message: { content: string | null } }[];
     error?: { message?: string };
     [key: string]: unknown;
@@ -96,13 +97,30 @@ export interface RoutingCatalog {
 }
 const root = "/api/model-routing";
 const chainPath = (id: string) => `${root}/chains/${encodeURIComponent(id)}`;
-export const listChains = () => api<ModelChain[]>(`${root}/chains`);
+// Memory-only, connection-scoped cache. Never reuse another server/account's data.
+function cached<T>(load: () => Promise<T>, ttl: number) {
+  let state: { version: number; at: number; value?: T; pending?: Promise<T> } | undefined;
+  return (force = false): Promise<T> => {
+    const version = connectionVersion();
+    if (!state || state.version !== version) state = { version, at: 0 };
+    const current = state;
+    if (current.pending) return current.pending;
+    if (!force && current.value !== undefined && Date.now() - current.at < ttl) return Promise.resolve(current.value);
+    current.pending = load().then(value => {
+      current.value = value;
+      current.at = Date.now();
+      return value;
+    }).finally(() => { current.pending = undefined; });
+    return current.pending;
+  };
+}
+export const listChains = cached(() => api<ModelChain[]>(`${root}/chains`), 30_000);
 export const listHealth = () => api<AccountHealthSnapshot[]>(`${root}/health`);
 export const listEvents = () => api<FallbackEvent[]>(`${root}/events`);
-export const routingCatalog = () =>
+export const routingCatalog = cached(() =>
   api<RoutingCatalog>(
     "/api/providers?include_all=true&include_unverified=true",
-  );
+  ), 300_000);
 export type ChainDraft = Pick<
   ModelChain,
   "id" | "name" | "entries" | "strip_thinking"
@@ -127,3 +145,23 @@ export const testChain = (id: string) =>
   api<ChainTestResult>(`${chainPath(id)}/test`, { method: "POST" });
 export const clearCooldown = (id: string) =>
   api(`${root}/health/${encodeURIComponent(id)}/clear`, { method: "POST" });
+
+export interface ModelDiscovery {
+  connections: {
+    provider_id: string;
+    access_profile: string;
+    status: string;
+    source: "discovery" | "stale_discovery" | "snapshot";
+    diagnostic?: string;
+    checked_at: string;
+    last_success?: { observed_at: string; completeness: "complete" | "partial"; models: { id: string }[] };
+  }[];
+}
+export const modelDiscovery = () => api<ModelDiscovery>("/api/providers/discovery");
+export const refreshModelDiscovery = () => api("/api/providers/catalog/refresh", { method: "POST" });
+export function modelEvidence(discovery: ModelDiscovery | undefined, provider: string, model: string): string {
+  const connections = discovery?.connections?.filter(c => c.provider_id === provider) ?? [];
+  if (connections.some(c => c.status === "discovered" && c.last_success?.models.some(m => m.id === model))) return "Listed by provider";
+  if (connections.some(c => c.last_success?.models.some(m => m.id === model))) return "Previously listed · refresh failed";
+  return "Fallback / unverified";
+}
