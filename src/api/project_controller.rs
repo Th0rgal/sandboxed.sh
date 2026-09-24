@@ -2,12 +2,12 @@
 //!
 //! A project's *controller* is a Hermes cron job that wakes on a schedule,
 //! reads the project's grant and roadmap, dispatches missions and reports.
-//! Hermes owns the job; this module only exposes a read model and three safe
+//! Hermes owns the job; this module only exposes a read model and lifecycle
 //! actions so a client can show the controller inside its project:
 //!
 //! - `GET  /api/projects/:slug/controller`         — job, settings, recent runs
 //! - `PUT  /api/projects/:slug/controller`         — edit the job's settings
-//! - `POST /api/projects/:slug/controller/action`  — `pause` | `resume` | `run`
+//! - `POST /api/projects/:slug/controller/action`  — `pause` | `resume` | `run` | `archive` | `restore`
 //!
 //! The data is read straight from the Hermes cron store that lives on the
 //! same host (`<hermes home>/cron/jobs.json`, `executions.db`, and one
@@ -689,10 +689,13 @@ pub(crate) async fn snapshot_view(
     slug: &str,
 ) -> Option<ControllerView> {
     let recorded = recorded_controller_id(state, slug);
-    let slug = slug.to_string();
-    tokio::task::spawn_blocking(move || controller_view_sync(&slug, recorded, MAX_RUNS))
-        .await
-        .ok()
+    let view_slug = slug.to_string();
+    let mut view =
+        tokio::task::spawn_blocking(move || controller_view_sync(&view_slug, recorded, MAX_RUNS))
+            .await
+            .ok()?;
+    annotate_archive(&state.projects, slug, &mut view).ok()?;
+    Some(view)
 }
 
 fn annotate_archive(
