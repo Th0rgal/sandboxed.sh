@@ -2079,17 +2079,17 @@ select.orb-select-native:disabled { cursor: default; }
 @media(max-width: 480px) { .agent-task-name > span { white-space: normal; overflow-wrap: anywhere; } }
 
 /* Side questions are a separate, compact conversation above the composer. */
-.btw-toggle { border:0; background:transparent; color:var(--dim,#888); padding:5px 7px; font:inherit; font-size:12px; border-radius:6px; cursor:pointer; }
-.btw-toggle:hover,.btw-toggle.on { color:#e1bd78; background:#e1bd7814; }
-.btw-panel { border:1px solid #383838; border-radius:12px; background:#191919; margin:0 0 10px; overflow:hidden; box-shadow:0 12px 36px #0004; }
-.btw-panel header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px; border-bottom:1px solid #ffffff0c; }
-.btw-panel header strong { display:block; font-weight:500; font-size:14px; color:#e1bd78; }
-.btw-panel header span { display:block; color:#888; font-size:11px; margin-top:3px; }
+.btw-toggle { border:0; background:transparent; color:var(--fg-3); padding:5px 7px; font:inherit; font-size:12px; border-radius:6px; cursor:pointer; }
+.btw-toggle:hover,.btw-toggle.on { color:var(--amber); background:var(--bg-hover); }
+.btw-panel { border:1px solid var(--stroke-strong); border-radius:12px; background:var(--menu-bg); color:var(--fg); margin:0 0 10px; overflow:hidden; box-shadow:0 12px 36px #0004; }
+.btw-panel header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px; border-bottom:1px solid var(--stroke-soft); }
+.btw-panel header strong { display:block; font-weight:500; font-size:14px; color:var(--amber); }
+.btw-panel header span { display:block; color:var(--fg-3); font-size:11px; margin-top:3px; }
 .btw-thread { max-height:min(40vh,360px); overflow:auto; padding:0 16px; overscroll-behavior:contain; }
-.btw-thread article { padding:12px 0; border-bottom:1px solid #ffffff0b; font-size:13px; }
+.btw-thread article { padding:12px 0; border-bottom:1px solid var(--stroke-soft); font-size:13px; }
 .btw-question { font-weight:500; margin:0 0 10px; white-space:pre-wrap; }
-.btw-transfer,.btw-reopen { border:0; background:transparent; color:#aaa; font:inherit; font-size:12px; cursor:pointer; padding:6px 0; }
-.btw-transfer:hover,.btw-reopen:hover { color:#e1bd78; }
+.btw-transfer,.btw-reopen { border:0; background:transparent; color:var(--fg-2); font:inherit; font-size:12px; cursor:pointer; padding:6px 0; }
+.btw-transfer:hover,.btw-reopen:hover { color:var(--amber); }
 .btw-panel form { display:flex; gap:10px; padding:12px 16px; align-items:flex-end; }
 .btw-panel textarea { resize:vertical; max-height:120px; min-width:0; flex:1; background:transparent; color:inherit; font:inherit; font-size:13px; border:0; outline:none; }
 .btw-panel form button { border:0; border-radius:50%; width:28px; height:28px; flex:none; background:#d5bd8e; color:#181818; display:grid; place-items:center; cursor:pointer; }

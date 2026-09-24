@@ -17,6 +17,10 @@ test('side conversation stays separate while the agent works',async({page})=>{
  await page.setViewportSize({width:390,height:844});
  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
  await page.screenshot({path:'/tmp/orb-btw-mobile.png'});
+ await page.evaluate(()=>document.documentElement.dataset.theme='light');
+ const contrast=await page.locator('.btw-panel').evaluate(el=>({fg:getComputedStyle(el).color,bg:getComputedStyle(el).backgroundColor}));
+ expect(contrast.fg).not.toBe(contrast.bg);
+ await page.screenshot({path:'/tmp/orb-btw-light.png'});
  await page.getByLabel('Close side questions').click();
  await expect(page.getByLabel('Side questions',{exact:true})).not.toBeVisible();
  await page.getByText('Side questions · 1').click();
