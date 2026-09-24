@@ -586,7 +586,7 @@ code {
 .dock .error-notice { position: relative; z-index: 1; }
 /* Fade the transcript beneath the controls without darkening the space above
    the composer. Use the surface color so this also works in light themes. */
-.dock .under { position: relative; isolation: isolate; }
+.dock .under { position: relative; isolation: isolate; z-index: 2; }
 .dock .under::before {
   content: "";
   position: absolute;

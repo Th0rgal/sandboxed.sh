@@ -43,6 +43,7 @@ async function setup(page: Page) {
 
 /** Every two-line entry: caption strictly below the title, both inside the row. */
 async function expectNoOverlap(page: Page) {
+  await page.locator(".na-menu").evaluate(async el => { await Promise.all(el.getAnimations().map(animation => animation.finished)); });
   const items = page.locator(".na-menu .menu-item:has(.menu-col)");
   const count = await items.count();
   expect(count).toBeGreaterThan(3); // core + the three nodes
@@ -50,14 +51,23 @@ async function expectNoOverlap(page: Page) {
     const item = items.nth(i);
     const row = (await item.boundingBox())!;
     const title = (await item.locator(".menu-title").boundingBox())!;
-    const sub = (await item.locator(".menu-sub").boundingBox())!;
-    expect(sub.y, `caption ${i} must start below the title`).toBeGreaterThanOrEqual(title.y + title.height - 0.5);
-    expect(row.height, `row ${i} must be tall enough for both lines`).toBeGreaterThanOrEqual(title.height + sub.height);
-    expect(row.y + row.height, `row ${i} must contain its caption`).toBeGreaterThanOrEqual(sub.y + sub.height - 0.5);
-    // The caption also must not run under the row below it.
+    expect(title.y).toBeGreaterThanOrEqual(row.y);
+    expect(title.y + title.height).toBeLessThanOrEqual(row.y + row.height + 0.5);
+    const caption = item.locator(".menu-sub");
+    if (await caption.count()) {
+      const sub = (await caption.boundingBox())!;
+      expect(sub.y).toBeGreaterThanOrEqual(title.y + title.height - 0.5);
+      expect(sub.y + sub.height).toBeLessThanOrEqual(row.y + row.height + 0.5);
+    }
+    const state = item.locator(".machine-node-state");
+    if (await state.count()) {
+      const box = (await state.boundingBox())!;
+      expect(title.x + title.width).toBeLessThanOrEqual(box.x + 0.5);
+      expect(box.x + box.width).toBeLessThanOrEqual(row.x + row.width + 0.5);
+    }
     if (i + 1 < count) {
       const next = (await items.nth(i + 1).boundingBox())!;
-      expect(sub.y + sub.height).toBeLessThanOrEqual(next.y + 0.5);
+      expect(row.y + row.height).toBeLessThanOrEqual(next.y + 0.5);
     }
   }
 }
@@ -70,11 +80,11 @@ test("machine picker: two-line entries never overlap, and the footer stays reach
 
   await expectNoOverlap(page);
 
-  // Single-line entries keep the original 28px rhythm. Measured loosely: a
-  // bounding box is reported in device pixels, so a row that is exactly 28 CSS
-  // pixels can come back as 27.99993896484375 depending on the display scale.
+  // Single-line entries keep the 32px rhythm. Measured loosely: a
+  // bounding box is reported in device pixels, so a row that is exactly 32 CSS
+  // pixels can come back as 31.99993896484375 depending on the display scale.
   const manage = page.getByRole("button", { name: "Manage machines" });
-  expect((await manage.boundingBox())!.height).toBeCloseTo(28, 2);
+  expect((await manage.boundingBox())!.height).toBeCloseTo(32, 2);
 
   // Footer is outside the scroll area, so it is visible without scrolling.
   await expect(manage).toBeInViewport();

@@ -230,7 +230,7 @@ jobs:
           cache-dependency-path: orb/pnpm-lock.yaml
       - run: df -h . && df -ih .
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm exec playwright install --with-deps chromium webkit
       - run: pnpm build
       - run: pnpm test
       - run: pnpm test:browser

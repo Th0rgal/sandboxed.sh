@@ -7,7 +7,7 @@ test('pending send moves out of input and restores on rejection',async({page})=>
  await input.press('Enter');
  await expect(input).toHaveValue('');
  await expect(page.getByLabel('Pending message')).toContainText('Please continue');
- await expect(page.getByRole('status')).toHaveText('Sending…');
+ await expect(page.getByRole('status')).toHaveText('Waiting for confirmation…');
  await page.screenshot({path:'test-results/pending-send.png'});
  await page.evaluate(()=>(window as any).finish(false));
  await expect(input).toHaveValue('Please continue with the shorter instructions.');

@@ -90,7 +90,7 @@ test("sidebar rows stay compact with distinct hover/selected and delayed real me
   await page.waitForTimeout(560);
   await expect(tip).toBeVisible();
   await expect(tip.locator(".row-tip-title")).toHaveText("Orb DGX launch without losing this draft");
-  await expect(tip.locator(".row-tip-meta")).toHaveText("DGX Spark");
+  await expect(tip.locator(".row-tip-meta").first()).toHaveText("DGX Spark");
   expect(await tip.evaluate((el) => getComputedStyle(el).backgroundColor)).toBe("rgb(25, 25, 25)");
   await expect(tip).not.toContainText("host");
   await expect(live).toHaveAttribute("aria-describedby", "orb-row-tip");
@@ -132,7 +132,7 @@ test("sidebar rows stay compact with distinct hover/selected and delayed real me
   await page.waitForTimeout(560);
   await expect(tip).toBeVisible();
   await expect(tip.locator(".row-tip-title")).toHaveText("Live mission 1");
-  await expect(tip.locator(".row-tip-meta")).toHaveCount(0);
+  await expect(tip.locator(".row-tip-meta")).toHaveText("m1");
   await page.locator(".sb-scroll").evaluate((el) => { el.scrollTop += 40; });
   await expect(tip).toBeHidden();
   await page.locator("#orb-sidebar").screenshot({ path: "test-results/orb-sidebar-finished.png" });

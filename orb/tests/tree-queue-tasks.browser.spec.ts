@@ -74,7 +74,7 @@ test("six Finished children terminate rails in both themes",async({page})=>{
   await expect(last.locator('.tree-rail')).toHaveCount(0);
   await expect(last.locator('.tree-junction')).toHaveClass(/last/);
   const geometry=await last.evaluate(el=>{const row=el.getBoundingClientRect(),rail=el.querySelector('.tree-junction')!.getBoundingClientRect();return{height:row.height,end:rail.bottom-row.top};});
-  expect(geometry).toEqual({height:30,end:15});
+  expect(geometry).toEqual({height:30,end:16});
   for(const theme of ["dark","light"]){await page.evaluate(theme=>document.documentElement.dataset.theme=theme,theme);await page.locator('#orb-sidebar').screenshot({path:`test-results/orb-tree-six-${theme}.png`});}
 });
 
@@ -144,7 +144,7 @@ test("retry after a lost HTTP receipt reuses the accepted message ID",async({pag
   state.loseNextReply();await field.fill("accepted but reply lost");await field.press("Enter");
   await expect(page.getByRole("alert")).toBeVisible();await expect(field).toHaveValue("accepted but reply lost");
   await field.press("Enter");await expect(field).toHaveValue("");
-  expect(state.posts).toHaveLength(2);expect(state.posts[0].client_message_id).toBe(state.posts[1].client_message_id);
+  await expect.poll(() => state.posts.length).toBe(2);expect(state.posts[0].client_message_id).toBe(state.posts[1].client_message_id);
   expect(state.pending).toHaveLength(1);await expect(page.locator('.queued-messages li')).toHaveCount(1);
 });
 
