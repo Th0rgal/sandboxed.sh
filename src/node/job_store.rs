@@ -266,7 +266,7 @@ impl JobStore {
 
     pub async fn mission_has_live_jobs(&self, mission_id: Uuid) -> anyhow::Result<bool> {
         self.with_conn(move |conn| {
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE mission_id=?1 AND state IN ('queued','running'))", [mission_id.to_string()], |row| row.get(0))?)
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE mission_id=?1 AND state IN ('queued','running'))", [mission_id.to_string()], |row| row.get(0))
         }).await
     }
 

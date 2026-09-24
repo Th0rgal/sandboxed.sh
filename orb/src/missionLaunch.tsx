@@ -248,5 +248,5 @@ export function MissionFailure(p: { mission?: Mission | null; error?: string; ac
  * animation on their prompt.
  */
 export function MissionPending(p: { destination: string; label: string }) {
-  return <div class="agent-wait-status" role="status" aria-live="polite">{p.label === "Starting" ? "Starting agent" : p.label}…</div>;
+  return <div class="agent-wait-status" role="status" aria-live="polite">{p.label} on {p.destination}…</div>;
 }

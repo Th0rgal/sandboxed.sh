@@ -222,7 +222,7 @@ fn validate(m: &Manifest) -> Result<(), String> {
     }
     for f in &m.files {
         relative(&f.path)?;
-        if f.path.split('/').any(|part| excluded(part)) {
+        if f.path.split('/').any(excluded) {
             return Err("Excluded path in manifest".into());
         }
         if !seen.insert(f.path.clone())

@@ -107,11 +107,11 @@ test("right-click an agent row: Copy mission ID copies the raw UUID and changes 
   const menu = page.getByRole("menu");
   await expect(menu).toBeVisible();
   // Identity actions only — no project/file creation leaking onto an agent row.
-  await expect(menu.getByRole("menuitem")).toHaveText(["Copy mission ID"]);
+  await expect(menu.getByRole("menuitem")).toHaveText([/^Fork conversation/, "Move", "Rename", "Copy mission ID"]);
 
   await menu.getByRole("menuitem", { name: "Copy mission ID" }).click();
   expect(await copied(page)).toEqual([MISSION_ID]);
-  await expect(page.getByRole("status")).toContainText(MISSION_ID);
+  await expect(menu).not.toBeVisible();
 
   // The right-click must not open or select the agent.
   await expect(row).not.toHaveClass(/active/);
@@ -324,6 +324,8 @@ test("right-click a project: Project settings opens a page in the main panel", a
 
 test("a project cap refusal explains itself and links to that project's settings", async ({ page }) => {
   const { posts } = await setup(page, { capAt: { active: 2, cap: 2 } });
+  await page.getByRole("button", { name: "Choose project" }).click();
+  await page.getByRole("option", { name: "Test", exact: true }).click();
   const composer = page.getByPlaceholder("Describe a task, / for commands, @ for context");
   await composer.fill("start the SRv3 report");
   await page.keyboard.press("Enter");
@@ -353,6 +355,8 @@ test("a project cap refusal explains itself and links to that project's settings
 
 test("retrying a refused launch reuses the idempotency key, so no second mission is created", async ({ page }) => {
   const { posts } = await setup(page, { capAt: { active: 2, cap: 2 } });
+  await page.getByRole("button", { name: "Choose project" }).click();
+  await page.getByRole("option", { name: "Test", exact: true }).click();
   const composer = page.getByPlaceholder("Describe a task, / for commands, @ for context");
   await composer.fill("start the SRv3 report");
   await page.keyboard.press("Enter");

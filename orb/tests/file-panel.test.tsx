@@ -4,6 +4,10 @@ import { FilePanelProvider, FilePanelButton } from "../src/FilePanel";
 import { MdView } from "../src/Markdown";
 vi.mock("../src/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../src/api")>()),
+  // This fixture has no controller; never let optional source discovery hit
+  // the real API and make reference resolution depend on network latency.
+  getProjectController: vi.fn(async () => ({ settings: {} })),
+  getProjectCron: vi.fn(async () => ({ settings: {} })),
   api: vi.fn(async (_path: string, init: RequestInit) => {
     const q = JSON.parse(String(init.body));
     if (q.action === "roots")
