@@ -775,7 +775,7 @@ export function LiveProjectsSection(p: {
       <Ic.BellIcon size={12} /><button class="cron-status-label" onClick={() => setCronInfo(d.slug)}>{cronUnsupported() ? "Crons need backend update" : cronRetryable[d.slug] ? "Crons temporarily unavailable" : "Crons unavailable"}</button>
       <Show when={!cronUnsupported() && cronRetryable[d.slug]}><button class="cron-retry" aria-label="Retry crons" title="Retry crons" onClick={() => void loadCrons(d.slug, true)}>↻</button></Show>
     </div>;
-    if (d.kind === "finished") return <button class="row done-toggle" title="Inactive conversations, including completed, failed, interrupted and archived missions" aria-expanded={row.expanded} onClick={() => setShowDone(d.path ? `${d.slug}:${d.path}` : d.slug, !showDone[d.path ? `${d.slug}:${d.path}` : d.slug])}>
+    if (d.kind === "finished") return <button class="row done-toggle" title="Inactive conversations and archived controllers" aria-expanded={row.expanded} onClick={() => setShowDone(d.path ? `${d.slug}:${d.path}` : d.slug, !showDone[d.path ? `${d.slug}:${d.path}` : d.slug])}>
       <span class="row-ico"><Show when={row.expanded} fallback={<Ic.FinishedIcon />}><Ic.FinishedOpenIcon /></Show></span><span class="row-label">{d.label}</span>
     </button>;
     if (d.kind === "folder") return <div class="row folder" onContextMenu={contextMenu}>
@@ -789,7 +789,7 @@ export function LiveProjectsSection(p: {
     </div>;
     if (d.kind === "cron") {
       const ticking = () => d.controller && (controllers[d.slug]?.runs ?? []).some(r => r.status === "running" || r.status === "claimed");
-      return <button class={`row agent cron ${p.selected() === row.id ? "active" : ""}`} {...rowTip.bind(rowDetail(d.label, [d.controller ? "Controller" : "Cron"]))} onClick={() => p.open(row.id)} onContextMenu={e => {
+      return <button class={`row agent cron ${d.job?.archived ? "done" : ""} ${p.selected() === row.id ? "active" : ""}`} {...rowTip.bind(rowDetail(d.label, [d.controller ? "Controller" : "Cron"]))} onClick={() => p.open(row.id)} onContextMenu={e => {
         if (!d.controller) return;
         e.preventDefault(); e.stopPropagation();
         setActionMenu(null); setMissionMenu(null);
@@ -826,8 +826,8 @@ export function LiveProjectsSection(p: {
       <Show when={projects().length === 0 && !error()}>
         <div class="row note">No projects on the core backend.</div>
       </Show>
-      <Show when={controllerMenu()}>{menu => <PopupMenu x={menu().x} y={menu().y} focus={false} items={[
-        {kind:"item",label:menu().archived ? "Restore" : "Archive",icon:menu().archived ? Ic.ReopenIcon : Ic.ArchiveIcon,onClick:()=>void archiveController(menu().slug,menu().archived)}
+      <Show when={controllerMenu()} keyed>{menu => <PopupMenu x={menu.x} y={menu.y} focus={false} items={[
+        {kind:"item",label:menu.archived ? "Restore" : "Archive",icon:menu.archived ? Ic.ReopenIcon : Ic.ArchiveIcon,onClick:()=>void archiveController(menu.slug,menu.archived)}
       ]} onClose={()=>setControllerMenu(null)} />}</Show>
       <Show when={actionMenu()}>
         {(menu) => <PopupMenu {...menu()} focus={actionFocus()} items={menuItems(menu().slug, menu().path)} onClose={() => setActionMenu(null)} />}
