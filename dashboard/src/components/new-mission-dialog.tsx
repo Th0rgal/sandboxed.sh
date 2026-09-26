@@ -15,7 +15,6 @@ const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'codex', 'gemini', 'grok', 
 const CHATGPT_UI_BACKEND_ID = 'chatgpt_ui';
 
 const CHATGPT_UI_CANONICAL_MODEL = 'gpt-5.6-pro';
-const CLAUDE_CODE_DEFAULT_MODEL = 'claude-opus-5';
 
 // Kept in sync with src/api/control.rs `normalize_model_effort_for_backend`.
 // Codex and Claude Code both accept the GPT reasoning-effort ladder. Other
@@ -394,6 +393,22 @@ export function NewMissionDialog({
     }
     return options;
   }, [backendModelOptions, providersResponse, providerAllowlist, selectedBackend, chatGptUiModel]);
+
+  // The server orders the newest available Opus first. Preserve explicit
+  // choices and edits; a fresh Claude mission starts with that catalog choice.
+  const catalogDefaultApplied = useRef(false);
+  useEffect(() => {
+    if (!open) { catalogDefaultApplied.current = false; return; }
+    if (!defaultSet || isEditMode || catalogDefaultApplied.current) return;
+    if (modelOverride) { catalogDefaultApplied.current = true; return; }
+    if (selectedBackend === 'claudecode') {
+      const opus = modelOptions.find(option => option.value.startsWith('claude-opus-'));
+      if (opus) {
+        catalogDefaultApplied.current = true;
+        setModelOverride(opus.value);
+      }
+    }
+  }, [open, defaultSet, isEditMode, modelOverride, selectedBackend, modelOptions]);
 
   const formatWorkspaceType = (type: Workspace['workspace_type']) =>
     type === 'host' ? 'host' : 'isolated';
@@ -899,7 +914,7 @@ export function NewMissionDialog({
                 >
                   <option value="">
                     {selectedBackend === 'claudecode'
-                      ? `No override (configured default; fallback ${CLAUDE_CODE_DEFAULT_MODEL})`
+                      ? 'No override (configured default)'
                       : 'No override (use default)'}
                   </option>
                   {(() => {

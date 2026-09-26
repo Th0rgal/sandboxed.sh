@@ -65,11 +65,9 @@ async function setup(page: Page, mixed = false) {
     }};
 }
 
-test("six Finished children terminate rails in both themes",async({page})=>{
-  await setup(page);await page.getByRole("button",{name:"6 finished",exact:true}).click();
-  const finished=page.locator('[data-tree-id="finished:test"]');
-  await expect(finished.locator('.tree-junction')).toHaveClass(/last/);
-  await expect(finished.locator('.tree-child-link')).toHaveCount(1);
+test("six completed missions stay in their project and terminate rails in both themes",async({page})=>{
+  await setup(page);
+  await expect(page.getByRole("button",{name:/History ·/})).toHaveCount(0);
   const last=page.locator('[data-tree-id="m:done-5"]');
   await expect(last.locator('.tree-rail')).toHaveCount(0);
   await expect(last.locator('.tree-junction')).toHaveClass(/last/);
@@ -79,7 +77,7 @@ test("six Finished children terminate rails in both themes",async({page})=>{
 });
 
 test("mixed tree supports five levels, keyboard, selection, lazy loading and empty states",async({page})=>{
-  const state=await setup(page,true);await page.getByRole("button",{name:"6 finished",exact:true}).click();
+  const state=await setup(page,true);
   for(const name of ["src","features","orb","panels"]) await page.getByRole("button",{name,exact:true}).click();
   const deep=page.getByRole("button",{name:"deep.md",exact:true});await deep.click();
   const entry=page.locator('[data-tree-id="pf:test:src/features/orb/panels/deep.md"]');

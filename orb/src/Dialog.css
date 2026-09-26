@@ -7,18 +7,18 @@
 .dlg {
   width: 480px; max-width: 100%; max-height: 100%; display: flex; flex-direction: column;
   background: var(--bg-dlg); color: var(--fg); border: 1px solid var(--stroke-strong);
-  border-radius: 12px; padding: 20px; box-shadow: var(--shadow-dlg); min-height: 0;
+  border-radius: var(--radius-xl); padding: 20px; box-shadow: var(--shadow-dlg); min-height: 0;
 }
 .dlg-wide { width: 720px; }
 .dlg-head { display: flex; align-items: center; gap: 10px; flex: none; margin-bottom: 16px; }
 .dlg-head h3 { margin: 0; font-size: 15px; line-height: 1.4; font-weight: 600; color: var(--fg-strong); overflow-wrap: anywhere; }
 .dlg-hint { color: var(--fg-2); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dlg-close { margin-left: auto; width: 28px; height: 28px; flex: none; display: grid; place-items: center; border-radius: 6px; color: var(--fg-2); }
+.dlg-close { margin-left: auto; width: 28px; height: 28px; flex: none; display: grid; place-items: center; border-radius: var(--radius-sm); color: var(--fg-2); }
 .dlg-close:hover:not(:disabled) { background: var(--bg-hover); color: var(--fg-strong); }
 .dlg-body { min-height: 0; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 12px; }
 .dlg-description { margin: 0; font-size: 13px; line-height: 1.6; color: var(--fg-2); }
 .dlg-foot { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 20px; flex: none; font-size: 12px; color: var(--fg-2); }
-.dlg-button, .dlg .s-btn, .dlg .s-btn.sm { height: 36px; padding: 0 14px; border-radius: 7px; border: 1px solid transparent; font: 500 13px var(--sans); flex: none; }
+.dlg-button, .dlg .s-btn, .dlg .s-btn.sm { height: 36px; padding: 0 14px; border-radius: var(--radius-md); border: 1px solid transparent; font: 500 13px var(--sans); flex: none; }
 .dlg-button-secondary, .dlg .s-btn, .dlg .s-btn.quiet { background: var(--bg-btn); border-color: var(--stroke-strong); color: var(--fg); }
 .dlg-button-secondary:hover:not(:disabled), .dlg .s-btn:hover:not(:disabled) { background: var(--bg-hover); }
 .dlg-button-primary, .dlg .s-btn.primary { background: var(--send-bg); color: var(--send-fg); }
@@ -28,7 +28,7 @@
 .dlg button:disabled { opacity: .45; cursor: default; }
 .dlg :is(button, input, textarea, select):focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 .prompt-row { display: flex; gap: 8px; align-items: center; }
-.prompt-input { flex: 1; min-width: 0; height: 36px; padding: 0 10px; border-radius: 7px; border: 1px solid var(--stroke-strong); background: var(--bg-field); color: var(--fg); font: 13px var(--sans); }
+.prompt-input { flex: 1; min-width: 0; height: 36px; padding: 0 10px; border-radius: var(--radius-md); border: 1px solid var(--stroke-strong); background: var(--bg-field); color: var(--fg); font: 13px var(--sans); }
 /* A quiet inset focus treatment keeps naming dialogs aligned and readable. */
 .dlg .prompt-input:focus, .dlg .prompt-input:focus-visible {
   outline: none; box-shadow: none;
@@ -49,7 +49,7 @@
   --anchored-dialog-width: 260px;
   width: 260px;
   padding: 8px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: var(--menu-bg);
   box-shadow: 0 4px 12px #0002;
 }
@@ -60,12 +60,12 @@
 .project-creation .prompt-row { flex-direction: column; align-items: stretch; gap: 6px; }
 .project-creation .prompt-input {
   flex: none; width: 100%; height: 32px; padding: 0 8px;
-  border-radius: 4px; border-color: var(--stroke); background: transparent;
+  border-radius: var(--radius-xs); border-color: var(--stroke); background: transparent;
 }
 .project-creation .prompt-input:focus { border-color: var(--stroke-strong); }
 .project-creation .dlg-button-primary {
   height: 30px; padding: 0 8px; text-align: left;
-  border-radius: 4px; border: 0; background: transparent; color: var(--fg);
+  border-radius: var(--radius-xs); border: 0; background: transparent; color: var(--fg);
   font-weight: 400; font-size: 13px; justify-content: flex-start;
 }
 .project-creation .dlg-button-primary:not(:disabled):hover { background: var(--bg-hover); }

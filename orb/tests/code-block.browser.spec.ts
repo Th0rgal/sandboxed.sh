@@ -6,6 +6,10 @@ test('worker highlighting and bottom-right copy remain usable with overflowing c
  await expect(page.locator('.token.keyword').first()).toHaveText('def');
  await page.getByRole('button',{name:'Copy code'}).first().click();
  expect(await page.evaluate(()=>(window as any).copied)).toBe('def hello():\n    return "hello"');
+ const lean=page.locator('.md-code-block').nth(1);
+ await expect(lean.locator('.token.keyword').first()).toHaveText('structure');
+ await expect(lean.locator('.token.class-name').first()).toHaveText('UIntN');
+ expect(await lean.locator('.token.keyword').first().evaluate(el=>getComputedStyle(el).color)).not.toBe(await lean.locator('code').evaluate(el=>getComputedStyle(el).color));
  const block=page.locator('.md-code-block').last();
  await block.locator('pre').evaluate(el=>{el.scrollLeft=10000;});
  await block.getByRole('button').click();

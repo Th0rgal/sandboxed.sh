@@ -123,6 +123,6 @@ describe("goal indicators", () => {
     const blocked = mission({ status: "awaiting_user" });
     const { container } = render(() => <LaunchStatus destination="DGX Spark" mission={blocked} goal="Stored" />);
     expect(container.querySelector(".goal-tag")?.textContent).toBe("Goal");
-    expect(container.querySelector("[role=status]")?.textContent).toContain("Waiting for input on DGX Spark");
+    expect(container.querySelector("[role=status]")?.textContent).toContain("Ready for a follow-up on DGX Spark");
   });
 });

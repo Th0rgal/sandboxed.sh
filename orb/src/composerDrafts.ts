@@ -26,3 +26,12 @@ export async function saveComposerDraft(scope:string,draft:ComposerDraft):Promis
   transaction.oncomplete=()=>resolve();transaction.onerror=()=>reject(transaction.error);
  });
 }
+/** Large side transcripts may include image bytes; keep them out of localStorage. */
+export async function readSideThread<T>(scope:string):Promise<T|undefined> {
+ const database=await db();
+ return new Promise((resolve,reject)=>{const request=database.transaction('drafts').objectStore('drafts').get(`thread:${scope}`);request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error);});
+}
+export async function saveSideThread<T>(scope:string,value:T):Promise<void> {
+ const database=await db();
+ return new Promise((resolve,reject)=>{const tx=database.transaction('drafts','readwrite');tx.objectStore('drafts').put(value,`thread:${scope}`);tx.oncomplete=()=>resolve();tx.onerror=()=>reject(tx.error);});
+}

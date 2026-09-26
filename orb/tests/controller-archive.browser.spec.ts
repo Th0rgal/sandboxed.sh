@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 
-test('archive moves a controller into finished and restore keeps it paused', async ({page}) => {
+test('archive moves a controller into the shared archive and restore keeps it paused', async ({page}) => {
   let archived = false;
   const actions: string[] = [];
   await page.route('**/api/**', async route => {
@@ -25,12 +25,13 @@ test('archive moves a controller into finished and restore keeps it paused', asy
   await controller.click({button:'right'});
   await page.getByRole('menuitem',{name:'Archive',exact:true}).click();
   await expect(controller).toHaveCount(0);
-  await page.getByRole('button',{name:'1 finished'}).click();
+  await page.getByRole('button',{name:'Archived',exact:true}).click();
+  await page.getByRole('tree',{name:'Archived conversations'}).getByRole('button',{name:'Project notes',exact:true}).click();
   await expect(controller).toBeVisible();
   await expect(controller.getByRole('img',{name:'Paused',exact:true})).toBeVisible();
   await controller.click({button:'right'});
   await page.getByRole('menuitem',{name:'Restore',exact:true}).click();
-  await expect(page.getByRole('button',{name:'1 finished'})).toHaveCount(0);
+  await expect(page.getByRole('tree',{name:'Archived conversations'}).getByRole('button',{name:/notes-controller/})).toHaveCount(0);
   await expect(controller).toBeVisible();
   expect(actions).toEqual(['archive','restore']);
   expect(errors).toEqual([]);

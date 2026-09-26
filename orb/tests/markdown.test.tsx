@@ -98,3 +98,27 @@ it("does not autolink code or nest anchors inside Markdown links", () => {
  expect(container.querySelector('a')?.getAttribute('href')).toBe('https://example.com/target');
  expect(container.querySelector('a a')).toBeNull();
 });
+
+import { fireEvent, waitFor } from "@solidjs/testing-library";
+import { vi } from "vitest";
+import { FileReferenceContext } from "../src/fileReferenceContext";
+
+it("renders Codex output citations through the file resolver and opens the original path", async () => {
+  const path='/Users/thomas/.orb/local-workspaces/default/output/pdf/index-32.pdf';
+  const ref={source:'workspace',path,name:'index-32.pdf'};
+  const open=vi.fn(), resolve=vi.fn(async()=>[ref]);
+  const {getByRole,container}=render(()=><FileReferenceContext.Provider value={{resolve,open,search:()=>{}}}><MdView text={`Download :codex-file-citation{purpose="output" path="${path}"} here.`}/></FileReferenceContext.Provider>);
+  await waitFor(()=>expect(getByRole('button',{name:'index-32.pdf'})).toBeTruthy());
+  expect(resolve).toHaveBeenCalledWith(path);
+  fireEvent.click(getByRole('button',{name:'index-32.pdf'}));
+  expect(open).toHaveBeenCalledWith([ref]);
+  expect(container.textContent).toBe('Download index-32.pdf here.');
+});
+
+it("keeps citation examples inside code literal and handles spaces and markdown punctuation in paths",()=>{
+  const citation=':codex-file-citation{path="/tmp/My [draft] (2).pdf" purpose="output"}';
+  const {container}=render(()=><MdView text={`${citation}\n\n\`${citation}\`\n\n\`\`\`text\n${citation}\n\`\`\``}/>);
+  expect(container.querySelector('p')?.textContent).toBe('My [draft] (2).pdf');
+  expect(container.querySelector('p code')?.textContent).toBe(citation);
+  expect(container.querySelector('pre')?.textContent).toContain(citation);
+});

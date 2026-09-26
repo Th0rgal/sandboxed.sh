@@ -22,7 +22,7 @@ it("reconnects a revoked sandboxed-owned Anthropic account using its existing id
   });
   vi.stubGlobal("fetch", fetch);
   render(() => <Providers />);
-  fireEvent.click(await screen.findByRole("button", { name: /Claude account/ }));
+  fireEvent.click(await screen.findByRole("button", { name: /^Claude account/ }));
   fireEvent.click(screen.getByRole("button", { name: "Reconnect", exact: true }));
   const input = await screen.findByLabelText("Authorization code or redirect URL");
   expect(screen.getByText(/Sign in as account@example.test/)).toBeTruthy();
@@ -39,9 +39,9 @@ it("does not expose empty API key rows as expandable buttons but keeps real erro
     : { entries: { muse: { provider_type: "muse" }, custom: { provider_type: "custom" }, minimax: { provider_type: "minimax", model_usage: [] }, zai: { provider_type: "zai", error: "Account unavailable" } } }))));
   const { container } = render(() => <Providers />);
   await screen.findAllByText("muse");
-  await waitFor(() => expect(screen.getByRole("button", { name: /zai/ })).toBeTruthy());
-  for (const name of ["muse", "custom", "minimax"]) expect(screen.queryByRole("button", { name: new RegExp(name) })).toBeNull();
+  await waitFor(() => expect(screen.getByRole("button", { name: /^zai/ })).toBeTruthy());
+  for (const name of ["muse", "custom", "minimax"]) expect(screen.queryByRole("button", { name: new RegExp(`^${name}`) })).toBeNull();
   expect(container.querySelectorAll(".p-acc-chev")).toHaveLength(1);
-  fireEvent.click(screen.getByRole("button", { name: /zai/ }));
+  fireEvent.click(screen.getByRole("button", { name: /^zai/ }));
   expect(screen.getByText("Account unavailable")).toBeTruthy();
 });

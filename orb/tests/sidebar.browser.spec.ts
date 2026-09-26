@@ -50,9 +50,9 @@ test("sidebar rows stay compact with distinct hover/selected and delayed real me
   await page.goto("/");
   await page.getByRole("button", { name: "test", exact: true }).click();
   const live = page.getByRole("button", { name: /Orb DGX launch/ });
-  const finished = page.getByRole("button", { name: "32 finished" });
+  const archived = page.getByRole("button", { name: "Archived", exact: true });
   await expect(live).toBeVisible();
-  await expect(finished).toBeVisible();
+  await expect(archived).toBeVisible();
   expect((await live.boundingBox())!.height).toBe(30);
   expect((await page.getByRole("button", { name: "New Agent" }).boundingBox())!.height).toBe(30);
   const liveBg = await live.evaluate((el) => getComputedStyle(el).backgroundColor);
@@ -71,12 +71,12 @@ test("sidebar rows stay compact with distinct hover/selected and delayed real me
   const idleHover = await newAgent.evaluate((el) => getComputedStyle(el).backgroundColor);
   expect(idleHover).not.toBe(selectedBg);
   await page.locator("#orb-sidebar").screenshot({ path: "test-results/orb-sidebar-hover-selected.png" });
-  await finished.click();
+  await expect(archived).toHaveAttribute("aria-expanded", "false");
   const done = page.getByRole("button", { name: /Finished mission 5/ });
   await expect(done).toBeVisible();
   const livePad = await live.evaluate((el) => getComputedStyle(el).paddingLeft);
   const donePad = await done.evaluate((el) => getComputedStyle(el).paddingLeft);
-  expect(parseFloat(donePad)).toBeGreaterThan(parseFloat(livePad));
+  expect(parseFloat(donePad)).toBe(parseFloat(livePad));
   const otherLive = page.getByRole("button", { name: "Live mission 1" });
   const doneColor = await done.evaluate((el) => getComputedStyle(el).color);
   const liveColor = await otherLive.evaluate((el) => getComputedStyle(el).color);
@@ -126,13 +126,13 @@ test("sidebar rows stay compact with distinct hover/selected and delayed real me
     await page.locator(".titlebar").click();
   }
   await live.focus();
-  await page.keyboard.press("Tab");
+  await page.keyboard.press("ArrowDown");
   await expect(otherLive).toBeFocused();
   await expect(tip).toBeHidden();
   await page.waitForTimeout(560);
   await expect(tip).toBeVisible();
   await expect(tip.locator(".row-tip-title")).toHaveText("Live mission 1");
-  await expect(tip.locator(".row-tip-meta")).toHaveText("m1");
+  await expect(tip.locator(".row-tip-meta")).toHaveText(["m1", "Running"]);
   await page.locator(".sb-scroll").evaluate((el) => { el.scrollTop += 40; });
   await expect(tip).toBeHidden();
   await page.locator("#orb-sidebar").screenshot({ path: "test-results/orb-sidebar-finished.png" });

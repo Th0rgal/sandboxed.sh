@@ -1,5 +1,6 @@
 import { Dynamic } from "solid-js/web";
-import { codexWindowLabel, effectiveProviderStatus, hasProviderUsageDetails, usageWindows } from "./providerUsage";
+import { codingPlanWindows, kimiWindows, codexWindowLabel, effectiveProviderStatus, hasProviderUsageDetails, usageWindows } from "./providerUsage";
+import { PopupMenu } from "./Menu";
 import { ProviderLogo } from "./ProviderLogo";
 import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
@@ -8,6 +9,8 @@ import * as Ic from "./icons";
 import { Dialog, DialogButton, Field } from "./Dialog";
 import { Toggle } from "./Settings";
 import {
+  api,
+  connectionVersion,
   getAllProviderUsage,
   getProviderUsage,
   getCliProxyLogin,
@@ -281,6 +284,7 @@ export function Providers() {
 
 function LiveProviders(p: { list: AIProvider[]; onRefresh: () => void }) {
   const [usage, setUsage] = createSignal<Record<string, ProviderUsage>>({});
+  const [keyEditor, setKeyEditor] = createSignal<AIProvider | "new" | null>(null);
   const [reauth, setReauth] = createSignal<AIProvider | null>(null);
   const oauth = () => p.list.filter((x) => x.uses_oauth);
   const keys = () => p.list.filter((x) => !x.uses_oauth);
@@ -294,8 +298,8 @@ function LiveProviders(p: { list: AIProvider[]; onRefresh: () => void }) {
       const snapshot = await getAllProviderUsage();
       if (!disposed) setUsage(snapshot);
       // The bulk endpoint returns its cache before starting background probes.
-      // Await each Codex account so the first visit receives the result too.
-      await Promise.allSettled(oauth().filter(a => a.provider_type === "openai").map(async a => {
+      // Await subscription accounts so the first visit receives their result too.
+      await Promise.allSettled(p.list.filter(a => ["kimi", "minimax", "zai"].includes(a.provider_type) || (a.uses_oauth && (a.provider_type === "openai" || a.provider_type === "xai"))).map(async a => {
         const value = await getProviderUsage(a.id);
         if (!disposed) setUsage(previous => ({ ...previous, [a.id]: value }));
       }));
@@ -330,10 +334,10 @@ function LiveProviders(p: { list: AIProvider[]; onRefresh: () => void }) {
       </section>
 
       <section class="s-sec">
-        <h3>API keys</h3>
+        <div class="section-row"><h3>API keys</h3><button class="s-btn sm quiet" onClick={() => setKeyEditor("new")}><Ic.PlusIcon size={12}/> Add API key</button></div>
         <div class="s-card">
           <For each={keys()}>
-            {(a) => <LiveRow a={a} usage={usage()[a.id]} onReconnect={() => setReauth(a)} />}
+            {(a) => <LiveRow a={a} usage={usage()[a.id]} onReconnect={() => setReauth(a)} onEditKey={() => setKeyEditor(a)} />}
           </For>
           <Show when={keys().length === 0}>
             <div class="s-row"><div class="s-row-desc">No API key providers configured.</div></div>
@@ -341,6 +345,7 @@ function LiveProviders(p: { list: AIProvider[]; onRefresh: () => void }) {
         </div>
       </section>
 
+      <Show when={keyEditor()} keyed>{target => <ApiKeyDialog provider={target === "new" ? undefined : target} onClose={() => setKeyEditor(null)} onDone={() => { setKeyEditor(null); p.onRefresh(); }}/>}</Show>
       <Show when={reauth()}>
         {(a) => (
           <ReAuthDialog
@@ -360,6 +365,39 @@ function LiveProviders(p: { list: AIProvider[]; onRefresh: () => void }) {
       </Show>
     </div>
   );
+}
+
+function ApiKeyDialog(p: {provider?: AIProvider; onClose: () => void; onDone: () => void}) {
+  const [type, setType] = createSignal(p.provider?.provider_type ?? "openai");
+  const [name, setName] = createSignal(p.provider?.name ?? "");
+  const [secret, setSecret] = createSignal("");
+  const [url, setUrl] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal("");
+  const version = connectionVersion();
+  onCleanup(() => setSecret(""));
+  const save = async () => {
+    if (busy() || !secret().trim() || !name().trim()) return;
+    if (version !== connectionVersion()) { setError("Connection changed. Close and reopen this dialog."); return; }
+    setBusy(true); setError("");
+    try {
+      await api(`/api/ai/providers${p.provider ? `/${encodeURIComponent(p.provider.id)}` : ""}`, {
+        method: p.provider ? "PUT" : "POST", headers: {"Content-Type":"application/json"},
+        body: JSON.stringify(p.provider ? {name:name().trim(),api_key:secret().trim()} : {provider_type:type(),name:name().trim(),api_key:secret().trim(),...(type()==="custom" ? {base_url:url().trim()} : {})}),
+      });
+      setSecret(""); if (version === connectionVersion()) p.onDone();
+    } catch { setError("Couldn’t save the API key. Check the connection and try again."); }
+    finally { setBusy(false); }
+  };
+  return <Dialog title={p.provider ? "Edit API key" : "Add API key"} busy={busy()} onClose={p.onClose}
+    footer={<><DialogButton disabled={busy()} onClick={p.onClose}>Cancel</DialogButton><DialogButton variant="primary" disabled={busy() || !secret().trim() || !name().trim() || (!p.provider && type()==="custom" && !/^https?:\/\//.test(url()))} onClick={() => void save()}>{busy() ? "Saving…" : "Save"}</DialogButton></>}>
+    <Show when={!p.provider}><Field label="Provider"><select class="s-input" value={type()} onChange={e=>setType(e.currentTarget.value)}><For each={KINDS.filter(k=>k.methods.some(m=>m.kind==="api"))}>{k=><option value={k.id}>{k.name}</option>}</For></select></Field></Show>
+    <Field label="Name"><input class="s-input" value={name()} onInput={e=>setName(e.currentTarget.value)} placeholder="Account name" /></Field>
+    <Show when={!p.provider && type()==="custom"}><Field label="Base URL"><input class="s-input" type="url" value={url()} onInput={e=>setUrl(e.currentTarget.value)} placeholder="https://api.example.com/v1" /></Field></Show>
+    <Field label={p.provider ? "New API key" : "API key"}><input class="s-input" type="password" autocomplete="new-password" spellcheck={false} value={secret()} onInput={e=>setSecret(e.currentTarget.value)} /></Field>
+    <p class="s-row-desc">{p.provider ? "Enter a replacement key. The saved key is never displayed." : "Saved on the connected backend."}</p>
+    <Show when={error()}><p role="alert" class="c-red">{error()}</p></Show>
+  </Dialog>;
 }
 
 const LEGACY_OAUTH_TYPES = new Set(["anthropic", "openai", "google"]);
@@ -384,7 +422,7 @@ function UsageSummary(p: { usage: ProviderUsage }) {
         <For each={windows()}>
           {(w) => (
             <span class="p-usage-chip" title={`${w.label} window: ${Math.round(w.used * 100)}% used`}>
-              <span class="p-usage-label">{w.label}</span>
+              <span class="p-usage-label">{w.label === "7d" ? "Weekly" : w.label}</span>
               <span class="p-usage-pct">{Math.round(w.used * 100)}%</span>
             </span>
           )}
@@ -561,12 +599,12 @@ function DetailBar(p: { label: string; usedPct: number; reset?: string }) {
   const pct = () => Math.max(0, Math.min(100, Math.round(p.usedPct)));
   return (
     <div class="p-usage-grid">
-      <span class="p-usage-label p-usage-label-wide">{p.label}</span>
-      <div class="p-bar">
-        <div class={`p-bar-fill ${pct() > 90 ? "hot" : pct() > 70 ? "warm" : ""}`} style={{ width: `${pct()}%` }} />
+      <div class="p-meter-meta"><span class="p-meter-caption">{p.label === "7d" ? "Weekly" : p.label}<span class="p-dot">·</span><span>{pct()}% used</span></span>
+        <Show when={p.reset}><span class="p-usage-reset" title={p.reset}><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M20 7v5h-5M4 17v-5h5M6 6a8 8 0 0 1 13 3M18 18a8 8 0 0 1-13-3" /></svg>{p.reset!.replace(/^reset\s+/i, "")}</span></Show>
       </div>
-      <span class="p-usage-pct">{pct()}%</span>
-      <span class="p-usage-reset">{p.reset ?? ""}</span>
+      <div class="p-bar" role="progressbar" aria-label={`${p.label} usage`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct()}>
+        <div class={`p-bar-fill ${pct() >= 100 ? "hot" : ""}`} style={{ width: `${pct()}%` }} />
+      </div>
     </div>
   );
 }
@@ -587,10 +625,10 @@ function UsageDetail(p: { usage: ProviderUsage; headerEmail?: string; planInHead
       </div>
 
       <Show when={type() === "anthropic" && u().unified_5h_utilization != null}>
-        <DetailBar label="5h window" usedPct={(u().unified_5h_utilization ?? 0) * 100} reset={u().unified_5h_reset ? `reset ${fmtReset(u().unified_5h_reset!)}` : undefined} />
+        <DetailBar label="5h" usedPct={(u().unified_5h_utilization ?? 0) * 100} reset={u().unified_5h_reset ? `reset ${fmtReset(u().unified_5h_reset!)}` : undefined} />
       </Show>
       <Show when={type() === "anthropic" && u().unified_7d_utilization != null}>
-        <DetailBar label="7d window" usedPct={(u().unified_7d_utilization ?? 0) * 100} reset={u().unified_7d_reset ? `reset ${fmtReset(u().unified_7d_reset!)}` : undefined} />
+        <DetailBar label="Weekly" usedPct={(u().unified_7d_utilization ?? 0) * 100} reset={u().unified_7d_reset ? `reset ${fmtReset(u().unified_7d_reset!)}` : undefined} />
       </Show>
 
       <Show when={type() === "openai" && u().codex_primary_used_percent != null && u().codex_primary_window_minutes !== 0}>
@@ -606,61 +644,78 @@ function UsageDetail(p: { usage: ProviderUsage; headerEmail?: string; planInHead
         <DetailBar label="Requests" usedPct={100 - ((u().requests_remaining ?? 0) / (u().requests_limit ?? 1)) * 100} reset={u().requests_reset ? `reset ${fmtReset(u().requests_reset!)}` : undefined} />
       </Show>
 
-      <Show when={type() === "minimax" && u().model_usage && (u().model_usage?.length ?? 0) > 0}>
+      <Show when={type() === "kimi"}>
+        <For each={kimiWindows(u())}>{window =>
+          <DetailBar label={window.label} usedPct={window.used_percent ?? 0} reset={window.reset_at ? `reset ${fmtResetEpoch(window.reset_at)}` : undefined} />
+        }</For>
+      </Show>
+
+      <Show when={type() === "xai"}>
+        <Show when={u().xai_credit_used_percent != null}>
+          <DetailBar label={u().xai_credit_label || "Credits"} usedPct={u().xai_credit_used_percent ?? 0} reset={u().xai_credit_reset ? `reset ${fmtResetEpoch(u().xai_credit_reset!)}` : undefined} />
+        </Show>
+        <Show when={u().xai_prepaid_usd != null}><div class="p-detail-meta"><span>Prepaid balance: ${u().xai_prepaid_usd?.toFixed(2)}</span></div></Show>
+        <Show when={u().xai_on_demand_used != null}><div class="p-detail-meta"><span>On-demand credits: {u().xai_on_demand_used}<Show when={u().xai_on_demand_cap != null}> / {u().xai_on_demand_cap}</Show></span></div></Show>
+      </Show>
+
+      <Show when={type() === "minimax" && !codingPlanWindows(u()).length && u().model_usage && (u().model_usage?.length ?? 0) > 0}>
         <For each={u().model_usage}>
           {(m) => (
             <div class="p-model">
               <div class="p-model-name">{m.model}</div>
-              <DetailBar label="5h window" usedPct={100 - m.interval_remaining_percent} reset={m.interval_reset > 0 ? `reset ${fmtResetEpoch(m.interval_reset)}` : undefined} />
+              <DetailBar label="5h" usedPct={100 - m.interval_remaining_percent} reset={m.interval_reset > 0 ? `reset ${fmtResetEpoch(m.interval_reset)}` : undefined} />
               <DetailBar label="Weekly" usedPct={100 - m.weekly_remaining_percent} reset={m.weekly_reset > 0 ? `reset ${fmtResetEpoch(m.weekly_reset)}` : undefined} />
             </div>
           )}
         </For>
       </Show>
 
-      <Show when={type() === "zai" && u().zai_tokens_percentage != null}>
-        <Show when={u().zai_plan}>
+      <Show when={codingPlanWindows(u()).length > 0}>
+        <Show when={u().zai_plan && !p.planInHeader}>
           <div class="p-detail-meta"><span>plan: {u().zai_plan}</span></div>
         </Show>
-        <DetailBar label="Tokens" usedPct={u().zai_tokens_percentage ?? 0} reset={u().zai_tokens_reset ? `reset ${fmtResetEpoch(u().zai_tokens_reset!)}` : undefined} />
+        <For each={codingPlanWindows(u())}>{w => <DetailBar label={w.label} usedPct={w.used * 100} reset={w.reset ? `reset ${fmtResetEpoch(w.reset)}` : undefined} />}</For>
         <Show when={u().zai_mcp_percentage != null}>
           <DetailBar label="MCP" usedPct={u().zai_mcp_percentage ?? 0} reset={u().zai_mcp_reset ? `reset ${fmtResetEpoch(u().zai_mcp_reset!)}` : undefined} />
         </Show>
       </Show>
 
+      <Show when={u().usage_note}><p class="s-row-desc">{u().usage_note}</p></Show>
       <Show when={u().error}>
-        <p class="s-row-desc c-red">{u().error}</p>
+        <p class="s-row-desc c-red">{u().error?.replace(/\s*—\s*/g, ". ")}</p>
       </Show>
     </div>
   );
 }
 
-function LiveRow(p: { a: AIProvider; usage?: ProviderUsage; onReconnect: () => void }) {
+function LiveRow(p: { a: AIProvider; usage?: ProviderUsage; onReconnect: () => void; onEditKey?: () => void }) {
   const a = p.a;
   const status = () => effectiveProviderStatus(a, p.usage);
   const stClass = () => status() === "connected" ? "connected" : ["needs_reauth", "error", "quota_exhausted"].includes(status()) ? "needs_reauth" : "not_configured";
   const stLabel = () => ({ connected: "Connected", needs_reauth: "Reconnect", quota_exhausted: "Quota exhausted", needs_auth: "Needs auth", error: "Error" }[status()] ?? "Unknown");
   const canReconnect = () => reconnectable(a);
-  const expandable = () => canReconnect() || hasProviderUsageDetails(p.usage) || !!a.status.reason || !!a.status.message;
+  const expandable = () => (canReconnect() && needsAuth()) || hasProviderUsageDetails(p.usage) || !!a.status.reason || !!a.status.message;
   const [open, setOpen] = createSignal(false);
+  const [menu, setMenu] = createSignal<{x:number;y:number} | null>(null);
+  const needsAuth = () => ["needs_reauth", "needs_auth"].includes(status());
+  const email = () => a.account_email || p.usage?.account_email || a.name.match(/\(([^()]+@[^()]+)\)/)?.[1];
+  const title = () => email() ? a.name.replace(`(${email()})`, "").trim() : a.name;
   return (
     <div class="p-acc-wrap">
+      <div class="p-account-header">
       <Dynamic component={expandable() ? "button" : "div"} class={`s-row p-acc ${expandable() ? "p-acc-btn" : ""}`} aria-expanded={expandable() ? open() : undefined} onClick={expandable() ? () => setOpen(!open()) : undefined}>
         <ProviderLogo type={a.provider_type} name={a.name} />
         <div class="s-row-text">
           <div class="s-row-title">
-            {a.name}
-            <span class="p-chip">{a.provider_type}</span>
+            {title()}
+            <Show when={email()}><span class="p-account-email">{email()}</span></Show>
           </div>
           <div class="s-row-desc">
             <span class={`p-st ${stClass()}`}>{stLabel()}</span>
-            <Show when={p.usage?.codex_plan_type}>
-              <span class="p-dot">·</span><span>{p.usage!.codex_plan_type} plan</span>
+            <Show when={p.usage?.codex_plan_type || p.usage?.xai_plan || p.usage?.kimi_plan || p.usage?.zai_plan}>
+              <span class="p-dot">·</span><span>{p.usage!.codex_plan_type || p.usage!.xai_plan || p.usage!.kimi_plan || p.usage!.zai_plan} plan</span>
             </Show>
-            <Show when={a.account_email && !a.name.includes(a.account_email)}>
-              <span class="p-dot">·</span>
-              {a.account_email}
-            </Show>
+
           </div>
         </div>
         <Show when={!open() && p.usage && !p.usage!.error}>
@@ -668,16 +723,20 @@ function LiveRow(p: { a: AIProvider; usage?: ProviderUsage; onReconnect: () => v
         </Show>
         <Show when={expandable()}><span class={`chev p-acc-chev ${open() ? "open" : ""}`}>›</span></Show>
       </Dynamic>
+      <Show when={canReconnect() || p.onEditKey}><button class="icon-btn p-account-menu" aria-label={`Actions for ${a.name}`} aria-haspopup="menu" aria-expanded={!!menu()} onClick={e => { const r=e.currentTarget.getBoundingClientRect(); setMenu({x:r.right-170,y:r.bottom+4}); }}><span aria-hidden="true">···</span></button></Show>
+      </div>
+      <Show when={menu()}>{position => <PopupMenu {...position()} onClose={()=>setMenu(null)} items={p.onEditKey ? [{kind:"item",label:"Edit API key",icon:Ic.PencilIcon,onClick:p.onEditKey}] : [{kind:"item",label:needsAuth()?"Reconnect":"Re-authenticate",onClick:p.onReconnect}]} />}</Show>
       <Show when={open() && expandable()}>
         <div class="p-acc-body">
           <Show when={hasProviderUsageDetails(p.usage)}>
             <UsageDetail usage={p.usage!} headerEmail={a.account_email ?? (p.usage?.account_email && a.name.includes(p.usage.account_email) ? p.usage.account_email : undefined)} planInHeader />
           </Show>
-          <Show when={!p.usage?.error && (a.status.reason || a.status.message)}><p class="s-row-desc c-red">{a.status.reason || a.status.message}</p></Show>
-          <Show when={canReconnect()}>
+          <Show when={!p.usage?.error && (a.status.reason || a.status.message)}><p class="s-row-desc c-red">{(a.status.reason || a.status.message)?.replace(/\s*—\s*/g, ". ")}</p></Show>
+          <Show when={p.onEditKey}><div class="p-acc-actions"><button class="s-btn" onClick={p.onEditKey}>Edit API key</button></div></Show>
+          <Show when={canReconnect() && needsAuth()}>
             <div class="p-acc-actions">
               <button class="s-btn" onClick={p.onReconnect}>
-                {stClass() === "connected" ? "Re-auth" : "Reconnect"}
+                Reconnect
               </button>
             </div>
           </Show>

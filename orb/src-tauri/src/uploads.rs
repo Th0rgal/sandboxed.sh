@@ -69,3 +69,62 @@ pub async fn read_upload_file(path: String) -> Result<String, String> {
     .await
     .map_err(|e| e.to_string())?
 }
+
+// Only OS-delivered drop paths enter the same allowlist as file-picker selections.
+pub fn allow_drop(paths: &[PathBuf]) -> Vec<String> {
+    let Ok(mut allowed) = selected().lock() else {
+        return vec![];
+    };
+    paths
+        .iter()
+        .filter_map(|path| {
+            let path = path.canonicalize().ok()?;
+            if !path.is_file() {
+                return None;
+            }
+            allowed.insert(path.clone());
+            Some(path.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub async fn stage_upload_file(
+    app: tauri::AppHandle,
+    name: String,
+    data_base64: String,
+) -> Result<String, String> {
+    use tauri::Manager;
+    if name.is_empty()
+        || name.contains(['/', '\\'])
+        || name == "."
+        || name == ".."
+        || name.len() > 240
+    {
+        return Err("Invalid filename".into());
+    }
+    if data_base64.len() > 28 * 1024 * 1024 {
+        return Err("Files must be 20 MiB or smaller".into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > 20 * 1024 * 1024 {
+        return Err("Files must be 20 MiB or smaller".into());
+    }
+    let directory = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("attachments")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    let path = directory.join(name);
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    let path = path.canonicalize().map_err(|e| e.to_string())?;
+    selected()
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(path.clone());
+    Ok(path.to_string_lossy().into_owned())
+}

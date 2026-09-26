@@ -2,7 +2,7 @@ import { deferredMessages } from "./deferredMessages";
 import type { StreamEvent } from "./stream";
 
 export type StreamItem =
-  | { kind: "user"; key: string; text: string; messageId?: string; queued?: boolean; attached?: boolean; receipt?: boolean }
+  | { kind: "user"; key: string; text: string; messageId?: string; source?: string; queued?: boolean; attached?: boolean; receipt?: boolean }
   | { kind: "think"; key: string; text: string; done: boolean }
   | { kind: "text"; key: string; text: string; live: boolean }
   | { kind: "error"; key: string; text: string; terminal?: boolean; cancelled?: boolean }
@@ -14,6 +14,7 @@ export type StreamItem =
       args: unknown;
       result?: unknown;
       done: boolean;
+      unresolved?: boolean;
     };
 
 
@@ -39,6 +40,11 @@ export class TranscriptReducer {
       const item = this.items[index];
       if (item?.kind === "text" && item.live) this.put(index, { ...item, live: false });
     }
+    for (let i=0;i<this.items.length;i++) {
+      const item=this.items[i];
+      if(item.kind==='tool'&&!item.done)this.put(i,{...item,done:true,unresolved:true});
+      if(item.kind==='think'&&!item.done)this.put(i,{...item,done:true});
+    }
     this.bubbles.clear();
   }
   apply(ev: StreamEvent) {
@@ -54,6 +60,7 @@ export class TranscriptReducer {
       }
       const messageId = typeof d.id === "string" ? d.id : ev.eventId;
       const queued = d.queued === true;
+      const source = typeof d.source === "string" ? d.source : undefined;
       if (!messageId && ev.sequence != null) {
         const legacyIdentity = `user:${ev.sequence}:${queued}`;
         if (this.seen.has(legacyIdentity)) return;
@@ -62,8 +69,9 @@ export class TranscriptReducer {
       const index = messageId ? this.users.get(messageId) : undefined;
       const previous = index == null ? undefined : this.items[index];
       if (previous?.kind === "user" && index != null) {
+        if (source && source !== previous.source) this.put(index, { ...previous, source });
         if (!previous.queued || queued) {
-          if (previous.receipt && d.receipt !== true) this.put(index, { ...previous, text: str(d.content) || previous.text, receipt: false });
+          if (previous.receipt && d.receipt !== true) this.put(index, { ...previous, source: source ?? previous.source, text: str(d.content) || previous.text, receipt: false });
           return;
         }
         this.close(); this.lastFinal = undefined;
@@ -74,12 +82,12 @@ export class TranscriptReducer {
           for (const [key, position] of map) if (position > index) map.set(key, position - 1);
         }
         this.users.set(messageId!, this.items.length);
-        this.items.push({ ...previous, text: str(d.content) || previous.text, queued: false, receipt: d.receipt === true });
+        this.items.push({ ...previous, source: source ?? previous.source, text: str(d.content) || previous.text, queued: false, receipt: d.receipt === true });
         return;
       }
       if (!queued) { this.close(); this.lastFinal = undefined; }
       if (messageId) this.users.set(messageId, this.items.length);
-      this.items.push({ kind: "user", key: messageId ? `user:${messageId}` : this.key("user"), text: str(d.content), messageId, queued, attached: d.attached === true, receipt: d.receipt === true });
+      this.items.push({ kind: "user", key: messageId ? `user:${messageId}` : this.key("user"), text: str(d.content), messageId, source, queued, attached: d.attached === true, receipt: d.receipt === true });
       return;
     }
     const id = ev.eventId ?? (typeof d.id === "string" ? d.id : undefined);
@@ -172,7 +180,7 @@ export class TranscriptReducer {
         const callId=str(d.tool_call_id), index=this.tools.get(callId);
         if(index!=null){
           const old=this.items[index];
-          if(old.kind==="tool"&&ev.type==="tool_result")this.put(index,{...old,result:d.result,done:true});
+          if(old.kind==="tool"&&ev.type==="tool_result")this.put(index,{...old,result:d.result,done:true,unresolved:false});
           else if(old.kind==="tool"&&ev.type==="tool_call")this.put(index,{...old,name:str(d.name)||old.name,args:d.args??old.args});
           return;
         }

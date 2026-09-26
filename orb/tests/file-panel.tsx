@@ -1,3 +1,4 @@
+import {FindBar} from "../src/FindBar";
 import { render } from "solid-js/web";
 import { FilePanelProvider, FilePanelButton } from "../src/FilePanel";
 import { MdView } from "../src/Markdown";
@@ -43,6 +44,7 @@ render(
           </div>
         </main>
       </FilePanelProvider>
+      <FindBar/>
     </div>
   ),
   document.getElementById("root")!,

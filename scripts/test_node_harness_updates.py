@@ -11,6 +11,20 @@ updater = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(updater)
 
 class UpdateSafety(unittest.TestCase):
+    def test_version_requires_component(self):
+        with patch('sys.argv', ['updater', '--version', '1.2.3']):
+            with self.assertRaises(SystemExit) as error: updater.main()
+        self.assertEqual(error.exception.code, 2)
+
+    def test_explicit_version_is_pinned(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(updater, 'ROOT', Path(directory)), patch.object(updater.os, 'geteuid', return_value=0), patch.object(updater, 'resolve', side_effect=AssertionError('must not resolve latest')), patch.object(updater, 'reconcile', return_value={'version': '1.2.3'}) as reconcile, patch('sys.argv', ['updater', '--only', 'codex', '--version', '1.2.3']):
+            updater.main()
+            reconcile.assert_called_once_with('codex', '1.2.3', 'sandboxed-node')
+
+    def test_version_rejects_paths_and_options(self):
+        for version in ['../file', '--help', '1.2.3;id', 'latest']:
+            with self.assertRaises(ValueError): updater.stable(version)
+
     def test_archive_symlink_is_rejected(self):
         blob = io.BytesIO()
         with tarfile.open(fileobj=blob, mode='w:gz') as archive:

@@ -95,8 +95,9 @@ const OPENROUTER_SEED_MODEL_IDS: &[&str] = &[
 /// OAuth-based Grok Build path. This is intentionally narrower than xAI's
 /// OpenAI-compatible `/v1/models` catalog: API-routable models such as
 /// rolling aliases can still appear for the custom router, but the `grok`
-/// backend only offers canonical IDs documented for Grok Build. Actual access
-/// remains account/region-dependent and is diagnosed by the CLI at runtime.
+/// backend offers cataloged, versioned text classes and these compatibility
+/// entries, never rolling aliases or media models. Actual access remains
+/// account/region-dependent and is diagnosed by the CLI at runtime.
 const GROK_CLI_TEXT_MODEL_IDS: &[&str] = &[
     "grok-4.6",
     "grok-4.5",
@@ -1887,6 +1888,17 @@ pub async fn list_providers(
     drop(cached);
     retire_superseded_claude_models(&mut providers);
 
+    for provider in &mut providers {
+        if matches!(provider.id.as_str(), "anthropic" | "openai" | "xai") {
+            let ids: Vec<_> = provider.models.iter().map(|m| m.id.as_str()).collect();
+            let indices = crate::model_selection::preferred_indices(&ids);
+            provider.models = indices
+                .into_iter()
+                .map(|i| provider.models[i].clone())
+                .collect();
+        }
+    }
+
     Json(ProvidersResponse {
         providers,
         configured_ids: configured.into_iter().collect(),
@@ -2058,6 +2070,16 @@ pub async fn list_backend_model_options(
             .collect();
         chain_options.append(opencode_opts);
         *opencode_opts = chain_options;
+    }
+
+    // Filter only after native-harness and account availability checks. A newer
+    // inaccessible release must not hide the newest usable older release.
+    for backend in ["claudecode", "codex", "grok"] {
+        if let Some(options) = backends.get_mut(backend) {
+            let ids: Vec<_> = options.iter().map(|m| m.value.as_str()).collect();
+            let indices = crate::model_selection::preferred_indices(&ids);
+            *options = indices.into_iter().map(|i| options[i].clone()).collect();
+        }
     }
 
     Json(BackendModelOptionsResponse { backends })
@@ -2324,7 +2346,8 @@ fn reject_known_unsupported_codex_model(model_id: &str) -> Result<(), String> {
 }
 
 fn is_codex_backend_model_id(model_id: &str) -> bool {
-    model_id.contains("codex")
+    (crate::model_selection::is_versioned_text_model(model_id, "gpt") && model_id != "gpt-5.5-sol")
+        || model_id.contains("codex")
         || matches!(
             model_id,
             "gpt-daybreak-blue-latest"
@@ -2345,6 +2368,8 @@ fn is_codex_backend_model_id(model_id: &str) -> bool {
 
 fn is_grok_backend_model_id(model_id: &str) -> bool {
     GROK_CLI_TEXT_MODEL_IDS.contains(&model_id)
+        || (crate::model_selection::is_versioned_text_model(model_id, "grok")
+            && !model_id.ends_with("-latest"))
 }
 
 #[cfg(test)]

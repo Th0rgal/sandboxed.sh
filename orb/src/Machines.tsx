@@ -1,3 +1,5 @@
+import { AgentSoftware } from "./AgentSoftware";
+import { ResourceIcon } from "./ResourceIcon";
 import { readHistory, saveHistory, freshSamples, historyScope } from "./resourceCache";
 import { ResourceHistory, appendSamples, type ResourceSample } from "./ResourceHistory";
 import { LocalMachine } from "./LocalMachine";
@@ -55,7 +57,7 @@ type Metrics = { cpu_percent: number; memory_used: number; memory_total: number;
 const gib = (n: number) => `${(n / 1024 ** 3).toFixed(1)} GiB`;
 function Resource(p: { label: string; used?: number | null; total?: number | null; value?: string }) {
   const known = () => p.used != null && p.total != null && p.total > 0;
-  return <div class="machine-resource"><span>{p.label}</span><strong>{p.value ?? (known() ? `${Math.round(p.used! / p.total! * 100)}%` : "Unavailable")}</strong>
+  return <div class="machine-resource"><span><ResourceIcon kind={p.label}/>{p.label}</span><strong>{p.value ?? (known() ? `${Math.round(p.used! / p.total! * 100)}%` : "Unavailable")}</strong>
     <Show when={known()}><small>{gib(p.used!)} / {gib(p.total!)}</small></Show></div>;
 }
 function FleetRow(p: { node?: RemoteNodeView; core?: Metrics; live?: boolean; history?: ResourceSample[] }) {
@@ -289,6 +291,7 @@ export function Machines() {
         <Show when={draft() && !draft()!.id && draft()}>{(d) => <Editor d={d()} />}</Show>
       </div>
 
+      <AgentSoftware external={editable()} />
       <div class="key-bar">
         <div class="key-bar-text">
           <div class="s-row-title">Paloma public key</div>

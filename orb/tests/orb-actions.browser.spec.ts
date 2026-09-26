@@ -48,6 +48,7 @@ async function setup(page: Page, options: Options = {}) {
     const request = route.request();
     const url = new URL(request.url());
     const path = url.pathname;
+    if(path === "/api/model-routing/chains") return route.fulfill({json:[{id:"builtin/smart",name:"Smart (Default)"}]});
     if (path === "/api/control/missions" && request.method() === "POST") {
       posts.push(request.postDataJSON());
       if (options.capAt) {
@@ -122,7 +123,6 @@ test("right-click an agent row: Copy mission ID copies the raw UUID and changes 
 test("finished agent rows offer the same copy, and it is never an execution id", async ({ page }) => {
   await setup(page);
   await expandProject(page);
-  await page.getByRole("button", { name: "1 finished" }).click();
 
   const done = page.getByRole("button", { name: /Earlier report/ });
   await done.click({ button: "right" });

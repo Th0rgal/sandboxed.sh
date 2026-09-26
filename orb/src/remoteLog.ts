@@ -17,7 +17,13 @@ export function remoteLog(raw: string): { text: string; details?: string } {
       parts.push(event.part.text);
     } catch { /* A log tail can begin in the middle of a JSON line. */ }
   }
-  if (!parts.length) return { text: raw };
+  if (!parts.length) {
+    // Claude's remote runner already returns plain Markdown. Only unwrap the
+    // exact successful receipt; failures and unknown structured logs stay visible.
+    const success = /^Remote node '[^']+' job [0-9a-f-]{36} finished with state 'succeeded' \(exit Some\(0\)\)$/.test(raw.slice(0, marker));
+    if (success && log.trim() && !/^[\s]*[\[{]/.test(log)) return { text: log, details: raw };
+    return { text: raw };
+  }
   const failed = !/finished with state 'succeeded'/.test(raw.slice(0, marker));
   return { text: (failed ? raw.slice(0, marker) + "\n\n" : "") + parts.join("\n\n"), details: raw };
 }

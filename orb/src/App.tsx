@@ -1,16 +1,22 @@
+import { monitorSoftware } from "./softwareInventory";
+import {QueuedMessages} from "./QueuedMessages";
+import {enqueueLocalMessage,startLocalQueueWorker,queuedLocalMessages,acceptedLocalMessages,forgetAcceptedLocalMessages} from "./localMessageQueue";
+import {BtwSettings} from "./btwSettings";
+import {createPlanProgress, type PlanProgressData} from "./PlanProgress";
+import { nativeComposerDrop } from "./composerDrop";
 import { SideQuestions, type SideQuestionsHandle } from "./SideQuestionPanel";
-import { AgentActivity } from "./AgentActivity";
+import { AgentActivity, activityShouldCollapse } from "./AgentActivity";
 import { startLocalOrigin } from "./localAgents";
 import { ChangeMachine } from "./ChangeMachine";
 import { adoptTransferredWorkspace, machineLabel } from "./machineTransfer";
 import type { ClientRunReceipt } from "./clientRuns";
 import { NativeInteraction } from "./NativeInteraction";
-import { hasNativePicker, pickNativeFiles, transferFile, prepareUploads, uploadToken, type UploadedFile, type UploadSource } from "./uploads";
+import { encoded, hasNativePicker, pickNativeFiles, transferFile, prepareUploads, uploadToken, type UploadedFile, type UploadSource } from "./uploads";
 import { readComposerDraft, saveComposerDraft } from "./composerDrafts";
 import { readImagePaste, imagePrompt, stageLocalImages, stageRemoteImages, IMAGE_COUNT, type DraftImage } from "./imageAttachments";
 import { FilePanelProvider, FilePanelButton } from "./FilePanel";
 import { ErrorNotice } from "./ErrorNotice";
-import { MissionFailure, LaunchStatus, MissionPending, missionPhase, phaseIsQuiet, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, launchRefusal, nodeLabel, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, missionSettingsIdle, dockModelLabel, type LaunchReceipt, type LaunchRefusal, type RemoteSupport } from "./missionLaunch";
+import { MissionFailure, LaunchStatus, MissionPending, missionPhase, phaseIsQuiet, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, launchRefusal, nodeLabel, isAdministrationNode, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, missionSettingsIdle, dockModelLabel, type LaunchReceipt, type LaunchRefusal, type RemoteSupport } from "./missionLaunch";
 import { goalDraft, goalObjective, goalPrompt, missionTitle, displayTitle, GoalTag, EMPTY_GOAL_ERROR, absorbGoalPrefix, composerModes, filterSlash, slashQuery, modePrompt, ModeChip, type ComposerMode } from "./goal";
 import { atQuery, chipToAttachment, filterAttach, insertMention, loadAttachItems, mentionedChips, type AttachChip, type AttachItem } from "./attach";
 import { DEFAULT_PROJECT, ensureDefaultProject, projectChoices } from "./defaultProject";
@@ -96,7 +102,7 @@ import {
   openExternalUrl,
 } from "./api";
 
-const PAGES = new Set(["settings", "routing", "machines", "providers", "execution"]);
+const PAGES = new Set(["settings", "btw-settings", "routing", "machines", "providers", "execution"]);
 
 const MODELS = ["Orb Lorem 4.6 High Fast", "Ipsum 5 Max", "Dolor 4.5 Sonnet", "Auto"];
 
@@ -253,33 +259,18 @@ function AgentTurn(p: { turn: Extract<Turn, { role: "agent" }>; streaming?: bool
   );
 }
 
-function StatusGlyph(p: { agent: { status: Agent["status"] }; busy: boolean }) {
-  return (
-    <Switch fallback={<span class="dot" />}>
-      <Match when={p.busy || p.agent.status === "running"}>
-        <Ic.RunningDots />
-      </Match>
-      <Match when={p.agent.status === "pr-closed"}>
-        <Ic.PrClosedIcon class="c-red" />
-      </Match>
-      <Match when={p.agent.status === "pr-merged"}>
-        <Ic.PrMergedIcon class="c-purple" />
-      </Match>
-    </Switch>
-  );
-}
-
 function OptimisticMessage(p: {draft:{text:string; images:DraftImage[]}}) {
   return <div class="optimistic-message" aria-label="Pending message"><div class="user"><Show when={p.draft.images.length}><div class="message-images"><For each={p.draft.images}>{(image,index)=><div class="message-image"><img src={image.dataUrl} alt={`Image #${image.reference ?? index()+1}`}/><span>#{image.reference ?? index()+1}</span></div>}</For></div></Show><span>{p.draft.text}</span></div><span class="composer-pending-status" role="status">Waiting for confirmation…</span></div>;
 }
 
 export function Composer(p: {
   revision?: { text: string; append?: boolean };
-  onBtw?: (question: string) => boolean;
+  onBtw?: (question: string, images?: DraftImage[], files?: UploadedFile[]) => boolean | Promise<boolean>;
+  sideQuestion?: boolean;
   onOpenBtw?: () => void;
   placeholder: string;
   busy: boolean;
-  onSend: (t: string, images: DraftImage[]) => void | boolean | Promise<void | boolean>;
+  onSend: (t: string, images: DraftImage[], files?: UploadedFile[]) => void | boolean | Promise<void | boolean>;
   onStop: () => void;
   autofocus?: boolean;
   tall?: boolean;
@@ -329,12 +320,39 @@ export function Composer(p: {
     } catch (error) { setUploadError(error instanceof Error ? error.message : String(error)); }
     finally { setUploading(false); }
   };
+  let composerElement:HTMLDivElement|undefined;
+  nativeComposerDrop(()=>composerElement, async sources=>{
+    if(sending()||uploading()||readingImages())return;
+    await attachMixed(sources);
+  });
+  const attachMixed = async (sources: UploadSource[]) => {
+    try {
+    const scope=p.scope;
+    sources=await Promise.all(sources.map(async source=>{
+      const mime:Record<string,string>={png:"image/png",jpg:"image/jpeg",jpeg:"image/jpeg",webp:"image/webp",gif:"image/gif"};
+      const type=mime[source.name.split('.').at(-1)?.toLowerCase()??''];
+      if(!source.file&&source.localPath&&type){
+        const bytes=Uint8Array.from(atob(await encoded(source)),c=>c.charCodeAt(0));
+        return {...source,file:new File([bytes],source.name,{type})};
+      }
+      return source;
+    }));
+    if(disposed||scope!==p.scope)return;
+    const pictures = sources.filter(source => source.file?.type.startsWith("image/"));
+    if (pictures.length) {
+      const clipboard = { files: pictures.map(source=>source.file!), getData:()=>"" };
+      await pasteImages({clipboardData:clipboard,preventDefault(){}} as unknown as ClipboardEvent);
+    }
+    const files = sources.filter(source => !pictures.includes(source));
+    if (files.length) await attachSources(files);
+    } catch(error){setUploadError(error instanceof Error?error.message:String(error));}
+  };
   const chooseFiles = async () => {
     setCtx(false); setUploadError(null);
     if (!hasNativePicker()) { fileInput.click(); return; }
     const scope = p.scope;
     const selection = uploadTarget();
-    try { const files = await pickNativeFiles(); if (!disposed && scope === p.scope && selection === uploadTarget()) await attachSources(files); }
+    try { const files = await pickNativeFiles(); if (!disposed && scope === p.scope && selection === uploadTarget()) await attachMixed(files); }
     catch (error) { setUploadError(error instanceof Error ? error.message : String(error)); }
   };
   const [images, setImages] = createSignal<DraftImage[]>([]);
@@ -359,7 +377,7 @@ export function Composer(p: {
   }));
   createEffect(() => {
     const scope=p.scope;
-    if (draftReady() && scope) void saveComposerDraft(scope,{text:pendingSend()?.text ?? text(),images:pendingSend()?.images ?? images(),mode:mode(),uploads:uploaded.map(file => ({...file, source:{name:file.source.name,localPath:file.source.localPath}}))}).catch(() => {});
+    if (draftReady() && scope) void saveComposerDraft(scope,{text:pendingSend()?.text ?? text(),images:pendingSend()?.images ?? images(),mode:mode(),uploads:uploaded.map(file => ({...file, source:file.source}))}).catch(() => {});
   });
   const [imageError, setImageError] = createSignal<string | null>(null);
   const [readingImages, setReadingImages] = createSignal(false);
@@ -415,7 +433,7 @@ export function Composer(p: {
   createEffect(() => {
     if (p.uploadTarget === "local") void refreshLocalAgents(false);
   });
-  const modes = createMemo(() => [...composerModes(backend(), p.uploadTarget === "local" ? !!localInstalled().find(h=>h.id===backend())?.plan_supported : p.uploadTarget === "core" && !!harnessChoices().find(h=>h.backend.id===backend())?.backend.native_plan), ...(p.onBtw ? [{id:"btw" as const, section:"Modes" as const,label:"Side question",title:"Ask without interrupting the agent"}] : [])]);
+  const modes = createMemo(() => p.sideQuestion ? [] : [...composerModes(backend(), p.uploadTarget === "local" ? !!localInstalled().find(h=>h.id===backend())?.plan_supported : p.uploadTarget === "core" && !!harnessChoices().find(h=>h.backend.id===backend())?.backend.native_plan), ...(p.onBtw ? [{id:"btw" as const, section:"Modes" as const,label:"Side question",title:"Ask without interrupting the agent"}] : [])]);
   const slash = createMemo(() => {
     if (mode() || voiceActive() || slashOff()) return null;
     const q = slashQuery(text());
@@ -520,15 +538,9 @@ export function Composer(p: {
       setUploadError("Plan mode is not supported by this harness on this machine. Your draft is kept.");
       return;
     }
-    if (mode() === "btw" || /^\/btw(?:\s|$)/.test(payload)) {
-      if (!p.onBtw) { setUploadError("Side questions require an existing conversation."); return; }
-      if (images().length || uploaded.length) { setUploadError("Side questions use the conversation only. Remove attachments or send a normal message."); return; }
-      const question = payload.replace(/^\/btw\s*/, "").trim();
-      if (!question) { p.onOpenBtw?.(); return; }
-      if (p.onBtw(question)) { setText(""); ta.value=""; setMode(null); setUploadError(null); resize(); }
-      else setUploadError("A side question is already running, or the question is too long. Your draft is kept.");
-      return;
-    }
+    const sideMode = mode() === "btw" || /^\/btw(?:\s|$)/.test(payload);
+    if (sideMode && !p.onBtw) { setUploadError("Side questions require an existing conversation."); return; }
+    if (sideMode && !payload.replace(/^\/btw\s*/, "").trim() && !images().length && !uploaded.length) { p.onOpenBtw?.(); return; }
     const sentImages = images();
     const originalMode = mode();
     const originalUploads = uploaded;
@@ -548,8 +560,11 @@ export function Composer(p: {
       uploaded = resolved.files;
       payload = draftOf(resolved.text);
       p.onAttachments?.(mentionedChips(resolved.text,atItems()));
-      accepted = await p.onSend(payload || "Please look at the attached images.", sentImages) !== false;
+      accepted = sideMode
+        ? await p.onBtw!(payload.replace(/^\/btw\s*/, "").trim() || "Please look at the attachments.", sentImages, resolved.files)
+        : await (p.sideQuestion ? p.onSend(payload || "Please look at the attached images.", sentImages, resolved.files) : p.onSend(payload || "Please look at the attached images.", sentImages)) !== false;
       if (accepted) {
+        if (sideMode) p.onAttachments?.([]);
         uploaded = [];
         setUploadError(null);
         if (draftScope) await saveComposerDraft(draftScope, {text:"",images:[]}).catch(() => {});
@@ -599,7 +614,7 @@ export function Composer(p: {
   });
   const plus = (
     <div class="plus-wrap" onPointerDown={(e) => e.stopPropagation()}>
-      <input ref={fileInput} type="file" multiple hidden aria-label="Choose files or images" onChange={(event) => { const files = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ""; void attachSources(files.map(file => ({ name: file.name, file }))); }} />
+      <input ref={fileInput} type="file" multiple hidden aria-label="Choose files or images" onChange={(event) => { const files = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ""; void attachMixed(files.map(file => ({ name: file.name, file }))); }} />
       <button class="plus" title="Add context" disabled={uploading() || sending()} onClick={() => setCtx(!ctx())}>
         <Ic.PlusIcon size={14} />
       </button>
@@ -687,7 +702,12 @@ export function Composer(p: {
           }
         >
           <div class="model-wrap">
-            <button class={`model ${which() === "harness" ? "on" : ""}`} title="Harness" onClick={() => setWhich(which() === "harness" ? null : "harness")}>
+            <button class={`model ${which() === "harness" ? "on" : ""}`} title="Harness" onClick={() => {
+              const opening = which() !== "harness";
+              setWhich(opening ? "harness" : null);
+              // Discover newly installed CLIs without recreating the composer.
+              if (opening && p.harnessIds) void refreshLocalAgents(false);
+            }}>
               {choice()?.backend.name ?? "Harness"} <Ic.ChevronDown size={12} />
             </button>
             <Show when={which() === "harness"}>
@@ -888,7 +908,11 @@ export function Composer(p: {
   );
   return (<>
     <Show when={!p.onPending && pendingSend()}>{pending=><OptimisticMessage draft={pending()} />}</Show>
-    <div class={`composer ${p.tall || images().length || multiline() ? "tall" : ""} ${voiceActive() ? "voice-on" : ""} ${mode() ? "has-mode" : ""}`} data-mode={mode() ?? ""} onClick={() => !voiceActive() && ta.focus()}>
+    <div ref={composerElement} class={`composer ${p.tall || images().length || multiline() ? "tall" : ""} ${voiceActive() ? "voice-on" : ""} ${mode() ? "has-mode" : ""}`} data-mode={mode() ?? ""}
+      onDragOver={e=>{if(Array.from(e.dataTransfer?.types??[]).includes("Files")){e.preventDefault();e.stopPropagation();if(e.dataTransfer)e.dataTransfer.dropEffect="copy";e.currentTarget.classList.add("drop-active");}}}
+      onDragLeave={e=>{if(!e.currentTarget.contains(e.relatedTarget as Node))e.currentTarget.classList.remove("drop-active");}}
+      onDrop={e=>{e.preventDefault();e.stopPropagation();e.currentTarget.classList.remove("drop-active");if(sending()||uploading()||readingImages())return;void attachMixed(Array.from(e.dataTransfer?.files??[]).map(file=>({name:file.name,file})));}}
+      onClick={() => !voiceActive() && ta.focus()}>
       {plus}
       {slashMenu}
       {atMenu}
@@ -902,7 +926,8 @@ export function Composer(p: {
           ref={ta}
           onPaste={event => void pasteImages(event)}
           rows={1}
-          placeholder={mode() === "btw" ? "Ask without interrupting…" : mode() === "goal" ? "Describe the objective" : mode() === "plan" ? "Plan before making changes…" : p.placeholder}
+          // Keep the placeholder clear of the native caret without shifting typed text.
+          placeholder={"\u2009" + (mode() === "btw" ? "Ask without interrupting…" : mode() === "goal" ? "Describe the objective" : mode() === "plan" ? "Plan before making changes…" : p.placeholder)}
           onInput={(e) => {
             const next = e.currentTarget.value;
             setSlashOff(false);
@@ -979,13 +1004,22 @@ export function Composer(p: {
 // Keep the last message reachable while the transparent dock floats over the transcript.
 function floatingDock(el: HTMLDivElement) {
   let parent: HTMLElement | null = null;
-  const update = () => parent?.style.setProperty("--dock-height", `${el.getBoundingClientRect().height}px`);
+  const update = () => {
+    const bounds = el.getBoundingClientRect();
+    parent?.style.setProperty("--dock-height", `${bounds.height}px`);
+    const composer = el.querySelector<HTMLElement>(".composer");
+    if (composer) el.closest<HTMLElement>(".app")?.style.setProperty(
+      "--composer-bottom-space", `${bounds.bottom - composer.getBoundingClientRect().bottom}px`,
+    );
+  };
   const observer = new ResizeObserver(update);
   queueMicrotask(() => { parent = el.parentElement; update(); observer.observe(el); });
-  onCleanup(() => { observer.disconnect(); parent?.style.removeProperty("--dock-height"); });
+  onCleanup(() => { observer.disconnect(); parent?.style.removeProperty("--dock-height"); el.closest<HTMLElement>(".app")?.style.removeProperty("--composer-bottom-space"); });
 }
 
 export default function App() {
+  onMount(() => { const stop = monitorSoftware(); onCleanup(stop); });
+  createEffect(()=>{connectionVersion();const stop=startLocalQueueWorker();onCleanup(stop);});
   const [projects, setProjects] = createStore<typeof seed>([]);
   const [selected, setSelected] = createSignal<string | null>((() => { const saved = localStorage.getItem("orb.selectedConversation"); return saved && (PAGES.has(saved) || /^(m|pf|c|pc|ps):/.test(saved)) ? saved : null; })());
   createEffect(() => { localStorage.setItem("orb.selectedConversation",selected() ?? ""); });
@@ -1019,10 +1053,10 @@ export default function App() {
   const [launchPreview, setLaunchPreview] = createSignal<LaunchReceipt | null>(null);
   let launchAttempt: { signature: string; key: string } | undefined;
   const MACHINE_KEY = "orb.machine";
-  const [newMachine, setNewMachine] = createSignal(localStorage.getItem(MACHINE_KEY) || "core");
+  const [newMachine, setNewMachine] = createSignal((localStorage.getItem(MACHINE_KEY) === "dgx-spark-admin" ? "core" : localStorage.getItem(MACHINE_KEY)) || "core");
   const chooseMachine = (id: string) => {
     setNewMachine(id);
-    try { localStorage.setItem(MACHINE_KEY, id); } catch { /* ignore */ }
+    try { localStorage.setItem(MACHINE_KEY, id === "dgx-spark-admin" ? "core" : id); } catch { /* ignore */ }
     if (id === "local") void refreshLocalAgents(false);
   };
   const [envOpen, setEnvOpen] = createSignal<"machine" | "project" | null>(null);
@@ -1051,6 +1085,7 @@ export default function App() {
 
   const [missions, setMissions] = createSignal<Mission[]>([]);
   const [previewContext, setPreviewContext] = createSignal<{id: string; pct: number | null} | null>(null);
+  const [previewPlan, setPreviewPlan] = createSignal<{id:string; data:PlanProgressData | undefined}>();
   const [openMission, setOpenMission] = createSignal<Mission | null>(null);
   /** Only missions still doing something: the sidebar is a place to act,
    * not a history. Everything else lives under its project. */
@@ -1133,12 +1168,6 @@ export default function App() {
     if (sep < 0) return null;
     return { slug: rest.slice(0, sep), path: rest.slice(sep + 1) };
   });
-  const missionGlyph = (s: string): Agent["status"] =>
-    s === "active" || s === "running"
-      ? "running"
-      : s === "failed" || s === "not_feasible" || s === "blocked" || s === "interrupted"
-        ? "pr-closed"
-        : "idle";
   const sortedNodes = () => [...fleetNodes()].sort((a, b) => Number(b.status === "online") - Number(a.status === "online"));
   const machineLabel = () => {
     if (isConnected()) {
@@ -1213,7 +1242,7 @@ export default function App() {
       context: previewContext()?.id === id ? previewContext()?.pct : null };
   });
 
-  const onSettings = () => selected() === "settings" || selected() === "routing";
+  const onSettings = () => selected() === "settings" || selected() === "routing" || selected() === "btw-settings";
   const openSettings = () => {
     open("settings");
   };
@@ -1348,7 +1377,7 @@ export default function App() {
     }
     launchAttempt = undefined;
     setAttachChips([]);
-    rememberLaunch(m.id, {prompt:typed,nodeId:"local",destination:"This computer"});
+    rememberLaunch(m.id, {prompt:imagePrompt(typed,images.map(image=>image.dataUrl),images),nodeId:"local",destination:"This computer"});
     setMissions(prev=>[m,...prev.filter(old=>old.id!==m.id)]);
     open(`m:${m.id}`);
     if(legacy){const run=await startLocal({id:m.id,harness:pick.backend,bin:row.path,cwd:root,prompt:sent,model:pick.model,imagePaths});void finishLocal(m.id,run);}
@@ -1365,7 +1394,7 @@ export default function App() {
       const prompt = goal.kind === "goal" ? goalPrompt(goal.objective) : text;
       const title = missionTitle(text);
       const machine = newMachine();
-      const receipt = {prompt,nodeId:machine,destination:nodeLabel(machine)};
+      const receipt = {prompt:imagePrompt(prompt,images.map(image=>image.dataUrl),images),nodeId:machine,destination:nodeLabel(machine)};
       const projectSlug = effectiveNewProject();
       const pick = effectivePick();
       setCreating(true); setCreateError(null); setCreateRefusal(null); setLaunchPreview(receipt);
@@ -1404,6 +1433,7 @@ export default function App() {
         launchAttempt = undefined;
         setAttachChips([]);
         rememberLaunch(m.id, receipt);
+        if (machine === "dgx-spark-admin") chooseMachine("core");
         setMissions(prev => [m, ...prev.filter(old => old.id !== m.id)]);
         open(`m:${m.id}`);
         void refreshMissions();
@@ -1547,9 +1577,16 @@ export default function App() {
                     harnessChoices={harnessChoices()}
                     onFork={m => { setMissions(ms => [m, ...ms.filter(x => x.id !== m.id)]); bumpProjects(); open(`m:${m.id}`); }}
                     selected={selected}
+                    onDeleted={ids => {
+                      const removed = new Set(ids.map(id => `m:${id}`));
+                      batch(() => {
+                        setMissions(rows => rows.filter(m => !ids.includes(m.id)));
+                        if (removed.has(selected() ?? "")) setSelected(null);
+                        // Back/forward must not reopen conversations that no longer exist.
+                        setHistory(entries => entries.map(id => id && removed.has(id) ? null : id));
+                      });
+                    }}
                     open={open}
-                    missionGlyph={missionGlyph}
-                    StatusGlyph={StatusGlyph}
                     onNewAgent={(slug, path) => {
                       setNewFolder(path ? { project: slug, path } : null);
                       setNewProject(slug);
@@ -1571,6 +1608,7 @@ export default function App() {
             </button>
             <div class="settings-nav-gap" />
             <button class={`row ${selected() === "settings" ? "active" : ""}`} onClick={() => open("settings")}><span class="row-ico"><Ic.GearIcon /></span><span class="row-label">Client</span></button>
+            <button class={`row ${selected() === "btw-settings" ? "active" : ""}`} onClick={() => open("btw-settings")}><span class="row-ico"><Ic.BranchIcon /></span><span class="row-label">Btw</span></button>
             <button class={`row ${selected() === "routing" ? "active" : ""}`} onClick={() => open("routing")}><span class="row-ico"><Ic.BranchIcon /></span><span class="row-label">Routing</span></button>
           </Show>
         </nav>
@@ -1607,6 +1645,7 @@ export default function App() {
             <Match when={selected() === "settings"}>
               <span>Settings · Client</span>
             </Match>
+            <Match when={selected() === "btw-settings"}><span>Settings · Btw</span></Match>
             <Match when={selected() === "routing"}><span>Settings · Routing</span></Match>
             <Match when={selected() === "machines"}>
               <span>Machines</span>
@@ -1623,7 +1662,7 @@ export default function App() {
             <Match when={currentMissionId()}>
               {(id) => (
                 <>
-                  <SessionPreview data={sessionPreview()} goal={!!missionGoal(missions().find((m) => m.id === id()) ?? openMission())} />
+                  <SessionPreview data={sessionPreview()} plan={previewPlan()?.id === id() ? previewPlan()?.data : undefined} goal={!!missionGoal(openMission()?.id === id() ? openMission() : missions().find((m) => m.id === id()))} />
                 </>
               )}
             </Match>
@@ -1664,6 +1703,7 @@ export default function App() {
 
       <main class="main">
         <Switch>
+          <Match when={selected() === "btw-settings"}><BtwSettings/></Match>
           <Match when={selected() === "settings"}>
             <Settings onOpenPage={open} />
           </Match>
@@ -1679,7 +1719,7 @@ export default function App() {
           <Match when={currentMissionId()}>
             {(id) => (
               <Show when={id()} keyed>
-                {(mid) => <MissionView id={mid} initial={missions().find(m => m.id === mid)} onMission={setOpenMission} onContext={(id, pct) => setPreviewContext({id, pct})} onFork={m => { setMissions(ms => [m, ...ms.filter(x => x.id !== m.id)]); bumpProjects(); open(`m:${m.id}`); }} />}
+                {(mid) => <MissionView id={mid} initial={missions().find(m => m.id === mid)} onMission={setOpenMission} onPlan={(id,data)=>setPreviewPlan({id,data})} onContext={(id, pct) => setPreviewContext({id, pct})} onFork={m => { setMissions(ms => [m, ...ms.filter(x => x.id !== m.id)]); bumpProjects(); open(`m:${m.id}`); }} />}
               </Show>
             )}
           </Match>
@@ -1844,8 +1884,8 @@ export default function App() {
                           <For each={sortedNodes()}>
                             {(n) => (
                               <button
-                                class={`menu-item ${n.id === newMachine() ? "on" : ""}`}
-                                title={nodeLaunchNote()}
+                                class={`menu-item machine-node-option ${n.id === newMachine() ? "on" : ""}`}
+                                title={isAdministrationNode(n) ? `Administration · Full sudo · Manual selection only. ${nodeLaunchNote() ?? ""}` : nodeLaunchNote()}
                                 onClick={() => {
                                   chooseMachine(n.id);
                                   setEnvOpen(null);
@@ -1855,9 +1895,9 @@ export default function App() {
                                   <Ic.ComputeNodeIcon />
                                 </span>
                                 <span class="menu-col">
-                                  <span class="menu-title">{n.id}</span>
+                                  <span class="menu-title">{isAdministrationNode(n) ? "DGX Spark · Admin" : n.id}</span>
                                 </span>
-                                <span class="machine-node-state"><span class={`machine-state-dot ${n.status === "online" && !n.cordoned ? "online" : ""}`} />{n.cordoned ? "Cordoned" : n.status}</span>
+                                <span class="machine-node-state"><span class={`machine-state-dot ${n.status === "online" && (!n.cordoned || isAdministrationNode(n)) ? "online" : ""}`} />{isAdministrationNode(n) && n.status === "online" ? "Manual" : n.cordoned ? "Cordoned" : n.status}</span>
                               </button>
                             )}
                           </For>
@@ -1882,15 +1922,14 @@ export default function App() {
                     </Show>
                   </div>
                 </div>
-                {/* The optimistic window: the prompt appears immediately and animates while
-    the request is in flight. No banner and no reserved space — LaunchStatus
-    stays silent for a healthy launch and speaks only if it is refused. */}
-                <Show when={launchPreview()}>{(receipt) => <div class="launch-preview"><UserTurn text={receipt().prompt} pending /><LaunchStatus submitting destination={receipt().destination} goal={goalObjective(receipt().prompt)} /><MissionPending destination={receipt().destination} label="Starting" /></div>}</Show>
-                <div hidden={creating()}>
+                {/* One preview from attachment preparation through acceptance; failures restore the composer. */}
+                <Show when={launchPreview()}>{(receipt) => <div class="launch-preview"><UserTurn text={receipt().prompt} pending /><MissionPending destination={receipt().destination} label="Working" /></div>}</Show>
+                <div hidden={!!launchPreview()}>
                 <Composer
                   placeholder="Describe a task, / for commands, @ for context"
                   busy={creating()}
                   onSend={create}
+                  onPending={draft => setLaunchPreview(draft ? {prompt:imagePrompt(draft.text,draft.images.map(image=>image.dataUrl),draft.images),nodeId:newMachine(),destination:nodeLabel(newMachine())} : null)}
                   onStop={stop}
                   onDraft={(text) => { if (createError() === EMPTY_GOAL_ERROR && goalDraft(text).kind !== "empty") setCreateError(null); }}
                   autofocus
@@ -2199,7 +2238,7 @@ function MissionDock(p: {
   );
 }
 
-function MissionView(p: { id: string; onContext?: (id: string, pct: number | null) => void; initial?: Mission; onMission?: (mission: Mission | null) => void; onFork?: (mission: Mission) => void }) {
+function MissionView(p: { id: string; onPlan?: (id:string,data:PlanProgressData | undefined)=>void; onContext?: (id: string, pct: number | null) => void; initial?: Mission; onMission?: (mission: Mission | null) => void; onFork?: (mission: Mission) => void }) {
   const receipt = recalledLaunch(p.id);
   const cached = peekReadyTranscript(p.id);
   const [mission, setMission] = createSignal<Mission | null>(p.initial ?? null);
@@ -2210,7 +2249,18 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
   const [error, setError] = createSignal<string | null>(null);
   const [queueError, setQueueError] = createSignal<string | null>(cached?.queueError ?? null);
   const [sendError, setSendError] = createSignal<string | null>(null);
-  const [optimistic, setOptimistic] = createSignal<{text:string; images:DraftImage[]} | null>(null);
+  const [optimistic, setOptimistic] = createSignal<{id:ReturnType<typeof crypto.randomUUID>;text:string; images:DraftImage[];waiting:boolean} | null>(null);
+  let sendingId:ReturnType<typeof crypto.randomUUID>|undefined;
+  const beginSend = (draft:{text:string;images:DraftImage[]}|null) => {
+    if(!draft){setOptimistic(null);return;}
+    sendingId=crypto.randomUUID();
+    setOptimistic({...draft,id:sendingId,waiting:busy()});
+  };
+  createEffect(()=>{
+    const ids=new Set(items().filter(i=>i.kind==='user').map(i=>i.kind==='user'?i.messageId??'':''));
+    // The canonical transcript now owns these identities.
+    forgetAcceptedLocalMessages(ids);
+  });
   let sideQuestions: SideQuestionsHandle | undefined;
   const [sideRevision,setSideRevision] = createSignal<{text:string;append:boolean}>();
   const [followAttach, setFollowAttach] = createSignal<AttachChip[]>([]);
@@ -2219,7 +2269,7 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
   cacheRemember(`m:${p.id}`);
 
   const scrollIfPinned = () => {
-    if (nearBottom) scroller?.scrollTo({ top: scroller.scrollHeight });
+    if (nearBottom && !scroller?.dataset.panelResizing) scroller?.scrollTo({ top: scroller.scrollHeight });
   };
   // Resize notifications run after streaming Markdown has changed layout.
   onMount(() => {
@@ -2322,7 +2372,12 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
     );
     // Slow status poll — the stream is authoritative for content, but the
     // composer busy state shouldn't depend on it alone.
-    const stopPoll = pollWhileVisible(refresh, 10000);
+    const stopPoll = pollWhileVisible(async () => {
+      await refresh();
+      // Queue failures are recoverable independently of the mission stream.
+      // A healthy stream must not leave a transient startup warning forever.
+      if (queueError()) await resync(true);
+    }, 10000);
     onCleanup(() => {
       if (scroller) putTranscriptHeight(p.id, scroller.scrollHeight);
       stopStream();
@@ -2369,20 +2424,29 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
    */
   const pending = () => {
     const phase = missionPhase(mission(), activity());
-    return !optimistic() && (localRunActive(p.id) || phase.moving) && !activity();
+    return (!!optimistic() && !optimistic()!.waiting || queuedLocalMessages(p.id).some(row=>!row.waiting || row.state==='dispatching' || row.state==='accepted') || localRunActive(p.id) || phase.moving) && !activity();
   };
-  const phaseLabel = () => localRunActive(p.id) ? "Starting agent" : missionPhase(mission(), activity()).label;
+  const phaseLabel = () => "Working";
 
-  const viewItems = () => {
-    const list = withInitialPrompt(items(), mission(), receipt);
+  const viewItems = createMemo(() => {
+    const canonical = withInitialPrompt(items(), mission(), receipt);
+    const known = new Set(canonical.filter(i=>i.kind==='user').map(i=>i.kind==='user'?i.messageId:undefined));
+    const outbox = [...acceptedLocalMessages(p.id), ...queuedLocalMessages(p.id).filter(row=>!row.waiting||row.state==='accepted'||row.state==='dispatching')];
+    const draft=optimistic();
+    const projected:StreamItem[]=[];
+    for(const row of outbox){if(!known.has(row.id)){known.add(row.id);projected.push({kind:'user',key:`user:${row.id}`,messageId:row.id,text:row.text});}}
+    if(draft&&!draft.waiting&&!known.has(draft.id))projected.push({kind:'user',key:`user:${draft.id}`,messageId:draft.id,text:imagePrompt(draft.text,draft.images.map(image=>image.dataUrl),draft.images)});
+    const list = [...canonical,...projected];
     const live = localLiveText(p.id);
     const withLive = live && !list.some(item => item.kind === "text" && item.text === live) ? [...list, { kind: "text" as const, key: `local:${p.id}`, text: live, live: localRunActive(p.id) }] : list;
     if (busy()) return withLive;
     // Terminal mission: force-close any bubble left open by a dropped
     // assistant_message finalizer.
     return withLive.map((i) => (i.kind === "text" && i.live ? { ...i, live: false } : i));
-  };
+  });
 
+  const planProgress = createPlanProgress({get mission(){return p.id;},get items(){return viewItems();},get active(){return clientPlaced()?localRunActive(p.id):busy();}});
+  createEffect(()=>p.onPlan?.(p.id,planProgress()));
   const titleContext = createMemo(() => awaiting() ? null : contextPct(estimateTokens(viewItems()), contextWindow(mission()?.backend)));
   createEffect(() => p.onContext?.(p.id, titleContext()));
 
@@ -2391,7 +2455,9 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
   let retryMessage: { key: string; id: string } | null = null;
   const sendMsg = async (text: string, images: DraftImage[] = [], chips: AttachChip[] = followAttach()) => {
     setSendError(null);
+    const attemptId=sendingId??crypto.randomUUID();sendingId=undefined;
     if (clientPlaced()) {
+      const sendVersion=connectionVersion(),sendMission=p.id;
       try {
         await import("./localAgents").then(m => m.restoreLocalBindings());
       } catch (error) {
@@ -2415,30 +2481,9 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
         if (plan.files.length) await writeLocalFiles(binding.cwd, plan.files);
         const imagePaths = await stageLocalImages(binding.cwd, images);
         const sent = imagePrompt(bindWorkspace(plan.prompt, binding.cwd), imagePaths, images);
-        const run = await startLocal({ id: p.id, harness: binding.harness, bin: binding.bin, cwd: binding.cwd, prompt: sent, model: binding.model, sessionId: binding.sessionId, imagePaths });
-        // Persist only accepted turns: a rejected launch must keep the draft
-        // without adding another copy to the conversation.
-        const userEventId = crypto.randomUUID();
-        const userContent = imagePrompt(text, imagePaths, images);
-        await appendClientTranscript(p.id, "user", userContent, userEventId, run).catch(e => {
-          setSendError(`The local run started, but saving your message failed: ${String(e)}`);
-        });
-        const userEvent: StreamEvent = { type: "user_message", eventId: userEventId, data: { id: userEventId, content: userContent } };
-        if (replaying) held.push(userEvent); else applyLive(userEvent);
+        if(connectionVersion()!==sendVersion||p.id!==sendMission)throw new Error("Conversation changed. Your draft is kept.");
+        await enqueueLocalMessage({id:p.id,harness:binding.harness,bin:binding.bin,cwd:binding.cwd,prompt:sent,model:binding.model,imagePaths},imagePrompt(text,imagePaths,images),{id:attemptId,waiting:optimistic()?.waiting??busy()});
         if (chips === followAttach()) setFollowAttach([]);
-        void followLocal(p.id, () => {}).then(async (state) => {
-          const note = binding.harness === "grok" && binding.sessionId && !state.resumed ? "Grok starts a new local session.\n\n" : "";
-          const body = `${note}${state.text}`.trim();
-          if (body) await appendClientTranscript(p.id, "assistant", body, undefined, run);
-          const failed = (state.exit_code != null && state.exit_code !== 0) || (!!state.error && !state.text.trim());
-          if (failed) recordLocalFailure(p.id, state.error || `Local process exited with code ${state.exit_code}`);
-          await setClientMissionStatus(p.id, failed ? "failed" : "awaiting_user", run);
-          void refresh();
-        }).catch(async (error) => {
-          recordLocalFailure(p.id, error);
-          await setClientMissionStatus(p.id, "failed", run).catch(() => {});
-          void refresh();
-        });
         return true;
       } catch (e) {
         // Launch rejection belongs to the composer; it is not a second mission failure.
@@ -2449,11 +2494,19 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
     }
     const attachments = chips.map(chipToAttachment);
     const key = JSON.stringify([connectionVersion(), text, attachments, images.map(image => image.id)]);
-    if (retryMessage?.key !== key) retryMessage = { key, id: crypto.randomUUID() };
+    if (retryMessage?.key !== key) retryMessage = { key, id: attemptId };
     try {
       const sent = imagePrompt(text, await stageRemoteImages(images, mission()), images);
       const result = await sendMissionMessage(p.id, sent, attachments, retryMessage.id);
       retryMessage = null;
+      if (result.replacement) {
+        const replacement = result.replacement;
+        const nodeId = replacement.remote_job?.node_id ?? replacement.remote_node_id ?? mission()?.remote_job?.node_id ?? mission()?.remote_node_id ?? "";
+        rememberLaunch(replacement.id, { prompt: sent, nodeId, destination: nodeLabel(nodeId), replacement: true });
+        if (chips === followAttach()) setFollowAttach([]);
+        p.onFork?.(replacement);
+        return true;
+      }
       const event: StreamEvent = { type: "user_message", eventId: result.id, data: { id: result.id, content: sent, queued: result.queued, receipt: true, attached: chips.length > 0 } };
       if (replaying) held.push(event);
       else applyLive(event);
@@ -2492,6 +2545,7 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
         class="scroll"
         ref={scroller}
         onScroll={() => {
+          if(scroller?.dataset.panelResizing)return;
           nearBottom = !scroller || scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
         }}
       >
@@ -2518,7 +2572,7 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
             <LaunchStatus submitting={localRunActive(p.id)} destination={missionDestination(mission(), receipt)} mission={mission()} goal={missionGoal(mission(), receipt)} activity={activity()} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
             <Transcript items={viewItems().filter(i => i.kind !== "user" || !i.queued)} pending={pending()} onSend={sendEditedPrompt} />
             <Show when={clientPlaced() && localActivities(p.id).length}>
-              <AgentActivity items={localActivities(p.id)} running={localRunActive(p.id)} />
+              <AgentActivity items={localActivities(p.id)} running={localRunActive(p.id)} completed={activityShouldCollapse(mission()?.status, localRunActive(p.id))} />
             </Show>
             <NativeInteraction mission={p.id} active={clientPlaced() ? localRunActive(p.id) : busy()} remote={!clientPlaced()} items={viewItems()} />
             <Show when={!sendError()}>
@@ -2528,7 +2582,7 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
               <MissionPending destination={missionDestination(mission(), receipt)} label={phaseLabel()} />
             </Show>
           </Show>
-          <Show when={optimistic()}>{draft => <OptimisticMessage draft={draft()} />}</Show>
+
           <Show when={refreshing()}><div class="agent-wait-status" role="status">Refreshing conversation…</div></Show>
         </div>
       </div>
@@ -2541,15 +2595,16 @@ function MissionView(p: { id: string; onContext?: (id: string, pct: number | nul
             </section>
           </Show>
           <SideQuestions mission={p.id} items={viewItems()} ref={handle=>sideQuestions=handle} onTransfer={text=>setSideRevision({text,append:true})}/>
+          <QueuedMessages mission={p.id} onEdit={text=>setSideRevision({text,append:true})}/>
           <Composer
             revision={sideRevision()}
-            onBtw={question=>sideQuestions?.ask(question)??false}
+            onBtw={(question,images,files)=>sideQuestions?.ask(question,images,files)??false}
             onOpenBtw={()=>sideQuestions?.open()}
             placeholder="Send follow-up"
             picker={false}
             busy={busy()}
-            onPending={setOptimistic}
-            onSend={sendMsg}
+            onPending={beginSend}
+            onSend={(text,images)=>sendMsg(text,images)}
             onStop={stopM}
             scope={`m:${p.id}`}
             uploadTarget={clientPlaced() ? "local" : mission()?.remote_node_id ?? mission()?.remote_job?.node_id ?? "core"}

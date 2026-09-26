@@ -54,7 +54,7 @@ it.each(['awaiting_user','waiting_user'])('keeps a normal completed response qui
  const mission={id:'local',status} as Mission;
  const [activity,setActivity]=createSignal(false);
  const {container}=render(()=><LaunchStatus destination="This computer" mission={mission} activity={activity()}/>);
- expect(container.textContent).toContain('Waiting for input');
+ expect(container.textContent).toContain('Ready for a follow-up');
  setActivity(true);
  expect(container.querySelector('.launch-status')).toBeNull();
 });
@@ -72,4 +72,14 @@ it("shows waiting for first output instead of a silent prompt-only active missio
   expect(container.textContent).toContain("Waiting for the first output");
   setActivity(true);
   expect(container.querySelector(".launch-status")).toBeNull();
+});
+
+it("describes a Core restart as an interruption, not a failed native task", () => {
+  const [mission, setMission] = createSignal({ id: "native", status: "interrupted", terminal_reason: "service_restart", tags: ["placement:client"] } as Mission);
+  const { container } = render(() => <MissionFailure mission={mission()} />);
+  expect(container.textContent).toContain("Mission interrupted");
+  expect(container.textContent).toContain("does not confirm that the agent on your computer stopped");
+  expect(container.textContent).not.toContain("Mission failed");
+  setMission({ ...mission(), status: "completed", terminal_reason: "client_runner" });
+  expect(container.querySelector(".error-notice")).toBeNull();
 });

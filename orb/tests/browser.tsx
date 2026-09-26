@@ -14,7 +14,7 @@ function Harness() {
   const [visible, setVisible] = createSignal(true);
   return <div style={{ display: "flex", height: "100vh", background: "var(--bg)" }}>
     <aside style={{ width: "260px", padding: "20px 10px", "flex-shrink": 0 }}>
-      <LiveProjectsSection selected={selected} open={setSelected} missionGlyph={() => "idle"} StatusGlyph={() => null} onNewAgent={() => {}} onNewProject={() => {}} />
+      <LiveProjectsSection selected={selected} open={setSelected} onNewAgent={() => {}} onNewProject={() => {}} />
       <div class="harness-controls"><button onClick={clearConnection}>Disconnect backend</button><button onClick={() => setConnection(window.location.origin, "local-browser-test")}>Reconnect backend</button><button class="s-btn" onClick={() => setVisible(!visible())}>Toggle view</button>
       <a href="#notes">Project link</a><input disabled aria-label="Disabled field" /></div>
     </aside>

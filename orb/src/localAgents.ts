@@ -153,7 +153,9 @@ export function refreshLocalAgents(force = true): Promise<ScanRow[]> {
     if (!invoke) { setInstalled([]); return []; }
     try {
       const rows = await invoke("local_agents_scan", { request: { overrides: paths } }) as ScanRow[];
-      setInstalled(Array.isArray(rows) ? rows : []);
+      // Older desktop builds tied `installed` to the version probe succeeding.
+      // A resolved path is enough to launch; missing version only limits capabilities.
+      setInstalled(Array.isArray(rows) ? rows.map(row => ({...row, installed: !!row.path})) : []);
       scannedAt = Date.now(); scannedPaths = key;
       return installed();
     } catch { return installed(); }
@@ -341,6 +343,8 @@ export interface StartLocal {
   sessionId?: string;
 }
 
+const nativeRecoveries = new Map<string, Promise<unknown>>();
+
 export async function startLocal(req: StartLocal): Promise<ClientRunReceipt> {
   if (localRunActive(req.id)) throw new Error("This mission is still running locally. Stop it before sending another message.");
   const invoke = tauriInvoke();
@@ -352,6 +356,8 @@ export async function startLocal(req: StartLocal): Promise<ClientRunReceipt> {
   setLiveText((prev) => ({ ...prev, [req.id]: "" }));
   setActivities(prev => ({ ...prev, [req.id]: [] }));
   try {
+    // Let this window's in-flight reconciliation release its native lock first.
+    await nativeRecoveries.get(req.id);
     const receipt = await invoke("local_run_launch", {
       connection: { api_url: getApiUrl(), token: getJwt() },
       request: { ...req, session_id: req.sessionId, image_paths: req.imagePaths ?? [] },
@@ -403,8 +409,8 @@ export async function reconcileLocalRun(id: string): Promise<void> {
     // A transport error does not mean the process stopped.
     if (runVersions.get(id)===version && /no local run/i.test(String(error))) {
       setRunning(prev => ({ ...prev, [id]: false }));
-      if (localBinding(id)) {
-        await tauriInvoke()?.("local_run_reconcile", { id, connection: { api_url: getApiUrl(), token: getJwt() } }).catch(() => {});
+      if (localBinding(id) && !launching.has(id)) {
+        await nativeRecovery(id).catch(() => {});
         // A failed recovery keeps the server fence. A deliberate send surfaces
         // the exact error; background polling must not produce unhandled errors.
       }
@@ -445,7 +451,11 @@ export async function followLocal(id: string, onText: (text: string) => void): P
         state=await new Promise<PollLocal>((resolve,reject)=>{
           const buffer=bufferedOutput<PollLocal>(publish,resolve);
           const channel=new core.Channel!();
-          channel.onmessage=event=>buffer.receive(event);
+          channel.onmessage=event=>{
+            const activity=(event as typeof event & {activities?:LocalActivity[]}).activities;
+            if(activity)setActivities(prev=>({...prev,[id]:activity}));
+            buffer.receive(event);
+          };
           void tauriInvoke()!("local_agents_subscribe",{id,onEvent:channel}).catch(error=>{buffer.dispose();reject(error)});
         });
       } catch(error) {
@@ -474,4 +484,22 @@ export async function startLocalOrigin(request: Omit<StartLocal,"id">, draft: {k
  rememberBinding(mission.id,{harness:request.harness,bin:request.bin,cwd:mission.working_directory ?? request.cwd,model:request.model});
  await reconcileLocalRun(mission.id);
  return mission;
+}
+
+/** Explicit retry must prove the previous native launch is no longer alive. */
+export async function recoverLocalLaunch(id: string): Promise<void> {
+ const invoke=tauriInvoke();
+ if(!invoke)throw new Error("Local agents run in the Orb desktop app.");
+ await nativeRecovery(id);
+ await reconcileLocalRun(id);
+}
+
+function nativeRecovery(id: string): Promise<unknown> {
+ const existing=nativeRecoveries.get(id);
+ if(existing)return existing;
+ const invoke=tauriInvoke();
+ if(!invoke)return Promise.reject(new Error("Local agents run in the Orb desktop app."));
+ const pending=invoke("local_run_reconcile",{id,connection:{api_url:getApiUrl(),token:getJwt()}}).finally(()=>{nativeRecoveries.delete(id);});
+ nativeRecoveries.set(id,pending);
+ return pending;
 }

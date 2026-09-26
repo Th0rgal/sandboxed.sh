@@ -24,3 +24,17 @@ it("highlights declared languages and escapes executable markup",()=>{
  expect(highlightCode('plain','unknown')).toBeNull();
  expect(highlightCode('x'.repeat(100001),'python')).toBeNull();
 });
+
+it("highlights Lean and Lean 4 without changing the source text",()=>{
+ const source='-- UIntN dimensions\nstructure Premises where\n  fee : UIntN 128\ndef mapFactor (factor : UIntN 128) : Int := 2^128 - 1 - factor.val\ntheorem test : 1 ≤ 2 := by omega\n#check "<script>"';
+ for(const label of ['lean','lean4',' Lean4 ']) {
+  const html=highlightCode(source,label)!;
+  expect(html).toContain('token keyword');
+  expect(html).toContain('token class-name');
+  expect(html).toContain('token operator');
+  expect(html).toContain('token comment');
+  expect(html).not.toContain('<script>');
+  const element=document.createElement('code');element.innerHTML=html;
+  expect(element.textContent).toBe(source);
+ }
+});

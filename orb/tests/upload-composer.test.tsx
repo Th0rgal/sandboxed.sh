@@ -5,19 +5,19 @@ import * as uploads from "../src/uploads";
 vi.mock("../src/uploads", async (original) => ({ ...await original<typeof import("../src/uploads")>(), hasNativePicker: () => true, pickNativeFiles: vi.fn(), transferFile: vi.fn() }));
 afterEach(() => { cleanup(); vi.clearAllMocks(); });
 it("opens an upload choice with no project context and inserts a real local path", async () => {
-  vi.mocked(uploads.pickNativeFiles).mockResolvedValue([{ name: "photo.png", localPath: "/Users/test/photo.png" }]);
-  vi.mocked(uploads.transferFile).mockResolvedValue({ source: { name: "photo.png", localPath: "/Users/test/photo.png" }, path: "/Users/test/photo.png", destination: "local", connection: 0 });
+  vi.mocked(uploads.pickNativeFiles).mockResolvedValue([{ name: "notes.txt", localPath: "/Users/test/notes.txt" }]);
+  vi.mocked(uploads.transferFile).mockResolvedValue({ source: { name: "notes.txt", localPath: "/Users/test/notes.txt" }, path: "/Users/test/notes.txt", destination: "local", connection: 0 });
   const send = vi.fn();
   render(() => <Composer placeholder="Task" busy={false} onSend={send} onStop={() => {}} uploadTarget="local" picker={false} />);
   fireEvent.click(screen.getByTitle("Add context"));
   fireEvent.click(screen.getByText("Upload file or image…"));
-  await waitFor(() => expect((screen.getByPlaceholderText("Task") as HTMLTextAreaElement).value).toBe("@/Users/test/photo.png "));
-  expect(uploads.transferFile).toHaveBeenCalledWith(expect.objectContaining({ name: "photo.png" }), "local");
+  await waitFor(() => expect((screen.getByPlaceholderText("Task") as HTMLTextAreaElement).value).toBe("@/Users/test/notes.txt "));
+  expect(uploads.transferFile).toHaveBeenCalledWith(expect.objectContaining({ name: "notes.txt" }), "local");
   fireEvent.click(screen.getByTitle("Send"));
-  await waitFor(() => expect(send).toHaveBeenCalledWith("@/Users/test/photo.png", []));
+  await waitFor(() => expect(send).toHaveBeenCalledWith("@/Users/test/notes.txt", []));
 });
 it("keeps the draft when transferring the file fails", async () => {
-  vi.mocked(uploads.pickNativeFiles).mockResolvedValue([{ name: "photo.png", localPath: "/Users/test/photo.png" }]);
+  vi.mocked(uploads.pickNativeFiles).mockResolvedValue([{ name: "notes.txt", localPath: "/Users/test/notes.txt" }]);
   vi.mocked(uploads.transferFile).mockRejectedValue(new Error("Machine offline"));
   render(() => <Composer placeholder="Task" busy={false} onSend={() => {}} onStop={() => {}} uploadTarget="ashur" picker={false} />);
   fireEvent.input(screen.getByPlaceholderText("Task"), { target: { value: "Keep my draft" } });

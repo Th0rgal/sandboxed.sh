@@ -289,6 +289,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     });
 
     // Initialize backend config store (persisted settings).
+    crate::agent_software::start_worker();
     // Probe each backend's declared CLI names so backends whose CLI is missing
     // default to disabled. CLI binary names live on the `Backend` trait
     // (`cli_names()`); this loop reads them via short-lived instances so the
@@ -764,6 +765,12 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
                 .layer(DefaultBodyLimit::max(crate::uploads::MAX_BODY_BYTES)),
         )
         .route("/api/stats", get(get_stats))
+        .route("/api/software", get(super::agent_software::inventory))
+        .route("/api/software/updates", post(super::agent_software::update))
+        .route(
+            "/api/software/updates/cancel",
+            post(super::agent_software::cancel),
+        )
         .route("/api/remote-nodes", get(list_remote_nodes))
         .route("/api/nodes/:name/cordon", post(cordon_remote_node))
         .route("/api/nodes/:name/uncordon", post(uncordon_remote_node))
@@ -912,6 +919,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(control::resume_mission),
         )
         .route(
+            "/api/control/missions/:id/btw/agent",
+            post(control::fork::btw_agent),
+        )
+        .route(
             "/api/control/missions/:id/fork",
             post(control::fork::fork_mission),
         )
@@ -925,7 +936,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         .route(
             "/api/control/missions/:id/btw",
-            post(crate::api::ask::btw::send),
+            post(crate::api::ask::btw::send).layer(DefaultBodyLimit::max(26 * 1024 * 1024)),
         )
         // Ask assistant (non-interrupting sidecar co-pilot)
         .route(

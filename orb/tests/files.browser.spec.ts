@@ -14,6 +14,7 @@ test("Cursor-style files preserve chat, resolve references and navigate Markdown
       kind: "file",
     },
   ];
+  let fileReads=0;
   await page.route("**/api/**", (route) => {
     if (!route.request().url().endsWith("/file-resources"))
       return route.fulfill({
@@ -24,6 +25,7 @@ test("Cursor-style files preserve chat, resolve references and navigate Markdown
         },
       });
     const q = route.request().postDataJSON();
+    if(q.action === "read")fileReads++;
     let body: unknown = {};
     if (q.action === "roots")
       body = {
@@ -71,7 +73,62 @@ test("Cursor-style files preserve chat, resolve references and navigate Markdown
     "Keep my draft",
   );
   await expect(page.locator(".file-panel")).toBeVisible();
+  await page.locator('.file-preview').click({position:{x:30,y:100}});
+  await page.keyboard.press('Meta+b');
+  await expect(page.getByRole('navigation',{name:'File explorer'})).toHaveCount(0);
+  await page.keyboard.press('Meta+b');
+  await expect(page.getByRole('navigation',{name:'File explorer'})).toBeVisible();
+  await page.getByRole('textbox',{name:'Draft'}).focus();
+  await page.keyboard.press('Meta+b');
+  await expect(page.getByRole('navigation',{name:'File explorer'})).toBeVisible();
+  const previousReads=fileReads;
+  await page.getByRole('button',{name:'Reload files',exact:true}).click();
+  await expect.poll(()=>fileReads).toBeGreaterThan(previousReads);
+  await expect(page.getByRole('heading',{name:'Pareto — Implementation brief'})).toBeVisible();
+
+  await page.locator('.file-preview').click({position:{x:30,y:100}});
+  await page.keyboard.press('Meta+f');
+  const find=page.getByRole('textbox',{name:'Find in file'});
+  await find.fill('Pareto');
+  await expect(page.locator('.find-count')).toHaveText(/1 \/ /);
+  await find.press('Escape');
+  await expect(find).not.toBeVisible();
+  await page.keyboard.press('Meta+Shift+f');
+  await expect(page.locator('.main')).not.toBeVisible();
+  const expanded=await page.locator('.file-panel').boundingBox();
+  expect(expanded!.x).toBe(220);expect(expanded!.width).toBe(1480);
+  await page.locator('.app').evaluate(el=>el.classList.add('sb-hidden'));
+  const firstControl=await page.getByRole('button',{name:'Restore conversation',exact:true}).boundingBox();
+  expect(firstControl!.x).toBeGreaterThanOrEqual(82);
+  await page.locator('.app').evaluate(el=>el.classList.remove('sb-hidden'));
+
+  await page.keyboard.press('Meta+j');
+  await expect(page.locator('.file-panel')).not.toBeVisible();
+  await expect(page.locator('.main')).toBeVisible();
+  await page.getByRole('textbox',{name:'Draft'}).focus();
+  await page.keyboard.press('Meta+j');
+  await expect(page.locator('.file-panel.maximized')).toBeVisible();
+  await expect(page.getByRole('heading',{name:'Pareto — Implementation brief'})).toBeVisible();
+
+  await page.keyboard.press('Meta+Shift+f');
+  await expect(page.locator('.main')).toBeVisible();
+  await expect(page.getByRole('textbox',{name:'Draft'})).toHaveValue('Keep my draft');
+  await page.keyboard.press('Meta+j');
+  await expect(page.locator('.file-panel')).not.toBeVisible();
+  await page.keyboard.press('Meta+j');
+  await expect(page.locator('.file-panel')).toBeVisible();
+  await expect(page.locator('.file-panel')).not.toHaveClass(/maximized/);
+
+
   await expect(page.locator(".file-toolbar")).toHaveCount(0);
+  await expect(page.getByLabel('File actions',{exact:true})).toHaveCount(0);
+  const bodyBeforeSearch=await page.locator('.file-body').boundingBox();
+  await page.getByRole('button',{name:'Find file',exact:true}).click();
+  await expect(page.getByRole('search',{name:'Search files'})).toBeVisible();
+  expect(await page.locator('.file-body').boundingBox()).toEqual(bodyBeforeSearch);
+  await page.getByRole('button',{name:'Close file search'}).click();
+  await expect(page.getByRole('search',{name:'Search files'})).toHaveCount(0);
+
   const tabBar = await page.locator(".file-tabs").boundingBox();
   const titleBar = await page.locator(".titlebar").boundingBox();
   expect(Math.abs(tabBar!.height - titleBar!.height)).toBeLessThanOrEqual(1);

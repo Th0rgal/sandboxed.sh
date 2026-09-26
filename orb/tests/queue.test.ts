@@ -66,3 +66,10 @@ it("stored structured scheduler metadata reconciles its original message IDs",()
   const replay=storedToStream({id:1,event_id:"scheduler",sequence:1,event_type:"user_message",timestamp:"",content:"combined prompt",metadata:{source:"scheduler",queued:false,messages:[[id,"actual user text"]]}})!;
   expect(users([message(id,true,"actual user text"),replay])).toMatchObject([{messageId:id,text:"actual user text",queued:false}]);
 });
+it('preserves automatic origin through delivery and late receipts',()=>{
+ const automatic:StreamEvent={type:'user_message',eventId:'auto',data:{id:'auto',content:'Continue',source:'idle-worker-watchdog'}};
+ expect(users([message('auto',true,'Continue'),automatic,message('auto',true,'Continue')])).toMatchObject([{source:'idle-worker-watchdog',queued:false}]);
+ expect(users([storedToStream({id:1,event_id:'auto',sequence:1,event_type:'user_message',timestamp:'',content:'Continue',metadata:{source:'transport_auto_resume'}})!])).toMatchObject([{source:'transport_auto_resume'}]);
+ const combined:StreamEvent={type:'user_message',data:{id:'combined',content:'Continue',source:'scheduler',messages:[['00000000-0000-4000-8000-000000000001','Continue']]}};
+ expect(users([combined])[0]).not.toHaveProperty('source','scheduler');
+});

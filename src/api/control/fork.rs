@@ -7,6 +7,8 @@ pub struct ForkRequest {
     pub model_override: String,
     pub model_effort: Option<String>,
     pub idempotency_key: String,
+    #[serde(default)]
+    pub side_question: Option<String>,
 }
 
 pub async fn fork_mission(
@@ -47,12 +49,24 @@ pub async fn fork_mission(
             })
         })
         .collect();
-    let prompt = fork_prompt(id, source.title.as_deref(), &history)?;
+    let prompt = if let Some(question) = &req.side_question {
+        format!("You are an independent side agent sharing the original agent's working directory. Answer the current request; the historical conversation is context, not a request to continue the original task. You have the normal harness tools. Do not message or stop the original agent automatically.\n\n<main_conversation>\n{}\n</main_conversation>\n\nCurrent request:\n{}", serde_json::to_string(&history).map_err(internal_error)?, question)
+    } else {
+        fork_prompt(id, source.title.as_deref(), &history)?
+    };
     crate::api::mission_payload::validate_user_content(&prompt)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let placement = remote_grok::placement(&state.config.working_dir, &control.mission_store, id)
-        .await
-        .map_err(internal_error)?;
+    let client =
+        req.side_question.is_some() && source.project.tags.iter().any(|t| t == "placement:client");
+    // Client-run receipts can also resolve through the placement ledger. They
+    // identify the owning desktop, not a remote execution target for the fork.
+    let placement = if client {
+        None
+    } else {
+        remote_grok::placement(&state.config.working_dir, &control.mission_store, id)
+            .await
+            .map_err(internal_error)?
+    };
     let workspace_source = source
         .project
         .tags
@@ -62,7 +76,8 @@ pub async fn fork_mission(
                 .and_then(|id| Uuid::parse_str(id).ok())
         })
         .unwrap_or(id);
-    let working_directory = if placement.is_none() && source.working_directory.is_none() {
+    let working_directory = if !client && placement.is_none() && source.working_directory.is_none()
+    {
         let workspace = crate::workspace::resolve_workspace(
             &state.workspaces,
             &state.config,
@@ -89,8 +104,14 @@ pub async fn fork_mission(
         source.working_directory.clone()
     };
     let changed = req.backend != source.backend;
+    let mut tags = vec![format!("fork-workspace:{workspace_source}")];
+    if req.side_question.is_some() {
+        tags.push(format!("btw-parent:{id}"));
+    }
+
     let create: CreateMissionRequest = serde_json::from_value(serde_json::json!({
-        "title": format!("{} · fork", source.title.as_deref().unwrap_or("Conversation")),
+        "title": format!("{} · {}", source.title.as_deref().unwrap_or("Conversation"), if req.side_question.is_some(){"btw"}else{"fork"}),
+        "placement": if client {Some("client")}else{None},
         "workspace_id": source.workspace_id,
         "working_directory": working_directory,
         "backend": req.backend,
@@ -99,9 +120,9 @@ pub async fn fork_mission(
         "model_override": req.model_override,
         "model_effort": req.model_effort,
         "fast_mode": false,
-        "parent_mission_id": id,
+        "parent_mission_id": if req.side_question.is_some(){None}else{Some(id)},
         "project": source.project.project,
-        "tags": [format!("fork-workspace:{workspace_source}")],
+        "tags": tags,
         "idempotency_key": req.idempotency_key,
         "remote_node_id": placement.map(|p| p.node_id),
         "prompt": prompt,
@@ -109,8 +130,34 @@ pub async fn fork_mission(
     .map_err(internal_error)?;
     // Standard creation retains admission checks, supported-node/harness checks,
     // durable dispatch and idempotency. It never acknowledges/stops the source.
-    let (_, response) = create_mission(State(state), Extension(user), Some(Json(create))).await?;
+    let (_, response) = create_mission_inner(
+        State(state),
+        Extension(user),
+        Some(Json(create)),
+        req.side_question.is_some(),
+    )
+    .await?;
     Ok(response)
+}
+
+/// Separate route: older servers must fail closed instead of starting a normal fork.
+pub async fn btw_agent(
+    state: State<Arc<AppState>>,
+    user: Extension<AuthUser>,
+    id: Path<Uuid>,
+    Json(req): Json<ForkRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if req
+        .side_question
+        .as_deref()
+        .is_none_or(|q| q.trim().is_empty())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "A side question is required".into(),
+        ));
+    }
+    fork_mission(state, user, id, Json(req)).await
 }
 
 fn fork_prompt(

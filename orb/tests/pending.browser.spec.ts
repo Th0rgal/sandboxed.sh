@@ -23,6 +23,7 @@ async function setup(page: Page, o: Options = {}) {
   });
   await page.route("**/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
+    if(path === "/api/model-routing/chains") return route.fulfill({json:[{id:"builtin/smart",name:"Smart (Default)"}]});
     if (path.endsWith("/events")) {
       while (!released) await new Promise((r) => setTimeout(r, 50));
       return route.fulfill({ json: o.events ?? [] });
@@ -41,11 +42,9 @@ async function setup(page: Page, o: Options = {}) {
   });
   await page.goto(`/#`);
   await page.getByRole("button", { name: "Test", exact: true }).click();
-  // A terminal mission lives under the collapsed "finished" fold.
+  // Completion stays visible until the user archives it.
   const row = page.getByRole("button", { name: /Pareto audit/ });
-  if (!(await row.isVisible().catch(() => false))) {
-    await page.getByRole("button", { name: /finished$/ }).click();
-  }
+  await expect(row).toBeVisible();
   await row.click();
   return { release: () => { released = true; } };
 }
@@ -115,4 +114,45 @@ test("a failure still shows", async ({ page }) => {
 test("an unconfirmed remote job still explains itself", async ({ page }) => {
   await setup(page, { status: "active", events: [evUser], remoteJob: { phase: "submit_ambiguous" } });
   await expect(page.locator(".launch-status")).toContainText("Checking submission");
+});
+
+test("a remote track follow-up opens its admitted replacement instead of showing the raw conflict", async ({page}) => {
+  await setup(page,{status:'completed',remoteJob:{phase:'finished',node_state:'succeeded'}});
+  const next='11111111-2222-4333-8444-555555555555';
+  const source={id:MISSION,workspace_id:'00000000-0000-0000-0000-000000000000',title:'Pareto audit',status:'completed',backend:'claudecode',project:'test',track:'mission-old',history:[{role:'user',content:'Original request'},{role:'assistant',content:'Original result'}],remote_job:{node_id:'dgx-spark',phase:'finished'},created_at:'',updated_at:''};
+  const replacement={...source,id:next,title:'Continued audit',status:'active',history:[],remote_job:{node_id:'dgx-spark',phase:'observed',node_state:'running'}};
+  let body:Record<string,unknown>|undefined;
+  let count=0;
+  await page.route('**/api/**',async route=>{
+    const path=new URL(route.request().url()).pathname;
+    if(path==='/api/control/message')return route.fulfill({status:409,body:'REMOTE_RESUME_REQUIRES_REPLACEMENT: PR or explicit-track missions need create admission'});
+    if(path==='/api/control/missions' && route.request().method()==='POST'){
+      body=route.request().postDataJSON();count++;
+      if(body?.workspace_id)return route.fulfill({status:409,json:{error:'workspace_occupied',mission_id:'unrelated-local-mission'}});
+      return route.fulfill({json:replacement});
+    }
+    if(path===`/api/control/missions/${MISSION}`)return route.fulfill({json:source});
+    if(path===`/api/control/missions/${next}`)return route.fulfill({json:replacement});
+    if(path===`/api/control/missions/${next}/events`)return route.fulfill({json:[{...evUser,content:body?.prompt}]});
+    if(path==='/api/control/missions')return route.fulfill({json:body?[source,replacement]:[source]});
+    return route.fallback();
+  });
+  const input=page.locator('.composer textarea');
+  await input.fill('Read the public vanity status');
+  await input.press('Enter');
+  await expect.poll(()=>body?.supersedes_mission_id).toBe(MISSION);
+  await expect.poll(()=>page.evaluate(()=>localStorage.getItem("orb.selectedConversation"))).toBe(`m:${next}`);
+  await expect(page.getByRole("button",{name:"Session details: Continued audit",exact:true})).toBeVisible();
+  await expect(page.locator('.user').last()).toContainText('Read the public vanity status');
+  await expect(page.getByText('Couldn’t send your message',{exact:true})).toHaveCount(0);
+  expect(body).toMatchObject({remote_node_id:'dgx-spark',project:'test',track:'mission-old'});
+  expect(body?.prompt).toContain('Original result');
+  await expect(page.locator('.user').last()).not.toContainText('historical conversation');
+  expect(count).toBe(1);
+  await expect(page.locator('.user').first()).toContainText('Original request');
+  await expect(page.locator('.st-text')).toContainText('Original result');
+  await page.evaluate(()=>sessionStorage.clear());
+  await page.reload();
+  await expect(page.locator('.user').first()).toContainText('Original request');
+  await expect(page.locator('.user').last()).toContainText('Read the public vanity status');
 });

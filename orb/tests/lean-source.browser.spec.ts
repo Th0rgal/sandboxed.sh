@@ -1,0 +1,21 @@
+import {test,expect} from '@playwright/test';
+test.use({browserName:'webkit'});
+test('Lean source highlights full-file tokens with accurate line numbers',async({page})=>{
+ await page.goto('/tests/lean-source.html');
+ await expect(page.locator('[data-line="1"] .token.keyword')).toHaveText('import');
+ await expect(page.locator('[data-line="3"] .token.comment')).toHaveText('# Comment with `def`');
+ await expect(page.locator('[data-line="5"] .token.keyword').first()).toHaveText('theorem');
+ await expect(page.locator('.file-line-number')).toHaveCount(6);
+ const start=await page.locator('[data-line="1"] code').boundingBox();
+ const end=await page.locator('[data-line="2"] code').boundingBox();
+ await page.mouse.move(start!.x+1,start!.y+start!.height/2);
+ await page.mouse.down();
+ await page.mouse.move(end!.x+end!.width,end!.y+end!.height/2,{steps:12});
+ await page.mouse.up();
+ const selected=await page.evaluate(()=>window.getSelection()?.toString());
+ expect(selected).toContain('import Midnight.Import');
+ expect(selected).toContain('/-!');
+ expect(selected).not.toMatch(/[12]/);
+ const token=page.locator('[data-line="1"] .token.keyword');
+ expect(await token.evaluate(el=>getComputedStyle(el).color)).not.toBe(await page.locator('[data-line="1"] code').evaluate(el=>getComputedStyle(el).color));
+});

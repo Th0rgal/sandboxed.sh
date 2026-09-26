@@ -22,8 +22,8 @@ it("keeps the login modal open during callback submission and exposes a rejected
     return new Response(JSON.stringify(data));
   }));
   render(() => <Providers />);
-  fireEvent.click(await screen.findByRole("button", { name: /Test account/ }));
-  fireEvent.click(screen.getByRole("button", { name: "Re-auth", exact: true }));
+  fireEvent.click(await screen.findByRole("button", { name: "Actions for Test account" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "Re-authenticate", exact: true }));
   const input = await screen.findByLabelText("Redirect URL (http://localhost:…)");
   fireEvent.input(input, { target: { value: "http://localhost:54545/callback?code=test" } });
   fireEvent.keyDown(input, { key: "Enter" });

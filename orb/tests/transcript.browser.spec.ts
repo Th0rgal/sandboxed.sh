@@ -56,7 +56,6 @@ test("native Grok canary final assistant_message then text_delta renders once",a
   });
   await page.goto("/");
   await page.getByRole("button",{name:"test",exact:true}).click();
-  await page.getByRole("button",{name:"1 finished"}).click();
   await page.getByRole("button",{name:/Orb native Grok launch verification/}).click();
   await expect(page.locator(".tb-title")).toContainText("Orb native Grok launch verification");
   await expect(page.locator(".tb-title")).not.toHaveText(/^Mission$/);
@@ -74,4 +73,39 @@ test("legacy OpenCode results render as Markdown with the raw log folded away",a
  });
  await expect(page.getByRole("heading",{name:"Status"})).toBeVisible();await expect(page.locator(".legacy-log pre")).toBeHidden();
  await page.getByText("Original execution log").click();await expect(page.locator(".legacy-log pre")).toContainText('"sessionID":"ses_native"');
+});
+
+test("successful remote receipt is collapsed beneath the human reply",async({page})=>{
+ await page.goto('/tests/transcript.html');
+ await page.waitForFunction(()=>!!(window as any).transcriptHarness);
+ const receipt="Remote node 'dgx-spark' job ab58d8b5-e1b4-4652-a5c0-9a0e37e0bb97 finished with state 'succeeded' (exit Some(0))\n\nlog tail:\n**Depuis quand** : mercredi.";
+ await page.evaluate(text=>(window as any).transcriptHarness.reset([{type:'assistant_message',data:{content:text}}]),receipt);
+ await expect(page.locator('.legacy-log')).toHaveCount(1);
+ await expect(page.locator('.legacy-log pre')).not.toBeVisible();
+ await expect(page.locator('.st-text')).toContainText('Depuis quand');
+ await page.locator('.legacy-log summary').click();
+ await expect(page.locator('.legacy-log pre')).toHaveText(receipt);
+});
+
+test('action details expand above their trigger without moving it off screen',async({page})=>{
+ await page.goto('/tests/transcript.html');
+ await page.waitForFunction(()=>!!(window as any).transcriptHarness);
+ await page.evaluate(()=> (window as any).transcriptHarness.reset([
+  {type:'user_message',data:{content:'Earlier context\n'.repeat(70)}},
+  {type:'tool_call',data:{tool_call_id:'a',name:'webfetch',args:{url:'https://example.test'}}},
+  {type:'tool_result',data:{tool_call_id:'a',result:'Details\n'.repeat(30)}},
+  {type:'assistant_message',data:{content:'Finished'}}
+ ]));
+ const fold=page.locator('.st-work-head');
+ await fold.scrollIntoViewIfNeeded();
+ const before=await fold.boundingBox();await fold.click();
+ await expect(fold).toHaveAttribute('aria-expanded','true');
+ await page.waitForTimeout(50);
+ const after=await fold.boundingBox();const body=await page.locator('.st-work-body').boundingBox();
+ expect(body!.y+body!.height).toBeLessThanOrEqual(after!.y+1);
+ expect(Math.abs(after!.y-before!.y)).toBeLessThan(3);
+ const tool=page.locator('.st-tool-head');await tool.click();
+ await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+ const detail=await page.locator('.st-tool-detail').boundingBox();const trigger=await tool.boundingBox();
+ expect(detail!.y+detail!.height).toBeLessThanOrEqual(trigger!.y+1);
 });

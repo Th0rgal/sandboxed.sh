@@ -8,6 +8,7 @@ test("machine details use live core metrics and heartbeat capacity without inven
   });
   await page.route("**/api/**", route => {
     const path = new URL(route.request().url()).pathname;
+    if(path === "/api/model-routing/chains") return route.fulfill({json:[{id:"builtin/smart",name:"Smart (Default)"}]});
     const json = path === "/api/remote-nodes" ? { nodes: [{ id: "spark", status: "online", labels: [], base_url: "http://spark:3088", cpu_total: 20, mem_total_bytes: 128 * 1024 ** 3, mem_available_bytes: 32 * 1024 ** 3, disk_total_bytes: 1024 ** 4, disk_available_bytes: 512 * 1024 ** 3, active_jobs: 2 }] }
       : path === "/api/projects" ? { projects: [] }
       : path === "/api/backends" || path === "/api/control/missions" ? []

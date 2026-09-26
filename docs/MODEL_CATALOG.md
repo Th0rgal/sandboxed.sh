@@ -157,3 +157,35 @@ installation rejected `claude-opus-5-5`; after updating to 2.1.281, a minimal
 request with that exact ID succeeded. This verifies that installation and account,
 not a universal minimum-version or account-access guarantee. Do not replace a
 valid upstream ID with an invented alias to work around an outdated CLI.
+
+## Picker preference: latest release per class
+
+Operator preference (2026-09-26): show only the newest available model in each
+Claude class (Opus, Fable, Sonnet, Haiku), GPT class, and Grok text class. Prefer
+Opus for fresh Claude selections. `src/model_selection.rs` owns this policy;
+Orb and the web dashboard consume the server-ordered choices, not copied version
+lists. Explicit user selections, configured defaults, routing chains, and mission
+history retain their exact model IDs. This is a picker preference, not a new
+execution ban or a silent migration of running agents.
+
+Apply the policy **after** connection discovery, profile fallback, native harness
+eligibility and account availability filtering. Compare numeric versions, not
+labels or lexicographic strings (5.10 > 5.9). Dated and `latest` aliases of the
+same numeric release collapse to one entry, preferring the canonical ID. Keep
+capability classes separate: GPT base, Astra, Sol, Terra, Luna, Pro, Mini, Nano,
+Codex; Grok base, Build, reasoning, non-reasoning, fast and multi-agent. Unknown
+IDs and unversioned aliases remain visible because their ordering is unknown.
+Custom providers are not subjected to the public-provider picker policy.
+
+`GET /api/providers` filters the three public providers; `/backend-models`
+filters the three native harness lists independently after eligibility checks.
+The full `/catalog`, discovery observations and exported snapshots remain intact
+for diagnostics and explicit routing. New version numbers of recognized text
+classes pass the native candidate filters without another hardcoded release
+entry; actual catalog presence and existing account checks still apply. New
+capability classes need explicit classification review. Grok rolling aliases
+remain excluded from the native harness, as before.
+
+Periodic refresh automatically recomputes the winners. OAuth sources that cannot
+be discovered still require the existing reviewed snapshot update workflow;
+this policy does not fabricate a newer release or guarantee CLI compatibility.

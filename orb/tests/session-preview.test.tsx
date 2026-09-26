@@ -24,6 +24,19 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 describe("session title preview", () => {
+  it("keeps the plan in the title and reveals its progress in session details", () => {
+    render(() => <SessionPreview data={base} plan={{
+      plan: {requestId:"plan",text:"Review the API before editing",approvedAt:""},
+      steps:[{text:"Review API",status:"in_progress"}],completed:0,
+      label:"In progress",saveFailed:false,
+    }}/>);
+    expect(screen.getByRole("button").textContent).toContain("Plan");
+    expect(screen.queryByText("Review API")).toBeNull();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText(/Plan · In progress/)).toBeTruthy();
+    expect(screen.getByText("Review API",{exact:false})).toBeTruthy();
+    expect(screen.getByText("Review the API before editing")).toBeTruthy();
+  });
   it("opens after a short hover, fetches local Git once, and remains hoverable", async () => {
     vi.useFakeTimers();
     render(() => <SessionPreview data={base} />);

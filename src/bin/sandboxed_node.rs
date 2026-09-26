@@ -148,10 +148,14 @@ async fn main() -> anyhow::Result<()> {
         runner,
         managed_auth,
     });
+    sandboxed_sh::agent_software::start_worker();
     sandboxed_sh::node::project_context::start(state.work_root.clone());
     let app = Router::new()
         .route("/project-context/prepare", post(prepare_project_context))
         .route("/heartbeat", get(heartbeat))
+        .route("/software", get(software_inventory))
+        .route("/software/updates", post(software_update))
+        .route("/software/updates/cancel", post(software_cancel))
         .route("/machine-transfer/capabilities", get(transfer_capabilities))
         .route("/machine-transfer/browse", post(transfer_browse))
         .route(
@@ -323,6 +327,9 @@ async fn execute(
     Json(request): Json<LeaseRequest>,
 ) -> Result<Json<ExecuteResponse>, (StatusCode, String)> {
     check_auth(&headers, &state)?;
+    let _software_execution =
+        sandboxed_sh::agent_software::begin(&uuid::Uuid::new_v4().to_string(), "node-lease", None)
+            .map_err(|e| (StatusCode::CONFLICT, e))?;
     // Leases may be signed with the previous token during rotation; pick the
     // secret that validates (run_lease_command re-validates internally).
     let signing_secret = validate_lease_any(
@@ -1226,4 +1233,45 @@ async fn prepare_project_context(
         .await
         .map(Json)
         .map_err(|error| (StatusCode::BAD_REQUEST, error))
+}
+
+async fn software_inventory(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    Query(q): Query<sandboxed_sh::api::agent_software::Params>,
+) -> Result<Json<sandboxed_sh::agent_software::Inventory>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    let mut inventory = tokio::task::spawn_blocking(move || {
+        if q.force {
+            sandboxed_sh::agent_software::clear_versions();
+        }
+        sandboxed_sh::agent_software::scan("Node runner", &std::collections::HashMap::new())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sandboxed_sh::agent_software::releases(&mut inventory, q.force).await;
+    Ok(Json(inventory))
+}
+async fn software_update(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    Json(body): Json<sandboxed_sh::api::agent_software::Update>,
+) -> Result<Json<sandboxed_sh::agent_software::UpdateJob>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    tokio::task::spawn_blocking(move || {
+        sandboxed_sh::agent_software::queue(&body.component, &body.version, &body.path)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map(Json)
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))
+}
+async fn software_cancel(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    Json(body): Json<sandboxed_sh::api::agent_software::Cancel>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    sandboxed_sh::agent_software::cancel(&body.id).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(serde_json::json!({"ok":true})))
 }

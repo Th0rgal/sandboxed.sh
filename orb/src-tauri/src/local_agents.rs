@@ -131,12 +131,13 @@ fn scan_local_agents(request: ScanRequest) -> Vec<ScanRow> {
             let path = override_path
                 .map(|p| PathBuf::from(p))
                 .filter(|p| p.is_file())
-                .or_else(|| which(bin));
+                .or_else(|| crate::agent_software::resolve(bin));
             let version = path.as_ref().and_then(|p| version_of(p));
             ScanRow {
                 id: (*id).to_string(),
                 bin: (*bin).to_string(),
-                installed: path.is_some() && version.is_some(),
+                // A slow version probe must not hide an installed CLI.
+                installed: path.is_some(),
                 plan_supported: version
                     .as_deref()
                     .is_some_and(|v| native_plan_supported(id, v)),
@@ -208,6 +209,13 @@ pub fn local_agents_write(request: WriteRequest) -> Result<WriteReport, String> 
 
 #[tauri::command]
 pub fn local_agents_start(request: StartRequest) -> Result<(), String> {
+    start_with_env(request, &[])
+}
+
+pub(crate) fn start_with_env(
+    request: StartRequest,
+    env: &[(String, String)],
+) -> Result<(), String> {
     if request
         .prompt
         .trim()
@@ -228,6 +236,8 @@ pub fn local_agents_start(request: StartRequest) -> Result<(), String> {
     if !bin.is_file() {
         return Err(format!("CLI not found at {}", request.bin));
     }
+    let software_execution =
+        crate::agent_software::begin(&request.id, &request.harness, Some(&bin))?;
     let mut map = runs().lock().map_err(|e| e.to_string())?;
     if let Some(previous) = map.get(&request.id) {
         if !previous.done.load(Ordering::SeqCst) {
@@ -252,7 +262,7 @@ pub fn local_agents_start(request: StartRequest) -> Result<(), String> {
     let resumed =
         request.session_id.as_deref().is_some_and(|s| !s.is_empty()) && request.harness != "grok";
     let interaction = crate::interactions::begin(&request.id);
-    let child = match spawn_harness(&request, &text, &session_id, &error, &done) {
+    let child = match spawn_harness(&request, &text, &session_id, &error, &done, env) {
         Ok(child) => child,
         Err(error) => {
             crate::interactions::finish(&interaction);
@@ -261,6 +271,7 @@ pub fn local_agents_start(request: StartRequest) -> Result<(), String> {
     };
     let child = Arc::new(Mutex::new(child));
     watch_exit(
+        software_execution,
         interaction,
         Arc::clone(&child),
         Arc::clone(&done),
@@ -285,33 +296,37 @@ pub fn local_agents_start(request: StartRequest) -> Result<(), String> {
 }
 
 fn watch_exit(
+    software_execution: crate::agent_software::Execution,
     mission_id: crate::interactions::Session,
     child: Arc<Mutex<Child>>,
     done: Arc<AtomicBool>,
     exit_code: Arc<Mutex<Option<i32>>>,
     output: Arc<Output>,
 ) {
-    thread::spawn(move || loop {
-        let status = child
-            .lock()
-            .ok()
-            .and_then(|mut child| child.try_wait().ok())
-            .flatten();
-        if let Some(status) = status {
-            crate::interactions::finish(&mission_id);
-            if let Ok(mut slot) = exit_code.lock() {
-                *slot = status.code();
+    thread::spawn(move || {
+        let _software_execution = software_execution;
+        loop {
+            let status = child
+                .lock()
+                .ok()
+                .and_then(|mut child| child.try_wait().ok())
+                .flatten();
+            if let Some(status) = status {
+                crate::interactions::finish(&mission_id);
+                if let Ok(mut slot) = exit_code.lock() {
+                    *slot = status.code();
+                }
+                while !output.drained() {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                done.store(true, Ordering::SeqCst);
+                break;
             }
-            while !output.drained() {
-                thread::sleep(Duration::from_millis(5));
+            if done.load(Ordering::SeqCst) {
+                break;
             }
-            done.store(true, Ordering::SeqCst);
-            break;
+            thread::sleep(Duration::from_millis(80));
         }
-        if done.load(Ordering::SeqCst) {
-            break;
-        }
-        thread::sleep(Duration::from_millis(80));
     });
 }
 
@@ -361,6 +376,7 @@ pub fn local_agents_subscribe(
             text: String::new(),
             reset: false,
             state: Some(state),
+            activities: None,
         });
         run.text.unsubscribe(token);
     });
@@ -410,12 +426,29 @@ fn spawn_harness(
     session_id: &Arc<Mutex<Option<String>>>,
     error: &Arc<Mutex<Option<String>>>,
     done: &Arc<AtomicBool>,
+    env: &[(String, String)],
 ) -> Result<Child, String> {
     match request.harness.as_str() {
         "claudecode" => spawn_claude(request, text, session_id, error),
         "codex" => spawn_codex(request, text, session_id, error, done),
-        "grok" => spawn_piped(request, grok_args(&request.prompt), text, error, false),
-        "opencode" => spawn_piped(request, opencode_args(request), text, error, true),
+        "grok" => spawn_piped(
+            request,
+            grok_args(&request.prompt),
+            text,
+            error,
+            false,
+            session_id,
+            env,
+        ),
+        "opencode" => spawn_piped(
+            request,
+            opencode_args(request),
+            text,
+            error,
+            true,
+            session_id,
+            env,
+        ),
         other => Err(format!("unknown local harness {other}")),
     }
 }
@@ -429,7 +462,13 @@ fn grok_args(prompt: &str) -> Vec<String> {
 }
 
 fn opencode_args(request: &StartRequest) -> Vec<String> {
-    let mut args = vec!["run".into(), "--format".into(), "json".into()];
+    let mut args = vec![
+        "run".into(),
+        "--format".into(),
+        "json".into(),
+        "--dir".into(),
+        request.cwd.clone(),
+    ];
     if let Some(model) = request.model.as_deref().filter(|m| !m.is_empty()) {
         args.push("--model".into());
         // Backend aliases need their configured OpenCode provider namespace.
@@ -535,6 +574,14 @@ fn spawn_claude(
                         continue;
                     };
                     output.claude_activity(&event);
+                    if event["type"] != "stream_event"
+                        || matches!(
+                            event["event"]["type"].as_str(),
+                            Some("content_block_start" | "content_block_stop")
+                        )
+                    {
+                        output.publish_activities();
+                    }
                     background.consume(&event);
                     if implement_after_result
                         && event["type"] == "assistant"
@@ -632,7 +679,7 @@ fn spawn_claude(
                 *failures.lock().unwrap() = Some(e);
             }
         });
-        pipe_output(None, child.stderr.take(), text, error, true);
+        pipe_output(None, child.stderr.take(), text, error, true, None, None);
         return Ok(child);
     }
 }
@@ -643,6 +690,8 @@ fn spawn_piped(
     text: &Arc<Output>,
     error: &Arc<Mutex<Option<String>>>,
     parse_json: bool,
+    session_id: &Arc<Mutex<Option<String>>>,
+    env: &[(String, String)],
 ) -> Result<Child, String> {
     let mut command = Command::new(&request.bin);
     #[cfg(unix)]
@@ -658,6 +707,7 @@ fn spawn_piped(
     if request.harness == "opencode" {
         command.env("OPENCODE_PERMISSION", r#"{"*":"allow"}"#);
     }
+    command.envs(env.iter().map(|(key, value)| (key, value)));
     command.env("NO_COLOR", "1");
     let mut child = command
         .current_dir(&request.cwd)
@@ -673,6 +723,8 @@ fn spawn_piped(
         text,
         error,
         parse_json,
+        Some(Arc::clone(session_id)),
+        (request.harness == "opencode").then(|| (request.bin.clone(), request.cwd.clone())),
     );
     Ok(child)
 }
@@ -728,15 +780,35 @@ fn strip_terminal_codes(text: &str) -> String {
     result
 }
 
+fn opencode_final_answer(value: &Value) -> Option<String> {
+    let messages = value["messages"].as_array()?;
+    let start = messages.iter().rposition(|m| m["info"]["role"] == "user")?;
+    let message = messages[start + 1..]
+        .iter()
+        .rev()
+        .find(|m| m["info"]["role"] == "assistant" && m["info"]["finish"] == "stop")?;
+    let text = message["parts"]
+        .as_array()?
+        .iter()
+        .filter(|p| p["type"] == "text")
+        .filter_map(|p| p["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
 fn pipe_output(
     stdout: Option<std::process::ChildStdout>,
     stderr: Option<std::process::ChildStderr>,
     text: &Arc<Output>,
     error: &Arc<Mutex<Option<String>>>,
     parse_json: bool,
+    session_id: Option<Arc<Mutex<Option<String>>>>,
+    recovery: Option<(String, String)>,
 ) {
     let text_out = Arc::clone(text);
     let error_out = Arc::clone(error);
+    let protocol_error = Arc::clone(error);
     if let Some(stdout) = stdout {
         let guard = text.reader();
         thread::spawn(move || {
@@ -748,6 +820,35 @@ fn pipe_output(
             }
             for line in reader.lines() {
                 let Ok(line) = line else { break };
+                if let Some(slot) = &session_id {
+                    if let Ok(event) = serde_json::from_str::<Value>(&line) {
+                        if let Some(id) = event
+                            .get("sessionID")
+                            .and_then(Value::as_str)
+                            .filter(|id| id.starts_with("ses_"))
+                        {
+                            if let Ok(mut slot) = slot.lock() {
+                                *slot = Some(id.to_string());
+                            }
+                        }
+                    }
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    text_out.native_activity(&value);
+                    if value["type"] == "tool_use" {
+                        text_out.publish_activities();
+                    }
+                    if value["type"] == "error" {
+                        let message = value
+                            .pointer("/error/data/message")
+                            .or_else(|| value.pointer("/error/message"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("OpenCode reported a protocol error");
+                        if let Ok(mut slot) = protocol_error.lock() {
+                            *slot = Some(message.chars().take(1000).collect());
+                        }
+                    }
+                }
                 let piece = if parse_json {
                     extract_text(&line)
                 } else {
@@ -755,6 +856,30 @@ fn pipe_output(
                 };
                 if let Some(piece) = piece.filter(|s| !s.is_empty()) {
                     text_out.append(&piece);
+                }
+            }
+            // OpenCode can persist a final text part without emitting it on
+            // its CLI JSON stream. Reconcile before releasing the reader guard.
+            if let (Some((bin, cwd)), Some(slot)) = (recovery, session_id) {
+                let id = slot.lock().ok().and_then(|id| id.clone());
+                if let Some(id) = id {
+                    let mut command = Command::new(bin);
+                    command
+                        .args(["export", &id])
+                        .current_dir(cwd)
+                        .stdin(Stdio::null());
+                    if std::env::var_os("OPENCODE_DB").is_none() {
+                        command.env("OPENCODE_DB", "orb-local.db");
+                    }
+                    if let Ok(result) = command.output() {
+                        if result.status.success() {
+                            if let Ok(value) = serde_json::from_slice::<Value>(&result.stdout) {
+                                if let Some(answer) = opencode_final_answer(&value) {
+                                    text_out.replace(answer);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -788,6 +913,7 @@ fn spawn_codex(
     let mut child = Command::new(&request.bin)
         .current_dir(&request.cwd)
         .arg("app-server")
+        .args(["--enable", "goals"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -806,19 +932,12 @@ fn spawn_codex(
     let session_bg = Arc::clone(session_out);
     let error_bg = Arc::clone(error);
     let done_bg = Arc::clone(done);
-    let stderr_error = Arc::clone(error);
     if let Some(stderr) = stderr {
         thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = BufReader::new(stderr).read_to_string(&mut buf);
-            let clean = strip_terminal_codes(&buf);
-            let trimmed = clean.trim();
-            if !trimmed.is_empty() {
-                if let Ok(mut slot) = stderr_error.lock() {
-                    if slot.is_none() {
-                        *slot = Some(trimmed.chars().take(500).collect());
-                    }
-                }
+            // Diagnostics are not turn outcomes. In particular app-server shutdown
+            // can emit rollout warnings after a successful turn.
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                eprintln!("Codex diagnostic: {}", strip_terminal_codes(&line));
             }
         });
     }
@@ -840,6 +959,7 @@ fn spawn_codex(
         );
         crate::interactions::finish(&mission_id);
         if let Err(message) = result {
+            eprintln!("Codex run failed: {message}");
             if let Ok(mut slot) = error_bg.lock() {
                 *slot = Some(if busy_thread(&message) {
                     format!("Codex thread is busy: {message}")
@@ -859,6 +979,28 @@ fn busy_thread(message: &str) -> bool {
         || lower.contains("already")
         || lower.contains("in progress")
         || lower.contains("in use")
+}
+
+// Native Codex caps goals at 4,000 characters. Keep oversized instructions
+// verbatim in a durable file rather than silently truncating their requirements.
+fn codex_goal_objective(objective: &str, cwd: &str) -> Result<String, String> {
+    if objective.len() <= 4000 {
+        return Ok(objective.to_string());
+    }
+    let path = std::path::Path::new(cwd).join(format!(".orb-goal-{}.md", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| format!("Could not preserve full goal: {e}"))?;
+    file.write_all(objective.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|e| format!("Could not preserve full goal: {e}"))?;
+    let goal = format!("Complete the full user objective stored in {}. Read that file before acting. It contains the authoritative requirements and acceptance criteria, all of which must be satisfied before marking this goal complete. Preserve the file for continuation turns.", path.display());
+    if goal.len() > 4000 {
+        return Err("Workspace path is too long for a native Codex goal".into());
+    }
+    Ok(goal)
 }
 
 fn drive_codex(
@@ -905,6 +1047,13 @@ fn drive_codex(
     if let Ok(mut slot) = session_out.lock() {
         *slot = Some(thread_id.clone());
     }
+    let goal_objective = prompt
+        .trim()
+        .strip_prefix("/goal")
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .map(str::trim)
+        .filter(|rest| !rest.is_empty());
+    let mut goal_mode = goal_objective.is_some();
     let plan_prompt = prompt
         .trim()
         .strip_prefix("/plan")
@@ -918,17 +1067,41 @@ fn drive_codex(
             .map(|path| json!({"type":"localImage", "path":path})),
     );
     let mut pending = Vec::new();
-    let _ = rpc_collect(
-        stdin,
-        reader,
-        "turn/start",
-        json!({
-            "threadId": thread_id,
-            "input": input,
-            "collaborationMode": {"mode": if planning {"plan"} else {"default"}, "settings": {"model":resolved_model.ok_or("Codex did not resolve a model for collaboration mode")?, "reasoning_effort":null, "developer_instructions":null}}
-        }),
-        &mut pending,
-    )?;
+    if let Some(objective) = goal_objective {
+        if !image_paths.is_empty() {
+            return Err("Goal launches with images are not supported yet; include file paths in the objective.".into());
+        }
+        let objective = codex_goal_objective(objective, cwd)?;
+        rpc_collect(
+            stdin,
+            reader,
+            "thread/goal/set",
+            json!({"threadId":thread_id,"objective":objective}),
+            &mut pending,
+        )?;
+    } else {
+        if resume.is_some() {
+            let goal = rpc_collect(
+                stdin,
+                reader,
+                "thread/goal/get",
+                json!({"threadId":thread_id}),
+                &mut pending,
+            )?;
+            goal_mode = goal.pointer("/goal/status").and_then(Value::as_str) == Some("active");
+        }
+        let _ = rpc_collect(
+            stdin,
+            reader,
+            "turn/start",
+            json!({
+                "threadId": thread_id,
+                "input": input,
+                "collaborationMode": {"mode": if planning {"plan"} else {"default"}, "settings": {"model":resolved_model.ok_or("Codex did not resolve a model for collaboration mode")?, "reasoning_effort":null, "developer_instructions":null}}
+            }),
+            &mut pending,
+        )?;
+    }
     let mut pending: std::collections::VecDeque<Value> = pending.into();
     let mut items = crate::local_stream::CodexText::default();
     let mut line = String::new();
@@ -946,6 +1119,16 @@ fn drive_codex(
             };
             value
         };
+        // App-server also emits notifications for child agents. Their output,
+        // errors and turn completion must never terminate this thread.
+        if value
+            .pointer("/params/threadId")
+            .or_else(|| value.pointer("/params/thread_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|id| id != thread_id)
+        {
+            continue;
+        }
         if let Some(message) = value
             .get("error")
             .and_then(|e| e.get("message"))
@@ -964,6 +1147,22 @@ fn drive_codex(
                 write_line(stdin, &json!({"id":id,"error":{"code":-32601,"message":"Unsupported interactive request"}}).to_string())?;
             }
             continue;
+        }
+        if method == "error"
+            && value.pointer("/params/willRetry").and_then(Value::as_bool) == Some(true)
+        {
+            text.codex_reconnecting(
+                value
+                    .pointer("/params/error/message")
+                    .and_then(Value::as_str),
+            );
+            continue;
+        }
+        if matches!(
+            method,
+            "item/started" | "item/agentMessage/delta" | "turn/completed" | "turn/complete"
+        ) {
+            text.codex_reconnecting(None);
         }
         if method == "error" {
             if let Some(message) = value
@@ -1005,7 +1204,28 @@ fn drive_codex(
                 pending.extend(early);
                 continue;
             }
+            if goal_mode
+                && value.pointer("/params/turn/status").and_then(Value::as_str)
+                    != Some("interrupted")
+            {
+                let mut early = Vec::new();
+                let goal = rpc_collect(
+                    stdin,
+                    reader,
+                    "thread/goal/get",
+                    json!({"threadId":thread_id}),
+                    &mut early,
+                )?;
+                pending.extend(early);
+                if goal.pointer("/goal/status").and_then(Value::as_str) == Some("active") {
+                    continue;
+                }
+            }
             break;
+        }
+        text.native_activity(&value);
+        if matches!(method, "item/started" | "item/completed") {
+            text.publish_activities();
         }
         items.apply(&value, text);
     }
@@ -1043,24 +1263,16 @@ fn rpc_collect(
         let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        if value.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
-            || value.get("id").is_some()
-                && value.get("method").is_none()
-                && value.get("result").is_some()
-            || value.get("error").is_some() && value.get("method").is_none()
+        if value.get("id").and_then(Value::as_str) == Some(id.as_str())
+            && value.get("method").is_none()
         {
-            if let Some(message) = value
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-            {
-                return Err(format!("{method}: {message}"));
+            if let Some(error) = value.get("error") {
+                return Err(format!(
+                    "{method}: {}",
+                    error["message"].as_str().unwrap_or("Codex RPC failed")
+                ));
             }
-            if value.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
-                || value.get("result").is_some()
-            {
-                return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-            }
+            return Ok(value.get("result").cloned().unwrap_or(Value::Null));
         }
         pending.push(value);
     }
@@ -1242,16 +1454,6 @@ fn uuid_like() -> String {
         })
 }
 
-fn which(name: &str) -> Option<PathBuf> {
-    let output = Command::new("which").arg(name).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let path = PathBuf::from(text.lines().next()?.trim());
-    path.is_file().then_some(path)
-}
-
 // Conservative floors: these are the versions exercised by the native
 // round-trip tests, not merely a CLI binary being present on PATH.
 fn native_plan_supported(id: &str, version: &str) -> bool {
@@ -1368,6 +1570,36 @@ pub(crate) fn is_secret_path(rel: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_version_does_not_hide_installed_harness() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("orb-version-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let rows = scan_local_agents(ScanRequest {
+            overrides: HARNESSES
+                .iter()
+                .map(|(id, _)| (id.to_string(), path.display().to_string()))
+                .collect(),
+        });
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(rows.len(), HARNESSES.len());
+        assert!(rows
+            .iter()
+            .all(|row| row.installed && row.version.is_none()));
+    }
+
+    #[test]
+    #[ignore = "requires locally installed OpenCode; run with desktop-style PATH"]
+    fn desktop_path_discovers_homebrew_opencode() {
+        let rows = scan_local_agents(ScanRequest {
+            overrides: HashMap::new(),
+        });
+        let row = rows.iter().find(|row| row.id == "opencode").unwrap();
+        assert!(row.installed, "OpenCode missing: {:?}", row.path);
+    }
+
     use super::*;
 
     #[test]
@@ -1444,6 +1676,20 @@ mod tests {
     }
 
     #[test]
+    fn opencode_export_recovers_only_latest_turn_final_answer() {
+        let user = json!({"info":{"role":"user"},"parts":[]});
+        let answer = |text: &str, finish: &str| json!({"info":{"role":"assistant","finish":finish},"parts":[{"type":"text","text":text}]});
+        let export = json!({"messages":[user,answer("Old answer","stop"),user,answer("......","tool-calls"),answer("Full final answer","stop")]});
+        assert_eq!(
+            opencode_final_answer(&export).as_deref(),
+            Some("Full final answer")
+        );
+        let incomplete =
+            json!({"messages":[user,answer("Old answer","stop"),user,answer(".","tool-calls")]});
+        assert_eq!(opencode_final_answer(&incomplete), None);
+    }
+
+    #[test]
     fn grok_and_opencode_args_match_the_pinned_flags() {
         assert_eq!(
             grok_args("hello"),
@@ -1465,7 +1711,7 @@ mod tests {
         };
         assert_eq!(
             opencode_args(&fresh),
-            vec!["run", "--format", "json", "--model", "xai/grok", "hi"]
+            vec!["run", "--format", "json", "--dir", "/tmp", "--model", "xai/grok", "hi"]
                 .into_iter()
                 .map(str::to_string)
                 .collect::<Vec<_>>()
@@ -1513,6 +1759,9 @@ mod tests {
             json!({"id":"orb-thread/start","result":{"model":"test-model","thread":{"id":"thread"}}}),
             json!({"method":"item/agentMessage/delta","params":{"itemId":"a","delta":"Early"}}),
             json!({"id":"orb-turn/start","result":{}}),
+            json!({"method":"item/agentMessage/delta","params":{"threadId":"child","itemId":"child","delta":"Wrong thread"}}),
+            json!({"method":"turn/completed","params":{"threadId":"child","turn":{"status":"completed"}}}),
+            json!({"method":"error","params":{"threadId":"child","error":{"message":"child failure"}}}),
             json!({"method":"item/completed","params":{"item":{"type":"agentMessage","id":"a","text":"Early answer"}}}),
             json!({"method":"turn/completed","params":{"turn":{"status":"completed"}}}),
         ];
@@ -1551,6 +1800,115 @@ mod tests {
             turn["params"]["input"][1],
             json!({"type":"localImage", "path":"/tmp/pasted.png"})
         );
+    }
+
+    #[test]
+    fn oversized_codex_goal_preserves_every_requirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let objective = "Évaluer toutes les exigences. ".repeat(300);
+        let goal = codex_goal_objective(&objective, dir.path().to_str().unwrap()).unwrap();
+        assert!(goal.len() <= 4000);
+        let path = std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(goal.contains(path.to_str().unwrap()));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), objective);
+        assert_eq!(
+            codex_goal_objective("Short objective", "/missing").unwrap(),
+            "Short objective"
+        );
+    }
+
+    #[test]
+    fn codex_rpc_only_accepts_its_own_response() {
+        let events = concat!(
+            "{\"id\":\"other\",\"result\":{\"wrong\":true}}\n",
+            "{\"id\":\"orb-thread/goal/get\",\"result\":{\"goal\":null}}\n"
+        );
+        let mut pending = Vec::new();
+        let result = rpc_collect(
+            &mut Vec::new(),
+            &mut std::io::Cursor::new(events),
+            "thread/goal/get",
+            json!({}),
+            &mut pending,
+        )
+        .unwrap();
+        assert_eq!(result, json!({"goal":null}));
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn codex_non_retryable_error_still_fails() {
+        let events = [
+            json!({"id":"orb-initialize","result":{}}),
+            json!({"id":"orb-thread/start","result":{"model":"test","thread":{"id":"root"}}}),
+            json!({"id":"orb-thread/goal/set","result":{}}),
+            json!({"method":"error","params":{"threadId":"root","willRetry":false,"error":{"message":"Retry limit reached"}}}),
+        ];
+        let input = events
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let result = drive_codex(
+            &mut Vec::new(),
+            &mut std::io::Cursor::new(input),
+            "/goal Work",
+            &[],
+            None,
+            "/tmp",
+            None,
+            &Output::default(),
+            &Mutex::new(None),
+            &crate::interactions::begin("terminal-error-test"),
+        );
+        assert_eq!(result.unwrap_err(), "Retry limit reached");
+    }
+
+    #[test]
+    fn codex_goal_uses_native_api_and_waits_across_turns() {
+        let events = [
+            json!({"id":"orb-initialize","result":{}}),
+            json!({"id":"orb-thread/start","result":{"model":"test-model","thread":{"id":"root"}}}),
+            json!({"id":"orb-thread/goal/set","result":{"goal":{"status":"active"}}}),
+            json!({"method":"error","params":{"threadId":"root","willRetry":true,"error":{"message":"Reconnecting... 2/5"}}}),
+            json!({"method":"turn/completed","params":{"threadId":"root","turn":{"status":"completed"}}}),
+            json!({"id":"orb-thread/goal/get","result":{"goal":{"status":"active"}}}),
+            json!({"method":"item/agentMessage/delta","params":{"threadId":"root","itemId":"a","delta":"Continued"}}),
+            json!({"method":"turn/completed","params":{"threadId":"root","turn":{"status":"completed"}}}),
+            json!({"id":"orb-thread/goal/get","result":{"goal":{"status":"complete"}}}),
+        ];
+        let input = events
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let mut requests = Vec::new();
+        let output = Output::default();
+        drive_codex(
+            &mut requests,
+            &mut std::io::Cursor::new(input),
+            "/goal Finish the work",
+            &[],
+            None,
+            "/tmp",
+            None,
+            &output,
+            &Mutex::new(None),
+            &crate::interactions::begin("native-goal-test"),
+        )
+        .unwrap();
+        let sent = String::from_utf8(requests).unwrap();
+        assert!(sent.contains("thread/goal/set"));
+        assert!(sent.contains("Finish the work"));
+        assert!(!sent.contains("turn/start"));
+        assert_eq!(output.snapshot(), "Continued");
     }
 
     #[test]
@@ -1605,6 +1963,8 @@ mod tests {
             &output,
             &Arc::new(Mutex::new(None)),
             false,
+            &Arc::new(Mutex::new(None)),
+            &[],
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);

@@ -95,7 +95,7 @@ pub async fn local_agents_start_authorized(
         }
     }
     let mission_id = request.id.clone();
-    crate::local_agents::local_agents_start(request)?;
+    crate::routed_opencode::start(request, &permit.api_url, &permit.token).await?;
     if !permit.legacy {
         let generation = crate::local_agents::native_generation(&mission_id);
         tauri::async_runtime::spawn(async move {

@@ -97,3 +97,14 @@ it("does not reattach a distinct later snapshot to lastFinal in the same user tu
   expect(texts(buildTranscript([final("First"),ev("text_delta",{content:" more",mode:"delta"})]))).toMatchObject([{text:"First",live:false},{text:" more"}]);
   expect(texts(buildTranscript([final("Same"),snap("Same")]))).toMatchObject([{text:"Same",live:false}]);
 });
+
+it('settles missing tool results at turn end without claiming success',()=>{
+ const items=buildTranscript([
+  {type:'tool_call',data:{tool_call_id:'fetch',name:'webfetch',args:{url:'https://example.test'}}},
+  {type:'assistant_message',data:{content:'Done',success:true}},
+ ]);
+ const tool=items.find(item=>item.kind==='tool');
+ expect(tool).toMatchObject({done:true,unresolved:true});
+ const updated=applyStreamEvent(items,{type:'tool_result',data:{tool_call_id:'fetch',result:{error:'403'}}});
+ expect(updated.find(item=>item.kind==='tool')).toMatchObject({done:true,unresolved:false,result:{error:'403'}});
+});

@@ -10349,6 +10349,15 @@ pub async fn create_mission(
     Extension(user): Extension<AuthUser>,
     body: Option<Json<CreateMissionRequest>>,
 ) -> Result<(axum::http::HeaderMap, Json<serde_json::Value>), (StatusCode, String)> {
+    create_mission_inner(State(state), Extension(user), body, false).await
+}
+
+pub(super) async fn create_mission_inner(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    body: Option<Json<CreateMissionRequest>>,
+    shared_side_workspace: bool,
+) -> Result<(axum::http::HeaderMap, Json<serde_json::Value>), (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
 
     let mut req = body.map(|b| b.0).unwrap_or(CreateMissionRequest {
@@ -10683,7 +10692,7 @@ pub async fn create_mission(
     // worker (`6f1e92b0`) on the same workspace as the existing writer;
     // ChatGPT OAuth is single-use and the extra occupant also races the
     // files. Sequential certify-after-repair is fine: the writer is terminal.
-    if let Some(ws_id) = req.workspace_id {
+    if let Some(ws_id) = req.workspace_id.filter(|_| !shared_side_workspace) {
         let control_state = control_for_user(&state, &user).await;
         if let Some(existing) = live_mission_on_workspace(&control_state.mission_store, ws_id).await
         {

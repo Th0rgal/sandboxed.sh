@@ -1,10 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#[path = "../../../shared/agent_software.rs"]
+mod agent_software;
 mod local_origin;
 #[path = "../../../shared/local_origin.rs"]
 mod local_origin_wire;
 #[path = "../../../shared/project_context.rs"]
 mod project_context_store;
 mod run_recovery;
+mod software;
 // Shared replica code uses the same module name in both binaries.
 use project_context_store as project_context;
 #[path = "../../../shared/context_replica.rs"]
@@ -18,6 +21,7 @@ mod interactions;
 mod local_agents;
 mod local_stream;
 mod machine_metrics;
+mod routed_opencode;
 mod session_preview;
 mod transfers;
 mod uploads;
@@ -99,11 +103,24 @@ fn local_bindings(
 }
 
 fn main() {
+    agent_software::start_worker();
     if context_service::worker_entry() {
         return;
     }
     tauri::Builder::default()
         .manage(voice::VoiceState::new())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) =
+                event
+            {
+                use tauri::Emitter;
+                let paths = uploads::allow_drop(paths);
+                let _ = window.emit(
+                    "orb-upload-drop",
+                    serde_json::json!({"paths":paths,"x":position.x,"y":position.y}),
+                );
+            }
+        })
         .setup(|app| {
             // Local voice input: the Python worker starts on first use and
             // is released again after a stretch of inactivity.
@@ -143,6 +160,7 @@ fn main() {
             session_preview::local_session_git,
             uploads::pick_upload_files,
             uploads::read_upload_file,
+            uploads::stage_upload_file,
             browse_local_files,
             machine_metrics::local_machine_metrics,
             open_url,
@@ -156,6 +174,9 @@ fn main() {
             context_service::project_context_prepare,
             context_service::project_context_status,
             context_service::project_context_disconnect,
+            software::software_inventory,
+            software::software_update,
+            software::software_cancel,
             local_agents::local_agents_scan,
             local_agents::local_agents_workspace,
             local_agents::local_agents_write,

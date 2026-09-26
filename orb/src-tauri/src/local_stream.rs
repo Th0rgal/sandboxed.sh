@@ -10,6 +10,7 @@ use tauri::ipc::Channel;
 pub struct Event {
     pub text: String,
     pub reset: bool,
+    pub activities: Option<Vec<Activity>>,
     pub state: Option<crate::local_agents::PollState>,
 }
 #[derive(Default)]
@@ -122,6 +123,105 @@ impl Drop for ReaderGuard {
 impl Output {
     pub fn activities(&self) -> Vec<Activity> {
         self.2.lock().unwrap().clone()
+    }
+    pub fn codex_reconnecting(&self, message: Option<&str>) {
+        let mut activities = self.2.lock().unwrap();
+        let index = activities.iter().position(|a| a.id == "codex:connection");
+        if let Some(message) = message {
+            let item = Activity::new(
+                "codex:connection".into(),
+                message.chars().take(160).collect(),
+                "connection",
+                false,
+            );
+            if let Some(index) = index {
+                activities[index] = item;
+            } else {
+                activities.push(item);
+            }
+        } else if let Some(index) = index {
+            if activities[index].done {
+                return;
+            }
+            activities[index].label = "Connection restored".into();
+            activities[index].finish("completed");
+        } else {
+            return;
+        }
+        drop(activities);
+        self.publish_activities();
+    }
+    pub fn native_activity(&self, value: &serde_json::Value) {
+        let method = value["method"].as_str().unwrap_or("");
+        let opencode = value["type"] == "tool_use";
+        if !opencode && !matches!(method, "item/started" | "item/completed") {
+            return;
+        }
+        let item = if opencode {
+            &value["part"]
+        } else {
+            &value["params"]["item"]
+        };
+        let kind = item["type"].as_str().unwrap_or("");
+        let (label, category) = if opencode {
+            (item["tool"].as_str().unwrap_or("Tool"), "tool")
+        } else {
+            match kind {
+                "reasoning" => ("Thinking", "thinking"),
+                "commandExecution" => ("Run command", "tool"),
+                "dynamicToolCall" | "mcpToolCall" => {
+                    (item["tool"].as_str().unwrap_or("Tool"), "tool")
+                }
+                "webSearch" => ("Search the web", "tool"),
+                "fileChange" => ("Edit files", "tool"),
+                "collabAgentToolCall" => ("Agent", "agent"),
+                _ => return,
+            }
+        };
+        let Some(id) = item[if opencode { "callID" } else { "id" }].as_str() else {
+            return;
+        };
+        let id = format!("native:{id}");
+        let mut activities = self.2.lock().unwrap();
+        let index = activities
+            .iter()
+            .position(|a| a.id == id)
+            .unwrap_or_else(|| {
+                activities.push(Activity::new(id, label.into(), category, false));
+                activities.len() - 1
+            });
+        let activity = &mut activities[index];
+        let status = if opencode {
+            item["state"]["status"].as_str()
+        } else {
+            item["status"].as_str()
+        }
+        .unwrap_or("");
+        // Only public tool data; encrypted/raw reasoning is never rendered.
+        if category != "thinking" {
+            let data = if opencode { &item["state"] } else { item };
+            activity.detail = Some(
+                serde_json::to_string_pretty(data)
+                    .unwrap_or_default()
+                    .chars()
+                    .take(8000)
+                    .collect(),
+            );
+        }
+        activity.updated_at = activity_now();
+        if method == "item/completed"
+            || (opencode && matches!(status, "completed" | "error" | "failed" | "cancelled"))
+        {
+            activity.finish(
+                if matches!(status, "error" | "failed") || item["success"] == false {
+                    "failed"
+                } else if status == "cancelled" {
+                    "stopped"
+                } else {
+                    "completed"
+                },
+            );
+        }
     }
     pub fn claude_activity(&self, value: &serde_json::Value) {
         let mut activities = self.2.lock().unwrap();
@@ -238,6 +338,20 @@ impl Output {
             }
         }
     }
+    pub fn publish_activities(&self) {
+        let activities = self.activities();
+        let event = Event {
+            text: String::new(),
+            reset: false,
+            state: None,
+            activities: Some(activities),
+        };
+        self.0
+            .lock()
+            .unwrap()
+            .listeners
+            .retain(|(_, channel)| channel.send(event.clone()).is_ok());
+    }
     pub fn reader(self: &Arc<Self>) -> ReaderGuard {
         self.1.fetch_add(1, Ordering::SeqCst);
         ReaderGuard(self.clone())
@@ -258,6 +372,7 @@ impl Output {
             text: text.into(),
             reset: false,
             state: None,
+            activities: None,
         };
         state
             .listeners
@@ -273,6 +388,7 @@ impl Output {
             text,
             reset: true,
             state: None,
+            activities: None,
         };
         state
             .listeners
@@ -285,6 +401,7 @@ impl Output {
                 text: state.text.clone(),
                 reset: true,
                 state: None,
+                activities: None,
             })
             .map_err(|e| e.to_string())?;
         state.next += 1;
@@ -353,6 +470,20 @@ impl CodexText {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_tools_preserve_identity_and_terminal_errors() {
+        let output = Output::default();
+        output.native_activity(&serde_json::json!({"method":"item/started","params":{"item":{"id":"a","type":"dynamicToolCall","tool":"exec"}}}));
+        assert!(!output.activities()[0].done);
+        output.native_activity(&serde_json::json!({"method":"item/completed","params":{"item":{"id":"a","type":"dynamicToolCall","tool":"exec","success":false}}}));
+        assert_eq!(output.activities().len(), 1);
+        assert!(output.activities()[0].failed);
+        output.native_activity(&serde_json::json!({"type":"tool_use","part":{"callID":"b","tool":"webfetch","state":{"status":"error","error":"403"}}}));
+        assert!(output.activities()[1].done && output.activities()[1].failed);
+        output.native_activity(&serde_json::json!({"method":"item/started","params":{"item":{"id":"c","type":"reasoning","encrypted_content":"private"}}}));
+        assert_eq!(output.activities()[2].detail, None);
+    }
+
     use serde_json::json;
     #[test]
     fn background_snapshot_recovers_task_and_notification_reports_failure() {

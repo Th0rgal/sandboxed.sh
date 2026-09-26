@@ -3631,6 +3631,11 @@ async fn run_mission_turn(
     boss_user_id: Option<String>,
     pr_readonly: bool,
 ) -> AgentResult {
+    let _software_execution =
+        match crate::agent_software::begin(&mission_id.to_string(), &backend_id, None) {
+            Ok(guard) => guard,
+            Err(error) => return AgentResult::failure(error, 0),
+        };
     #[cfg(test)]
     if let Some(result) = super::control::dispatch_admission_tests::native_goal_fixture(
         &config,

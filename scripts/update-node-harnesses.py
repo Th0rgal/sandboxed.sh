@@ -210,7 +210,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--only', choices=['opencode', 'claude', 'codex', 'grok'])
     parser.add_argument('--probe-user', default='sandboxed-node')
+    parser.add_argument('--version', type=stable, help='Exact stable version; requires --only')
     args = parser.parse_args()
+    if args.version and not args.only:
+        parser.error('--version requires --only')
     if os.geteuid() != 0:
         raise SystemExit('Run as root')
     ROOT.mkdir(parents=True, exist_ok=True)
@@ -221,7 +224,7 @@ def main():
         results = {}
         for name in ([args.only] if args.only else ['opencode', 'claude', 'codex', 'grok']):
             try:
-                version = resolve(name, pins)
+                version = args.version or resolve(name, pins)
                 results[name] = {'ok': True, **reconcile(name, version, args.probe_user)}
             except Exception as error:
                 results[name] = {'ok': False, 'error': str(error)[:250]}

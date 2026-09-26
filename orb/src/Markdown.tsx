@@ -1,6 +1,7 @@
+import {requestHighlight} from "./codeHighlightClient";
 import { CodeBlock } from "./CodeBlock";
 import { FileReference, FileReferenceText } from "./fileReferenceContext";
-import { For, createMemo, createSignal, type JSX } from "solid-js";
+import { For, Show, createEffect, onCleanup, createMemo, createSignal, type JSX } from "solid-js";
 import { openExternalUrl } from "./api";
 
 /**
@@ -45,11 +46,19 @@ function plainInline(text: string, links: boolean): JSX.Element[] {
 
 function inline(text: string, links = true): JSX.Element[] {
   const out: JSX.Element[] = [];
-  const re = /\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\(([^)]+)\)/g;
+  const re = /\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\(([^)]+)\)|(:codex-file-citation\{(?:[^"{}]|"(?:\\.|[^"\\])*")*\})/g;
   let last = 0;
   for (let m = re.exec(text); m; m = re.exec(text)) {
     if (m.index > last) out.push(...plainInline(text.slice(last, m.index), links));
-    if (m[1] !== undefined) out.push(<strong>{inline(m[1], links)}</strong>);
+    if (m[5] !== undefined) {
+      const attributes = [...m[5].matchAll(/([a-z_]+)\s*=\s*("(?:\\.|[^"\\])*")/g)];
+      const quoted = attributes.find(attribute => attribute[1] === "path")?.[2];
+      let path: string | undefined;
+      try { path = quoted ? JSON.parse(quoted) : undefined; } catch { /* malformed citation remains readable */ }
+      if (path) out.push(<FileReference raw={path}>{path.split("/").pop() || path}</FileReference>);
+      else out.push(m[5]);
+    }
+    else if (m[1] !== undefined) out.push(<strong>{inline(m[1], links)}</strong>);
     else if (m[2] !== undefined) out.push(<FileReference raw={m[2]}><code>{m[2]}</code></FileReference>);
     else if (!safeHref(m[4])) out.push(<FileReference raw={m[4]}>{m[3]}</FileReference>);
     else
@@ -369,6 +378,24 @@ export function MdSource(p: { text: string; onInput: (t: string) => void; readOn
 }
 
 /** The same syntax presentation as the editor, without a writable textarea. */
-export function ReadOnlySource(p: { text: string; line?: number }) {
-  return <div class="file-source-code"><For each={p.text.split("\n")}>{(line,i)=><div data-line={i()+1} class={p.line===i()+1?"highlight":""}><span class="file-line-number">{i()+1}</span><code>{hlLine(line)||" "}</code></div>}</For></div>;
+export function ReadOnlySource(p: { text: string; line?: number; language?: string }) {
+  const [highlighted,setHighlighted]=createSignal<string[]|null>(null);
+  createEffect(()=>{
+    const text=p.text,language=p.language;setHighlighted(null);
+    if(!language||typeof Worker==='undefined')return;
+    const cancel=requestHighlight(text,language,html=>setHighlighted(html?highlightedLines(html):null));
+    onCleanup(cancel);
+  });
+  return <div class="file-source-code"><For each={p.text.split("\n")}>{(line,i)=><div data-line={i()+1} class={p.line===i()+1?"highlight":""}><span class="file-line-number">{i()+1}</span><Show when={highlighted()?.[i()]} fallback={<code>{p.language?line||" ":hlLine(line)||" "}</code>}>{html=><code innerHTML={html()}/>}</Show></div>}</For></div>;
+}
+
+/** Reopen multiline token spans on each row without losing their lexical context. */
+export function highlightedLines(html:string):string[]{
+ const lines:string[]=[],stack:string[]=[];let current='';
+ for(const token of html.match(/<\/?span\b[^>]*>|\n|[^<\n]+|</g)??[]){
+  if(token==='\n'){lines.push(current+'</span>'.repeat(stack.length));current=stack.join('');continue;}
+  if(token.startsWith('<span'))stack.push(token);else if(token==='</span>')stack.pop();
+  current+=token;
+ }
+ lines.push(current+'</span>'.repeat(stack.length));return lines;
 }

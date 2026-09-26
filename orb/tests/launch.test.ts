@@ -13,7 +13,10 @@ describe("mission launch projection",()=>{
   const receipt={prompt:"Hello",nodeId:"dgx-spark",destination:"DGX Spark"};
   expect(withInitialPrompt([],mission(),receipt)).toHaveLength(1);
   const events=buildTranscript([{type:"user_message",data:{id:"a",content:"Hello"}},{type:"user_message",data:{id:"b",content:"Hello"}}]);
-  expect(withInitialPrompt(events,mission(),receipt)).toBe(events);
+  const reconciled=withInitialPrompt(events,mission(),receipt);
+  expect(reconciled).toHaveLength(2);
+  expect(reconciled[0].key).toBe(withInitialPrompt([],mission(),receipt)[0].key);
+  expect(reconciled[1]).toBe(events[1]);
   expect(missionDestination(mission({workspace_name:"host"}),receipt)).toBe("DGX Spark");
  });
  it.each(["pending","resuming","interrupted","failed","completed"])("renders honest %s status without text",status=>{
@@ -108,3 +111,12 @@ describe("remote launch preflight follows the server-advertised capability",()=>
   expect(initialPrompt(m)).toBe("/goal Original saved objective");
  });
 });
+
+ it("allows the explicitly selected administration profile while ordinary cordons stay unavailable",()=>{
+ const admin={...node,id:"dgx-spark-admin",cordoned:true,labels:["administration","manual-only"]};
+ const pick={backend:"claudecode",model:"claude-opus-5-5"};
+ expect(remoteLaunchPreflight(fleet(typed,{nodes:[admin]}),admin.id,pick)).toBeNull();
+ for(const unavailable of [{...admin,labels:[]},{...admin,status:"offline"},{...node,cordoned:true}]) {
+ expect(remoteLaunchPreflight(fleet(typed,{nodes:[unavailable]}),unavailable.id,pick)).toContain("unavailable");
+ }
+ });

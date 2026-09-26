@@ -8,11 +8,17 @@ describe("legacy OpenCode remote log", () => {
     expect(remoteLog(raw)).toEqual({text:"## Status\n\nRunning and durable.",details:raw});
   });
   it("does not reinterpret ordinary JSON, malformed logs, or other harnesses", () => {
-    for(const raw of [text,envelope+'broken',envelope+JSON.stringify({type:"text",data:"hello"})]) expect(remoteLog(raw)).toEqual({text:raw});
+    for(const raw of [text,envelope+'',envelope+JSON.stringify({type:"text",data:"hello"})]) expect(remoteLog(raw)).toEqual({text:raw});
   });
   it("retains failure status even when the log contains a text part", () => {
     const raw=envelope.replace("'succeeded'", "'failed'")+text;
     expect(remoteLog(raw).text).toContain("'failed'");
     expect(remoteLog(raw).text).toContain("## Status\n");
   });
+});
+
+it("unwraps successful Claude Markdown while keeping the receipt in details",()=>{
+ const answer="- **Depuis quand** : mercredi.\n\nDébit non disponible.";
+ expect(remoteLog(envelope+answer)).toEqual({text:answer,details:envelope+answer});
+ for(const header of [envelope.replace("'succeeded'","'failed'"),envelope.replace('Some(0)','Some(1)')])expect(remoteLog(header+answer)).toEqual({text:header+answer});
 });

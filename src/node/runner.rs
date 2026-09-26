@@ -338,6 +338,9 @@ impl JobRunner {
         job: &QueuedJob,
         token: &CancellationToken,
     ) -> anyhow::Result<(JobState, Option<i32>, Option<String>, Option<String>)> {
+        let _software_execution =
+            crate::agent_software::begin(&job.id.to_string(), "node-job", None)
+                .map_err(anyhow::Error::msg)?;
         let log_path = self.log_path(job.id);
         // Ask the external slot provider (the Spark arbiter) to make room
         // before anything runs; the lease releases the slot when we return.

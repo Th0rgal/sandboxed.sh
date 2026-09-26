@@ -106,9 +106,61 @@ it("keeps remote-node replies on the content-only continuation contract", async 
 it("keeps the project/model catalog available offline, without crossing accounts",async()=>{
  const {listProjects,listBackendModels}=await import('../src/api');
  setConnection('http://offline.test','account-a');
- vi.stubGlobal('fetch',vi.fn(async(input:string)=>new Response(JSON.stringify(input.includes('backend-models')?{backends:{codex:[{value:'model',label:'Model'}]}}:{projects:[{slug:'notes',title:'Notes'}]}))));
+ vi.stubGlobal('fetch',vi.fn(async(input:string)=>new Response(JSON.stringify(input.includes('/model-routing/chains')?[]:input.includes('backend-models')?{backends:{codex:[{value:'model',label:'Model'}]}}:{projects:[{slug:'notes',title:'Notes'}]}))));
  expect((await listProjects())[0].slug).toBe('notes');await listBackendModels();
  vi.stubGlobal('fetch',vi.fn(async()=>{throw new TypeError('offline');}));
  expect((await listProjects())[0].slug).toBe('notes');expect((await listBackendModels()).codex[0].value).toBe('model');
  setConnection('http://offline.test','account-b');await expect(listProjects()).rejects.toThrow('offline');
+});
+
+it("replaces a remote explicit-track refusal through create admission with context and identity", async () => {
+  setConnection('http://replacement.test','token');
+  const source = {id:'source',workspace_id:'00000000-0000-0000-0000-000000000000',remote_job:{node_id:'dgx-spark'},project:'default',track:'mission-original',github_pr:'org/repo#12',tags:['pr-writer'],backend:'claudecode',model_override:'opus',model_effort:'high',history:[{role:'user',content:'Find an address'},{role:'assistant',content:'Result found'}]};
+  const fetcher = vi.fn(async (url:string, init?:RequestInit) => {
+    if (url.endsWith('/source')) return Response.json(source);
+    if (url.endsWith('/message')) return new Response('REMOTE_RESUME_REQUIRES_REPLACEMENT: PR or explicit-track missions need create admission',{status:409});
+    return Response.json({id:'replacement',remote_node_id:'dgx-spark',status:'active'});
+  });
+  vi.stubGlobal('fetch',fetcher);
+  const receipt = await sendMissionMessage('source','Read the new public file',[{kind:'file',path:'notes.md'}],'attempt');
+  expect(receipt.replacement?.id).toBe('replacement');
+  const body=JSON.parse(fetcher.mock.calls[2][1]!.body as string);
+  expect(body).toMatchObject({supersedes_mission_id:'source',remote_node_id:'dgx-spark',project:'default',track:'mission-original',github_pr:'org/repo#12',writer:true,backend:'claudecode',model_override:'opus',model_effort:'high',idempotency_key:'orb-followup:source:attempt',attachments:[{kind:'file',path:'notes.md'}]});
+  expect(body).not.toHaveProperty('workspace_id');
+  expect(body.prompt).toContain('Result found'); expect(body.prompt).toContain('Current user request:\nRead the new public file');
+});
+
+it("replays the same replacement create after a lost response without sending the old mission again", async () => {
+  setConnection('http://replacement-retry.test','token');
+  let creates=0;
+  const fetcher=vi.fn(async(url:string,init?:RequestInit)=>{
+    if(url.endsWith('/source'))return Response.json({id:'source',remote_node_id:'dgx-spark',history:[]});
+    if(url.endsWith('/message'))return new Response('REMOTE_RESUME_REQUIRES_REPLACEMENT: no session',{status:409});
+    if(++creates===1)throw new TypeError('network disconnected');
+    return Response.json({id:'replacement'});
+  });vi.stubGlobal('fetch',fetcher);
+  await expect(sendMissionMessage('source','Follow up',undefined,'retry')).rejects.toThrow('network disconnected');
+  await expect(sendMissionMessage('source','Follow up',undefined,'retry')).resolves.toMatchObject({replacement:{id:'replacement'}});
+  expect(fetcher.mock.calls.filter(([url])=>url.endsWith('/message'))).toHaveLength(1);
+  const bodies=fetcher.mock.calls.filter(([url])=>url.endsWith('/missions')).map(([,init])=>init!.body);
+  expect(bodies[0]).toEqual(bodies[1]);
+});
+
+it.each([['REMOTE_JOB_STILL_RUNNING: wait',409],['REMOTE_RESUME_REQUIRES_REPLACEMENT: unknown outcome',503]])('does not replace for %s',async(detail,status)=>{
+  setConnection('http://no-replacement.test','token');
+  const fetcher=vi.fn(async(url:string)=>url.endsWith('/source')?Response.json({id:'source',remote_node_id:'dgx-spark'}):new Response(detail as string,{status:status as number}));vi.stubGlobal('fetch',fetcher);
+  await expect(sendMissionMessage('source','Follow up')).rejects.toThrow(detail as string);
+  expect(fetcher).toHaveBeenCalledTimes(2);
+});
+
+
+it("preserves a dedicated remote worktree so real occupancy protection still applies",async()=>{
+  setConnection('http://dedicated.test','token');
+  const fetcher=vi.fn(async(url:string,init?:RequestInit)=>{
+    if(url.endsWith('/source'))return Response.json({id:'source',remote_node_id:'dgx-spark',workspace_id:'dedicated-workspace'});
+    if(url.endsWith('/message'))return new Response('REMOTE_RESUME_REQUIRES_REPLACEMENT: explicit track',{status:409});
+    return new Response(JSON.stringify({error:'workspace_occupied',mission_id:'actual-occupant'}),{status:409});
+  });vi.stubGlobal('fetch',fetcher);
+  await expect(sendMissionMessage('source','Continue',undefined,'dedicated')).rejects.toThrow('workspace_occupied');
+  expect(JSON.parse(fetcher.mock.calls[2][1]!.body as string).workspace_id).toBe('dedicated-workspace');
 });

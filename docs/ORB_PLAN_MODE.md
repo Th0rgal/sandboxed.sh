@@ -110,3 +110,17 @@ Old native builds remain readable without invented durations or results.
 
 Regression coverage: `agent-activity.test.tsx`, `agent-activity.browser.spec.ts`
 (WebKit desktop/mobile), and native `local_stream` lifecycle tests.
+
+## Approved-plan tracking in Orb
+
+After successful delivery of **Implement plan**, Orb records the request ID,
+plan text, approval time and transcript boundary in IndexedDB, scoped to the
+server, account and mission. A Plan disclosure below the composer restores this
+receipt after reload and exposes the approved text. This is local UI history,
+not a new mission execution authority or a cross-device approval record.
+
+The latest `TodoWrite`, `todowrite` or `update_plan` snapshot after that boundary
+provides steps and their reported status. Missing progress is explicitly shown;
+idle execution never implies completion. “Steps reported complete” reflects the
+agent's checklist, not independent validation. Old approvals without a receipt
+are not inferred from assistant prose. Revisions do not record an approval.

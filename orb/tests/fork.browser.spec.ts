@@ -2,12 +2,13 @@ import { test, expect } from "@playwright/test";
 
 test("fork dialog opens a new page without mutating the source", async ({ page }) => {
   const source = { id: "original", title: "Original work", status: "active", backend: "grok", model_override: "grok-4.6", project: "test", remote_node_id: "dgx-spark", history: [], created_at: "", updated_at: "" };
-  const fork = { ...source, id: "forked", title: "Original work · fork", backend: "opencode", model_override: "qwen" };
+  const fork = { ...source, id: "forked", title: "Original work · fork", backend: "opencode", model_override: "builtin/smart" };
   let created = false;
   const mutations: { path: string; body: any }[] = [];
   await page.addInitScript(() => { localStorage.setItem("orb.apiUrl", location.origin); localStorage.setItem("orb.jwt", "test"); localStorage.setItem("orb-theme", "dark"); });
   await page.route("**/api/**", async route => {
     const req = route.request(), path = new URL(req.url()).pathname;
+    if(path === "/api/model-routing/chains") return route.fulfill({json:[{id:"builtin/smart",name:"Smart (Default)"}]});
     if (req.method() !== "GET") {
       mutations.push({ path, body: req.postDataJSON() });
       if (path === "/api/control/missions/original/fork") { created = true; return route.fulfill({ json: fork }); }
@@ -35,12 +36,12 @@ test("fork dialog opens a new page without mutating the source", async ({ page }
   await expect(menu).toBeVisible();
   await menu.getByRole("menuitem", { name: "OpenCode" }).click();
   const models = page.getByRole("menu", { name: "Choose a model" });
-  await expect(models.getByRole("menuitem", { name: "Qwen" })).toBeVisible();
+  await expect(models.getByRole("menuitem", { name: "Smart (Default)" })).toBeVisible();
   await page.screenshot({ path: "test-results/fork-dialog.png" });
-  await models.getByRole("menuitem", { name: "Qwen" }).click();
+  await models.getByRole("menuitem", { name: "Smart (Default)" }).click();
   await expect(menu).toHaveCount(0);
   await expect(page.locator(".under-harness")).toHaveText("OpenCode");
   expect(mutations).toHaveLength(1);
-  expect(mutations[0]).toMatchObject({ path: "/api/control/missions/original/fork", body: { backend: "opencode", model_override: "qwen" } });
+  expect(mutations[0]).toMatchObject({ path: "/api/control/missions/original/fork", body: { backend: "opencode", model_override: "builtin/smart" } });
   await expect(page.locator(".row.agent", { hasText: "Original work" }).first()).toBeVisible();
 });

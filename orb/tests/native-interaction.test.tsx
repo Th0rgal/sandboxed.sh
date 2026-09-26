@@ -1,8 +1,10 @@
 import {describe,it,expect,vi} from 'vitest';
 import {render,screen,fireEvent,waitFor,cleanup} from '@solidjs/testing-library';
+import {createSignal} from 'solid-js';
+import {MissionGlyph} from '../src/MissionGlyph';
 import {NativeInteraction} from '../src/NativeInteraction';
 import {api} from '../src/api';
-vi.mock('../src/api',()=>({api:vi.fn()}));
+vi.mock('../src/api',async importOriginal=>({...await importOriginal<typeof import('../src/api')>(),api:vi.fn()}));
 import {composerModes,modePrompt} from '../src/goal';
 
 describe('native plan interactions',()=>{
@@ -24,12 +26,14 @@ describe('native plan interactions',()=>{
   });
   const host=window as any;const previous=host.__TAURI_INTERNALS__;host.__TAURI_INTERNALS__={invoke};
   try{
-   render(()=><NativeInteraction mission="mission" active/>);
+   render(()=><><MissionGlyph missionId="mission" status="awaiting_user"/><NativeInteraction mission="mission" active/></>);
    await screen.findByText('Which greeting?');
+   expect(document.querySelector('.mission-glyph')?.getAttribute('title')).toBe('Waiting for your reply');
    fireEvent.click(screen.getByRole('radio'));
    fireEvent.click(screen.getByRole('button',{name:'Continue'}));
    await waitFor(()=>expect(screen.queryByRole('button',{name:'Continue'})).toBeNull());
    expect(invoke.mock.calls.filter(([cmd])=>cmd==='local_interaction_answer')).toHaveLength(1);
+   expect(document.querySelector('.mission-glyph')?.getAttribute('title')).toBe('Ready for a follow-up');
   }finally{cleanup();host.__TAURI_INTERNALS__=previous;}
  });
  it('switching from a custom answer to an option clears the custom field',async()=>{
@@ -78,3 +82,18 @@ describe('native plan interactions',()=>{
  });
 
 });
+
+ it('shares request replacement and cancellation with the sidebar',()=>{
+  const question={kind:'tool' as const,key:'q',callId:'q',name:'ui_native_request',args:{method:'questions',params:{questions:[]}},done:false};
+  const [items,setItems]=createSignal([question]);
+  const [active,setActive]=createSignal(true);
+  const {container}=render(()=><><MissionGlyph missionId="shared" status="awaiting_user"/><NativeInteraction mission="shared" active={active()} remote items={items()}/></>);
+  const label=()=>container.querySelector('.mission-glyph')?.getAttribute('title');
+  expect(label()).toBe('Waiting for your reply');
+  setItems([{...question,callId:'plan',args:{method:'plan',params:{questions:[]}}}]);
+  expect(label()).toBe('Approval requested');
+  setActive(false);
+  expect(label()).toBe('Ready for a follow-up');
+  expect(container.querySelector('.native-question')).toBeNull();
+  cleanup();
+ });

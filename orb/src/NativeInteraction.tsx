@@ -1,6 +1,8 @@
+import {rememberApprovedPlan} from "./PlanProgress";
 import {For,Show,createEffect,createSignal,onCleanup,untrack} from 'solid-js';
 import {MdView} from './Markdown';
-import {api} from './api';
+import {api,connectionVersion} from './api';
+import {observeMissionInteraction} from './missionAttention';
 import type {StreamItem} from './transcriptModel';
 
 type Request={id:string;method:string;params:{plan?:string;tool?:string;input?:{command?:string;file_path?:string;description?:string};questions?:Array<{id?:string;question:string;header?:string;multiSelect?:boolean;options?:Array<{label:string;description?:string}>}>}};
@@ -17,9 +19,17 @@ export function NativeInteraction(p:{mission:string;active:boolean;remote?:boole
  const [error,setError]=createSignal('');
  const answered=new Set<string>();
  let currentMission=p.mission;
+ let currentConnection=connectionVersion();
+ createEffect(()=>{
+  connectionVersion();
+  const current=request();
+  if(p.active && current) onCleanup(observeMissionInteraction(p.mission,current));
+ });
  createEffect(()=>{
   const id=p.mission;
-  if(id!==currentMission){answered.clear();currentMission=id;}
+  const version=connectionVersion();
+  if(version!==currentConnection){answered.clear();setRequest(null);currentConnection=version;}
+  if(id!==currentMission){answered.clear();setRequest(null);currentMission=id;}
   if(p.remote){
    if(!p.active){setRequest(null);return;}
    const item=p.items?.find(i=>i.kind==='tool'&&!i.done&&!answered.has(i.callId)&&['ui_native_request','AskUserQuestion','question'].includes(i.name));
@@ -37,13 +47,15 @@ export function NativeInteraction(p:{mission:string;active:boolean;remote?:boole
    const next=await invoke('local_interaction',{id}) as Request|null;
    if(!live)return;
    if(next?.id!==request()?.id){setAnswers({});setFeedback('');setError('');}
-   setRequest(next);
+   setRequest(next && !answered.has(next.id) ? next : null);
   }catch{/* Old native builds do not advertise this capability. */}};
   void refresh();const timer=setInterval(refresh,350);
   onCleanup(()=>{live=false;clearInterval(timer);});
  });
  const reply=async(action?:string)=>{
   const current=request();if(!current||sending())return;
+  const selectedMission=p.mission;
+  const boundary=p.items?.at(-1)?.key;
   setSending(true);setError('');
   const mapped=Object.fromEntries((current.params.questions??[]).map((q,i)=>{
    const key=q.id??String(i),values=answers()[key]??[];
@@ -56,6 +68,9 @@ export function NativeInteraction(p:{mission:string;active:boolean;remote?:boole
     const result=await api<{delivered:boolean}>('/api/control/tool_result',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tool_call_id:current.id,name:item?.kind==='tool'?item.name:'ui_native_request',result:answer})});
     if(!result.delivered)throw new Error('This request has expired. Resume the session to continue.');
    }else await invoke('local_interaction_answer',{id:p.mission,requestId:current.id,answer});
+   if(current.method==='plan'&&action==='accept') {
+    await rememberApprovedPlan(selectedMission,{requestId:current.id,text:current.params.plan??'Plan text unavailable',approvedAt:new Date().toISOString(),boundary}).catch(()=>setError('Plan accepted, but its local tracking could not be saved.'));
+   }
    answered.add(current.id);
    setRequest(null);
   }

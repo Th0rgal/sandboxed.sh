@@ -8,6 +8,7 @@ import {
 } from "solid-js";
 import { Portal } from "solid-js/web";
 import * as Ic from "./icons";
+import { PlanDetails, type PlanProgressData } from "./PlanProgress";
 import { GoalTag } from "./goal";
 import { localSessionGit } from "./localAgents";
 
@@ -23,7 +24,7 @@ export interface SessionPreviewData {
   effort?: string;
   context?: number | null;
 }
-export function SessionPreview(p: { data: SessionPreviewData; goal?: boolean }) {
+export function SessionPreview(p: { data: SessionPreviewData; goal?: boolean; plan?: PlanProgressData }) {
   const tipId = createUniqueId();
   const [open, setOpen] = createSignal(false);
   const [position, setPosition] = createSignal({ left: 0, top: 0, width: 340 });
@@ -124,6 +125,7 @@ export function SessionPreview(p: { data: SessionPreviewData; goal?: boolean }) 
         onClick={show}
       >
         <Show when={p.goal}><GoalTag class="small" /></Show>
+        <Show when={p.plan}><span class="goal-tag small plan-tag"><Ic.PlanIcon size={12}/><span class="goal-tag-label">Plan</span></span></Show>
         <span class="session-title-text">{p.data.title}</span>
         <Show when={p.data.local} fallback={<Ic.CloudIcon />}>
           <Ic.LaptopIcon />
@@ -144,6 +146,8 @@ export function SessionPreview(p: { data: SessionPreviewData; goal?: boolean }) 
             }}
             onPointerEnter={() => clearTimeout(hideTimer)}
             onPointerLeave={leave}
+            onFocusIn={() => clearTimeout(hideTimer)}
+            onFocusOut={e => { if (!panel?.contains(e.relatedTarget as Node)) leave(); }}
           >
             <div class="session-preview-title">{p.data.title}</div>
             <Show when={git()}>
@@ -198,6 +202,7 @@ export function SessionPreview(p: { data: SessionPreviewData; goal?: boolean }) 
                 </span>
               </div>
             </Show>
+            <Show when={p.plan}>{plan=><PlanDetails data={plan()}/>}</Show>
             <Show when={p.data.project}>
               <div class="session-preview-project">
                 Project · {p.data.project}

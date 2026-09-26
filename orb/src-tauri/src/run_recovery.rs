@@ -418,3 +418,101 @@ mod process_tests {
             .contains("still running locally or waiting"));
     }
 }
+
+#[cfg(test)]
+mod btw_smoke {
+    use super::*;
+    #[test]
+    #[ignore = "explicit operator replay; ORB_BTW_REPAIR_PROMPT and ORB_BTW_TEST_* required"]
+    fn btw_replay_empty_response() {
+        let id = std::env::var("ORB_BTW_TEST_ID").unwrap();
+        let connection = Connection {
+            api_url: std::env::var("ORB_BTW_TEST_URL").unwrap(),
+            token: std::env::var("ORB_BTW_TEST_TOKEN").unwrap(),
+        };
+        let request = local_agents::StartRequest {
+            id: id.clone(),
+            harness: "opencode".into(),
+            bin: "/opt/homebrew/bin/opencode".into(),
+            cwd: std::env::var("ORB_BTW_TEST_CWD").unwrap(),
+            prompt: std::fs::read_to_string(std::env::var("ORB_BTW_REPAIR_PROMPT").unwrap())
+                .unwrap(),
+            model: Some("builtin/smart".into()),
+            session_id: None,
+            image_paths: vec![],
+        };
+        let receipt =
+            tauri::async_runtime::block_on(local_run_launch(request, connection.clone())).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(240);
+        loop {
+            let state = local_agents::local_agents_poll(id.clone()).unwrap();
+            if state.done {
+                assert_eq!(state.exit_code, Some(0), "{:?}", state.error);
+                assert!(!state.text.trim().is_empty(), "No response captured");
+                for (route, body) in [
+                    (
+                        "client-transcript",
+                        json!({"id":uuid::Uuid::new_v4().to_string(),"role":"assistant","content":state.text,"run_id":receipt["run_id"],"generation":receipt["generation"]}),
+                    ),
+                    (
+                        "client-status",
+                        json!({"status":"awaiting_user","run_id":receipt["run_id"],"generation":receipt["generation"]}),
+                    ),
+                ] {
+                    let response =
+                        tauri::async_runtime::block_on(post(&connection, &id, route, body))
+                            .unwrap();
+                    assert!(response.status().is_success(), "{}", response.status());
+                }
+                println!(
+                    "Replayed side question and persisted {} response bytes",
+                    state.text.len()
+                );
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                local_agents::local_agents_stop(id.clone()).unwrap();
+                panic!("Replay timed out");
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    #[test]
+    #[ignore = "authenticated OpenCode integration; ORB_BTW_TEST_ID/URL/TOKEN/CWD required"]
+    fn btw_same_workspace_roundtrip() {
+        let id = std::env::var("ORB_BTW_TEST_ID").unwrap();
+        let cwd = std::env::var("ORB_BTW_TEST_CWD").unwrap();
+        let connection = Connection {
+            api_url: std::env::var("ORB_BTW_TEST_URL").unwrap(),
+            token: std::env::var("ORB_BTW_TEST_TOKEN").unwrap(),
+        };
+        let request=local_agents::StartRequest{id:id.clone(),harness:"opencode".into(),bin:"/opt/homebrew/bin/opencode".into(),cwd:cwd.clone(),prompt:"Integration check: use the bash tool to run pwd, then read btw-fixture.txt in this directory. Reply with its exact content and the working directory. Do not edit any files or delegate.".into(),model:Some("builtin/smart".into()),session_id:None,image_paths:vec![]};
+        let receipt =
+            tauri::async_runtime::block_on(local_run_launch(request, connection.clone())).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        loop {
+            let state = local_agents::local_agents_poll(id.clone()).unwrap();
+            if state.done {
+                assert_eq!(state.exit_code, Some(0), "{:?}", state.error);
+                assert!(state.text.contains("BTW-TOOLS-7319"), "{}", state.text);
+                assert!(state.text.contains(&cwd), "{}", state.text);
+                assert!(
+                    state
+                        .session_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("ses_")),
+                    "OpenCode session identity was not captured"
+                );
+                tauri::async_runtime::block_on(settle(&connection, &id, &receipt)).unwrap();
+                println!("BTW native tools, shared cwd and session identity verified");
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                local_agents::local_agents_stop(id.clone()).unwrap();
+                panic!("side agent timed out");
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+}

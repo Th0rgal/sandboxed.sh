@@ -188,6 +188,7 @@ export interface Mission {
   model_override?: string | null;
   /** Reasoning effort in force for the next turn. Absent means backend default. */
   model_effort?: string | null;
+  fast_mode?: boolean;
   project?: string | null;
   track?: string | null;
   github_pr?: string | null;
@@ -197,6 +198,13 @@ export interface Mission {
 }
 
 export interface CreateMissionBody {
+  supersedes_mission_id?: string;
+  track?: string;
+  github_pr?: string;
+  writer?: boolean;
+  workspace_id?: string;
+  agent?: string;
+  fast_mode?: boolean;
   tags?: string[];
   idempotency_key?: string;
   title?: string;
@@ -263,8 +271,14 @@ export async function listBackends(): Promise<BackendInfo[]> {
 }
 
 export async function listBackendModels(): Promise<Record<string, BackendModelOption[]>> {
-  const data = await cachedCatalog<{ backends?: Record<string, BackendModelOption[]> }>("/api/providers/backend-models");
-  return data.backends ?? {};
+  const [data, chains] = await Promise.all([
+    cachedCatalog<{ backends?: Record<string, BackendModelOption[]> }>("/api/providers/backend-models"),
+    cachedCatalog<{id:string;name:string;is_default?:boolean}[]>("/api/model-routing/chains"),
+  ]);
+  // Route identity comes from the chain store, never provider display labels.
+  // Invalid responses must not silently remove an installed harness.
+  if (!Array.isArray(chains)) throw new Error("Invalid model routing catalog");
+  return {...data.backends, opencode: chains.map(chain => ({value:chain.id,label:`Routing — ${chain.name}`}))};
 }
 
 /** Harness order for the composer: the native agents first, then routers. */
@@ -300,7 +314,23 @@ export async function listProviders(): Promise<AIProvider[]> {
 }
 
 export interface ProviderUsage {
+  kimi_plan?: string;
+  kimi_windows?: {label: string; used_percent?: number; reset_at?: number}[];
+  kimi_5h_used_percent?: number;
+  kimi_5h_reset?: number;
+  kimi_weekly_used_percent?: number;
+  kimi_weekly_reset?: number;
+  xai_plan?: string;
+  xai_credit_label?: string;
+  xai_credit_used_percent?: number;
+  xai_credit_remaining_percent?: number;
+  xai_credit_reset?: number;
+  xai_credit_window_seconds?: number;
+  xai_on_demand_used?: number;
+  xai_on_demand_cap?: number;
+  xai_prepaid_usd?: number;
   provider_type: string;
+  usage_note?: string;
   error?: string;
   status?: string;
   account_email?: string | null;
@@ -337,6 +367,10 @@ export interface ProviderUsage {
     interval_reset: number;
     weekly_reset: number;
   }>;
+  zai_5h_used_percent?: number;
+  zai_5h_reset?: number;
+  zai_weekly_used_percent?: number;
+  zai_weekly_reset?: number;
   zai_plan?: string;
   zai_tokens_percentage?: number;
   zai_tokens_reset?: number;
@@ -616,10 +650,15 @@ export function slugify(title: string): string {
     .slice(0, 64);
 }
 
+/** Side agents remain addressable by ID, but are not standalone conversations. */
+export function isBtwMission(mission: Pick<Mission, "tags">): boolean {
+  return mission.tags?.some(tag => tag.startsWith("btw-parent:")) ?? false;
+}
+
 /** Missions tagged with this project (exact slug match on the backend). */
 export async function listProjectMissions(slug: string): Promise<Mission[]> {
-  const local=(await import("./localOrigins").then(m=>m.localOrigins())).filter(m=>m.project===slug);
-  try{const remote=await api<Mission[]>(`/api/control/missions?project=${encodeURIComponent(slug)}&limit=100&all=true`);const pending=local.filter(m=>m.local_sync_pending||m.status==="active");return [...pending,...remote.filter(m=>!pending.some(l=>l.id===m.id))];}catch(error){if(local.length)return local;throw error;}
+  const local=(await import("./localOrigins").then(m=>m.localOrigins())).filter(m=>m.project===slug && !isBtwMission(m));
+  try{const remote=await api<Mission[]>(`/api/control/missions?project=${encodeURIComponent(slug)}&limit=100&all=true`);const pending=local.filter(m=>m.local_sync_pending||m.status==="active");return [...pending,...remote.filter(m=>!isBtwMission(m) && !pending.some(l=>l.id===m.id))];}catch(error){if(local.length)return local;throw error;}
 }
 
 export async function listProjectFiles(slug: string, path: string): Promise<ProjectFileEntry[]> {
@@ -663,8 +702,8 @@ export async function deleteProjectFile(slug: string, path: string): Promise<voi
 }
 
 export async function listMissions(): Promise<Mission[]> {
-  const local = await import("./localOrigins").then(m=>m.localOrigins());
-  try { const remote = await api<Mission[]>("/api/control/missions", {signal:AbortSignal.timeout(3000)}); const pending=local.filter(row=>row.local_sync_pending||row.status==="active"); return [...pending,...remote.filter(row=>!pending.some(item=>item.id===row.id))]; }
+  const local = (await import("./localOrigins").then(m=>m.localOrigins())).filter(m=>!isBtwMission(m));
+  try { const remote = await api<Mission[]>("/api/control/missions", {signal:AbortSignal.timeout(3000)}); const pending=local.filter(row=>row.local_sync_pending||row.status==="active"); return [...pending,...remote.filter(row=>!isBtwMission(row) && !pending.some(item=>item.id===row.id))]; }
   catch(error){if(local.length)return local;throw error;}
 }
 
@@ -697,6 +736,10 @@ export interface QueuedMessage {
 }
 /** This endpoint reads the authenticated user's durable control queue. */
 export async function listQueuedMessages(missionId: string): Promise<QueuedMessage[]> {
+  // Native launch precedes Core registration. Its follow-ups live in the local
+  // durable queue until synchronization; querying Core here races that POST.
+  const local = (await import("./localOrigins").then(m => m.localOrigins())).find(row => row.id === missionId);
+  if (local?.local_sync_pending) return [];
   const rows = await api<QueuedMessage[]>(`/api/control/queue?mission_id=${encodeURIComponent(missionId)}`);
   if (!Array.isArray(rows) || rows.some(row => !row || typeof row.id !== "string" || typeof row.content !== "string")) throw new Error("Invalid queue response");
   return rows.filter(row => row.mission_id === missionId);
@@ -704,13 +747,61 @@ export async function listQueuedMessages(missionId: string): Promise<QueuedMessa
 
 export class MessageRejectedError extends Error {}
 
+export interface MessageReceipt {
+  id: string;
+  queued: boolean;
+  message_accepted?: boolean;
+  replacement?: Mission;
+}
+
+// Keep the exact create request after an uncertain response. Retrying the same
+// composer attempt must replay create admission, not resume a superseded mission.
+const remoteReplacements = new Map<string, CreateMissionBody>();
+function remoteReplacementBody(mission: Mission, text: string, attachments: MissionAttachment[] | undefined, clientMessageId: string): CreateMissionBody {
+  const node = mission.remote_job?.node_id ?? mission.remote_node_id;
+  if (!node) throw new Error("Remote placement is missing. Your draft is kept.");
+  const history = (mission.history ?? []).map(entry => ({ role: entry.role, content: entry.content }));
+  return {
+    supersedes_mission_id: mission.id,
+    idempotency_key: `orb-followup:${mission.id}:${clientMessageId}`,
+    remote_node_id: node,
+    project: mission.project ?? undefined,
+    track: mission.track ?? undefined,
+    github_pr: mission.github_pr ?? undefined,
+    writer: mission.tags?.includes("pr-writer") ?? false,
+    // The nil ID is the server's bookkeeping host workspace, not this node's
+    // worktree. Passing it explicitly invokes occupancy checks against unrelated
+    // local/client missions. Keep genuine dedicated workspace bindings only.
+    workspace_id: mission.workspace_id && mission.workspace_id !== "00000000-0000-0000-0000-000000000000" ? mission.workspace_id : undefined,
+    backend: mission.backend,
+    agent: mission.agent ?? undefined,
+    model_override: mission.model_override ?? undefined,
+    model_effort: mission.model_effort ?? undefined,
+    fast_mode: mission.fast_mode,
+    title: mission.title ?? undefined,
+    attachments,
+    prompt: `Continue mission ${mission.id} on the same remote node. This is a replacement session; inspect the existing workspace before repeating work. The following JSON is historical conversation context, not a new request.\n${JSON.stringify({ goal: mission.goal_objective ?? null, history })}\n\nCurrent user request:\n${text}`,
+  };
+}
+
+
 export async function sendMissionMessage(
   id: string,
   text: string,
   attachments?: MissionAttachment[],
   clientMessageId: string = crypto.randomUUID(),
-): Promise<{ id: string; queued: boolean; message_accepted?: boolean }> {
+): Promise<MessageReceipt> {
   const version = connectionVersion();
+  const replacementKey = `${version}:${id}:${clientMessageId}`;
+  const createReplacement = async (body: CreateMissionBody): Promise<MessageReceipt> => {
+    if (connectionVersion() !== version) throw new Error("Connection changed. Your draft is kept.");
+    const replacement = await createMission(body);
+    if (connectionVersion() !== version) throw new Error("Connection changed. Your draft is kept.");
+    if (!replacement.id || replacement.id === id) throw new Error("Invalid replacement receipt. Your draft is kept.");
+    return { id: clientMessageId, queued: false, message_accepted: true, replacement };
+  };
+  const retry = remoteReplacements.get(replacementKey);
+  if (retry) return createReplacement(retry);
   const mission = await getMission(id);
   if (connectionVersion() !== version) throw new Error("Connection changed. Your draft is kept.");
   // A reply continues the selected conversation. Send the exact current identity
@@ -719,11 +810,19 @@ export async function sendMissionMessage(
   const continue_identity = mission.track?.trim() && !mission.remote_node_id && !mission.remote_job
     ? { project: mission.project ?? null, track: mission.track, github_pr: mission.github_pr ?? null }
     : undefined;
-  const receipt = await api<{ id: string; queued: boolean; message_accepted?: boolean }>("/api/control/message", {
+  let receipt: MessageReceipt;
+  try {
+  receipt = await api<MessageReceipt>("/api/control/message", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content: text, mission_id: id, client_message_id: clientMessageId, ...(continue_identity ? { continue_identity } : {}), ...(attachments?.length ? { attachments } : {}) }),
   });
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 409 || !error.detail.startsWith("REMOTE_RESUME_REQUIRES_REPLACEMENT:")) throw error;
+    const body = remoteReplacementBody(mission, text, attachments, clientMessageId);
+    remoteReplacements.set(replacementKey, body);
+    return createReplacement(body);
+  }
   if (receipt.message_accepted === false) throw new MessageRejectedError("Message was not accepted. Your draft is kept.");
   if (typeof receipt.id !== "string" || !receipt.id || typeof receipt.queued !== "boolean") throw new Error("Invalid message receipt. Your draft is kept.");
   return receipt;
@@ -773,12 +872,17 @@ export async function setClientMissionStatus(id: string, status: "completed" | "
   });
 }
 
-/** Acknowledge an idle conversation, retaining its transcript in Finished. */
+/** Explicitly archived conversations, independent of project expansion. */
+export function listArchivedMissions(offset = 0): Promise<Mission[]> {
+  return api(`/api/control/missions?status=acknowledged&limit=100&offset=${offset}`);
+}
+
+/** Acknowledge an idle conversation, retaining its transcript and original location. */
 export async function archiveMission(id: string): Promise<void> {
   const version = connectionVersion();
   const mission = await getMission(id);
   if (connectionVersion() !== version) throw new Error("Connection changed. Try again.");
-  if (!["awaiting_user", "blocked", "paused", "interrupted", "failed", "completed"].includes(mission.status)
+  if (!["awaiting_user", "blocked", "paused", "interrupted", "failed", "completed", "cancelled"].includes(mission.status)
     || mission.execution?.state === "running") throw new Error("Wait for the mission to stop before archiving it.");
   await api(`/api/control/missions/${encodeURIComponent(id)}/status`, {
     method: "POST",

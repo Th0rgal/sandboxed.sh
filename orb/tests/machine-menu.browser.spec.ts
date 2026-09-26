@@ -6,6 +6,7 @@ import { test, expect, type Page } from "@playwright/test";
  * name. These tests measure the real boxes rather than eyeballing a screenshot.
  */
 const nodes = [
+  { id: "dgx-spark-admin", status: "online", cordoned: true, labels: ["administration", "manual-only"] },
   { id: "dgx-spark", status: "online", cordoned: false },
   { id: "paloma-frankfurt-01", status: "degraded", cordoned: true },
   { id: "hermes-worker-eu-west-1b", status: "offline", cordoned: false },
@@ -19,6 +20,7 @@ async function setup(page: Page) {
   });
   await page.route("**/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
+    if(path === "/api/model-routing/chains") return route.fulfill({json:[{id:"builtin/smart",name:"Smart (Default)"}]});
     const json =
       path === "/api/remote-nodes"
         ? { enabled: true, nodes, remote_launch: { typed: true, harnesses: ["claudecode", "codex"], proxy_url_configured: true } }
@@ -120,3 +122,13 @@ test("machine picker at 375px: wraps inside the viewport with no overlap", async
   await expect(page.getByRole("button", { name: "Manage machines" })).toBeInViewport();
   await page.screenshot({ path: "artifacts/orb-machine-menu-narrow.png" });
 });
+
+ test("administration is explicit and never restored as the default machine", async ({page}) => {
+ await setup(page);
+ await page.getByRole("button", {name:/Core \(agent-core\)/}).click();
+ await page.getByRole("button", {name:/DGX Spark · Administration/}).click();
+ await expect(page.locator(".na-drop-btn").filter({hasText:"DGX Spark · Administration"})).toBeVisible();
+ expect(await page.evaluate(()=>localStorage.getItem("orb.machine"))).toBe("core");
+ await page.reload();
+ await expect(page.getByRole("button", {name:/Core \(agent-core\)/})).toBeVisible();
+ });

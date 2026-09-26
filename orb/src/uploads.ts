@@ -2,7 +2,7 @@ import { api, connectionVersion, getApiUrl } from "./api";
 import { mentionText, scanMentions } from "./attach";
 
 export interface UploadSource { name: string; localPath?: string; file?: File }
-export interface UploadedFile { source: UploadSource; path: string; destination: string; connection: number; endpoint?: string }
+export interface UploadedFile { source: UploadSource; path: string; destination: string; connection: number; endpoint?: string; dataBase64?: string }
 export interface UploadReceipt { name: string; path: string; size: number; sha256: string }
 const MAX = 20 * 1024 * 1024;
 type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -16,7 +16,7 @@ export async function pickNativeFiles(): Promise<UploadSource[]> {
   const files = await invoke<Array<{ name: string; path: string }>>("pick_upload_files");
   return files.map(file => ({ name: file.name, localPath: file.path }));
 }
-async function encoded(source: UploadSource): Promise<string> {
+export async function encoded(source: UploadSource): Promise<string> {
   if (source.localPath) {
     const invoke = nativeInvoke();
     if (!invoke) throw new Error("Reopen this file in the desktop app.");
@@ -33,9 +33,17 @@ async function encoded(source: UploadSource): Promise<string> {
 export const uploadToken = (path: string) => mentionText({ kind: "file", path });
 export async function transferFile(source: UploadSource, destination: string): Promise<UploadedFile> {
   const connection = connectionVersion();
+  if (destination === "side") {
+    return { source, path: `side-attachment/${crypto.randomUUID()}/${source.name}`, destination, connection, endpoint:getApiUrl(), dataBase64:await encoded(source) };
+  }
   if (destination === "local") {
-    if (!source.localPath) throw new Error("Choose this file again in the desktop app to use its local path.");
-    return { source, path: source.localPath, destination, connection, endpoint: getApiUrl() };
+    if (!source.localPath) {
+      const invoke=nativeInvoke();
+      if(!invoke)throw new Error("Local file attachments require the desktop app.");
+      const path=await invoke<string>("stage_upload_file",{name:source.name,dataBase64:await encoded(source)});
+      source={...source,localPath:path};
+    }
+    return { source, path: source.localPath!, destination, connection, endpoint: getApiUrl() };
   }
   const data = await encoded(source);
   if (connection !== connectionVersion()) throw new Error("The backend changed. Choose the file again.");

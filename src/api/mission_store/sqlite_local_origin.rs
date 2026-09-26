@@ -29,6 +29,9 @@ pub(super) async fn sync(store: &SqliteMissionStore, snapshot: Snapshot) -> Resu
    // or restart an existing mission, even when its UUID collides.
    let tags=serde_json::to_string(&o.tags.iter().cloned().chain(std::iter::once("placement:client".to_owned())).collect::<Vec<_>>()).map_err(err)?;
    tx.execute("INSERT INTO missions (id,status,title,workspace_id,backend,model_override,created_at,updated_at,working_directory,requires_local_disk,project,tags,origin) VALUES (?1,'active',?2,?3,?4,?5,?6,?7,?8,0,?9,?10,'orb-client')",params![id,o.title,crate::workspace::DEFAULT_WORKSPACE_ID.to_string(),o.backend,o.model,o.created_at,now,o.cwd,o.project,tags]).map_err(err)?;
+   if let Some(objective)=o.prompt.trim().strip_prefix("/goal").filter(|rest| rest.starts_with(char::is_whitespace)).map(str::trim).filter(|rest| !rest.is_empty()) {
+    tx.execute("UPDATE missions SET goal_mode=1,goal_objective=?2 WHERE id=?1",params![id,objective]).map_err(err)?;
+   }
    tx.execute("INSERT INTO mission_runs (run_id,mission_id,generation,execution_state,owner_actor_id,scope_unit,started_at,heartbeat_at) VALUES (?1,?2,1,'running',?3,?4,?5,?6)",params![run,id,format!("orb-client:{}",o.client_id),format!("orb-cwd:{}",o.cwd),o.created_at,now]).map_err(err)?;
    tx.execute("INSERT INTO local_origins (mission_id,origin,sequence) VALUES (?1,?2,0)",params![id,origin]).map_err(err)?;
    tx.execute("INSERT INTO mission_events (mission_id,sequence,event_type,timestamp,event_id,content) VALUES (?1,1,'user_message',?2,?1,?3)",params![id,o.created_at,o.prompt]).map_err(err)?;
@@ -69,6 +72,20 @@ mod tests {
             status: "active".into(),
             error: None,
         }
+    }
+    #[tokio::test]
+    async fn local_origin_records_goal_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteMissionStore::new(temp.path().to_path_buf(), "goal-origin")
+            .await
+            .unwrap();
+        let mut s = snapshot();
+        s.origin.prompt = "/goal\nFinish the audit".into();
+        let id = s.origin.id;
+        sync(&store, s).await.unwrap();
+        let mission = store.get_mission(id).await.unwrap().unwrap();
+        assert!(mission.goal_mode);
+        assert_eq!(mission.goal_objective.as_deref(), Some("Finish the audit"));
     }
     #[tokio::test]
     async fn local_origin_replay_is_atomic_and_cannot_restart_finished_run() {

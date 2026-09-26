@@ -112,10 +112,14 @@ describe('NewMissionDialog', () => {
     expect(openSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('shows Claude Opus 5 as the Claude Code default', async () => {
+  it('selects the catalog Opus default and allows an explicit no-override choice', async () => {
     vi.mocked(listBackends).mockResolvedValue([
       { id: 'claudecode', name: 'Claude Code' },
     ]);
+    vi.mocked(listBackendModelOptions).mockResolvedValue({ backends: { claudecode: [
+      { value: 'claude-opus-6', label: 'Anthropic — Claude Opus 6' },
+      { value: 'claude-haiku-5', label: 'Anthropic — Claude Haiku 5' },
+    ] } });
     const onCreate = vi.fn().mockResolvedValue({ id: 'claude-mission' });
 
     renderDialog(onCreate);
@@ -124,9 +128,16 @@ describe('NewMissionDialog', () => {
 
     expect(
       await screen.findByRole('option', {
-        name: 'No override (configured default; fallback claude-opus-5)',
+        name: 'No override (configured default)',
       })
     ).toBeVisible();
+    const harness = await screen.findByRole('option', { name: 'Claude Code default' });
+    fireEvent.change(harness.closest('select')!, { target: { value: 'claudecode:' } });
+    const opus = await screen.findByRole('option', { name: 'Claude Opus 6' });
+    const select = opus.closest('select')!;
+    await waitFor(() => expect(select).toHaveValue('claude-opus-6'));
+    fireEvent.change(select, { target: { value: '' } });
+    await waitFor(() => expect(select).toHaveValue(''));
   });
 
   it('uses one host-only canonical Pro option for ChatGPT UI missions', async () => {

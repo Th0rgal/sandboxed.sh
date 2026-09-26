@@ -1,10 +1,11 @@
+import { remoteContinuation } from "./remoteContinuation";
 import { ErrorNotice } from "./ErrorNotice";
 import { Show } from "solid-js";
 import { ApiError, getApiUrl, type Mission, type RemoteLaunchCapability, type RemoteNodesResponse } from "./api";
 import { goalObjective, GoalTag } from "./goal";
 import type { StreamItem } from "./Transcript";
 
-export type LaunchReceipt = { prompt: string; nodeId: string; destination: string };
+export type LaunchReceipt = { prompt: string; nodeId: string; destination: string; replacement?: boolean };
 const receiptKey = (id: string) => `orb.launch:${getApiUrl()}:${id}`;
 const receipts = new Map<string, LaunchReceipt>();
 export function rememberLaunch(id: string, receipt: LaunchReceipt) {
@@ -16,7 +17,8 @@ export function recalledLaunch(id: string): LaunchReceipt | undefined {
   if (cached) return cached;
   try { return JSON.parse(sessionStorage.getItem(receiptKey(id)) ?? "null") ?? undefined; } catch { return undefined; }
 }
-export const nodeLabel = (id: string) => id === "core" ? "Core" : id === "local" ? "This computer" : id === "dgx-spark" ? "DGX Spark" : id;
+export const nodeLabel = (id: string) => id === "core" ? "Core" : id === "local" ? "This computer" : id === "dgx-spark" ? "DGX Spark" : id === "dgx-spark-admin" ? "DGX Spark · Administration" : id;
+export const isAdministrationNode = (node: { id: string; labels?: string[] }) => node.id === "dgx-spark-admin" && node.labels?.includes("administration") === true && node.labels.includes("manual-only");
 
 /** Statuses where PATCH /settings can change the next-turn model. A live turn returns 409. */
 const SETTINGS_IDLE = new Set([
@@ -52,7 +54,18 @@ export function withInitialPrompt(items: StreamItem[], mission: Mission | null, 
   // event replaces it, even if backend normalization changed the stored text.
   // Subsequent real repeated messages are never deduplicated by text.
   const prompt = initialPrompt(mission, receipt);
-  return prompt && !items.some(item => item.kind === "user") ? [{kind:"user",key:`initial:${mission?.id ?? "launch"}`,text:prompt}, ...items] : items;
+  const first = items.findIndex(item => item.kind === "user");
+  const continuation = remoteContinuation(first >= 0 && items[first].kind === "user" ? items[first].text : mission?.history?.find(entry => entry.role === "user")?.content ?? "");
+  if (continuation) {
+    const expanded: StreamItem[] = continuation.map((entry, index) => entry.role === "user"
+      ? {kind:"user", key:`continuation:${mission?.id}:${index}`, text:entry.content}
+      : {kind:"text", key:`continuation:${mission?.id}:${index}`, text:entry.content, live:false});
+    return first < 0 ? [...expanded, ...items] : [...items.slice(0, first), ...expanded, ...items.slice(first + 1)];
+  }
+  const key = `initial:${mission?.id ?? "launch"}`;
+  if (first < 0) return prompt ? [{kind:"user",key,text:prompt}, ...items] : items;
+  // Keep the optimistic turn mounted when its canonical event arrives.
+  return receipt ? items.map((item,index) => index === first ? {...item,key,...(receipt.replacement && item.kind === "user" ? {text:receipt.prompt} : {})} : item) : items;
 }
 export const TYPED_LAUNCH_UNSUPPORTED = "This backend does not support structured remote launches. Update the connected backend to enable them. Your draft and selection are kept; no mission was submitted.";
 export type RemoteSupport = "supported" | "unsupported" | "unknown";
@@ -70,7 +83,7 @@ export function remoteHarnessSupport(capability: RemoteLaunchCapability | null |
 export function remoteLaunchPreflight(fleet: RemoteNodesResponse, nodeId: string, pick: { backend: string; model: string }, harnessName: (id: string) => string = id => id): string | null {
   const destination = nodeLabel(nodeId);
   const node = fleet.nodes?.find(n => n.id === nodeId);
-  if (!fleet.enabled || !node || node.cordoned || !["online","degraded"].includes(node.status)) return `${destination} is unavailable. Choose an available machine; your draft is kept.`;
+  if (!fleet.enabled || !node || (node.cordoned && !isAdministrationNode(node)) || !["online","degraded"].includes(node.status)) return `${destination} is unavailable. Choose an available machine; your draft is kept.`;
   const capability = fleet.remote_launch;
   if (!capability || capability.typed !== true) return TYPED_LAUNCH_UNSUPPORTED;
   const harnesses = Array.isArray(capability.harnesses) ? capability.harnesses : [];
@@ -178,11 +191,15 @@ export function missionPhase(mission: Mission | null, activity: boolean) {
   if (["failed","interrupted","cancelled","canceled","not_feasible"].includes(status)) {
     const reason = mission?.terminal_reason ?? mission?.remote_job?.terminal_reason ?? mission?.execution?.terminal_reason;
     return { label: status === "interrupted" ? "Interrupted" : status.startsWith("cancel") ? "Cancelled" : "Failed", moving: false, failed: true,
-      detail: reason === "orphan_no_runner" ? "The backend could not find an active runner." : mission?.status_message ?? reason?.replaceAll("_", " ") ?? "The mission stopped before completion." };
+      detail: status === "interrupted" && ["service_restart", "server_shutdown"].includes(reason ?? "")
+        ? mission?.tags?.includes("placement:client")
+          ? "The backend restarted and marked this conversation interrupted. This does not confirm that the agent on your computer stopped."
+          : "The backend restarted during this run. The conversation is preserved; send a follow-up to continue if it does not resume."
+        : reason === "orphan_no_runner" ? "The backend could not find an active runner." : mission?.status_message ?? reason?.replaceAll("_", " ") ?? "The mission stopped before completion." };
   }
   if (["completed","done"].includes(status)) return { label:"Completed", moving:false, detail:activity ? "" : "The mission completed without transcript output." };
-  if (["awaiting_user","waiting_user"].includes(status) && activity) return {label:"Waiting for input",moving:false,detail:""};
-  if (["paused","blocked","awaiting_user","waiting_user"].includes(status)) return {label:status==="paused"?"Paused":"Waiting for input",moving:false,detail:"The mission is not currently running."};
+  if (["awaiting_user","waiting_user","acknowledged"].includes(status)) return {label:"Ready for a follow-up",moving:false,detail:activity ? "" : "Send a message to continue this conversation."};
+  if (["paused","blocked"].includes(status)) return {label:status==="paused"?"Paused":"Waiting for input",moving:false,detail:"The mission is not currently running."};
   const job = mission?.remote_job;
   if (job || mission?.execution?.state === "waiting_remote_job") {
     // Active means durable acceptance, not that the selected harness is running.
@@ -239,7 +256,7 @@ export function MissionFailure(p: { mission?: Mission | null; error?: string; ac
   const message = () => p.error || (phase().detail === "client runner"
     ? "The local run could not be completed. Retry on the computer that started it."
     : phase().detail || "The mission stopped before completion.");
-  return <Show when={!p.active && !p.failureInTranscript && (p.error || phase().failed)}><ErrorNotice title={phase().label === "Cancelled" ? "Mission cancelled" : "Mission failed"} error={message()} /></Show>;
+  return <Show when={!p.active && !p.failureInTranscript && (p.error || phase().failed)}><ErrorNotice title={phase().label === "Cancelled" ? "Mission cancelled" : phase().label === "Interrupted" && !p.error ? "Mission interrupted" : "Mission failed"} error={message()} /></Show>;
 }
 
 /**

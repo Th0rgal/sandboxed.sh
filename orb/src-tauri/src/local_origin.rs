@@ -72,7 +72,14 @@ fn write(p: &Path, r: &Record) -> Result<(), String> {
 fn view(r: &Record) -> Value {
     let s = &r.snapshot;
     let o = &s.origin;
-    json!({"id":o.id,"title":o.title,"status":s.status,"project":o.project,"tags":o.tags.iter().cloned().chain(std::iter::once("placement:client".into())).collect::<Vec<_>>(),"backend":o.backend,"model_override":o.model,"working_directory":o.cwd,"created_at":o.created_at,"updated_at":o.created_at,"history":[{"role":"user","content":o.prompt},{"role":"assistant","content":s.text}],"status_message":s.error,"local_sync_pending":r.acked<s.sequence,"local_sync_error":r.error})
+    let objective = o
+        .prompt
+        .trim()
+        .strip_prefix("/goal")
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .map(str::trim)
+        .filter(|rest| !rest.is_empty());
+    json!({"id":o.id,"title":o.title,"status":s.status,"project":o.project,"tags":o.tags.iter().cloned().chain(std::iter::once("placement:client".into())).collect::<Vec<_>>(),"backend":o.backend,"model_override":o.model,"working_directory":o.cwd,"created_at":o.created_at,"updated_at":o.created_at,"history":[{"role":"user","content":o.prompt},{"role":"assistant","content":s.text}],"goal_mode":objective.is_some(),"goal_objective":objective,"status_message":s.error,"local_sync_pending":r.acked<s.sequence,"local_sync_error":r.error})
 }
 fn workers() -> &'static Mutex<HashSet<PathBuf>> {
     static W: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -320,7 +327,9 @@ pub async fn local_origin_launch(
             json!({"harness":request.harness,"bin":request.bin,"cwd":request.cwd,"model":request.model}),
         ),
     )?;
-    if let Err(error) = local_agents::local_agents_start(request) {
+    if let Err(error) =
+        crate::routed_opencode::start(request, &connection.api_url, &connection.token).await
+    {
         record.snapshot.status = "failed".into();
         record.snapshot.sequence += 1;
         record.snapshot.error = Some(error);

@@ -1,3 +1,4 @@
+import { ResourceIcon } from "./ResourceIcon";
 import { readHistory, saveHistory, freshSamples } from "./resourceCache";
 import { ResourceHistory, appendSamples, type ResourceSample } from "./ResourceHistory";
 import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
@@ -44,10 +45,10 @@ export function LocalMachine() {
     <Show when={sample()} fallback={<p class="s-row-desc">{error() || "Reading local metrics…"}</p>}>{s => <>
       <ResourceHistory samples={history()} live={!error()} />
       <div class="machine-resources">
-        <div class="machine-resource"><span>CPU</span><strong>{s().cpu_percent == null ? "Sampling…" : `${Math.round(s().cpu_percent!)}%`}</strong></div>
-        <div class="machine-resource"><span>Memory</span><strong>{percent(s().memory_used, s().memory_total)}</strong><small>{size(s().memory_used)} / {size(s().memory_total)}</small></div>
-        <div class="machine-resource"><span>Disk</span><strong>{percent(s().disk_used, s().disk_total)}</strong><small>{size(s().disk_used)} / {size(s().disk_total)}</small></div>
-        <div class="machine-resource"><span>GPU</span><strong>{s().gpu_percent != null ? `${Math.round(s().gpu_percent!)}%` : "Unavailable"}</strong></div>
+        <div class="machine-resource"><span><ResourceIcon kind="CPU"/>CPU</span><strong>{s().cpu_percent == null ? "Sampling…" : `${Math.round(s().cpu_percent!)}%`}</strong></div>
+        <div class="machine-resource"><span><ResourceIcon kind="Memory"/>Memory</span><strong>{percent(s().memory_used, s().memory_total)}</strong><small>{size(s().memory_used)} / {size(s().memory_total)}</small></div>
+        <div class="machine-resource"><span><ResourceIcon kind="Disk"/>Disk</span><strong>{percent(s().disk_used, s().disk_total)}</strong><small>{size(s().disk_used)} / {size(s().disk_total)}</small></div>
+        <div class="machine-resource"><span><ResourceIcon kind="GPU"/>GPU</span><strong>{s().gpu_percent != null ? `${Math.round(s().gpu_percent!)}%` : "Unavailable"}</strong></div>
       </div>
       <Show when={s().consumers.some(c => c.processes > 0)}><div class="local-consumers" title="Resident process memory · % of total RAM. Shared pages may overlap; macOS-managed WebKit processes may be excluded."><For each={s().consumers}>{(c, index) => <Show when={c.processes > 0}><div class="local-consumer"><span class="consumer-label"><i style={{ background: ["#92968d", "#a397bc", "#849ca4"][index()] }} />{c.label}</span><span>{size(c.memory)}</span><span>{percent(c.memory, s().memory_total)}</span></div></Show>}</For></div></Show>
     </>}</Show>

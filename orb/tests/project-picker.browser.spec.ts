@@ -59,6 +59,7 @@ test("Default is created on first use; failed creation retains the draft and ret
   });
   await page.route("**/api/**", async route => {
     const request = route.request(), path = new URL(request.url()).pathname;
+    if(path === "/api/model-routing/chains") return route.fulfill({json:[{id:"builtin/smart",name:"Smart (Default)"}]});
     if (path === "/api/projects" && request.method() === "PUT") {
       projectWrites++;
       if (fail) return route.fulfill({status:503,body:"Cannot create project"});

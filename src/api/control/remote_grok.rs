@@ -400,7 +400,8 @@ impl GrokStream {
                 Some("tool_use") => {
                     let update = serde_json::json!({
                         "toolCallId": part["callID"], "name": part["tool"],
-                        "rawInput": part["state"]["input"], "status": part["state"]["status"],
+                        "rawInput": part["state"]["input"], "status": if part["state"]["status"] == "error" { serde_json::json!("failed") } else { part["state"]["status"].clone() },
+                        "error": part["state"]["error"],
                         "output": part["state"]["output"],
                     });
                     updates.push(StreamUpdate::Tool {
@@ -1443,6 +1444,13 @@ mod tests {
     const SPARK_STREAM: &str =
         include_str!("../../../tests/fixtures/native_grok_goal_resume.jsonl");
     const SPARK_TEXT: &str = include_str!("../../../tests/fixtures/native_grok_goal_resume.txt");
+
+    #[test]
+    fn opencode_error_is_a_terminal_tool_result() {
+        let mut stream = GrokStream::default();
+        let updates=stream.feed("{\"type\":\"tool_use\",\"sessionID\":\"ses_error\",\"part\":{\"callID\":\"call_error\",\"tool\":\"webfetch\",\"state\":{\"status\":\"error\",\"error\":\"HTTP 403\"}}}\n");
+        assert!(updates.iter().any(|u|matches!(u,StreamUpdate::Tool {update,completed:true} if update["status"]=="failed" && update["error"]=="HTTP 403")));
+    }
 
     #[test]
     fn opencode_stream_preserves_session_text_and_tools_across_chunks() {
