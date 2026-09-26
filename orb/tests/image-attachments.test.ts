@@ -1,5 +1,5 @@
 import {beforeEach, expect, it, vi} from "vitest";
-vi.mock("../src/api", () => ({api: vi.fn()}));
+vi.mock("../src/api", () => ({api: vi.fn(), getApiUrl:()=>"https://images.test", connectionVersion:()=>0}));
 vi.mock("../src/localAgents", () => ({writeLocalFiles: vi.fn()}));
 import {api} from "../src/api";
 import {writeLocalFiles} from "../src/localAgents";

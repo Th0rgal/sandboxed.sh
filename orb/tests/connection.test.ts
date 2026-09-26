@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { sendMissionMessage, createMission, api, clearConnection, connectionVersion, getJwt, isConnected, setConnection } from "../src/api";
+import { sendMissionMessage, createMission, listProjects, api, clearConnection, connectionVersion, getJwt, isConnected, setConnection } from "../src/api";
 
 afterEach(() => { clearConnection(); vi.unstubAllGlobals(); });
 
@@ -163,4 +163,26 @@ it("preserves a dedicated remote worktree so real occupancy protection still app
   });vi.stubGlobal('fetch',fetcher);
   await expect(sendMissionMessage('source','Continue',undefined,'dedicated')).rejects.toThrow('workspace_occupied');
   expect(JSON.parse(fetcher.mock.calls[2][1]!.body as string).workspace_id).toBe('dedicated-workspace');
+});
+
+
+it("keeps the last valid project catalog when a successful response is empty or malformed", async () => {
+  setConnection("http://projects-cache.test", "test");
+  const projects = [{slug:"verity", title:"Verity"}];
+  const fetcher = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({projects})))
+    .mockResolvedValueOnce(new Response(""))
+    .mockResolvedValueOnce(new Response(JSON.stringify({projects:null})));
+  vi.stubGlobal("fetch", fetcher);
+  await expect(listProjects()).resolves.toEqual(projects);
+  await expect(listProjects()).resolves.toEqual(projects);
+  await expect(listProjects()).resolves.toEqual(projects);
+});
+
+it("rejects an invalid project catalog without caching it and recovers on retry", async () => {
+  setConnection("http://projects-retry.test", "test");
+  const fetcher = vi.fn().mockResolvedValueOnce(new Response("<html>unavailable</html>"))
+    .mockResolvedValueOnce(new Response(JSON.stringify({projects:[{slug:"verity",title:"Verity"}]})));
+  vi.stubGlobal("fetch", fetcher);
+  await expect(listProjects()).rejects.toThrow("Couldn’t load projects");
+  await expect(listProjects()).resolves.toEqual([{slug:"verity",title:"Verity"}]);
 });

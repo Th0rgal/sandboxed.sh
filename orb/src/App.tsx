@@ -1379,7 +1379,7 @@ export default function App() {
     }
     launchAttempt = undefined;
     setAttachChips([]);
-    rememberLaunch(m.id, {prompt:imagePrompt(typed,images.map(image=>image.dataUrl),images),nodeId:"local",destination:"This computer"});
+    rememberLaunch(m.id, {prompt:imagePrompt(typed,imagePaths,images),images,nodeId:"local",destination:"This computer"});
     setMissions(prev=>[m,...prev.filter(old=>old.id!==m.id)]);
     open(`m:${m.id}`);
     if(legacy){const run=await startLocal({id:m.id,harness:pick.backend,bin:row.path,cwd:root,prompt:sent,model:pick.model,imagePaths});void finishLocal(m.id,run);}
@@ -1396,7 +1396,7 @@ export default function App() {
       const prompt = goal.kind === "goal" ? goalPrompt(goal.objective) : text;
       const title = missionTitle(text);
       const machine = newMachine();
-      const receipt = {prompt:imagePrompt(prompt,images.map(image=>image.dataUrl),images),nodeId:machine,destination:nodeLabel(machine)};
+      const receipt = {prompt,images,nodeId:machine,destination:nodeLabel(machine)};
       const projectSlug = effectiveNewProject();
       const pick = effectivePick();
       setCreating(true); setCreateError(null); setCreateRefusal(null); setLaunchPreview(receipt);
@@ -1434,7 +1434,7 @@ export default function App() {
         const m = await createMission({...body,idempotency_key:launchAttempt.key});
         launchAttempt = undefined;
         setAttachChips([]);
-        rememberLaunch(m.id, receipt);
+        rememberLaunch(m.id, {...receipt,prompt:sentPrompt});
         if (machine === "dgx-spark-admin") chooseMachine("core");
         setMissions(prev => [m, ...prev.filter(old => old.id !== m.id)]);
         open(`m:${m.id}`);
@@ -1925,13 +1925,13 @@ export default function App() {
                   </div>
                 </div>
                 {/* One preview from attachment preparation through acceptance; failures restore the composer. */}
-                <Show when={launchPreview()}>{(receipt) => <div class="launch-preview"><UserTurn text={receipt().prompt} pending /><MissionPending destination={receipt().destination} label="Working" /></div>}</Show>
+                <Show when={launchPreview()}>{(receipt) => <div class="launch-preview"><UserTurn text={receipt().prompt} images={receipt().images} pending /><MissionPending destination={receipt().destination} label="Working" /></div>}</Show>
                 <div hidden={!!launchPreview()}>
                 <Composer
                   placeholder="Describe a task, / for commands, @ for context"
                   busy={creating()}
                   onSend={create}
-                  onPending={draft => setLaunchPreview(draft ? {prompt:imagePrompt(draft.text,draft.images.map(image=>image.dataUrl),draft.images),nodeId:newMachine(),destination:nodeLabel(newMachine())} : null)}
+                  onPending={draft => setLaunchPreview(draft ? {prompt:draft.text,images:draft.images,nodeId:newMachine(),destination:nodeLabel(newMachine())} : null)}
                   onStop={stop}
                   onDraft={(text) => { if (createError() === EMPTY_GOAL_ERROR && goalDraft(text).kind !== "empty") setCreateError(null); }}
                   autofocus
@@ -2437,7 +2437,7 @@ function MissionView(p: { id: string; onPlan?: (id:string,data:PlanProgressData 
     const draft=optimistic();
     const projected:StreamItem[]=[];
     for(const row of outbox){if(!known.has(row.id)){known.add(row.id);projected.push({kind:'user',key:`user:${row.id}`,messageId:row.id,text:row.text});}}
-    if(draft&&!draft.waiting&&!known.has(draft.id))projected.push({kind:'user',key:`user:${draft.id}`,messageId:draft.id,text:imagePrompt(draft.text,draft.images.map(image=>image.dataUrl),draft.images)});
+    if(draft&&!draft.waiting&&!known.has(draft.id))projected.push({kind:'user',key:`user:${draft.id}`,messageId:draft.id,text:draft.text,images:draft.images});
     const list = [...canonical,...projected];
     const live = localLiveText(p.id);
     const withLive = live && !list.some(item => item.kind === "text" && item.text === live) ? [...list, { kind: "text" as const, key: `local:${p.id}`, text: live, live: localRunActive(p.id) }] : list;
@@ -2560,7 +2560,7 @@ function MissionView(p: { id: string; onPlan?: (id:string,data:PlanProgressData 
                   {(r) => (
                     <>
                       <LaunchStatus destination={missionDestination(mission(), r())} mission={mission()} goal={missionGoal(mission(), r())} />
-                      <UserTurn text={r().prompt} pending={pending()} onSend={sendEditedPrompt} />
+                      <UserTurn text={r().prompt} images={r().images} pending={pending()} onSend={sendEditedPrompt} />
                       <Show when={pending()}>
                         <MissionPending destination={missionDestination(mission(), r())} label={phaseLabel()} />
                       </Show>

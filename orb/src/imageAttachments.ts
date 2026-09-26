@@ -1,4 +1,5 @@
-import { api, type Mission } from "./api";
+import { rememberImagePreview, imagePreviewScope } from "./imagePreviews";
+import { api, getApiUrl, connectionVersion, type Mission } from "./api";
 import { writeLocalFiles } from "./localAgents";
 
 export interface DraftImage { id: string; name: string; type: string; dataUrl: string; reference?: number; }
@@ -17,22 +18,31 @@ export async function readImage(file: File): Promise<DraftImage> {
   const id = crypto.randomUUID();
   return { id, name: `image-${id}.${extensions[file.type]}`, type: file.type, dataUrl };
 }
-export function imagePrompt(text: string, paths: string[], images: DraftImage[] = []): string {
+export function imagePrompt(text: string, paths: string[], images: Pick<DraftImage, "reference">[] = []): string {
   return [text, ...paths.map((path, index) => `${images[index]?.reference ? `[Image #${images[index].reference}] ` : ""}[Uploaded: ${path}]`)].filter(Boolean).join("\n\n");
 }
 export async function stageLocalImages(root: string, images: DraftImage[]): Promise<string[]> {
   if (!images.length) return [];
+  const scope = imagePreviewScope(getApiUrl(), connectionVersion(), "local");
   const files = images.map(image => ({rel: `.paloma/images/${image.name}`, content:image.dataUrl.split(",")[1], encoding:"base64" as const}));
   await writeLocalFiles(root, files);
-  return files.map(file => `${root}/${file.rel}`);
+  return files.map((file,index) => {
+    const path = `${root}/${file.rel}`;
+    rememberImagePreview(scope, path, images[index].dataUrl);
+    return path;
+  });
 }
 export async function stageRemoteImages(images: DraftImage[], mission?: Mission | null, destination?: string): Promise<string[]> {
   const node = destination ?? mission?.remote_node_id ?? mission?.remote_job?.node_id ?? "core";
+  const version = connectionVersion();
+  const scope = imagePreviewScope(getApiUrl(), version, node);
   const paths: string[] = [];
   for (const image of images) {
     if (node !== "core") {
       const result = await api<{path:string}>("/api/uploads", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({node_id:node,name:image.name,data_base64:image.dataUrl.split(",")[1]})});
       if (!result?.path) throw new Error("Image upload did not return a file path. Your draft is kept.");
+      if (version !== connectionVersion()) throw new Error("The backend changed. Your draft is kept.");
+      rememberImagePreview(scope, result.path, image.dataUrl);
       paths.push(result.path);
       continue;
     }
@@ -44,6 +54,8 @@ export async function stageRemoteImages(images: DraftImage[], mission?: Mission 
     if (mission) query.set("mission_id", mission.id);
     const result = await api<{path:string}>(`/api/fs/upload?${query}`, {method:"POST",body:form});
     if (!result?.path) throw new Error("Image upload did not return a file path. Your draft is kept.");
+    if (version !== connectionVersion()) throw new Error("The backend changed. Your draft is kept.");
+    rememberImagePreview(scope, result.path, image.dataUrl);
     paths.push(result.path);
   }
   return paths;

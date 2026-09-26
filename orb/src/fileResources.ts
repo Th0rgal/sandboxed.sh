@@ -1,3 +1,4 @@
+import { imagePreview, imagePreviewScope } from "./imagePreviews";
 import {
   api,
   getApiUrl,
@@ -6,6 +7,7 @@ import {
   getProjectController,
   getProjectCron,
   getJwt,
+  connectionVersion,
   type Mission,
 } from "./api";
 import { localBinding } from "./localAgents";
@@ -63,6 +65,13 @@ export const fileScopeKey = (s: FileScope) =>
   `${getApiUrl()}:${s.mission?.id ?? `project:${s.project ?? ""}:controller:${s.controller ?? ""}`}${s.mission?.machine_transfer ? `:transfer:${s.mission.machine_transfer.id}` : ""}`;
 export function createFileClient(scope: FileScope) {
   const project = scope.mission?.project ?? scope.project;
+  const endpoint = getApiUrl(), version = connectionVersion(), token = getJwt();
+  const mission = scope.mission;
+  const transfer = mission?.machine_transfer?.destination;
+  const destination = transfer ? (transfer.kind === "client" ? "local" : transfer.kind === "core" ? "core" : transfer.id)
+    : mission?.tags?.includes("placement:client") || (mission && localBinding(mission.id)) ? "local"
+    : mission?.remote_job?.node_id ?? mission?.remote_node_id ?? "core";
+  const previewScope = imagePreviewScope(endpoint, version, destination);
   const binding = scope.mission && (!scope.mission.machine_transfer || scope.mission.machine_transfer.destination.kind === "client") ? localBinding(scope.mission.id) : undefined;
   const server = (source: string, op: FileOp) =>
     api<FileReply>("/api/file-resources", {
@@ -287,7 +296,45 @@ export function createFileClient(scope: FileScope) {
     }
     return server(source, op);
   }
-  return { roots, call };
+  async function loadUploadedImage(path: string): Promise<string | null> {
+    // The initial Core upload predates the mission and lives in context/, outside
+    // its workspace root. Use the upload API's authenticated, path-checked reader.
+    // Never reinterpret a node/local path as a Core path.
+    if (version !== connectionVersion() || destination !== "core" || !mission || !/\.(png|jpe?g|webp|gif)$/i.test(path)) return null;
+    const queries: URLSearchParams[] = [];
+    if (mission.workspace_id) queries.push(new URLSearchParams({path, workspace_id:mission.workspace_id, mission_id:mission.id}));
+    queries.push(new URLSearchParams({path}));
+    for (const query of queries) {
+      const response = await fetch(`${endpoint}/api/fs/download?${query}`, {
+        headers: {Authorization:`Bearer ${token ?? ""}`}, signal:AbortSignal.timeout(15000),
+      });
+      if (version !== connectionVersion()) return null;
+      if (!response.ok) {
+        // A workspace-bound path can be outside that root yet be a valid Core
+        // upload. Both candidates are independently checked by the server.
+        if ([400,403,404].includes(response.status)) continue;
+        throw new Error("Couldn’t load the image. Click to retry.");
+      }
+      const reader = response.body?.getReader();
+      if (!reader) return null;
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      try {
+        while (true) {
+          const {value,done} = await reader.read();
+          if (done) break;
+          size += value.byteLength;
+          if (version !== connectionVersion() || size > 20 * 1024 * 1024) { await reader.cancel(); return null; }
+          chunks.push(value);
+        }
+      } finally { reader.releaseLock(); }
+      if (!size || version !== connectionVersion()) return null;
+      const extension = path.split(".").at(-1)!.toLowerCase();
+      return URL.createObjectURL(new Blob(chunks as BlobPart[], {type: extension === "jpg" ? "image/jpeg" : `image/${extension}`}));
+    }
+    return null;
+  }
+  return { roots, call, loadUploadedImage, imagePreview: (path: string) => version === connectionVersion() ? imagePreview(previewScope, path) : undefined };
 }
 export function parseFileTarget(
   raw: string,

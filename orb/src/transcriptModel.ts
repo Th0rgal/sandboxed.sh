@@ -1,8 +1,9 @@
+import type { DraftImage } from "./imageAttachments";
 import { deferredMessages } from "./deferredMessages";
 import type { StreamEvent } from "./stream";
 
 export type StreamItem =
-  | { kind: "user"; key: string; text: string; messageId?: string; source?: string; queued?: boolean; attached?: boolean; receipt?: boolean }
+  | { kind: "user"; key: string; text: string; images?: DraftImage[]; messageId?: string; source?: string; queued?: boolean; attached?: boolean; receipt?: boolean }
   | { kind: "think"; key: string; text: string; done: boolean }
   | { kind: "text"; key: string; text: string; live: boolean }
   | { kind: "error"; key: string; text: string; terminal?: boolean; cancelled?: boolean }

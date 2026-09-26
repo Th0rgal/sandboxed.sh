@@ -1,3 +1,5 @@
+import {createSignal,useContext} from "solid-js";
+import {FileReferenceContext,type ReferenceResolver} from "../src/fileReferenceContext";
 import { render, fireEvent, waitFor } from "@solidjs/testing-library";
 import { it, expect, vi } from "vitest";
 import { FilePanelProvider, FilePanelButton } from "../src/FilePanel";
@@ -95,4 +97,16 @@ it("only resolves completed assistant text and updates changed references", asyn
       container.querySelector('[title="workspace: second.md"]'),
     ).not.toBeNull(),
   );
+});
+
+it("reschedules file lookups after a scope change cancels a pending batch",async()=>{
+ const [project,setProject]=createSignal('before');
+ let resolver!:ReferenceResolver;
+ const Capture=()=>{resolver=useContext(FileReferenceContext)!;return null;};
+ render(()=><FilePanelProvider scope={{project:project()}}><Capture/></FilePanelProvider>);
+ const old=resolver.resolve('note.md');
+ setProject('after');
+ expect(await old).toEqual([]);
+ const fresh=await resolver.resolve('note.md');
+ expect(fresh).toEqual([expect.objectContaining({name:'note.md',source:'workspace'})]);
 });

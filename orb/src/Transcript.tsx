@@ -1,6 +1,6 @@
 import {anchoredDisclosure} from "./anchoredDisclosure";
 import { messageImages } from "./messageImages";
-import { imagePrompt } from "./imageAttachments";
+import { imagePrompt, type DraftImage } from "./imageAttachments";
 import { Dialog } from "./Dialog";
 import { FileReferenceContext } from "./fileReferenceContext";
 import { copyText } from "./clipboard";
@@ -86,21 +86,25 @@ function MessageImage(p: {path:string; index:number}) {
   const resolver=useContext(FileReferenceContext);
   const [url,setUrl]=createSignal<string | null>(null);
   const [expanded,setExpanded]=createSignal(false);
+  const [attempt,setAttempt]=createSignal(0);
+  const [loading,setLoading]=createSignal(false);
   createEffect(() => {
     const path=p.path;
+    attempt();
+    if (/^data:image\/(?:png|jpeg|webp|gif);base64,/i.test(path)) { setUrl(path); setLoading(false); return; }
     let cancelled=false;
     let loaded:string | null=null;
-    setUrl(null);
-    void resolver?.loadImage?.(path).then(value => {
-      if(cancelled) { if(value)URL.revokeObjectURL(value); return; }
-      loaded=value;setUrl(value);
-    }).catch(() => {});
-    onCleanup(() => {cancelled=true;if(loaded)URL.revokeObjectURL(loaded);});
+    setUrl(null); setLoading(true);
+    void Promise.resolve(resolver?.loadImage?.(path)).then(value => {
+      if(cancelled) { if(value?.startsWith("blob:"))URL.revokeObjectURL(value); return; }
+      loaded=value ?? null;setUrl(value ?? null);
+    }).catch(() => {}).finally(() => {if(!cancelled)setLoading(false);});
+    onCleanup(() => {cancelled=true;if(loaded?.startsWith("blob:"))URL.revokeObjectURL(loaded);});
   });
   return <>
-    <button class="message-image" aria-label={`Image #${p.index}`} title={url()?`Open image #${p.index}`:`Image #${p.index} — preview unavailable`} disabled={!url()} onDblClick={e=>e.stopPropagation()} onClick={e=>{e.stopPropagation();setExpanded(true);}}>
+    <button class="message-image" aria-label={`Image #${p.index}`} title={url()?`Open image #${p.index}`:loading()?"Loading image…":"Preview unavailable — click to retry"} disabled={loading()} onDblClick={e=>e.stopPropagation()} onClick={e=>{e.stopPropagation();if(url())setExpanded(true);else setAttempt(n=>n+1);}}>
       <Show when={url()} fallback={<Ic.FileIcon size={22}/>}>{src=><img src={src()} alt={`Image #${p.index}`} onError={()=>setUrl(null)}/>}</Show>
-      <span>#{p.index}</span>
+      <span>{loading()?"Loading…":url()?`#${p.index}`:"Retry"}</span>
     </button>
     <Show when={expanded() && url()}><Dialog title={`Image #${p.index}`} size="wide" onClose={()=>setExpanded(false)}><img class="message-image-preview" src={url()!} alt={`Image #${p.index}`}/></Dialog></Show>
   </>;
@@ -108,10 +112,13 @@ function MessageImage(p: {path:string; index:number}) {
 
 const AUTOMATIC_SOURCES = new Set(["scheduler", "idle-worker-watchdog", "transport_auto_resume", "remote-build-terminal", "task-board"]);
 
-export function UserTurn(p: { text: string; source?: string; attached?: boolean; pending?: boolean; onSend?: (text: string) => boolean | Promise<boolean> }) {
+export function UserTurn(p: { text: string; images?: DraftImage[]; source?: string; attached?: boolean; pending?: boolean; onSend?: (text: string) => boolean | Promise<boolean> }) {
   const fork = createMemo(() => forkContext(p.text));
   const presentation = createMemo(() => messagePresentation(p.text));
   const images = createMemo(() => messageImages(presentation().text));
+  const thumbnails = createMemo(() => images().paths.length
+    ? images().paths.map((path,index)=>({path,reference:images().references[index]}))
+    : (p.images ?? []).map((image,index)=>({path:image.dataUrl,reference:image.reference ?? index+1})));
   const goal = createMemo(() => goalDraft(images().text));
   const plan = createMemo(() => planObjective(images().text));
   let bubble!: HTMLDivElement;
@@ -124,7 +131,7 @@ export function UserTurn(p: { text: string; source?: string; attached?: boolean;
     if (sending() || !draft().trim() || !p.onSend) return;
     setSending(true); setSendError("");
     try {
-      const accepted = await p.onSend(imagePrompt(draft(), images().paths));
+      const accepted = await p.onSend(imagePrompt(draft(), images().paths, images().references.map(reference=>({reference}))));
       if (accepted) setEditing(false);
       else setSendError("The message was not sent. Your draft is kept; try again.");
     } catch (e) { setSendError(e instanceof Error ? e.message : String(e)); }
@@ -137,7 +144,7 @@ export function UserTurn(p: { text: string; source?: string; attached?: boolean;
   const edit = () => { if (fork()) return; bubble.style.setProperty("--editing-width", `${bubble.getBoundingClientRect().width}px`); setDraft(images().text); setCopyState(""); setSendError(""); setEditing(true); };
   return (
     <div ref={bubble} onDblClick={() => { if (!editing()) edit(); }} class={`user ${editing() ? "editing" : ""} ${goal().kind === "goal" ? "goal" : ""} ${plan() !== null ? "plan" : ""} ${p.pending ? "pending" : ""}`}>
-      <Show when={images().paths.length}><div class="message-images"><For each={images().paths}>{(path,index)=><MessageImage path={path} index={index()+1}/>}</For></div></Show>
+      <Show when={thumbnails().length}><div class="message-images"><For each={thumbnails()}>{image=><MessageImage path={image.path} index={image.reference}/>}</For></div></Show>
       <Show when={editing()} fallback={<>
       <Show when={p.source && AUTOMATIC_SOURCES.has(p.source)}><small class="user-origin" title="This message was generated by the agent coordinator">↻ Automatic follow-up</small></Show>
       <Show when={plan() !== null}><small class="user-plan"><Ic.PlanIcon size={12}/>Plan</small></Show>
@@ -309,7 +316,7 @@ export function Transcript(p: { items: StreamItem[]; pending?: boolean; onSend?:
             case "user":
               // Only the turn still waiting for a reply animates: once anything
               // has been said or done after it, the work is visible on its own.
-              return <UserTurn text={item.text} source={item.source} attached={item.attached} onSend={p.onSend} pending={p.pending && item.key === lastUserKey()} />;
+              return <UserTurn text={item.text} images={item.images} source={item.source} attached={item.attached} onSend={p.onSend} pending={p.pending && item.key === lastUserKey()} />;
             case "think":
               return <ThinkBlock item={item} />;
             case "text":

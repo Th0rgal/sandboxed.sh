@@ -197,13 +197,14 @@ export function FilePanelProvider(p: {
     return rootPromise;
   }
   createEffect(
-    on(scopeKey, (key) => {
+    on([scopeKey, connectionVersion], ([key]) => {
       generation++;
       readGeneration++;
       client = createFileClient(untrack(() => p.scope));
       rootPromise = undefined;
       cache = new Map();
       if (batchTimer) clearTimeout(batchTimer);
+      batchTimer = undefined;
       for (const callbacks of queue.values()) callbacks.forEach((cb) => cb([]));
       queue = new Map();
       const saved = loadSaved(key);
@@ -399,13 +400,24 @@ export function FilePanelProvider(p: {
   }
   const resolver: ReferenceResolver = {
     async loadImage(path) {
+      scopeKey(); // Retry the image when its mission/connection scope becomes ready.
       const g = generation;
       const c = client;
+      const preview = c.imagePreview(path);
+      if (preview) return preview;
       const extension = path.split(".").at(-1)?.toLowerCase();
       const mime = ({png:"image/png",jpg:"image/jpeg",jpeg:"image/jpeg",webp:"image/webp",gif:"image/gif"} as Record<string,string>)[extension ?? ""];
       if (!mime) return null;
+      // Failed lookups must be retriable after upload/provisioning completes.
+      cache.delete(path);
       const refs = await resolver.resolve(path);
-      if (g !== generation || !refs.length) return null;
+      if (g !== generation) return null;
+      if (!refs.length) {
+        rootPromise = undefined;
+        const url = await c.loadUploadedImage(path);
+        if (g !== generation) { if (url) URL.revokeObjectURL(url); return null; }
+        return url;
+      }
       const ref = refs[0];
       const chunks: Uint8Array[] = [];
       let offset=0;

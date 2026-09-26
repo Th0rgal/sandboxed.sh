@@ -253,14 +253,14 @@ export interface HarnessChoice {
 }
 
 /** Small read-only catalogs keep local launch available across offline restarts. */
-async function cachedCatalog<T>(path:string):Promise<T>{
+async function cachedCatalog<T>(path:string, valid?: (value: unknown) => boolean):Promise<T>{
  const version=connectionVersion(),token=getJwt();
  let hash=2166136261;for(const c of `${getApiUrl()}:${token??""}`)hash=Math.imul(hash^c.charCodeAt(0),16777619);
  const key=`orb.catalog:${hash>>>0}:${path}`;
- try{const value=await api<T>(path,{signal:AbortSignal.timeout(3000)});if(version===connectionVersion())try{localStorage.setItem(key,JSON.stringify(value));}catch{}return value;}
+ try{const value=await api<T>(path,{signal:AbortSignal.timeout(3000)});if(valid && !valid(value))throw new Error("Couldn’t load projects. The server returned an invalid response.");if(version===connectionVersion())try{localStorage.setItem(key,JSON.stringify(value));}catch{}return value;}
  catch(error){
   if(version!==connectionVersion()||getJwt()!==token||error instanceof ApiError)throw error;
-  const stored=localStorage.getItem(key);if(stored){try{return JSON.parse(stored) as T;}catch{}}
+  const stored=localStorage.getItem(key);if(stored){try{const value=JSON.parse(stored);if(!valid || valid(value))return value as T;}catch{}}
   throw error;
  }
 }
@@ -479,7 +479,9 @@ export async function archiveProject(slug: string): Promise<void> {
 }
 
 export async function listProjects(): Promise<ProjectSummary[]> {
-  const data = await cachedCatalog<{ projects?: ProjectSummary[] }>("/api/projects");
+  const data = await cachedCatalog<{ projects: ProjectSummary[] }>("/api/projects",
+    value => !!value && typeof value === "object" && Array.isArray((value as {projects?: unknown}).projects)
+      && (value as {projects: unknown[]}).projects.every(project => !!project && typeof project === "object" && typeof (project as {slug?: unknown}).slug === "string"));
   return (data.projects ?? []).filter(
     (p) => p.status !== "archived" && p.status !== "deleted" && !archivedSlugs.has(p.slug),
   );

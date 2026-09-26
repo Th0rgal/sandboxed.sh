@@ -412,9 +412,12 @@ export function LiveProjectsSection(p: {
     finally { if (currentConnection(version)) setCronChecking(false); }
   };
 
+  let refreshingVersion: number | undefined;
   const refresh = () => {
     if (!isConnected()) return;
     const version = connectionVersion();
+    if (refreshingVersion === version) return;
+    refreshingVersion = version;
     listProjects()
       .then((list) => {
         if (!currentConnection(version)) return;
@@ -430,7 +433,7 @@ export function LiveProjectsSection(p: {
             ? "This backend build doesn't expose projects yet — update the core."
             : msg,
         );
-      });
+      }).finally(() => { if (refreshingVersion === version) refreshingVersion = undefined; });
   };
   createEffect(on(projectsVersion, () => refresh(), { defer: true }));
   onMount(() => {
@@ -439,6 +442,7 @@ export function LiveProjectsSection(p: {
     // expand time (the flat "Sandboxed" list polls, this tree didn't).
     const stop = pollWhileVisible(() => {
       if (!isConnected()) return;
+      if (error()) refresh();
       for (const project of projects()) {
         if (!expanded[project.slug]) continue;
         loadMissions(project.slug);
@@ -995,7 +999,7 @@ export function LiveProjectsSection(p: {
         </button>
       </div>
       <Show when={error()}>
-        <div class="row note">{error()}</div>
+        <div class="row note">{error()} <button class="text-btn" onClick={refresh}>Retry</button></div>
       </Show>
       <Show when={cronWarning()}><ErrorNotice error={cronWarning()!} /></Show>
       <Show when={actionError()}><ErrorNotice error={actionError()!} /></Show>

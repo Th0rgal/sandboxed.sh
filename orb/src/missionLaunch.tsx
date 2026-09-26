@@ -1,3 +1,4 @@
+import type { DraftImage } from "./imageAttachments";
 import { remoteContinuation } from "./remoteContinuation";
 import { ErrorNotice } from "./ErrorNotice";
 import { Show } from "solid-js";
@@ -5,7 +6,7 @@ import { ApiError, getApiUrl, type Mission, type RemoteLaunchCapability, type Re
 import { goalObjective, GoalTag } from "./goal";
 import type { StreamItem } from "./Transcript";
 
-export type LaunchReceipt = { prompt: string; nodeId: string; destination: string; replacement?: boolean };
+export type LaunchReceipt = { prompt: string; images?: DraftImage[]; nodeId: string; destination: string; replacement?: boolean };
 const receiptKey = (id: string) => `orb.launch:${getApiUrl()}:${id}`;
 const receipts = new Map<string, LaunchReceipt>();
 export function rememberLaunch(id: string, receipt: LaunchReceipt) {
@@ -63,7 +64,7 @@ export function withInitialPrompt(items: StreamItem[], mission: Mission | null, 
     return first < 0 ? [...expanded, ...items] : [...items.slice(0, first), ...expanded, ...items.slice(first + 1)];
   }
   const key = `initial:${mission?.id ?? "launch"}`;
-  if (first < 0) return prompt ? [{kind:"user",key,text:prompt}, ...items] : items;
+  if (first < 0) return prompt ? [{kind:"user",key,text:prompt,images:receipt?.images}, ...items] : items;
   // Keep the optimistic turn mounted when its canonical event arrives.
   return receipt ? items.map((item,index) => index === first ? {...item,key,...(receipt.replacement && item.kind === "user" ? {text:receipt.prompt} : {})} : item) : items;
 }
