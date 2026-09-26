@@ -9,12 +9,22 @@
 //!
 //! Everything here compiles on every platform so the protocol logic is
 //! checked on Linux CI; only macOS on Apple Silicon reports `supported`.
+//!
+//! Shared model: when the `voiced` daemon (github.com/Th0rgal/murmure) is
+//! installed, Orb speaks the same protocol v1 over its Unix socket instead
+//! of spawning a private worker, so Orb, Murmure and any other client share
+//! one resident model. Default socket:
+//! `~/Library/Application Support/md.thomas.voice/voiced.sock`
+//! (`ORB_VOICE_SOCKET` overrides it; `off` disables). No socket → the
+//! private worker below, unchanged.
 
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -86,6 +96,8 @@ pub struct Capability {
     pub model_ready: bool,
     /// "off" (no worker), "warm" (model resident), "busy" (request in flight).
     pub worker: &'static str,
+    /// Connected to a shared engine, rather than an Orb-owned child.
+    pub shared: bool,
     pub languages: Vec<&'static str>,
     pub max_seconds: f64,
     pub idle_seconds: u64,
@@ -118,6 +130,8 @@ pub struct Paths {
     pub model_dir: PathBuf,
     pub runtime: PathBuf,
     pub log: PathBuf,
+    /// Shared `voiced` socket, tried before spawning a private worker.
+    pub socket: Option<PathBuf>,
 }
 
 impl Paths {
@@ -128,14 +142,21 @@ impl Paths {
                 .map(PathBuf::from)
         };
         let home_dir = env("HOME").unwrap_or_else(|| PathBuf::from("/"));
-        Self::from_env(
+        let socket = match std::env::var("ORB_VOICE_SOCKET") {
+            Ok(v) if v == "off" => None,
+            Ok(v) if !v.is_empty() => Some(PathBuf::from(v)),
+            _ => Some(home_dir.join("Library/Application Support/md.thomas.voice/voiced.sock")),
+        };
+        let mut paths = Self::from_env(
             home_dir,
             env("ORB_VOICE_HOME"),
             env("ORB_VOICE_PYTHON"),
             env("ORB_VOICE_MODEL_DIR"),
             env("HF_HUB_CACHE"),
             env("HF_HOME"),
-        )
+        );
+        paths.socket = socket;
+        paths
     }
 
     fn from_env(
@@ -162,9 +183,26 @@ impl Paths {
         Paths {
             runtime: home.join("runtime"),
             log: home.join("logs/worker.log"),
+            socket: None,
             home,
             python,
             model_dir,
+        }
+    }
+
+    /// The shared daemon's socket exists (launchd starts it on connect).
+    pub fn shared_ready(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            self.socket
+                .as_ref()
+                .and_then(|s| s.metadata().ok())
+                .is_some_and(|m| m.file_type().is_socket())
+        }
+        #[cfg(not(unix))]
+        {
+            false
         }
     }
 
@@ -258,10 +296,61 @@ pub fn validate_audio(bytes: &[u8]) -> Result<f64, VoiceError> {
 // ---------------------------------------------------------------------------
 // Worker process
 
+/// What a worker connection runs on: a private child process, or a
+/// connection to the shared `voiced` daemon.
+enum Handle {
+    Child(Child),
+    #[cfg(unix)]
+    Shared {
+        stream: UnixStream,
+        pid: Option<u32>,
+    },
+}
+
+impl Handle {
+    /// Unblock pending I/O. For a child: kill it. For the shared daemon:
+    /// close only this connection; the daemon and its model stay up for the
+    /// other clients, and a result still in flight is discarded.
+    fn kill(&mut self) {
+        match self {
+            Handle::Child(c) => {
+                let _ = c.kill();
+            }
+            #[cfg(unix)]
+            Handle::Shared { stream, .. } => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    fn reap(&mut self) {
+        self.kill();
+        if let Handle::Child(c) = self {
+            let _ = c.wait();
+        }
+    }
+
+    fn is_shared(&self) -> bool {
+        match self {
+            Self::Child(_) => false,
+            #[cfg(unix)]
+            Self::Shared { .. } => true,
+        }
+    }
+
+    fn id(&self) -> Option<u32> {
+        match self {
+            Handle::Child(c) => Some(c.id()),
+            #[cfg(unix)]
+            Handle::Shared { pid, .. } => *pid,
+        }
+    }
+}
+
 struct Worker {
-    child: Arc<Mutex<Child>>,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    child: Arc<Mutex<Handle>>,
+    stdin: Box<dyn Write + Send>,
+    stdout: BufReader<Box<dyn Read + Send>>,
     next_id: u64,
     loaded: bool,
 }
@@ -318,15 +407,67 @@ impl Worker {
                 )
             })?;
         let mut w = Worker::attach(child)?;
-        let hello = w.request(json!({"op": "hello"}), None, HELLO_TIMEOUT)?;
+        w.handshake(HELLO_TIMEOUT)?;
+        Ok(w)
+    }
+
+    fn handshake(&mut self, timeout: Duration) -> Result<Value, VoiceError> {
+        let hello = self.request(json!({"op": "hello"}), None, timeout)?;
         if hello.get("protocol").and_then(Value::as_u64) != Some(PROTOCOL_VERSION) {
-            w.kill();
+            self.kill();
             return Err(VoiceError::new(
                 "protocol",
                 "voice worker protocol mismatch",
             ));
         }
-        Ok(w)
+        Ok(hello)
+    }
+
+    /// Connect to the shared `voiced` daemon. `None` when it is not
+    /// installed or not answering, so the caller falls back to a private
+    /// worker.
+    #[cfg(unix)]
+    fn connect_shared(
+        paths: &Paths,
+        connected: impl FnOnce(&Arc<Mutex<Handle>>),
+    ) -> Option<Worker> {
+        let socket = paths.socket.as_ref().filter(|s| s.exists())?;
+        let stream = UnixStream::connect(socket).ok()?;
+        let reader = stream.try_clone().ok()?;
+        let writer = stream.try_clone().ok()?;
+        let mut w = Worker {
+            child: Arc::new(Mutex::new(Handle::Shared { stream, pid: None })),
+            stdin: Box::new(writer),
+            stdout: BufReader::new(Box::new(reader)),
+            next_id: 0,
+            loaded: false,
+        };
+        // Publish before hello so cancel can interrupt a queued handshake.
+        connected(&w.child);
+        // voiced serializes hello behind other clients' load/inference jobs.
+        let hello = w.handshake(LOAD_TIMEOUT).ok()?;
+        if hello.get("shared").and_then(Value::as_bool) != Some(true)
+            || hello.get("daemon").and_then(Value::as_str) != Some("voiced")
+            || hello.get("model_repo").and_then(Value::as_str) != Some(MODEL_REPO)
+            || hello.get("model_revision").and_then(Value::as_str) != Some(MODEL_REVISION)
+        {
+            return None;
+        }
+        w.loaded = hello
+            .get("loaded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if let (Some(pid), Ok(mut h)) = (hello.get("pid").and_then(Value::as_u64), w.child.lock()) {
+            if let Handle::Shared { pid: slot, .. } = &mut *h {
+                *slot = u32::try_from(pid).ok().filter(|pid| *pid > 0);
+            }
+        }
+        Some(w)
+    }
+
+    #[cfg(not(unix))]
+    fn connect_shared(_: &Paths, _: impl FnOnce(&Arc<Mutex<Handle>>)) -> Option<Worker> {
+        None
     }
 
     /// Wrap an already-spawned child whose stdin/stdout are piped.
@@ -340,9 +481,9 @@ impl Worker {
             .take()
             .ok_or_else(|| VoiceError::new("io", "no stdout"))?;
         Ok(Worker {
-            child: Arc::new(Mutex::new(child)),
-            stdin,
-            stdout: BufReader::new(stdout),
+            child: Arc::new(Mutex::new(Handle::Child(child))),
+            stdin: Box::new(stdin),
+            stdout: BufReader::new(Box::new(stdout)),
             next_id: 0,
             loaded: false,
         })
@@ -415,8 +556,7 @@ impl Worker {
 
     fn kill(&mut self) {
         if let Ok(mut c) = self.child.lock() {
-            let _ = c.kill();
-            let _ = c.wait();
+            c.reap();
         }
     }
 }
@@ -436,7 +576,7 @@ struct Watchdog {
 }
 
 impl Watchdog {
-    fn arm(child: Arc<Mutex<Child>>, timeout: Duration) -> Watchdog {
+    fn arm(child: Arc<Mutex<Handle>>, timeout: Duration) -> Watchdog {
         let done = Arc::new(AtomicBool::new(false));
         let fired = Arc::new(AtomicBool::new(false));
         {
@@ -448,7 +588,7 @@ impl Watchdog {
                     if Instant::now() >= deadline {
                         fired.store(true, Ordering::Release);
                         if let Ok(mut c) = child.lock() {
-                            let _ = c.kill();
+                            c.kill();
                         }
                         break;
                     }
@@ -481,8 +621,9 @@ pub struct Shared {
     /// Serializes every worker interaction, hence inference.
     worker: Mutex<Option<Worker>>,
     /// Handle to the live child for cancel while `worker` is locked by a request.
-    child: Mutex<Option<Arc<Mutex<Child>>>>,
+    child: Mutex<Option<Arc<Mutex<Handle>>>>,
     busy: AtomicBool,
+    cancelled: AtomicBool,
     loaded: AtomicBool,
     last_used: Mutex<Instant>,
 }
@@ -505,7 +646,16 @@ impl VoiceState {
             .as_ref()?
             .try_lock()
             .ok()
-            .map(|c| c.id())
+            .and_then(|c| c.id())
+    }
+
+    pub fn worker_shared(&self) -> bool {
+        self.0
+            .child
+            .try_lock()
+            .ok()
+            .and_then(|handle| handle.as_ref()?.try_lock().ok().map(|h| h.is_shared()))
+            .unwrap_or(false)
     }
 
     pub fn new() -> Self {
@@ -524,6 +674,7 @@ impl VoiceState {
             worker: Mutex::new(None),
             child: Mutex::new(None),
             busy: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
             loaded: AtomicBool::new(false),
             last_used: Mutex::new(Instant::now()),
         }))
@@ -579,12 +730,18 @@ impl Shared {
             platform: std::env::consts::OS,
             arch: std::env::consts::ARCH,
             python: self.paths.python.display().to_string(),
-            python_ready: self.paths.python_ready(),
+            python_ready: self.paths.python_ready() || self.paths.shared_ready(),
             model_repo: MODEL_REPO,
             model_revision: MODEL_REVISION,
             model_dir: self.paths.model_dir.display().to_string(),
-            model_ready: self.paths.model_ready(),
+            model_ready: self.paths.model_ready() || self.paths.shared_ready(),
             worker,
+            shared: self
+                .child
+                .try_lock()
+                .ok()
+                .and_then(|c| c.as_ref()?.try_lock().ok().map(|h| h.is_shared()))
+                .unwrap_or(false),
             languages: SUPPORTED_LANGUAGES.to_vec(),
             max_seconds: MAX_SECONDS,
             idle_seconds: self.idle.as_secs(),
@@ -619,8 +776,28 @@ impl Shared {
 
     fn ensure<'a>(&self, slot: &'a mut Option<Worker>) -> Result<&'a mut Worker, VoiceError> {
         if slot.is_none() {
-            self.preflight()?;
-            let w = Worker::spawn(&self.paths)?;
+            let w = match Worker::connect_shared(&self.paths, |handle| {
+                if let Ok(mut child) = self.child.lock() {
+                    *child = Some(handle.clone());
+                }
+                if self.cancelled.load(Ordering::Acquire) {
+                    if let Ok(mut handle) = handle.lock() {
+                        handle.kill();
+                    }
+                }
+            }) {
+                Some(w) => w,
+                None => {
+                    if self.cancelled.load(Ordering::Acquire) {
+                        return Err(VoiceError::new("cancelled", "Voice request cancelled"));
+                    }
+                    if let Ok(mut child) = self.child.lock() {
+                        *child = None;
+                    }
+                    self.preflight()?;
+                    Worker::spawn(&self.paths)?
+                }
+            };
             if let Ok(mut c) = self.child.lock() {
                 *c = Some(w.child.clone());
             }
@@ -645,6 +822,7 @@ impl Shared {
             .worker
             .lock()
             .map_err(|_| VoiceError::new("internal", "voice state poisoned"))?;
+        self.cancelled.store(false, Ordering::Release);
         self.busy.store(true, Ordering::Release);
         self.touch();
         let result = self.ensure(&mut slot).and_then(|w| {
@@ -711,16 +889,17 @@ impl Shared {
         })
     }
 
-    /// Abort an in-flight request by killing the worker. The blocked request
-    /// fails with `worker_exited`, and the next use starts a fresh worker.
+    /// Abort this client's I/O. A private worker is killed; a shared daemon
+    /// only loses this connection. The next request reconnects.
     pub fn cancel(&self) -> bool {
         if !self.busy.load(Ordering::Acquire) {
             return false;
         }
+        self.cancelled.store(true, Ordering::Release);
         if let Ok(c) = self.child.lock() {
             if let Some(child) = c.as_ref() {
                 if let Ok(mut child) = child.lock() {
-                    let _ = child.kill();
+                    child.kill();
                     return true;
                 }
             }
@@ -728,7 +907,7 @@ impl Shared {
         false
     }
 
-    /// Stop the worker (if idle) to give its memory back.
+    /// Release an idle worker. Shared engine residency belongs to voiced.
     pub fn release(&self) -> bool {
         if let Ok(mut slot) = self.worker.try_lock() {
             let had = slot.take().is_some();
@@ -1062,6 +1241,224 @@ mod tests {
             .request(json!({"op": "again"}), None, Duration::from_secs(5))
             .unwrap();
         assert_eq!(r["echo"], "again");
+    }
+
+    /// With a `voiced` socket present, requests go to the shared daemon: no
+    /// Python, venv or model is needed on Orb's side, the daemon pid is
+    /// reported for metrics, and releasing only drops the connection.
+    #[cfg(unix)]
+    #[test]
+    fn shared_daemon_is_preferred_over_a_private_worker() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("orb-voiced-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("voiced.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            let mut ops = Vec::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return ops;
+                }
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let n = req["audio_bytes"].as_u64().unwrap_or(0) as usize;
+                let mut body = vec![0u8; n];
+                reader.read_exact(&mut body).unwrap();
+                let op = req["op"].as_str().unwrap().to_string();
+                let result = match op.as_str() {
+                    "hello" => {
+                        json!({"protocol": 1, "shared": true, "daemon": "voiced", "model_repo": MODEL_REPO, "model_revision": MODEL_REVISION, "pid": 4242, "loaded": true})
+                    }
+                    "transcribe" => {
+                        json!({"text": "shared", "duration_secs": wav_duration(&body).unwrap()})
+                    }
+                    _ => json!({}),
+                };
+                ops.push(op);
+                let resp = json!({"id": req["id"], "ok": true, "result": result});
+                writeln!(writer, "{resp}").unwrap();
+            }
+        });
+        let mut paths = Paths::from_env(
+            dir.clone(),
+            Some(dir.clone()),
+            Some(dir.join("no-python")),
+            Some(dir.join("no-model")),
+            None,
+            None,
+        );
+        paths.socket = Some(sock);
+        assert!(!paths.python_ready());
+        let state = VoiceState::with_paths(paths, DEFAULT_IDLE);
+        let cap = state.0.capability();
+        assert!(cap.python_ready && cap.model_ready);
+        let t = state
+            .0
+            .transcribe(wav(16000, 1, 16, 32000, 1), "fr")
+            .unwrap();
+        assert_eq!(t.text, "shared");
+        assert_eq!(state.worker_pid(), Some(4242));
+        assert!(state.worker_shared());
+        assert!(state.0.capability().shared);
+        assert!(state.0.release());
+        assert_eq!(server.join().unwrap(), vec!["hello", "transcribe"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_shared_hello_disconnects_without_spawning_or_killing_daemon() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::Builder::new()
+            .prefix("voice-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = dir.path().join("v.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            for round in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(req["op"], "hello");
+                if round == 0 {
+                    ready_tx.send(()).unwrap();
+                    line.clear();
+                    assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+                } else {
+                    writeln!(stream, "{}", json!({"id":req["id"],"ok":true,"result":{"protocol":1,"shared":true,"daemon":"voiced","model_repo":MODEL_REPO,"model_revision":MODEL_REVISION,"pid":4242,"loaded":true}})).unwrap();
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    let req: Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(req["op"], "load");
+                    writeln!(
+                        stream,
+                        "{}",
+                        json!({"id":req["id"],"ok":true,"result":{"loaded":true}})
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        let mut paths = Paths::from_env(
+            dir.path().into(),
+            Some(dir.path().into()),
+            Some(dir.path().join("missing")),
+            None,
+            None,
+            None,
+        );
+        paths.socket = Some(socket);
+        let state = VoiceState::with_paths(paths, DEFAULT_IDLE);
+        let copy = state.clone();
+        let request = thread::spawn(move || copy.0.prewarm());
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(state.0.cancel());
+        assert!(request.join().unwrap().is_err());
+        state.0.prewarm().unwrap();
+        assert_eq!(state.worker_pid(), Some(4242));
+        state.0.release();
+        server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_shared_socket_falls_back_to_private_preflight() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::Builder::new()
+            .prefix("voice-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = dir.path().join("v.sock");
+        drop(UnixListener::bind(&socket).unwrap());
+        let mut paths = Paths::from_env(
+            dir.path().into(),
+            Some(dir.path().into()),
+            Some(dir.path().join("missing")),
+            None,
+            None,
+            None,
+        );
+        paths.socket = Some(socket);
+        let state = VoiceState::with_paths(paths, DEFAULT_IDLE);
+        let error = state.0.prewarm().unwrap_err();
+        assert!(matches!(
+            error.code.as_str(),
+            "python_missing" | "unsupported"
+        ));
+        assert!(state.worker_pid().is_none());
+    }
+
+    /// Opt-in smoke test through Orb's Rust client against installed voiced.
+    /// Supply a 16 kHz mono PCM WAV via ORB_VOICE_TEST_WAV. Never installs,
+    /// starts, stops, or changes the daemon/venv itself.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn installed_voiced_transcribe_cancel_reconnect() {
+        let state = VoiceState::with_paths(Paths::discover(), DEFAULT_IDLE);
+        assert!(state.0.paths.shared_ready());
+        state.0.prewarm().unwrap();
+        assert!(state.worker_shared());
+        let pid = state.worker_pid();
+        let wav =
+            std::fs::read(std::env::var("ORB_VOICE_TEST_WAV").expect("supply test WAV")).unwrap();
+        let first = state.0.transcribe(wav.clone(), "en").unwrap();
+        assert!(!first.text.trim().is_empty());
+        let copy = state.clone();
+        let audio = wav.clone();
+        let request = thread::spawn(move || copy.0.transcribe(audio, "en"));
+        let start = Instant::now();
+        while !state.0.busy.load(Ordering::Acquire) && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Allow this test clip to enter inference before closing the socket.
+        thread::sleep(Duration::from_millis(100));
+        assert!(state.0.cancel());
+        assert!(request.join().unwrap().is_err());
+        assert!(!state
+            .0
+            .transcribe(wav, "en")
+            .unwrap()
+            .text
+            .trim()
+            .is_empty());
+        assert!(state.worker_shared());
+        assert_eq!(state.worker_pid(), pid);
+        state.0.release();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn installed_private_worker_fallback() {
+        let mut paths = Paths::discover();
+        assert!(paths.socket.is_none(), "run with ORB_VOICE_SOCKET=off");
+        paths.socket = None;
+        let state = VoiceState::with_paths(paths, DEFAULT_IDLE);
+        let wav =
+            std::fs::read(std::env::var("ORB_VOICE_TEST_WAV").expect("supply test WAV")).unwrap();
+        assert!(!state
+            .0
+            .transcribe(wav, "en")
+            .unwrap()
+            .text
+            .trim()
+            .is_empty());
+        assert!(!state.worker_shared());
+        assert!(state.worker_pid().is_some());
+        state.0.release();
     }
 
     /// Drive the real worker.py through the Rust side with the stub backend.

@@ -57,7 +57,11 @@ pub fn start(voice: crate::voice::VoiceState) {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         std::thread::spawn(move || loop {
-            if let Ok(snapshot) = collect(voice.worker_pid(), crate::local_agents::active_pids()) {
+            if let Ok(snapshot) = collect(
+                voice.worker_pid(),
+                voice.worker_shared(),
+                crate::local_agents::active_pids(),
+            ) {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -93,7 +97,11 @@ pub fn local_machine_metrics() -> Result<CachedSnapshot, String> {
         .ok_or_else(|| "Local metrics are warming up".to_string())
 }
 
-fn collect(voice_pid: Option<u32>, agents: Vec<u32>) -> Result<Snapshot, String> {
+fn collect(
+    voice_pid: Option<u32>,
+    voice_shared: bool,
+    agents: Vec<u32>,
+) -> Result<Snapshot, String> {
     static SYSTEM: OnceLock<Mutex<(System, bool)>> = OnceLock::new();
     let mut state = SYSTEM
         .get_or_init(|| Mutex::new((System::new(), false)))
@@ -122,7 +130,11 @@ fn collect(voice_pid: Option<u32>, agents: Vec<u32>) -> Result<Snapshot, String>
             processes: 0,
         },
         Consumer {
-            label: "Cohere · speech to text",
+            label: if voice_shared {
+                "Cohere · shared speech engine"
+            } else {
+                "Cohere · speech to text"
+            },
             memory: 0,
             processes: 0,
         },
@@ -177,7 +189,7 @@ mod tests {
     use super::*;
     #[test]
     fn native_collector_reads_host_resources() {
-        let sample = collect(None, Vec::new()).expect("native system collector");
+        let sample = collect(None, false, Vec::new()).expect("native system collector");
         assert!(sample.memory_total > 0);
         assert!(sample.memory_used <= sample.memory_total);
         if let Some(gpu) = sample.gpu_percent {

@@ -139,3 +139,39 @@ utterance 2.32 s / warm 0.35 s, peak MLX memory 0.95 GB.
       and records (entitlement + usage description in the bundle).
 - [ ] Confirm `navigator.mediaDevices` exists under the packaged `tauri://`
       origin (WKWebView treats it as secure; wry grants the capture request).
+
+### Optional shared engine (`voiced`)
+
+When `~/Library/Application Support/md.thomas.voice/voiced.sock` is present,
+Orb first connects to `voiced` using the unchanged protocol v1. It checks the
+protocol, daemon identity, and pinned model repo/revision before using it.
+`ORB_VOICE_SOCKET` overrides the path; `ORB_VOICE_SOCKET=off` forces the private
+worker. An absent, stale, or incompatible daemon falls back to Orb's existing
+runtime. Orb does not install or manage voiced and does not require Murmure.
+
+The shared handshake permits 240 seconds because it can queue behind another
+client's model load. Existing load (240 s) and transcription (90 s when warm)
+timeouts are unchanged. Cancellation, errors, and idle release close only Orb's
+connection; they never signal the daemon PID. A cancelled shared handshake does
+not fall back to starting a private worker. Subsequent requests reconnect.
+
+Capabilities report `shared: true` while connected. Machine metrics label the
+resident daemon as **Cohere · shared speech engine**, separate from Orb's native
+process tree. This reports the full daemon residency, not an allocation to Orb.
+The daemon controls model unloading, so Orb's warm state is its last observation.
+
+The worker, quantization patch, protocol, model pin, and venv location are
+unchanged. Do not recreate the shared venv while voiced uses it. Installation
+and daemon lifecycle remain in Murmure's `scripts/install-voiced.sh`.
+
+Opt-in native smoke tests (16 kHz mono PCM WAV containing speech):
+
+```sh
+cd orb/src-tauri
+ORB_VOICE_TEST_WAV=/path/to/speech.wav cargo test voice::tests::installed_voiced_transcribe_cancel_reconnect -- --ignored --exact
+ORB_VOICE_SOCKET=off ORB_VOICE_TEST_WAV=/path/to/speech.wav cargo test voice::tests::installed_private_worker_fallback -- --ignored --exact
+```
+
+The first connects to the installed daemon and checks transcription, cancel,
+reconnection and stable daemon PID. The second explicitly starts and releases
+Orb's private worker. Neither test installs or kills voiced.
