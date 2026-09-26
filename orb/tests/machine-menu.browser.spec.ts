@@ -126,7 +126,7 @@ test("machine picker at 375px: wraps inside the viewport with no overlap", async
  test("administration is explicit and never restored as the default machine", async ({page}) => {
  await setup(page);
  await page.getByRole("button", {name:/Core \(agent-core\)/}).click();
- await page.getByRole("button", {name:/DGX Spark · Administration/}).click();
+ await page.getByRole("button", {name:/DGX Spark · Admin Manual/}).click();
  await expect(page.locator(".na-drop-btn").filter({hasText:"DGX Spark · Administration"})).toBeVisible();
  expect(await page.evaluate(()=>localStorage.getItem("orb.machine"))).toBe("core");
  await page.reload();

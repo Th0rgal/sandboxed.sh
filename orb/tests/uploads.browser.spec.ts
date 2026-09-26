@@ -10,12 +10,12 @@ test("file picker transfers binary bytes, then relocates the reference when the 
  await page.getByTitle("Add context").click();
  await expect(page.getByText("Upload file or image…")).toBeVisible();
  const chooserPromise=page.waitForEvent("filechooser"); await page.getByText("Upload file or image…").click();
- await (await chooserPromise).setFiles({name:"photo one.png",mimeType:"image/png",buffer:Buffer.from([0,255,1,2])});
- await expect(page.getByPlaceholder("Describe a task")).toHaveValue('@"/core/uploads/photo one.png" ');
+ await (await chooserPromise).setFiles({name:"sample one.bin",mimeType:"application/octet-stream",buffer:Buffer.from([0,255,1,2])});
+ await expect(page.getByPlaceholder("Describe a task")).toHaveValue('@"/core/uploads/sample one.bin" ');
  expect(requests[0].data_base64).toBe("AP8BAg==");
  await page.screenshot({path:"/tmp/orb-upload-composer.png"});
  await page.getByLabel("Machine").selectOption("ashur");
  await page.getByTitle("Send",{exact:true}).click();
- await expect(page.getByLabel("Sent prompt")).toHaveText('@"/ashur/uploads/photo one.png"');
+ await expect(page.getByLabel("Sent prompt")).toHaveText('@"/ashur/uploads/sample one.bin"');
  expect(requests.map(r=>r.node_id)).toEqual(["core","ashur"]);
 });

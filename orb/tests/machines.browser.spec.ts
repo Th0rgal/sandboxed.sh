@@ -48,7 +48,7 @@ test("collapsed providers show right-aligned used percentages and local monochro
   await page.route("**/api/**", route => {
     const path = new URL(route.request().url()).pathname;
     const json = path === "/api/ai/providers" ? [{ id: "anthropic", name: "Anthropic", provider_type: "anthropic", uses_oauth: true, status: { type: "connected" }, account_email: "example@example.com" }]
-      : path === "/api/ai/providers/usage" ? { entries: { anthropic: { unified_5h_utilization: 0, unified_7d_utilization: 0.63 } } }
+      : path === "/api/ai/providers/usage" ? { entries: { anthropic: { provider_type: "anthropic", unified_5h_utilization: 0, unified_7d_utilization: 0.63 } } }
       : path === "/api/projects" ? { projects: [] }
       : path === "/api/remote-nodes" ? { nodes: [] }
       : path === "/api/backends" || path === "/api/control/missions" ? [] : {};

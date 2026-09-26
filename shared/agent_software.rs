@@ -655,7 +655,7 @@ fn install(job: &UpdateJob) -> Result<(), String> {
     let path = Path::new(&job.path);
     if let Some(installer) = &job.installer {
         if owner(path) != *installer
-            || std::fs::read_link(path).map_err(io)? != PathBuf::from(&job.previous_target)
+            || std::fs::read_link(path).map_err(io)? != Path::new(&job.previous_target)
         {
             return Err(
                 "Installation changed since this update was queued. Refresh and retry.".into(),
@@ -678,7 +678,7 @@ fn install(job: &UpdateJob) -> Result<(), String> {
         }
         return Ok(());
     }
-    if std::fs::read_link(path).map_err(io)? != PathBuf::from(&job.previous_target)
+    if std::fs::read_link(path).map_err(io)? != Path::new(&job.previous_target)
         || !codex_launcher(path)
     {
         return Err("Executable changed since this update was queued. Refresh and retry.".into());
@@ -711,7 +711,7 @@ fn install(job: &UpdateJob) -> Result<(), String> {
     if !help.contains("app-server") {
         return Err("Codex app-server protocol check failed".into());
     }
-    if std::fs::read_link(path).map_err(io)? != PathBuf::from(&job.previous_target) {
+    if std::fs::read_link(path).map_err(io)? != Path::new(&job.previous_target) {
         return Err("Executable changed during staging; activation cancelled".into());
     }
     switch_link(path, &next)?;

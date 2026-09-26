@@ -108,14 +108,14 @@ test("right-click an agent row: Copy mission ID copies the raw UUID and changes 
   const menu = page.getByRole("menu");
   await expect(menu).toBeVisible();
   // Identity actions only — no project/file creation leaking onto an agent row.
-  await expect(menu.getByRole("menuitem")).toHaveText([/^Fork conversation/, "Move", "Rename", "Copy mission ID"]);
+  await expect(menu.getByRole("menuitem")).toHaveText(["Delete agent…", /^Fork conversation/, "Move", "Rename", "Copy mission ID"]);
 
   await menu.getByRole("menuitem", { name: "Copy mission ID" }).click();
   expect(await copied(page)).toEqual([MISSION_ID]);
   await expect(menu).not.toBeVisible();
 
-  // The right-click must not open or select the agent.
-  await expect(row).not.toHaveClass(/active/);
+  // Context selection highlights the row without opening its conversation.
+  await expect(row).toHaveClass(/active/);
   await expect(page.locator(".tb-title")).toHaveText("New Agent");
   await expect(page.getByPlaceholder("Describe a task, / for commands, @ for context")).toBeVisible();
 });
@@ -132,7 +132,8 @@ test("finished agent rows offer the same copy, and it is never an execution id",
   expect(values).toEqual([DONE_ID]);
   expect(values[0]).not.toContain("m:");
   expect(values[0]).not.toBe("job_9f81c0aa");
-  await expect(done).not.toHaveClass(/active/);
+  await expect(done).toHaveClass(/active/);
+  await expect(page.locator(".tb-title")).toHaveText("New Agent");
 });
 
 test("a refused clipboard write is reported, not swallowed", async ({ page }) => {
@@ -280,7 +281,7 @@ test("composer effort: absent for a harness the core ignores effort for, and res
   // control disappears rather than offering a level that would be dropped.
   await picks.nth(0).click();
   await page.locator(".picks .menu").getByRole("button", { name: "OpenCode" }).click();
-  await expect(page.locator(".picks .model")).toHaveText(["OpenCode", "Grok 4.6"]);
+  await expect(page.locator(".picks .model")).toHaveText(["OpenCode", "Smart (Default)"]);
 
   // Returning to Codex does not resurrect the dropped level.
   await page.locator(".picks .model").nth(0).click();

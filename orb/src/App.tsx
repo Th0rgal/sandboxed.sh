@@ -575,9 +575,11 @@ export function Composer(p: {
       if (!accepted && draftScope === p.scope) {
         uploaded = originalUploads;
         setMode(originalMode);setText(original);setImages(sentImages);
-        ta.value=original;resize();if(ta.isConnected)ta.focus();
+        ta.value=original;resize();
       }
       setPendingSend(null);p.onPending?.(null);setSending(false);
+      // The launch preview hides the composer. Restore visibility before focus.
+      if (!accepted && draftScope === p.scope && ta.isConnected) ta.focus();
     }
   };
   const insertDictation = (t: string) => {

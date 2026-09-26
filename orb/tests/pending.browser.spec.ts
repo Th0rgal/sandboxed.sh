@@ -58,8 +58,8 @@ test("a running mission shows a compact startup status below the optimistic prom
   await expect(page.locator(".user")).toContainText("What's the status of Pareto audit?");
   const status = page.locator(".agent-wait-status");
   await expect(status).toBeVisible();
-  await expect(status).toContainText(/^Starting on .+/);
-  const destination = (await status.textContent())!.replace(/^Starting on /, "").replace(/…$/, "");
+  await expect(status).toContainText(/^Working on .+/);
+  const destination = (await status.textContent())!.replace(/^Working on /, "").replace(/…$/, "");
   await expect(page.locator(".under-loc")).toContainText(destination);
   await page.locator(".main").screenshot({ path: "artifacts/orb-pending-quiet.png" });
 });
@@ -92,15 +92,16 @@ test("reduced motion keeps the state visible without moving anything", async ({ 
   const turn = page.locator(".user.pending");
   await expect(turn).toHaveCount(1);
   expect(await turn.evaluate((el) => getComputedStyle(el).animationName)).toBe("none");
-  // Still distinguishable from a settled turn.
-  expect(Number(await turn.evaluate((el) => getComputedStyle(el).opacity))).toBeLessThan(1);
+  // The status carries progress without dimming or animating the user message.
+  await expect(page.locator(".agent-wait-status")).toContainText("Working on");
+  expect(Number(await turn.evaluate((el) => getComputedStyle(el).opacity))).toBe(1);
 });
 
 test("states the user must act on still show a compact banner", async ({ page }) => {
   await setup(page, { status: "awaiting_user", events: [evUser] });
   const banner = page.locator(".launch-status");
   await expect(banner).toHaveCount(1);
-  await expect(banner).toContainText("Waiting for input");
+  await expect(banner).toContainText("Ready for a follow-up");
   await expect(page.locator(".user.pending")).toHaveCount(0);
 });
 
