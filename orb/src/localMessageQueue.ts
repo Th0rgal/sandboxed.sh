@@ -1,5 +1,5 @@
 import {createSignal,batch} from 'solid-js';
-import {connectionVersion,getMission,appendClientTranscript,setClientMissionStatus} from './api';
+import {connectionVersion,getMission,reopenMission,appendClientTranscript,setClientMissionStatus} from './api';
 import type {ClientRunReceipt} from './clientRuns';
 import {readSideThread,saveSideThread} from './composerDrafts';
 import {sideQuestionKey} from './sideQuestionStorage';
@@ -121,11 +121,20 @@ export function startLocalQueueWorker(){
      const claimed=await locked(key,async()=>{const current=await read(key);const first=current.find(r=>r.mission===row.mission);if(first?.id!==row.id||first.state!=='queued'||!valid()||stopping.has(runKey))return false;first.state='dispatching';first.claimedAt=Date.now();await write(key,current);return true;});
      if(!claimed)continue;
      row.state='dispatching';
+     // Sending a saved follow-up explicitly reopens an archived conversation.
+     // Do this after claiming it so another window cannot dispatch the same draft.
+     if(mission.status==='acknowledged'){
+      try{await reopenMission(row.mission);}catch(error){
+       await update(key,row.id,stored=>{stored.state='error';stored.error=String(error);});
+       continue;
+      }
+      if(!valid())return;
+     }
      const receipt=await startLocal({...row.request,sessionId:localBinding(row.mission)?.sessionId});
      row.state='accepted';row.receipt=receipt;
      await update(key,row.id,stored=>{stored.state='accepted';stored.receipt=receipt;delete stored.error;});
      follow(row);
-    }catch(error){if(valid())await update(key,row.id,stored=>{if(stored.state==='queued')stored.state='error';stored.error=stored.state==='dispatching'?`Launch outcome uncertain. Retry will check that the previous run stopped. ${String(error)}`:String(error);});}
+    }catch(error){if(valid())await update(key,row.id,stored=>{if(stored.state==='queued'||/^Local launch rejected:/.test(error instanceof Error?error.message:String(error)))stored.state='error';stored.error=stored.state==='dispatching'?`Launch outcome uncertain. Retry will check that the previous run stopped. ${String(error)}`:String(error);});}
    }
   }catch{/* Durable entries stay available for the next attempt. */}
   finally{busy=false;if(again&&valid()){again=false;queueMicrotask(()=>void tick());}}

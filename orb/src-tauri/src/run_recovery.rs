@@ -169,6 +169,11 @@ pub async fn local_run_launch(
     let status = response.status();
     let body = response.text().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
+        // A client-run conflict is a definitive refusal before native spawn.
+        // Transport/server failures remain uncertain and require recovery.
+        if status.as_u16() == 409 {
+            return Err(format!("Local launch rejected: {status}: {body}"));
+        }
         return Err(format!("{status}: {body}"));
     }
     let receipt: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
@@ -269,6 +274,36 @@ mod protocol_tests {
             },
             handle,
         )
+    }
+    #[test]
+    fn rejected_launch_does_not_spawn_and_is_safe_to_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let (connection, server) = server(vec![
+            (409, "No active run on this computer".into()),
+            (
+                409,
+                format!("acknowledged mission {id} cannot acquire a non-terminal run"),
+            ),
+        ]);
+        let request = local_agents::StartRequest {
+            id: id.clone(),
+            harness: "grok".into(),
+            bin: "/must-not-start".into(),
+            cwd: root.path().to_str().unwrap().into(),
+            prompt: "follow-up".into(),
+            session_id: None,
+            model: None,
+            image_paths: vec![],
+        };
+        let error =
+            tauri::async_runtime::block_on(local_run_launch(request, connection)).unwrap_err();
+        assert!(error.starts_with("Local launch rejected: 409"));
+        assert!(stopped(&id).unwrap());
+        assert!(lock(&id).is_ok());
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["op"], "begin");
     }
     #[test]
     fn recovery_closes_only_the_inspected_generation() {
