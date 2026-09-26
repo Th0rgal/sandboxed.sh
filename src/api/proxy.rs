@@ -214,7 +214,7 @@ static KIMI_CONCURRENCY: std::sync::LazyLock<tokio::sync::Semaphore> =
 ///
 /// Returns `None` for providers that don't have an OpenAI-compatible API
 /// (e.g., Google Gemini uses a different format).
-fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
+pub(crate) fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
     match provider_type {
         ProviderType::OpenAI => Some("https://api.openai.com/v1"),
         ProviderType::Xai => Some("https://api.x.ai/v1"),
@@ -293,26 +293,21 @@ fn native_protocol_supported(
     match protocol {
         NativeProtocol::Responses => match provider_type {
             ProviderType::Muse => has_api_key,
-            // OAuth-only OpenAI (Codex) and xAI (Grok Build) accounts route
-            // native Responses through the local CLI proxy, which owns the
-            // credential. The CLI-proxy route is stateless: it does not honor
-            // `previous_response_id`, so continuity there is items-replay only.
-            ProviderType::OpenAI => {
-                has_api_key
-                    || (has_oauth && crate::api::ai_providers::openai_cli_proxy_account_available())
-            }
+            // OAuth Responses use the configured credential owner: core or
+            // CLIProxyAPI for Codex, CLIProxyAPI for Grok Build. These
+            // subscription routes require client-side input replay.
+            ProviderType::OpenAI => has_api_key || has_oauth,
             ProviderType::Xai => {
                 has_api_key
                     || (has_oauth && crate::api::ai_providers::xai_cli_proxy_account_available())
             }
             _ => false,
         },
-        // Direct API keys hit api.anthropic.com. OAuth (subscription) accounts
-        // route native Messages through the local CLI proxy, which owns the
-        // Claude credential and preserves signed thinking blocks on replay.
+        // The resolver supplies a direct API key or core-owned OAuth token.
+        // OAuth-only entries use CLIProxyAPI when it owns the credential.
         NativeProtocol::AnthropicMessages => {
             provider_type == ProviderType::Anthropic
-                && ((has_api_key && !has_oauth)
+                && (has_api_key
                     || (has_oauth
                         && crate::api::ai_providers::anthropic_cli_proxy_account_available()))
         }
@@ -993,6 +988,23 @@ fn parse_direct_model_entry(model: &str) -> Option<crate::provider_health::Chain
     })
 }
 
+/// Native Claude Code sends bare Anthropic model IDs. Configured chains are
+/// resolved first; this fallback preserves the exact requested model.
+fn parse_native_model_entry(
+    model: &str,
+    protocol: NativeProtocol,
+) -> Option<crate::provider_health::ChainEntry> {
+    parse_direct_model_entry(model).or_else(|| {
+        (protocol == NativeProtocol::AnthropicMessages
+            && model.starts_with("claude-")
+            && !model.contains('/'))
+        .then(|| crate::provider_health::ChainEntry {
+            provider_id: "anthropic".into(),
+            model_id: model.into(),
+        })
+    })
+}
+
 /// Parse a direct `provider/model` id whose prefix is a **custom** provider
 /// referenced by its sanitized name (e.g. `spark/step3p7-flash-148b`) — the id
 /// the catalog and model-routing UI expose for self-hosted OpenAI-compatible
@@ -1185,6 +1197,7 @@ async fn native_protocol_proxy(
     };
     let requested_model = req.model;
     let is_stream = req.stream.unwrap_or(false);
+    super::ai_providers::reconcile_openai_store_from_codex_homes(&state.ai_providers).await;
     let standard_accounts = super::ai_providers::read_standard_accounts(&state.config.working_dir);
     let exact_chain_exists = state.chain_store.get(&requested_model).await.is_some();
     let resolved_chain_id = if exact_chain_exists {
@@ -1210,7 +1223,7 @@ async fn native_protocol_proxy(
             )
             .await;
         (id, configured, resolved)
-    } else if let Some(direct) = parse_direct_model_entry(&requested_model)
+    } else if let Some(direct) = parse_native_model_entry(&requested_model, protocol)
         .or(parse_kimi_bare_model_entry(&requested_model))
         .or(parse_custom_direct_model_entry(&state, &requested_model).await)
     {
@@ -1281,20 +1294,72 @@ async fn native_protocol_proxy(
         // `previous_response_id`, so reject stateful continuation instead of
         // pretending it was honored. Messages continuity is client-side block
         // replay, which the CLI proxy preserves.
-        let via_cli_proxy = match protocol {
-            NativeProtocol::Responses => {
-                matches!(provider_type, ProviderType::OpenAI | ProviderType::Xai)
-                    && entry
-                        .api_key
-                        .as_deref()
-                        .filter(|v| !v.trim().is_empty())
-                        .is_none()
+        // Core-owned Codex accounts already use the shared refresh lock for
+        // local app-server launches. Remote clients use the same owner through
+        // this proxy; never copy rotating ChatGPT credentials onto leaf nodes.
+        let direct_codex = matches!(protocol, NativeProtocol::Responses)
+            && provider_type == ProviderType::OpenAI
+            && entry.has_oauth
+            && entry
+                .api_key
+                .as_deref()
+                .filter(|key| !key.trim().is_empty())
+                .is_none()
+            && !super::oauth_owner::cli_proxy_owns(ProviderType::OpenAI);
+        let mut codex_account_id = None;
+        let via_cli_proxy = !direct_codex
+            && match protocol {
+                NativeProtocol::Responses => {
+                    matches!(provider_type, ProviderType::OpenAI | ProviderType::Xai)
+                        && entry
+                            .api_key
+                            .as_deref()
+                            .filter(|v| !v.trim().is_empty())
+                            .is_none()
+                }
+                NativeProtocol::AnthropicMessages => {
+                    provider_type == ProviderType::Anthropic
+                        && entry.has_oauth
+                        && entry
+                            .api_key
+                            .as_deref()
+                            .filter(|v| !v.trim().is_empty())
+                            .is_none()
+                }
+            };
+        let (url, credential) = if direct_codex {
+            if !is_stream || body_has_previous_response_id(&body) {
+                return error_response(StatusCode::BAD_REQUEST,
+                    "Core-owned Codex OAuth requires stream=true and replayed input; previous_response_id is unsupported".to_string(), "unsupported_parameter");
             }
-            NativeProtocol::AnthropicMessages => {
-                provider_type == ProviderType::Anthropic && entry.has_oauth
-            }
-        };
-        let (url, credential) = if via_cli_proxy {
+            let Some(account) =
+                super::ai_providers::get_all_openai_oauth_accounts(&state.config.working_dir)
+                    .into_iter()
+                    .find(|account| account.provider_id == entry.account_id)
+            else {
+                continue;
+            };
+            let account = match super::ai_providers::prepare_codex_oauth_account_for_launch(
+                &state.config.working_dir,
+                &account,
+            )
+            .await
+            {
+                Ok(account) => account,
+                Err(_) => {
+                    state
+                        .health_tracker
+                        .record_entry_failure(entry, CooldownReason::AuthError, None)
+                        .await;
+                    continue;
+                }
+            };
+            codex_account_id = Some(account.chatgpt_account_id);
+            (
+                "https://chatgpt.com/backend-api/codex/responses".to_string(),
+                account.access_token,
+            )
+        } else if via_cli_proxy {
             if matches!(protocol, NativeProtocol::Responses) && body_has_previous_response_id(&body)
             {
                 return error_response(
@@ -1331,7 +1396,7 @@ async fn native_protocol_proxy(
         } else {
             entry.model_id.as_str()
         };
-        let upstream_body = match rewrite_model(&body, rewrite_model_id) {
+        let mut upstream_body = match rewrite_model(&body, rewrite_model_id) {
             Ok(body) => body,
             Err(error) => {
                 return error_response(
@@ -1341,11 +1406,25 @@ async fn native_protocol_proxy(
                 );
             }
         };
+        if direct_codex {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&upstream_body).expect("rewritten JSON");
+            value["store"] = serde_json::json!(false);
+            upstream_body = serde_json::to_vec(&value)
+                .expect("serializable JSON")
+                .into();
+        }
         let mut request = state
             .http_client
             .post(&url)
             .header(header::CONTENT_TYPE, "application/json")
             .body(upstream_body);
+        if let Some(account_id) = codex_account_id {
+            request = request
+                .header("chatgpt-account-id", account_id)
+                .header("OpenAI-Beta", "responses=experimental")
+                .header("originator", "codex_cli_rs");
+        }
         match protocol {
             NativeProtocol::Responses => {
                 request = request.bearer_auth(credential);
@@ -1367,11 +1446,18 @@ async fn native_protocol_proxy(
                         request = request.header(name, value);
                     }
                 }
-                // Preserve explicit protocol/beta selection from the native client.
-                for name in ["anthropic-version", "anthropic-beta"] {
+                // Preserve native features without dropping the OAuth beta
+                // required by a core-owned subscription credential.
+                for name in ["anthropic-version", "user-agent"] {
                     if let Some(value) = headers.get(name) {
                         request = request.header(name, value);
                     }
+                }
+                if let Some(beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+                    request = request.header(
+                        "anthropic-beta",
+                        native_anthropic_beta(beta, entry.has_oauth),
+                    );
                 }
             }
         }
@@ -1915,7 +2001,10 @@ pub(crate) async fn chat_completions_inner(
             let rewrite_result = if provider_type == ProviderType::Kimi {
                 rewrite_model_for_kimi(&body, &entry.model_id)
             } else {
-                rewrite_model(&body, &entry.model_id)
+                rewrite_model(
+                    &body,
+                    canonical_upstream_model(provider_type, &entry.model_id),
+                )
             };
             let upstream_body = match rewrite_result {
                 Ok(b) => b,
@@ -3263,6 +3352,16 @@ async fn enqueue_deferred_request(
         .into_response()
 }
 
+// Older catalogs advertised this client-side context hint as an API model ID.
+// Z.ai exposes the same 1M context under the canonical glm-5.3 ID.
+fn canonical_upstream_model(provider: ProviderType, model: &str) -> &str {
+    if provider == ProviderType::Zai && model == "glm-5.3[1m]" {
+        "glm-5.3"
+    } else {
+        model
+    }
+}
+
 /// Rewrite the `model` field in the JSON request body.
 fn rewrite_model(body: &[u8], new_model: &str) -> Result<bytes::Bytes, String> {
     let mut value: serde_json::Value =
@@ -3524,9 +3623,13 @@ fn anthropic_body_drop_thinking_and_disable(body: &[u8]) -> Result<bytes::Bytes,
         strip_thinking_blocks(messages);
     }
     if let Some(obj) = value.as_object_mut() {
+        let adaptive_only = obj
+            .get("model")
+            .and_then(|v| v.as_str())
+            .is_some_and(crate::model_policy::requires_adaptive_thinking);
         obj.insert(
             "thinking".to_string(),
-            serde_json::json!({ "type": "disabled" }),
+            serde_json::json!({ "type": if adaptive_only { "adaptive" } else { "disabled" } }),
         );
         // Opus 5 rejects disabled thinking at xhigh/max effort. This recovery
         // path deliberately disables thinking for one turn, so cap an
@@ -3540,7 +3643,7 @@ fn anthropic_body_drop_thinking_and_disable(body: &[u8]) -> Result<bytes::Bytes,
                 .get("effort")
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|effort| matches!(effort, "xhigh" | "max"));
-            if incompatible {
+            if incompatible && !adaptive_only {
                 output_config.insert("effort".to_string(), serde_json::json!("high"));
             }
         }
@@ -4745,6 +4848,22 @@ fn apply_google_client_headers(builder: reqwest::RequestBuilder) -> reqwest::Req
         .header(header::USER_AGENT, GOOGLE_USER_AGENT)
         .header("X-Goog-Api-Client", GOOGLE_API_CLIENT)
         .header("Client-Metadata", GOOGLE_CLIENT_METADATA)
+}
+
+fn native_anthropic_beta(beta: &str, oauth: bool) -> String {
+    if oauth
+        && !beta
+            .split(',')
+            .any(|value| value.trim() == "oauth-2025-04-20")
+    {
+        if beta.trim().is_empty() {
+            "oauth-2025-04-20".into()
+        } else {
+            format!("{beta},oauth-2025-04-20")
+        }
+    } else {
+        beta.to_string()
+    }
 }
 
 fn build_anthropic_proxy_headers(credential: &str, has_oauth: bool) -> HeaderMap {
@@ -6361,10 +6480,25 @@ mod tests {
     use futures::StreamExt;
 
     #[test]
+    fn opus_55_recovery_keeps_adaptive_thinking_and_effort() {
+        let body = br#"{"model":"claude-opus-5-5","thinking":{"type":"enabled","budget_tokens":2048},"output_config":{"effort":"max"},"messages":[]}"#;
+        let repaired = anthropic_body_drop_thinking_and_disable(body).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&repaired).unwrap();
+        assert_eq!(value["thinking"], serde_json::json!({"type":"adaptive"}));
+        assert_eq!(value["output_config"]["effort"], "max");
+    }
+
+    #[test]
     fn protocol_capabilities_are_credential_aware_and_fail_closed() {
         let xai_key = protocol_capabilities(ProviderType::Xai, true, false);
         assert!(xai_key.chat_completions && xai_key.responses && xai_key.previous_response_id);
         assert!(!xai_key.anthropic_messages && !xai_key.thinking_blocks_replay);
+
+        let core_codex = protocol_capabilities(ProviderType::OpenAI, false, true);
+        assert!(core_codex.responses && core_codex.native_function_tools);
+        assert!(!core_codex.previous_response_id);
+        let disconnected_codex = protocol_capabilities(ProviderType::OpenAI, false, false);
+        assert!(!disconnected_codex.responses);
 
         let xai_oauth = protocol_capabilities(ProviderType::Xai, false, true);
         assert!(!xai_oauth.responses && !xai_oauth.previous_response_id);
@@ -6376,9 +6510,10 @@ mod tests {
 
         let anthropic_cli = protocol_capabilities(ProviderType::Anthropic, false, true);
         assert!(!anthropic_cli.anthropic_messages);
-        let anthropic_oauth_token_hoisted_as_key =
-            protocol_capabilities(ProviderType::Anthropic, true, true);
-        assert!(!anthropic_oauth_token_hoisted_as_key.anthropic_messages);
+        // A directly resolved credential remains usable when an OAuth account
+        // also exists; the resolver owns credential validation.
+        let anthropic_key_with_oauth = protocol_capabilities(ProviderType::Anthropic, true, true);
+        assert!(anthropic_key_with_oauth.anthropic_messages);
 
         let kimi = protocol_capabilities(ProviderType::Kimi, true, false);
         assert!(kimi.chat_completions && kimi.reasoning_content_replay);
@@ -6466,7 +6601,7 @@ mod tests {
             true,
             false,
         ));
-        assert!(!native_protocol_supported(
+        assert!(native_protocol_supported(
             NativeProtocol::Responses,
             ProviderType::OpenAI,
             false,
@@ -6830,6 +6965,46 @@ mod tests {
     }
 
     #[test]
+    fn native_anthropic_core_owned_oauth_is_supported() {
+        assert!(native_protocol_supported(
+            NativeProtocol::AnthropicMessages,
+            ProviderType::Anthropic,
+            true,
+            true
+        ));
+        assert_eq!(
+            native_anthropic_beta("context-1m", true),
+            "context-1m,oauth-2025-04-20"
+        );
+        assert_eq!(
+            native_anthropic_beta("context-1m,oauth-2025-04-20", true),
+            "context-1m,oauth-2025-04-20"
+        );
+        assert_eq!(native_anthropic_beta("context-1m", false), "context-1m");
+        assert_eq!(native_anthropic_beta("", true), "oauth-2025-04-20");
+    }
+
+    #[test]
+    fn native_anthropic_models_keep_exact_catalog_id() {
+        let e =
+            super::parse_native_model_entry("claude-sonnet-4-6", NativeProtocol::AnthropicMessages)
+                .unwrap();
+        assert_eq!(e.provider_id, "anthropic");
+        assert_eq!(e.model_id, "claude-sonnet-4-6");
+        assert!(
+            super::parse_native_model_entry("claude-sonnet-4-6", NativeProtocol::Responses)
+                .is_none()
+        );
+        assert!(
+            super::parse_native_model_entry("smart", NativeProtocol::AnthropicMessages).is_none()
+        );
+        assert!(
+            super::parse_native_model_entry("typo/model", NativeProtocol::AnthropicMessages)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn parse_direct_model_entry_accepts_known_provider_prefix() {
         let e = parse_direct_model_entry("xai/grok-4.5").expect("known provider");
         assert_eq!(e.provider_id, "xai");
@@ -6900,6 +7075,22 @@ mod tests {
         assert!(parse_kimi_bare_model_entry("kimi/k3-256k").is_none());
         assert!(parse_kimi_bare_model_entry("grok-4.5").is_none());
         assert!(parse_kimi_bare_model_entry("smart").is_none());
+    }
+
+    #[test]
+    fn zai_context_hint_is_not_an_upstream_model_id() {
+        assert_eq!(
+            canonical_upstream_model(ProviderType::Zai, "glm-5.3[1m]"),
+            "glm-5.3"
+        );
+        assert_eq!(
+            canonical_upstream_model(ProviderType::Zai, "glm-5.3"),
+            "glm-5.3"
+        );
+        assert_eq!(
+            canonical_upstream_model(ProviderType::Custom, "glm-5.3[1m]"),
+            "glm-5.3[1m]"
+        );
     }
 
     #[test]

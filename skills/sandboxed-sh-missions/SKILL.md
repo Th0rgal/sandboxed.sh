@@ -12,7 +12,11 @@ metadata:
 
 Delegate coding/automation tasks to **isolated containerised missions** via the `mcp_sandboxed_assistant_*` MCP. Each mission runs in a chosen workspace (a fresh container with a known set of init scripts and pre-installed tools) and executes the prompt autonomously via a configured agent. Intermediate tool calls stay in the mission's own context.
 
-A conversational `start_mission` is a **worker of this chat**. Hermes stamps `origin_session_id`, enrolls the mission, and the terminal webhook folds the result back here. End the turn after dispatch — do not poll, and do not invent a cron just to wait. Controller/cron ticks are different: they pass `project` and report on the next tick / project route.
+`start_mission` with `project` / `track` is a worker. Confirm
+`pending`/`active`, then end the turn — do not poll, do not invent a cron
+just to wait, and do not wait for a callback in this chat. Completion is
+a mission row; a controller tick (Orb cron page) reconciles it.
+`origin_session_id` is v1 plumbing when a Hermes plugin injects it.
 
 When dispatching against a project roadmap, also pass the declared `track`,
 its `acceptance_criteria`, and a stable retry-safe `idempotency_key`. The
@@ -246,12 +250,12 @@ mcp_sandboxed_assistant_start_mission(
 )
 ```
 
-Conversational launches are workers of this chat. Hermes stamps
-`origin_session_id` and enrolls the mission so the terminal webhook
-folds the result back here. End the turn after dispatch. Do not poll
-and do not create a `cronjob` just to wait. Prefer
-`delegate_task(backend="mission")` when you want an explicit handle;
-`start_mission` from a desktop/API conversation is equivalent.
+Conversational launches still call `start_mission`. End the turn after
+dispatch. Do not poll and do not create a `cronjob` just to wait.
+Completion is the mission row (and the next controller tick), not a
+`[Mission callback]` you sit on. Prefer `delegate_task(backend="mission")`
+when you want an explicit handle; `start_mission` from Orb / desktop / API
+is equivalent.
 
 **Prompt structure** (template):
 
@@ -293,11 +297,11 @@ Self-containment is the single biggest factor in mission success. The mission ag
 
 ### How the result comes back
 
-**Conversational launch** (desktop / API / TUI): `start_mission` is a worker of this chat. Hermes stamps `origin_session_id` and enrolls the mission. Confirm `pending`/`active`, then end the turn. The terminal webhook folds the result back here (ledger), or appends a `[Mission callback]` and wakes this session. Do **not** verify `PALOMA_WEBHOOK_FORWARD_URL`, do not start `fleet-heartbeat`, and do not create a `cronjob` to poll.
+**Conversational / Orb launch:** `start_mission` with `project` when you have one. Confirm `pending`/`active`, then end the turn. Look at the mission row. Do **not** verify `PALOMA_WEBHOOK_FORWARD_URL`, do not start `fleet-heartbeat`, and do not create a `cronjob` to poll.
 
-**Controller launch** (cron tick with `deliver: project:<slug>`): pass `project`, `track` (a key from `get_situation`; unknown keys are absorbed as unplanned items), `intent`, and a stable `idempotency_key`. One writer per track: `409 track_owned` names the holder — attach to it or dispatch read-only (`writer=false`). Do not wait. Report on the next tick or the project route. Never stamp a `cron_*` session as origin.
+**Controller launch** (cron tick with `deliver: project:<slug>` plumbing): pass `project`, `track` (a key from `get_situation`; unknown keys are absorbed as unplanned items), `intent`, and a stable `idempotency_key`. One writer per track: `409 track_owned` names the holder — attach to it or dispatch read-only (`writer=false`). Do not wait. Report on the next tick. Never stamp a `cron_*` session as origin.
 
-**On callback:** inspect `get_mission` / `get_mission_digest` plus artifacts through the direct source before reporting. Mission self-report is not success. Notify Thomas for a user-launched completion, failure, blocker, decision, PR opened/merged, or useful research result. Stale duplicate ACKs may stay silent.
+**On completion:** inspect `get_mission` / `get_mission_digest` plus artifacts through the direct source before reporting. Mission self-report is not success. Notify Thomas for a user-launched completion, failure, blocker, decision, PR opened/merged, or useful research result. Stale duplicate ACKs may stay silent.
 
 Do **not** block a Hermes turn with `sleep until complete`. Missions can run for hours; a sleeping parent can be compacted or killed.
 

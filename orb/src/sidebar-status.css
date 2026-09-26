@@ -1,0 +1,12 @@
+/* Agent identity stays constant; the adjacent mark describes its actual state. */
+.row .row-ico.mission-lead { width: auto; height: 18px; }
+.mission-glyph { display: inline-flex; align-items: center; gap: 4px; height: 18px; width: max-content; color: var(--fg-3); }
+.mission-status-mark { display: inline-flex; width: 12px; height: 12px; flex: none; }
+.mission-glyph.running .mission-status-mark { color: var(--blue); }
+.mission-glyph.success .mission-status-mark { color: var(--green); }
+.mission-glyph.attention .mission-status-mark { color: var(--amber); }
+.mission-status-spin { animation: mission-status-spin 1.4s linear infinite; }
+@keyframes mission-status-spin { to { transform: rotate(360deg); } }
+.row.done-toggle .history-chevron { width: 12px; height: 12px; flex: none; color: var(--fg-3); }
+.history-chevron.open { transform: rotate(90deg); }
+@media (prefers-reduced-motion: reduce) { .mission-status-spin { animation: none; } }

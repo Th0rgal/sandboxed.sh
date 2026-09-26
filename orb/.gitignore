@@ -1,0 +1,7 @@
+node_modules
+dist
+src-tauri/target
+src-tauri/gen
+
+# Screenshots captured by browser tests (test-results is wiped per run).
+artifacts/

@@ -1,0 +1,11 @@
+import {createSignal} from 'solid-js';
+import {render} from 'solid-js/web';
+import {QueuedMessages} from '../src/QueuedMessages';
+import {enqueueLocalMessage} from '../src/localMessageQueue';
+import {Composer} from '../src/App';
+import '../src/styles.css';
+const request={id:'queue-fixture',harness:'claudecode',bin:'claude',cwd:'/work',prompt:''};
+await enqueueLocalMessage({...request,prompt:'ceci est un message dans la queue'},'ceci est un message dans la queue');
+await enqueueLocalMessage({...request,prompt:'et en voici un autre'},'et en voici un autre');
+const [revision,setRevision]=createSignal<{text:string;append:boolean}>();
+render(()=><main style={{padding:'32px','max-width':'760px',margin:'160px auto 0'}}><QueuedMessages mission="queue-fixture" onEdit={text=>setRevision({text,append:true})}/><Composer revision={revision()} busy placeholder="Send follow-up" onSend={async(text)=>{await enqueueLocalMessage({...request,prompt:text},text);return true;}} onStop={()=>{}}/></main>,document.getElementById('root')!);

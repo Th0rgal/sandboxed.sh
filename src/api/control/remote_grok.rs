@@ -308,6 +308,118 @@ impl GrokStream {
             self.diagnostics.push_back(diagnostic);
             return;
         };
+        // Codex exec emits native thread/turn/item events. Keep the thread id
+        // for continuation on the same node and preserve tool/text ordering.
+        let kind = value["type"].as_str().unwrap_or_default();
+        if matches!(
+            kind,
+            "thread.started"
+                | "turn.started"
+                | "turn.completed"
+                | "turn.failed"
+                | "item.started"
+                | "item.updated"
+                | "item.completed"
+        ) {
+            self.snapshot_pending(updates);
+            self.json_events += 1;
+            if kind == "thread.started" {
+                if let Some(session) = value["thread_id"].as_str() {
+                    self.session_id = Some(session.to_string());
+                    updates.push(StreamUpdate::SessionId(session.to_string()));
+                }
+            } else if kind == "turn.completed" {
+                // Codex can emit retry diagnostics before a successful turn.
+                self.error = None;
+                self.ended = true;
+                self.stop_reason = Some("end_turn".to_string());
+                updates.push(StreamUpdate::End);
+            } else if kind == "turn.failed" {
+                let error = value["error"]["message"]
+                    .as_str()
+                    .unwrap_or("Codex turn failed")
+                    .to_string();
+                self.error = Some(error.clone());
+                updates.push(StreamUpdate::Error(error));
+            } else if kind.starts_with("item.") {
+                self.progress = true;
+                let item = &value["item"];
+                match item["type"].as_str() {
+                    Some("agent_message") if kind == "item.completed" => {
+                        if let Some(text) = item["text"].as_str() {
+                            if !self.text.is_empty() {
+                                self.text.push_str("\n\n");
+                            }
+                            self.text.push_str(text);
+                            updates.push(StreamUpdate::TextSnapshot(self.text.clone()));
+                        }
+                    }
+                    Some("reasoning") if kind == "item.completed" => {
+                        if let Some(text) = item["text"].as_str() {
+                            self.thinking = text.to_string();
+                            updates.push(StreamUpdate::ThinkingSnapshot(self.thinking.clone()));
+                        }
+                    }
+                    Some("command_execution" | "file_change" | "mcp_tool_call" | "web_search")
+                        if kind != "item.updated" =>
+                    {
+                        updates.push(StreamUpdate::Tool {
+                                update: serde_json::json!({
+                                    "toolCallId": item["id"], "name": item["type"],
+                                    "rawInput": item, "output": item["aggregated_output"],
+                                    "status": if item["status"] == "failed" { "failed" } else { "completed" },
+                                }),
+                                completed: kind == "item.completed",
+                            });
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+        // OpenCode emits full text/tool parts and a native sessionID on every event.
+        if let Some(session) = value.get("sessionID").and_then(|v| v.as_str()) {
+            self.snapshot_pending(updates);
+            self.json_events += 1;
+            self.progress = true;
+            if self.session_id.as_deref() != Some(session) {
+                self.session_id = Some(session.to_string());
+                updates.push(StreamUpdate::SessionId(session.to_string()));
+            }
+            let part = &value["part"];
+            match value["type"].as_str() {
+                Some("text") => {
+                    if let Some(text) = part["text"].as_str() {
+                        if !self.text.is_empty() {
+                            self.text.push_str("\n\n");
+                        }
+                        self.text.push_str(text);
+                        updates.push(StreamUpdate::TextSnapshot(self.text.clone()));
+                    }
+                }
+                Some("tool_use") => {
+                    let update = serde_json::json!({
+                        "toolCallId": part["callID"], "name": part["tool"],
+                        "rawInput": part["state"]["input"], "status": if part["state"]["status"] == "error" { serde_json::json!("failed") } else { part["state"]["status"].clone() },
+                        "error": part["state"]["error"],
+                        "output": part["state"]["output"],
+                    });
+                    updates.push(StreamUpdate::Tool {
+                        update: update.clone(),
+                        completed: false,
+                    });
+                    updates.push(StreamUpdate::Tool {
+                        update,
+                        completed: true,
+                    });
+                }
+                Some("error") => {
+                    self.error = Some(value["error"].to_string());
+                }
+                _ => {}
+            }
+            return;
+        }
         let is_text = grok_event_text(&value).is_some() && grok_event_reasoning(&value).is_none();
         let is_thinking = grok_event_reasoning(&value).is_some();
         if !matches!(updates.last(), Some(StreamUpdate::Text) if is_text)
@@ -491,7 +603,14 @@ impl NativeGrokObserver {
         job_id: Uuid,
     ) -> Option<Self> {
         let mission = match owner.mission_store.get_mission(mission_id).await {
-            Ok(Some(mission)) if mission.backend == GROK_BACKEND => mission,
+            Ok(Some(mission))
+                if matches!(
+                    mission.backend.as_str(),
+                    GROK_BACKEND | "opencode" | "codex"
+                ) =>
+            {
+                mission
+            }
             _ => return None,
         };
         Some(Self {
@@ -567,7 +686,7 @@ impl NativeGrokObserver {
             .running_since
             .get_or_insert_with(std::time::Instant::now);
         if since.elapsed() >= std::time::Duration::from_secs(120) {
-            self.stream.error = Some("Native Grok produced no model/tool progress within 120 seconds; check the node's managed login and CLI connectivity before resuming.".to_string());
+            self.stream.error = Some("Remote harness produced no model/tool progress within 120 seconds; check the node's managed login and CLI connectivity before resuming.".to_string());
             if !self.auth_cancel_requested {
                 self.auth_cancel_requested =
                     client.cancel_job(node, token, self.job_id).await.is_ok();
@@ -721,7 +840,12 @@ impl NativeGrokObserver {
         match self
             .owner
             .mission_store
-            .update_mission_session_id(self.mission_id, session_id, GROK_BACKEND, run.as_ref())
+            .update_mission_session_id(
+                self.mission_id,
+                session_id,
+                &self.mission.backend,
+                run.as_ref(),
+            )
             .await
         {
             Ok(true) => {
@@ -729,7 +853,7 @@ impl NativeGrokObserver {
                 self.mission.session_id = Some(session_id.to_string());
                 self.owner.send(AgentEvent::SessionIdUpdate {
                     run,
-                    backend: GROK_BACKEND.to_string(),
+                    backend: self.mission.backend.clone(),
                     session_id: session_id.to_string(),
                     mission_id: self.mission_id,
                 });
@@ -795,7 +919,8 @@ impl NativeGrokObserver {
                 );
             } else {
                 report.push_str(&format!(
-                    "Remote grok job {} on node '{}' finished with state '{}' (exit {:?}){}.",
+                    "Remote {} job {} on node '{}' finished with state '{}' (exit {:?}){}.",
+                    self.mission.backend,
                     self.job_id,
                     node_id,
                     status.state,
@@ -828,7 +953,8 @@ impl NativeGrokObserver {
             }
         } else if content.is_empty() {
             content = format!(
-                "Remote grok job {} on node '{}' finished without assistant text (stop reason: {}).",
+                "Remote {} job {} on node '{}' finished without assistant text (stop reason: {}).",
+                self.mission.backend,
                 self.job_id,
                 node_id,
                 self.stream.stop_reason.as_deref().unwrap_or("unknown")
@@ -904,6 +1030,26 @@ pub(crate) async fn placement(
     store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
 ) -> Result<Option<RemotePlacement>, String> {
+    if let Some(t) = super::machine_transfer::committed(store, mission_id).await? {
+        match t.destination {
+            crate::api::mission_store::transfer::Machine::Node { id } => {
+                let run = store.get_latest_mission_run(mission_id).await?;
+                let job = run
+                    .as_ref()
+                    .filter(|r| r.generation > t.generation)
+                    .and_then(|r| r.owner_actor_id.strip_prefix("remote-job:"))
+                    .and_then(|s| Uuid::parse_str(s).ok());
+                return Ok(Some(RemotePlacement {
+                    node_id: id,
+                    job_id: job.unwrap_or(Uuid::nil()),
+                    live: run.is_some_and(|r| {
+                        r.generation > t.generation && !r.execution_state.is_terminal()
+                    }),
+                }));
+            }
+            _ => return Ok(None),
+        }
+    }
     use remote_node::job_ledger::JobHandleKind;
     let handles = remote_node::job_ledger::load(ledger_dir)
         .await
@@ -974,7 +1120,10 @@ pub(crate) async fn reject_local_followup(
 /// `resume_mission_impl` so internal callers (watchdog, MCP) never start a
 /// local harness beside — or instead of — the node job.
 pub(crate) fn local_resume_refusal(mission: &Mission, placement: &RemotePlacement) -> String {
-    if mission.backend == GROK_BACKEND {
+    if matches!(
+        mission.backend.as_str(),
+        GROK_BACKEND | "opencode" | "codex"
+    ) {
         format!(
             "{REMOTE_RESUME_REQUIRES_REPLACEMENT}: mission {} runs natively on remote node '{}'; \
              resume it through POST /api/control/missions/{}/resume (which continues it on the node) or create a replacement mission with remote_node_id",
@@ -991,8 +1140,8 @@ pub(crate) fn local_resume_refusal(mission: &Mission, placement: &RemotePlacemen
 
 /// Continue a remotely placed mission on its node with a new turn.
 ///
-/// - Only native Grok missions can continue: their CLI session id is the
-///   durable identity `--resume` needs. Other harnesses get a
+/// - Grok and OpenCode continue using their recorded native CLI session.
+///   Other harnesses get a
 ///   [`REMOTE_RESUME_REQUIRES_REPLACEMENT`] conflict.
 /// - A live node job ([`REMOTE_JOB_STILL_RUNNING`]) and an unconfigured
 ///   node are conflicts too; nothing is started locally in any case.
@@ -1012,6 +1161,9 @@ pub(crate) async fn continue_on_node(
         .await
         .map_err(internal)?;
     let store = control.mission_store.clone();
+    super::machine_transfer::guard(&store, mission_id)
+        .await
+        .map_err(internal)?;
     let mission = store
         .get_mission(mission_id)
         .await
@@ -1083,7 +1235,10 @@ pub(crate) async fn continue_on_node(
     } else {
         None
     };
-    if mission.backend != GROK_BACKEND {
+    if !matches!(
+        mission.backend.as_str(),
+        GROK_BACKEND | "opencode" | "codex"
+    ) {
         return Err((
             StatusCode::CONFLICT,
             local_resume_refusal(&mission, &placement),
@@ -1131,11 +1286,46 @@ pub(crate) async fn continue_on_node(
     let content = content
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty());
-    let session_id = mission.session_id.as_deref().map(str::trim)
-        .filter(|s| !s.is_empty()).map(str::to_string)
-        .ok_or_else(|| (StatusCode::CONFLICT, format!(
-            "{REMOTE_RESUME_REQUIRES_REPLACEMENT}: mission {mission_id} has no recorded native Grok session; create a remote replacement with supersedes_mission_id={mission_id}"
-        )))?;
+    // Jobs launched before OpenCode streaming was enabled have a placeholder
+    // session id. Recover the native identity from that exact job's log.
+    let mut native_session = mission.session_id.clone();
+    let transferred = super::machine_transfer::committed(&store, mission_id)
+        .await
+        .map_err(internal)?
+        .is_some();
+    if !transferred
+        && mission.backend == "opencode"
+        && !native_session
+            .as_deref()
+            .is_some_and(|s| s.starts_with("ses_"))
+    {
+        let token = std::env::var(&_node.token_env).map_err(internal)?;
+        let client = RemoteNodeClient::default();
+        let mut stream = GrokStream::default();
+        let mut offset = 0;
+        for _ in 0..MAX_CHUNKS_PER_TICK {
+            let chunk = client
+                .get_job_log(&_node, &token, placement.job_id, offset)
+                .await
+                .map_err(internal)?;
+            stream.feed(&chunk.data);
+            if stream.session_id.is_some() {
+                break;
+            }
+            if chunk.next_offset <= offset || chunk.next_offset >= chunk.log_len {
+                break;
+            }
+            offset = chunk.next_offset;
+        }
+        native_session = stream.session_id;
+    }
+    let session_id = native_session.filter(|s| !s.trim().is_empty());
+    if session_id.is_none() && !transferred {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("{REMOTE_RESUME_REQUIRES_REPLACEMENT}: mission {mission_id} has no recorded native session; create a remote replacement with supersedes_mission_id={mission_id}"),
+        ));
+    }
     let prompt = content.clone().unwrap_or_else(|| {
         if mission.goal_mode {
             "/goal resume".to_string()
@@ -1143,7 +1333,12 @@ pub(crate) async fn continue_on_node(
             super::INTERRUPTED_RESUME_PROMPT.to_string()
         }
     });
-    if let Some(objective) = super::parse_goal_objective(&prompt) {
+    let history_prompt = prompt.clone();
+    let prompt =
+        super::machine_transfer::context(&store, mission_id, prompt, session_id.as_deref())
+            .await
+            .map_err(internal)?;
+    if let Some(objective) = super::parse_goal_objective(&history_prompt) {
         if objective == "clear" {
             store
                 .update_mission_goal(mission.id, false, None)
@@ -1161,11 +1356,39 @@ pub(crate) async fn continue_on_node(
     } else {
         RESUME_SOURCE.to_string()
     };
-    let plan = RemoteHarnessPlan::Grok {
-        model: mission_model(&mission),
-        prompt: prompt.clone(),
-        resume_session_id: Some(session_id),
-        new_session_id: None,
+    let plan = if mission.backend == "codex" {
+        RemoteHarnessPlan::Codex {
+            effort: mission.model_effort.clone(),
+            fast_mode: mission.fast_mode,
+            model: mission.model_override.clone().ok_or_else(|| {
+                (
+                    StatusCode::CONFLICT,
+                    "Codex remote session has no recorded model".to_string(),
+                )
+            })?,
+            prompt: prompt.clone(),
+            resume_session_id: session_id.clone(),
+        }
+    } else if mission.backend == "opencode" {
+        RemoteHarnessPlan::OpenCode {
+            model: mission
+                .model_override
+                .as_deref()
+                .map(|m| m.strip_prefix("builtin/").unwrap_or(m).to_string()),
+            prompt: prompt.clone(),
+            resume_session_id: session_id.clone(),
+        }
+    } else {
+        RemoteHarnessPlan::Grok {
+            model: mission_model(&mission),
+            prompt: prompt.clone(),
+            resume_session_id: session_id.clone(),
+            new_session_id: if session_id.is_none() {
+                Some(Uuid::new_v4().to_string())
+            } else {
+                None
+            },
+        }
     };
     require_node_managed_auth(state, &placement.node_id, &plan)
         .await
@@ -1206,7 +1429,7 @@ pub(crate) async fn continue_on_node(
                 return Err((StatusCode::CONFLICT, message));
             }
         };
-    persist_turn_prompt(&owner, mission.id, &prompt, &source, message_id).await;
+    persist_turn_prompt(&owner, mission.id, &history_prompt, &source, message_id).await;
     Ok(resumed)
 }
 
@@ -1221,6 +1444,43 @@ mod tests {
     const SPARK_STREAM: &str =
         include_str!("../../../tests/fixtures/native_grok_goal_resume.jsonl");
     const SPARK_TEXT: &str = include_str!("../../../tests/fixtures/native_grok_goal_resume.txt");
+
+    #[test]
+    fn opencode_error_is_a_terminal_tool_result() {
+        let mut stream = GrokStream::default();
+        let updates=stream.feed("{\"type\":\"tool_use\",\"sessionID\":\"ses_error\",\"part\":{\"callID\":\"call_error\",\"tool\":\"webfetch\",\"state\":{\"status\":\"error\",\"error\":\"HTTP 403\"}}}\n");
+        assert!(updates.iter().any(|u|matches!(u,StreamUpdate::Tool {update,completed:true} if update["status"]=="failed" && update["error"]=="HTTP 403")));
+    }
+
+    #[test]
+    fn opencode_stream_preserves_session_text_and_tools_across_chunks() {
+        let mut stream = GrokStream::default();
+        let lines = concat!(
+            "{\"type\":\"text\",\"sessionID\":\"ses_test\",\"part\":{\"text\":\"Checking files\"}}\n",
+            "{\"type\":\"tool_use\",\"sessionID\":\"ses_test\",\"part\":{\"callID\":\"call_1\",\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"input\":{\"command\":\"pwd\"},\"output\":\"/workspace\"}}}\n",
+            "{\"type\":\"text\",\"sessionID\":\"ses_test\",\"part\":{\"text\":\"Done\"}}\n"
+        );
+        let mut updates = stream.feed(&lines[..17]);
+        updates.extend(stream.feed(&lines[17..]));
+        assert_eq!(stream.session_id.as_deref(), Some("ses_test"));
+        assert_eq!(stream.text, "Checking files\n\nDone");
+        assert!(stream.progress);
+        assert!(updates.iter().any(|u| matches!(
+            u,
+            StreamUpdate::Tool {
+                completed: true,
+                ..
+            }
+        )));
+        let plan = RemoteHarnessPlan::OpenCode {
+            model: Some("smart".into()),
+            prompt: "continue".into(),
+            resume_session_id: Some("ses_test".into()),
+        };
+        let execution =
+            super::super::remote_execution_for_plan(&plan, "https://core.example", "test-key");
+        assert!(execution.command.contains("--session 'ses_test'"));
+    }
 
     #[tokio::test]
     async fn native_finish_preserves_event_order_with_delayed_logger() {
@@ -1637,6 +1897,40 @@ mod tests {
     }
 
     #[test]
+    fn codex_stream_preserves_thread_tools_text_and_failure() {
+        let mut stream = GrokStream::default();
+        let events = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"thread-123\"}\n",
+            "{\"type\":\"item.started\",\"item\":{\"type\":\"command_execution\",\"id\":\"cmd-1\",\"command\":\"pwd\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"id\":\"cmd-1\",\"status\":\"completed\",\"aggregated_output\":\"/work\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Done\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{}}\n",
+        );
+        let mut updates = stream.feed(&events[..23]);
+        updates.extend(stream.feed(&events[23..]));
+        assert_eq!(stream.session_id.as_deref(), Some("thread-123"));
+        assert_eq!(stream.text, "Done");
+        assert!(stream.ended && stream.progress);
+        assert!(matches!(
+            &updates[1],
+            StreamUpdate::Tool {
+                completed: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &updates[2],
+            StreamUpdate::Tool {
+                completed: true,
+                ..
+            }
+        ));
+        assert_eq!(updates.last(), Some(&StreamUpdate::End));
+        stream.feed("{\"type\":\"turn.failed\",\"error\":{\"message\":\"rate limited\"}}\n");
+        assert_eq!(stream.error.as_deref(), Some("rate limited"));
+    }
+
+    #[test]
     fn stream_flags_interactive_login_and_errors() {
         let mut stream = GrokStream::default();
         let updates = stream.feed("\nSigning in with Grok...\nOpen this URL to sign in:\n  https://auth.x.ai/oauth2/authorize?x=y\n");
@@ -1685,9 +1979,11 @@ mod tests {
             "{grok}"
         );
         assert!(grok.contains("/resume"), "{grok}");
-        mission.backend = "opencode".into();
+        mission.backend = "codex".into();
+        assert!(local_resume_refusal(&mission, &placement).contains("/resume"));
+        mission.backend = "claudecode".into();
         let other = local_resume_refusal(&mission, &placement);
         assert!(other.contains("supersedes_mission_id"), "{other}");
-        assert!(other.contains("'opencode'"), "{other}");
+        assert!(other.contains("'claudecode'"), "{other}");
     }
 }

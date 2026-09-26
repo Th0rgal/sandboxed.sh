@@ -4,7 +4,7 @@ on:
   push:
     branches: [master, main, "release/*"]
   pull_request:
-    branches: [master, main]
+    branches: [master, main, feat/add-orb-client]
     types: [opened, synchronize, reopened, ready_for_review]
   # Run CI on a schedule to catch issues even without new commits
   schedule:
@@ -20,6 +20,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  CARGO_BUILD_JOBS: 2
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -209,3 +210,32 @@ jobs:
 
       - name: Type check and build
         run: bun run build
+
+  orb:
+    name: Orb
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false || github.event_name == 'push' || github.event_name == 'schedule'
+    defaults:
+      run:
+        working-directory: orb
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: orb/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: orb/pnpm-lock.yaml
+      - run: df -h . && df -ih .
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium webkit
+      - run: pnpm build
+      - run: pnpm test
+      - run: pnpm test:browser
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: orb-browser-evidence
+          path: orb/test-results

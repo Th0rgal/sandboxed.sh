@@ -146,7 +146,7 @@ pub async fn run_opencode_turn(
                 .ok()
                 .filter(|v| !v.trim().is_empty())
         })
-        .map(|model| canonicalize_opencode_cli_model(&model));
+        .map(|model| canonicalize_configured_opencode_model(&model, app_working_dir));
     let auth_state = detect_opencode_provider_auth(Some(app_working_dir));
     let has_openai = auth_state.has_openai;
     let has_anthropic = auth_state.has_anthropic;
@@ -314,7 +314,7 @@ pub async fn run_opencode_turn(
     let mut total_cache_creation_input_tokens: u64 = 0;
     let mut total_cache_read_input_tokens: u64 = 0;
     let agent_model = resolve_opencode_model_from_config(&opencode_config_dir_host, agent)
-        .map(|model| canonicalize_opencode_cli_model(&model));
+        .map(|model| canonicalize_configured_opencode_model(&model, app_working_dir));
     if resolved_model.is_none() {
         resolved_model = agent_model.clone();
     }
@@ -2262,6 +2262,28 @@ fn canonicalize_opencode_cli_model(model: &str) -> String {
     opencode_model_argument(Some(canonical.as_ref())).into_owned()
 }
 
+/// Routing IDs belong to the proxy, not OpenCode's provider namespace. Resolve
+/// exact configured IDs before native aliases (a chain can itself be named
+/// `grok-4.6`) and preserve slashes in custom chain IDs.
+fn canonicalize_configured_opencode_model(
+    model: &str,
+    app_working_dir: &std::path::Path,
+) -> String {
+    let model = model.trim();
+    let chains = std::fs::read(app_working_dir.join(".sandboxed-sh/model_chains.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).ok())
+        .unwrap_or_default();
+    if !model.starts_with("builtin/")
+        && chains
+            .iter()
+            .any(|chain| chain["id"].as_str() == Some(model))
+    {
+        return format!("builtin/{model}");
+    }
+    canonicalize_opencode_cli_model(model)
+}
+
 fn model_is_xai_provider_id(model: &str) -> bool {
     model
         .split_once('/')
@@ -2336,11 +2358,38 @@ fn opencode_inactivity_should_kill(
 #[cfg(test)]
 mod path_tests {
     use super::{
-        canonicalize_opencode_cli_model, linux_pid_has_children, linux_pid_is_alive,
-        normalize_opencode_model_id, opencode_inactivity_should_kill, opencode_model_argument,
-        opencode_path,
+        canonicalize_configured_opencode_model, canonicalize_opencode_cli_model,
+        linux_pid_has_children, linux_pid_is_alive, normalize_opencode_model_id,
+        opencode_inactivity_should_kill, opencode_model_argument, opencode_path,
     };
     use std::time::Duration;
+
+    #[test]
+    fn configured_routing_chains_use_proxy_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".sandboxed-sh")).unwrap();
+        std::fs::write(
+            dir.path().join(".sandboxed-sh/model_chains.json"),
+            r#"[{"id":"private"},{"id":"team/custom"},{"id":"builtin/smart"},{"id":"grok-4.6"}]"#,
+        )
+        .unwrap();
+        for (input, expected) in [
+            ("private", "builtin/private"),
+            (" private ", "builtin/private"),
+            ("team/custom", "builtin/team/custom"),
+            ("builtin/smart", "builtin/smart"),
+            ("builtin/private", "builtin/private"),
+            ("grok-4.6", "builtin/grok-4.6"),
+            ("zai/glm-5.3", "zai/glm-5.3"),
+            ("kimi-k3", "kimi/k3"),
+            ("unknown", "unknown"),
+        ] {
+            assert_eq!(
+                canonicalize_configured_opencode_model(input, dir.path()),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn legacy_kimi_k3_aliases_are_canonicalized() {

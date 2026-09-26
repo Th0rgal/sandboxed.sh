@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "provider_id": "anthropic",
+  "access_profile": "api",
+  "source": "curated",
+  "observed_at": null,
+  "completeness": "partial",
+  "models": [
+    {
+      "id": "claude-opus-5",
+      "name": "Claude Opus 5",
+      "description": "Default for complex agentic coding, adaptive thinking, 1M context"
+    },
+    {
+      "id": "claude-opus-5-5",
+      "name": "Claude Opus 5.5",
+      "description": "Agentic coding, always-adaptive thinking, 1M context"
+    },
+    {
+      "id": "claude-fable-5-1",
+      "name": "Claude Fable 5.1",
+      "description": "Demanding reasoning and long-horizon agentic work, adaptive thinking, 1M context"
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "name": "Claude Sonnet 4.6",
+      "description": "Latest Sonnet, balanced speed and capability"
+    },
+    {
+      "id": "claude-sonnet-4-5-20250929",
+      "name": "Claude Sonnet 4.5",
+      "description": "Balanced speed and capability"
+    },
+    {
+      "id": "claude-sonnet-5",
+      "name": "Claude Sonnet 5",
+      "description": "Balanced speed and capability"
+    },
+    {
+      "id": "claude-sonnet-4-20250514",
+      "name": "Claude Sonnet 4",
+      "description": "Good balance of speed and capability"
+    },
+    {
+      "id": "claude-3-5-haiku-20241022",
+      "name": "Claude Haiku 3.5",
+      "description": "Fastest, most economical"
+    }
+  ]
+}

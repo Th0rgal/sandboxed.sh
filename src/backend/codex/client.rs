@@ -13,6 +13,7 @@
 /// codex's goals.rs runtime.
 #[derive(Debug, Clone)]
 pub struct CodexConfig {
+    pub interactive: Option<tokio::sync::mpsc::Sender<NativeRequest>>,
     pub cli_path: String,
     pub default_model: Option<String>,
     pub model_effort: Option<String>,
@@ -43,6 +44,7 @@ pub struct CodexExternalChatgptAuth {
 impl Default for CodexConfig {
     fn default() -> Self {
         Self {
+            interactive: None,
             cli_path: std::env::var("CODEX_CLI_PATH").unwrap_or_else(|_| "codex".to_string()),
             default_model: None,
             model_effort: None,
@@ -53,4 +55,11 @@ impl Default for CodexConfig {
             continuity: None,
         }
     }
+}
+
+#[derive(Debug)]
+pub struct NativeRequest {
+    pub method: String,
+    pub params: serde_json::Value,
+    pub reply: tokio::sync::oneshot::Sender<serde_json::Value>,
 }

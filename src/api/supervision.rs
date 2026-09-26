@@ -102,7 +102,9 @@ pub(crate) async fn recover_server_shutdown_missions(
             #[cfg(test)]
             let scanned: Vec<_> = active_missions.iter().map(|mission| mission.id).collect();
             for mission in active_missions {
-                if excluded.contains(&mission.id) {
+                if super::control::client_placement::is_tagged(&mission.project.tags)
+                    || excluded.contains(&mission.id)
+                {
                     continue;
                 }
                 // Waiting for admission recovery must not turn newly created
@@ -226,6 +228,18 @@ pub(crate) async fn recover_server_shutdown_missions(
                 if excluded.contains(&mission_id) {
                     continue;
                 }
+                // Old Core versions may have interrupted a desktop-owned run.
+                // Only its originating computer may recover it.
+                match mission_store.get_mission(mission_id).await {
+                    Ok(Some(mission))
+                        if !super::control::client_placement::is_tagged(&mission.project.tags) => {}
+                    Ok(_) => continue,
+                    Err(error) => {
+                        tracing::warn!(%mission_id, %error, "Startup recovery: ownership unavailable; deferring recovery");
+                        continue;
+                    }
+                }
+
                 if seen.insert(mission_id) {
                     to_resume.push(mission_id);
                 }
@@ -523,7 +537,10 @@ async fn mission_has_detached_durable_run(
     Ok(mission_store
         .get_active_mission_run(mission_id)
         .await?
-        .is_some_and(|run| detached_run_proves_durable_liveness(run.execution_state)))
+        .is_some_and(|run| {
+            run.owner_actor_id.starts_with("orb-client:")
+                || detached_run_proves_durable_liveness(run.execution_state)
+        }))
 }
 
 /// Same as [`mission_has_detached_durable_run`] but a lease owned by a raw
@@ -540,8 +557,9 @@ async fn mission_has_detached_durable_run_excluding_remote_jobs(
         .get_active_mission_run(mission_id)
         .await?
         .is_some_and(|run| {
-            detached_run_proves_durable_liveness(run.execution_state)
-                && !is_remote_mission_job_owner(&run.owner_actor_id)
+            run.owner_actor_id.starts_with("orb-client:")
+                || (detached_run_proves_durable_liveness(run.execution_state)
+                    && !is_remote_mission_job_owner(&run.owner_actor_id))
         }))
 }
 

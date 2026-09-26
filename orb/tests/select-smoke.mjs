@@ -1,0 +1,30 @@
+import {chromium,webkit,expect} from '@playwright/test';
+for(const engine of [chromium,webkit]) {
+ const browser=await engine.launch();const page=await browser.newPage({viewport:{width:800,height:600},deviceScaleFactor:2});
+ page.setDefaultTimeout(8000); page.on('pageerror', e=>console.log(e.message));
+ console.log(engine.name(), 'navigate');
+ await page.goto('http://127.0.0.1:1432/tests/select.html');
+ const select=page.getByRole('combobox',{name:'Open in'});
+ console.log('open');await select.click();await expect(page.locator('.orb-options')).toBeVisible();
+ console.log('choose'); await page.locator('.orb-options').getByRole('option',{name:'Browser Tab',exact:true}).click();
+ await expect(page.locator('output')).toHaveText('browser');
+ await expect(page.locator('.orb-select-label')).toHaveText('Browser Tab');
+ await select.press('ArrowDown');await select.press('ArrowDown');await select.press('Enter');
+ await expect(page.locator('output')).toHaveText('off');
+ await select.click();await select.press('Escape');await expect(page.locator('.orb-options')).toHaveCount(0);
+ await select.click();await page.getByRole('button',{name:'Reset'}).click();await expect(page.locator('.orb-options')).toHaveCount(0);
+ await select.click();await page.screenshot({path:`/tmp/orb-select-${engine.name()}.png`});
+ await select.press('Escape');
+ const input=page.getByRole('combobox',{name:'Model',exact:true});await input.click();
+ await expect(page.getByRole('option',{name:'Grok 4.6 (Latest)',exact:true})).toBeVisible();
+ await page.waitForTimeout(250);
+ await expect(page.getByRole('option',{name:'Grok 4.6 (Latest)',exact:true})).toBeVisible();
+ const bounds=await page.locator('.routing-picker-list').boundingBox();
+ expect(bounds.y+bounds.height).toBeLessThanOrEqual(600);
+ expect(bounds.width).toBe(260);
+ await page.screenshot({path:`/tmp/orb-model-picker-${engine.name()}.png`});
+ await input.press('ArrowDown');await input.press('ArrowDown');await input.press('Enter');await expect(input).toHaveValue('grok-4.6-latest');
+ await input.fill('custom-model');await input.press('Tab');await expect(input).toHaveValue('custom-model');
+ console.log(engine.name()+': pointer, keyboard, disabled option, escape, outside click, reactive value, model suggestions and custom input passed');
+ await browser.close();
+}

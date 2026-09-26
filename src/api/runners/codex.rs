@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -304,7 +305,7 @@ fn user_without_negated_tool_clauses(user_lower: &str) -> String {
         .replace(" however, ", ". however, ");
     let mut actionable = String::with_capacity(clause_separated.len());
 
-    for clause in clause_separated.split_inclusive(['.', '!', '?', ';', '\n']) {
+    for clause in clause_separated.split_inclusive(['.', '!', '?', ';', ':', '\n']) {
         let trimmed = clause.trim_start();
         let directive = trimmed
             .strip_prefix("but ")
@@ -655,6 +656,7 @@ pub(crate) async fn run_codex_turn_with_rotation(
     session_id: Option<&str>,
     current_message: &str,
     is_continuation: bool,
+    tool_hub: Option<Arc<crate::api::control::FrontendToolHub>>,
 ) -> AgentResult {
     let path = continuity::binding_path(app_working_dir, mission_id);
     let binding = match continuity::read(&path) {
@@ -695,6 +697,7 @@ pub(crate) async fn run_codex_turn_with_rotation(
                 session_id,
                 None,
                 &native_input,
+                tool_hub.clone(),
             )
             .await;
 
@@ -722,6 +725,7 @@ pub(crate) async fn run_codex_turn_with_rotation(
                     session_id,
                     None,
                     &native_input,
+                    tool_hub.clone(),
                 )
                 .await;
             } else if codex_tool_stall_should_retry_with_default_model(requested_model, &result) {
@@ -749,6 +753,7 @@ pub(crate) async fn run_codex_turn_with_rotation(
                     session_id,
                     None,
                     &native_input,
+                    tool_hub.clone(),
                 )
                 .await;
             }
@@ -858,6 +863,7 @@ pub(crate) async fn run_codex_turn_with_rotation(
                     session_id,
                     Some(&credential_override),
                     &native_input,
+                    tool_hub.clone(),
                 )
                 .await;
 
@@ -887,6 +893,7 @@ pub(crate) async fn run_codex_turn_with_rotation(
                         session_id,
                         Some(&credential_override),
                         &native_input,
+                        tool_hub.clone(),
                     )
                     .await;
                 } else if codex_tool_stall_should_retry_with_default_model(requested_model, &result)
@@ -916,6 +923,7 @@ pub(crate) async fn run_codex_turn_with_rotation(
                         session_id,
                         Some(&credential_override),
                         &native_input,
+                        tool_hub.clone(),
                     )
                     .await;
                 }
@@ -1005,6 +1013,7 @@ async fn run_codex_turn(
     session_id: Option<&str>,
     override_credential: Option<&crate::api::ai_providers::CodexCredentialOverride<'_>>,
     native_input: &NativeTurnInput<'_>,
+    tool_hub: Option<Arc<crate::api::control::FrontendToolHub>>,
 ) -> AgentResult {
     use crate::backend::codex::CodexBackend;
     use crate::backend::{Backend, SessionConfig};
@@ -1251,7 +1260,30 @@ async fn run_codex_turn(
         extra_env.extend(remote_build_env);
     }
 
+    let interactive = tool_hub.map(|hub| {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::backend::codex::client::NativeRequest>(8);
+        let events = events_tx.clone();
+        let cancellation = cancel.clone();
+        tokio::spawn(async move {
+            while let Some(mut request) = rx.recv().await {
+                let id = format!("native-{}", Uuid::new_v4());
+                let waiter = hub.register(id.clone()).await;
+                let _guard = crate::api::control::FrontendToolHub::begin_waiting(&hub, mission_id);
+                let name = "ui_native_request".to_string();
+                let _ = events.send(AgentEvent::ToolCall {tool_call_id:id.clone(),name:name.clone(),args:serde_json::json!({"method":request.method,"params":request.params}),mission_id:Some(mission_id)});
+                let answer = tokio::select! {_ = cancellation.cancelled() => None, _=request.reply.closed()=>None, answer=waiter => answer.ok()};
+                hub.unregister(&id).await;
+                let Some(answer)=answer else {break};
+                if request.reply.send(answer.clone()).is_ok() {
+                    let _ = events.send(AgentEvent::ToolResult {tool_call_id:id,name,result:answer,mission_id:Some(mission_id)});
+                }
+            }
+        });
+        tx
+    });
+
     let codex_config = crate::backend::codex::client::CodexConfig {
+        interactive,
         cli_path,
         model_effort: model_effort.map(|s| s.to_string()),
         fast_mode,

@@ -45,6 +45,8 @@ pub mod github_connection;
 pub mod hermes_tools;
 pub mod library;
 pub mod mcp;
+pub mod model_policy;
+pub mod model_selection;
 pub mod node;
 pub mod nspawn;
 pub mod opencode;
@@ -57,6 +59,7 @@ pub mod settings;
 pub mod skills_registry;
 pub mod task;
 pub mod tools;
+pub mod uploads;
 pub mod util;
 pub mod watchdog;
 pub mod workspace;
@@ -66,3 +69,27 @@ pub use ai_providers::{AIProvider, AIProviderStore, ProviderType};
 pub use config::Config;
 pub use opencode_config::{OpenCodeConnection, OpenCodeStore};
 pub use settings::{Settings, SettingsStore};
+
+#[path = "../shared/file_browser.rs"]
+pub mod file_browser;
+
+#[path = "../shared/machine_transfer.rs"]
+pub mod machine_transfer;
+
+pub mod model_catalog;
+pub mod model_discovery;
+
+#[path = "../shared/project_context.rs"]
+pub mod project_context;
+
+#[path = "../shared/context_replica.rs"]
+pub mod context_replica;
+
+#[cfg(test)]
+mod context_replica_tests;
+
+#[path = "../shared/local_origin.rs"]
+pub mod local_origin;
+
+#[path = "../shared/agent_software.rs"]
+pub mod agent_software;

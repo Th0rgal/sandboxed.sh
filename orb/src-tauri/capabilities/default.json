@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "allow-voice",
+    "allow-paloma-ssh-pubkey",
+    "allow-window-theme",
+    "allow-open-url",
+    "allow-local-agents",
+    "allow-local-metrics"
+  ]
+}

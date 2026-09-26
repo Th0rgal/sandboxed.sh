@@ -14,6 +14,7 @@ pub(crate) mod gemini;
 pub(crate) mod grok;
 pub(crate) mod midturn;
 pub(crate) mod opencode;
+pub(crate) mod stream_guard;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -114,6 +115,7 @@ pub(crate) enum TurnExtras<'a> {
     None,
     Codex {
         current_message: &'a str,
+        tool_hub: Option<Arc<FrontendToolHub>>,
     },
     ClaudeCode {
         secrets: Option<Arc<SecretsStore>>,
@@ -261,11 +263,17 @@ impl HarnessRunner for CodexRunner {
             ctx.cancel,
             ctx.app_working_dir,
             ctx.session_id,
-            match ctx.extras {
-                TurnExtras::Codex { current_message } => current_message,
+            match &ctx.extras {
+                TurnExtras::Codex {
+                    current_message, ..
+                } => current_message,
                 _ => ctx.message,
             },
             ctx.is_continuation,
+            match ctx.extras {
+                TurnExtras::Codex { tool_hub, .. } => tool_hub,
+                _ => None,
+            },
         ))
     }
 }

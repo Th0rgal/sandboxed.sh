@@ -1,3 +1,5 @@
+#[path = "palomactl/models.rs"]
+mod models;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use regex::Regex;
@@ -26,6 +28,7 @@ fn run(args: Vec<String>) -> Result<()> {
     };
 
     match command {
+        "models" => models::run(&args[1..])?,
         "status" => {
             let state = load_state(&root)?;
             println!("{}", render_status_text(&state));
@@ -113,7 +116,7 @@ fn run(args: Vec<String>) -> Result<()> {
 
 fn print_usage() {
     println!(
-        "usage:\n  palomactl status\n  palomactl reconcile [--api <url> [--token <jwt>] [--dir <trackers>] [slug...]]\n  palomactl import-trackers --api <url> [--token <jwt>] [--dir <trackers>] [--dry-run] [slug...]\n  palomactl pr-gates <owner/repo> <number> [--worker-head <sha>]\n  palomactl set-mode <project> <mode> --until <iso>\n  palomactl dispatch-plan --project <slug>\n  palomactl validation-matrix [path]\n  palomactl cluster-lean-errors <log-path>"
+        "usage:\n  palomactl models discover|export|diff|validate|snapshot update\n  palomactl status\n  palomactl reconcile [--api <url> [--token <jwt>] [--dir <trackers>] [slug...]]\n  palomactl import-trackers --api <url> [--token <jwt>] [--dir <trackers>] [--dry-run] [slug...]\n  palomactl pr-gates <owner/repo> <number> [--worker-head <sha>]\n  palomactl set-mode <project> <mode> --until <iso>\n  palomactl dispatch-plan --project <slug>\n  palomactl validation-matrix [path]\n  palomactl cluster-lean-errors <log-path>"
     );
 }
 

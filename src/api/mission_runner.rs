@@ -45,7 +45,7 @@ use super::library::SharedLibrary;
 /// consumed by [`WorkspaceExec`]. Container callers naturally refer to guest
 /// paths (for example `/workspace/verity/base`), while the API process must
 /// validate the corresponding path below the container rootfs.
-fn resolve_mission_working_directory(
+pub(crate) fn resolve_mission_working_directory(
     workspace_root: &Path,
     workspace_type: WorkspaceType,
     requested: &str,
@@ -93,6 +93,40 @@ fn resolve_mission_working_directory(
     }
 
     Ok(resolved)
+}
+
+/// Refuse a turn whose model this deployment no longer runs.
+///
+/// Reaching this means the dispatch-time upgrade (`model_for_dispatch`) could
+/// not be recorded, or a caller bypassed dispatch altogether. Both of the
+/// alternatives are worse than failing: silently upgrading here would run a
+/// model no client reports, and proceeding would run a model that has been
+/// withdrawn. Returning `Some` aborts the turn before its harness is spawned,
+/// because the caller returns it in place of running anything.
+///
+/// Coverage, stated precisely: this guards turns that go through
+/// `run_mission_turn`. Typed remote-node creation is a separate path —
+/// `plan_remote_harness` / `dispatch_remote_job` — which does not pass through
+/// here; an explicitly requested retired model is rejected there at create time
+/// by `validate_model_override`, and `model_for_dispatch` upgrades a stored one
+/// before either path reads it. So this is the last gate for local turns, not a
+/// single choke point for every typed remote dispatch.
+pub(crate) fn refuse_retired_model(mission_id: Uuid, model: &str) -> Option<AgentResult> {
+    let replacement = crate::model_policy::retired_claude_model(model)?;
+    tracing::error!(
+        mission_id = %mission_id,
+        requested = %model,
+        replacement = %replacement,
+        "refusing to run a retired model: the upgrade was not recorded"
+    );
+    Some(AgentResult::failure(
+        format!(
+            "This mission is set to '{model}', which this backend no longer runs, and the upgrade \
+             to '{replacement}' could not be saved. Nothing was started. Set the model to \
+             '{replacement}' in the mission's settings and run it again."
+        ),
+        0,
+    ))
 }
 
 /// Build the synthetic `AgentResult::failure` produced when a turn is
@@ -2802,6 +2836,35 @@ impl MissionRunner {
         let run = mission_store
             .begin_mission_run(self.mission_id, owner_actor_id, None)
             .await?;
+        // A retained idle runner may predate a move away and back. Refresh the
+        // authoritative workspace after acquiring the generation, before spawn.
+        if super::control::machine_transfer::committed(mission_store, self.mission_id)
+            .await?
+            .is_some()
+        {
+            match mission_store.get_mission(self.mission_id).await {
+                Ok(Some(mission)) => {
+                    self.workspace_id = mission.workspace_id;
+                    self.working_directory = mission.working_directory;
+                    self.session_id = mission.session_id;
+                    self.backend_id = mission.backend;
+                    self.model_override = mission.model_override;
+                    self.model_effort = mission.model_effort;
+                    self.config_profile = mission.config_profile;
+                    self.agent_override = mission.agent;
+                }
+                _ => {
+                    let _ = mission_store
+                        .finish_mission_run(
+                            run.run_id,
+                            run.generation,
+                            Some("transfer_workspace_unavailable"),
+                        )
+                        .await;
+                    return Err("Transferred workspace could not be resolved".into());
+                }
+            }
+        }
         let alive = mission_store
             .heartbeat_mission_run(
                 run.run_id,
@@ -3133,6 +3196,11 @@ impl MissionRunner {
 
         // Emit user message event with mission context, preserving the original
         // attribution (api:/telegram/…) stored on the queued message.
+        let harness_message = if msg_source.as_deref() == Some("scheduler") {
+            super::control::deferred_messages::strip(&user_message)
+        } else {
+            user_message.clone()
+        };
         let _ = events_tx.send(AgentEvent::UserMessage {
             id: msg_id,
             content: user_message.clone(),
@@ -3162,7 +3230,7 @@ impl MissionRunner {
                         status,
                         cancel,
                         hist_snapshot,
-                        user_message.clone(),
+                        harness_message,
                         Some(mission_ctrl),
                         tree_ref,
                         progress_ref,
@@ -3563,8 +3631,16 @@ async fn run_mission_turn(
     boss_user_id: Option<String>,
     pr_readonly: bool,
 ) -> AgentResult {
+    let _software_execution =
+        match crate::agent_software::begin(&mission_id.to_string(), &backend_id, None) {
+            Ok(guard) => guard,
+            Err(error) => return AgentResult::failure(error, 0),
+        };
     #[cfg(test)]
     if let Some(result) = super::control::dispatch_admission_tests::native_goal_fixture(
+        &config,
+        &workspaces,
+        mission_store.as_ref(),
         mission_id,
         &user_message,
         events_tx.clone(),
@@ -3574,6 +3650,20 @@ async fn run_mission_turn(
     {
         return result;
     }
+    let mission_working_directory = if let Some(store) = mission_store.as_ref() {
+        match super::control::machine_transfer::committed(store, mission_id).await {
+            Ok(Some(action)) => {
+                if action.destination != crate::api::mission_store::transfer::Machine::Core {
+                    return AgentResult::failure("Mission execution moved away from Core", 0);
+                }
+                action.destination_root
+            }
+            Ok(None) => mission_working_directory,
+            Err(error) => return AgentResult::failure(error, 0),
+        }
+    } else {
+        mission_working_directory
+    };
     let mut config = config;
     // Operator-note bridge: flush any pending Ask-assistant writes into this
     // turn's message so the working agent learns about out-of-band edits it
@@ -3599,6 +3689,18 @@ async fn run_mission_turn(
         config.opencode_agent = Some(agent.clone());
     }
     if let Some(ref model) = model_override {
+        // Fail closed. Retirement is applied once, at dispatch
+        // (`model_for_dispatch`), which also records the upgrade so clients
+        // show the model that is about to run. Silently upgrading again here
+        // would run a model nothing reported; silently accepting a retired id
+        // would run a model this deployment has withdrawn. So a retired id
+        // reaching this point means the upgrade was never recorded (or the
+        // caller bypassed dispatch) — refuse the turn and say why, before the
+        // harness is spawned. See `refuse_retired_model` for what this does and
+        // does not cover: typed remote creation is guarded at create instead.
+        if let Some(refusal) = refuse_retired_model(mission_id, model) {
+            return refusal;
+        }
         config.default_model = Some(model.clone());
     } else if backend_id == "claudecode" {
         config.default_model = config
@@ -3844,6 +3946,66 @@ async fn run_mission_turn(
         mission_work_dir
     };
 
+    let user_message = if super::context_execution::has_mentions(&user_message) {
+        let project = if let Some(store) = mission_store.as_ref() {
+            store
+                .get_mission(mission_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|mission| mission.project.project)
+        } else {
+            None
+        };
+        let Some(project) = project else {
+            return AgentResult::failure("Context references require a project", 0);
+        };
+        if !super::projects_overview::is_plain_key(&project) {
+            return AgentResult::failure("Invalid context project", 0);
+        }
+        let root = super::mission_payload::project_files_root(&config.working_dir, &project);
+        let metadata = config
+            .working_dir
+            .join(".sandboxed-sh/project-context-state")
+            .join(&project);
+        let manifest = match crate::project_context::Store::new(root.clone(), metadata).manifest() {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                return AgentResult::failure(format!("Prepare shared context: {error}"), 0)
+            }
+        };
+        let visible = match crate::workspace_exec::WorkspaceExec::new(workspace.clone())
+            .mount_project_context(&root, &project)
+            .await
+        {
+            Ok(path) => path,
+            Err(error) => return AgentResult::failure(format!("Mount shared context: {error}"), 0),
+        };
+        match super::context_execution::resolve(&user_message, Path::new(&visible), &manifest) {
+            Ok(message) => message,
+            Err(error) => {
+                return AgentResult::failure(format!("Prepare shared context: {error}"), 0)
+            }
+        }
+    } else {
+        user_message
+    };
+
+    let user_message = match crate::api::mission_payload::materialize_turn(
+        &config.working_dir,
+        &mission_work_dir,
+        mission_id,
+        &user_message,
+    ) {
+        Ok(message) => {
+            if message != user_message {
+                convo.push_str("\nRead attached context in `.paloma/attach.md`.\n");
+            }
+            message
+        }
+        Err(error) => return AgentResult::failure(format!("materialize attachments: {error}"), 0),
+    };
+
     // For Telegram missions, append channel instructions and memory awareness
     // to CLAUDE.md so the backend LLM adopts the bot persona.
     if user_message.contains("[Telegram from ") {
@@ -3880,10 +4042,32 @@ async fn run_mission_turn(
         .count();
     let should_rotate = turn_count > 0 && turn_count % SESSION_ROTATION_INTERVAL == 0;
 
+    let user_message = if let Some(store) = mission_store.as_ref() {
+        match super::control::machine_transfer::context(
+            store,
+            mission_id,
+            user_message,
+            session_id.as_deref(),
+        )
+        .await
+        {
+            Ok(prompt) => prompt,
+            Err(error) => return AgentResult::failure(error, 0),
+        }
+    } else {
+        user_message
+    };
+
     // Prepare user message and session ID (potentially with rotation)
     let (mut user_message, mut session_id) = (user_message, session_id);
 
-    if should_rotate && backend_id == "claudecode" {
+    if should_rotate
+        && backend_id == "claudecode"
+        && !user_message
+            .trim()
+            .strip_prefix("/plan")
+            .is_some_and(|s| s.is_empty() || s.starts_with(char::is_whitespace))
+    {
         tracing::info!(
             mission_id = %mission_id,
             turn_count = turn_count,
@@ -4002,6 +4186,7 @@ async fn run_mission_turn(
             } else if backend_id == "codex" {
                 super::runners::TurnExtras::Codex {
                     current_message: &user_message,
+                    tool_hub: Some(Arc::clone(&tool_hub)),
                 }
             } else {
                 super::runners::TurnExtras::None
@@ -6028,7 +6213,16 @@ fn build_opencode_auth_from_ai_providers(
                 "expires": oauth.expires_at,
             });
             for key in &keys {
-                map.insert((*key).to_string(), entry.clone());
+                // Several accounts can share one OpenCode provider key. Never let
+                // an older OAuth record overwrite a fresher credential just because
+                // it appears later in the provider store.
+                let existing_expiry = map
+                    .get(*key)
+                    .and_then(|value| value.get("expires"))
+                    .and_then(serde_json::Value::as_i64);
+                if existing_expiry.is_none_or(|expires| oauth.expires_at > expires) {
+                    map.insert((*key).to_string(), entry.clone());
+                }
             }
         }
     }
@@ -7505,16 +7699,67 @@ fn claudecode_install_command(
 }
 
 fn desired_claudecode_version() -> String {
-    // 2.1.257 is the first production pin that supports Claude Fable 5.1
-    // (`claude-fable-5-1` requires Claude Code >= 2.1.251). It also retains
-    // the bug-fixed native `/goal` command introduced in 2.1.139 and hardened
-    // in 2.1.140. Keep the per-workspace installer at or above this version:
-    // otherwise mission startup silently downgrades the host CLI and the
-    // model appears in the catalog but every Fable 5.1 dispatch fails.
+    // Opus 5.5 requires 2.1.280. Treat the default as a minimum so fleet
+    // updates are not silently undone by mission startup. Explicit pins stay exact.
     std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "2.1.257".to_string())
+        .unwrap_or_else(|| "2.1.280".to_string())
+}
+
+fn claude_version_is_supported(output: &str, desired: &str, pinned: bool) -> bool {
+    let observed = output.split_whitespace().next().unwrap_or("");
+    if pinned {
+        return observed == desired;
+    }
+    fn version(value: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = value.split('.');
+        let result = (
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+        );
+        parts.next().is_none().then_some(result)
+    }
+    match (version(observed), version(desired)) {
+        (Some(actual), Some(minimum)) => actual >= minimum,
+        _ => false,
+    }
+}
+
+#[test]
+fn claude_cli_minimum_keeps_fleet_updates() {
+    assert!(claude_version_is_supported(
+        "2.1.280 (Claude Code)",
+        "2.1.280",
+        false
+    ));
+    assert!(claude_version_is_supported(
+        "2.1.281 (Claude Code)",
+        "2.1.280",
+        false
+    ));
+    assert!(!claude_version_is_supported(
+        "2.1.257 (Claude Code)",
+        "2.1.280",
+        false
+    ));
+    assert!(!claude_version_is_supported(
+        "2.1.2800 (Claude Code)",
+        "2.1.280",
+        true
+    ));
+    assert!(!claude_version_is_supported(
+        "2.1.281 (Claude Code)",
+        "2.1.280",
+        true
+    ));
+    assert!(claude_version_is_supported(
+        "2.1.280 (Claude Code)",
+        "2.1.280",
+        true
+    ));
+    assert!(!claude_version_is_supported("invalid", "2.1.280", false));
 }
 
 async fn claude_cli_matches_desired_version(
@@ -7546,7 +7791,9 @@ async fn claude_cli_matches_desired_version(
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let version_output = format!("{}{}", stdout, stderr);
-            if version_output.contains(desired_version) {
+            let pinned = std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION")
+                .is_ok_and(|value| !value.trim().is_empty());
+            if claude_version_is_supported(&version_output, desired_version, pinned) {
                 true
             } else {
                 tracing::info!(
@@ -9151,24 +9398,36 @@ impl TextDeltaCoalescer {
     }
 }
 
+// KMP examines only the suffix that can overlap the incoming fragment.
+// UTF-8 is self-synchronizing: a matching prefix of a valid string ending at
+// an existing string boundary is also a complete code-point sequence.
 fn suffix_prefix_overlap_len(existing: &str, incoming: &str) -> usize {
-    let max_chars = existing.chars().count().min(incoming.chars().count());
-    for overlap_chars in (1..=max_chars).rev() {
-        let existing_start = existing
-            .char_indices()
-            .nth(existing.chars().count() - overlap_chars)
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
-        let incoming_end = incoming
-            .char_indices()
-            .nth(overlap_chars)
-            .map(|(idx, _)| idx)
-            .unwrap_or(incoming.len());
-        if existing[existing_start..] == incoming[..incoming_end] {
-            return incoming_end;
+    let p = incoming.as_bytes();
+    if p.is_empty() {
+        return 0;
+    }
+    let mut pi = vec![0; p.len()];
+    for i in 1..p.len() {
+        let mut j = pi[i - 1];
+        while j > 0 && p[i] != p[j] {
+            j = pi[j - 1]
+        }
+        if p[i] == p[j] {
+            j += 1
+        }
+        pi[i] = j;
+    }
+    let start = existing.len().saturating_sub(p.len());
+    let mut j = 0;
+    for &b in &existing.as_bytes()[start..] {
+        while j > 0 && (j == p.len() || b != p[j]) {
+            j = pi[j - 1]
+        }
+        if b == p[j] {
+            j += 1
         }
     }
-    0
+    j
 }
 
 pub(crate) fn merge_stream_fragment(buffer: &mut String, fragment: &str) {
@@ -9222,120 +9481,16 @@ pub(crate) fn degenerate_repeated_substring(
     min_substring_len: usize,
     min_repeats: usize,
 ) -> Option<String> {
-    if min_substring_len == 0 || min_repeats < 2 || window_chars == 0 {
-        return None;
+    match crate::api::runners::stream_guard::detect(
+        accumulated,
+        window_chars,
+        min_substring_len,
+        min_repeats,
+        &tokio_util::sync::CancellationToken::new(),
+    ) {
+        crate::api::runners::stream_guard::Verdict::Repeated { needle, .. } => Some(needle),
+        _ => None,
     }
-    let chars: Vec<char> = accumulated.chars().collect();
-    if chars.len() < min_substring_len.saturating_mul(min_repeats) {
-        return None;
-    }
-    let window_end = chars.len();
-    let window_start = window_end.saturating_sub(window_chars);
-    let window = &chars[window_start..window_end];
-
-    // Walk every starting offset in the window. For each offset, try
-    // candidate substring lengths in `min_substring_len..=2*min_substring_len`
-    // (anything longer would have been broken up by the LLM streaming
-    // cadence). Count non-overlapping occurrences; if we find >= min_repeats
-    // we have a degenerate loop.
-    //
-    // To keep this O(window_chars * substring_len_max) per delta we cap the
-    // candidate substring length at 256 and bail out early once we have a hit.
-    let max_candidate_len = min_substring_len.saturating_mul(2).min(256);
-    for start in 0..window.len().saturating_sub(min_substring_len) {
-        for len in min_substring_len..=max_candidate_len {
-            if start + len > window.len() {
-                break;
-            }
-            let needle: String = window[start..start + len].iter().collect();
-            // Skip "noise" candidates that are mostly whitespace or a single
-            // character repeated (e.g. "----").
-            if !needle.chars().any(|c| c.is_alphanumeric()) {
-                continue;
-            }
-            // Skip single-token loops (e.g. "yes, yes, yes" or
-            // "ok. ok. ok."). Require the substring to contain at least
-            // two distinct "substantive" words (length >= 4, alphabetic).
-            // This is the key differentiator between a legitimate
-            // short-token echo and a model that has lost the plot on a
-            // meaningful phrase.
-            let distinct_substantive = count_distinct_substantive_words(&needle);
-            if distinct_substantive < 2 {
-                continue;
-            }
-            let mut count = 0usize;
-            let mut idx = 0usize;
-            let mut last_end: Option<usize> = None;
-            while let Some(found) = find_subslice(window, &needle, idx) {
-                // A degenerate loop is ADJACENT: the model emits the same
-                // string back to back. A structured report legitimately
-                // repeats 40+ char scaffolding — measured 2026-08-06, mission
-                // 7fb8970f was killed mid-way through a 17-guarantee review
-                // table whose rows shared long prefixes — but those repeats
-                // are separated by distinct content. Only count a repeat when
-                // it starts within one needle-length of the previous match's
-                // end; anything farther apart is prose that happens to rhyme.
-                let adjacent = match last_end {
-                    None => true,
-                    Some(end) => found <= end.saturating_add(len),
-                };
-                if adjacent {
-                    count += 1;
-                } else {
-                    count = 1;
-                }
-                if count >= min_repeats {
-                    tracing::warn!(
-                        repeated_substring = %needle.chars().take(120).collect::<String>(),
-                        repeats = count,
-                        "degenerate-stream detector matched; this substring is \
-                         what tripped it"
-                    );
-                    return Some(needle);
-                }
-                // Non-overlapping, as the comment above has always claimed:
-                // advancing by one char let a periodic needle count its own
-                // overlaps and inflate the tally.
-                idx = found + len;
-                last_end = Some(found + len);
-            }
-        }
-    }
-    None
-}
-
-/// Count distinct "substantive" words in `s`: tokens that are at least 4
-/// characters long and made up of letters/digits. Used to differentiate a
-/// meaningful phrase like "Yielding pending your choice" (4 substantive
-/// words) from a single-token echo like "yes, yes, yes" (1 word) or
-/// "ok. ok. ok." (1 word).
-fn count_distinct_substantive_words(s: &str) -> usize {
-    let mut seen = std::collections::HashSet::new();
-    for token in s.split(|c: char| !c.is_alphanumeric()) {
-        if token.chars().count() >= 4 {
-            seen.insert(token.to_ascii_lowercase());
-        }
-    }
-    seen.len()
-}
-
-/// Find the next index in `haystack` (a Vec<char>) that begins a run equal to
-/// `needle`, starting the search at `from`. Avoids allocating a substring per
-/// comparison by indexing through `chars`.
-fn find_subslice(haystack: &[char], needle: &str, from: usize) -> Option<usize> {
-    let needle_chars: Vec<char> = needle.chars().collect();
-    if needle_chars.is_empty() || from + needle_chars.len() > haystack.len() {
-        return None;
-    }
-    'outer: for i in from..=haystack.len() - needle_chars.len() {
-        for j in 0..needle_chars.len() {
-            if haystack[i + j] != needle_chars[j] {
-                continue 'outer;
-            }
-        }
-        return Some(i);
-    }
-    None
 }
 
 /// Compact info about a running mission (for API responses).
@@ -10028,6 +10183,38 @@ mod tests {
     }
 
     #[test]
+    fn opencode_multiple_oauth_accounts_keep_freshest_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join(".sandboxed-sh");
+        fs::create_dir_all(&store).unwrap();
+        let account = |expires_at, token: &str| {
+            let mut provider = crate::ai_providers::AIProvider::new(
+                crate::ai_providers::ProviderType::Anthropic,
+                "Test".into(),
+            );
+            provider.oauth = Some(crate::ai_providers::OAuthCredentials {
+                access_token: token.into(),
+                refresh_token: "test-refresh".into(),
+                expires_at,
+            });
+            provider
+        };
+        for accounts in [
+            vec![account(200, "fresh"), account(100, "expired")],
+            vec![account(100, "expired"), account(200, "fresh")],
+        ] {
+            fs::write(
+                store.join("ai_providers.json"),
+                serde_json::to_vec(&accounts).unwrap(),
+            )
+            .unwrap();
+            let auth = build_opencode_auth_from_ai_providers(temp.path()).unwrap();
+            assert_eq!(auth["anthropic"]["access"], "fresh");
+            assert_eq!(auth["anthropic"]["expires"], 200);
+        }
+    }
+
+    #[test]
     fn muse_provider_auth_is_written_under_opencode_meta_key() {
         let temp = tempfile::tempdir().expect("temp dir");
         let store = temp.path().join(".sandboxed-sh");
@@ -10167,6 +10354,45 @@ mod tests {
             Some("private reasoning")
         );
         assert_eq!(grok_event_text(&event), None);
+    }
+
+    #[test]
+    fn stream_overlap_matches_unicode_oracle() {
+        fn oracle(a: &str, b: &str) -> usize {
+            b.char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(b.len()))
+                .filter(|&i| a.ends_with(&b[..i]))
+                .max()
+                .unwrap_or(0)
+        }
+        let mut strings = vec![String::new()];
+        let mut level = vec![String::new()];
+        for _ in 0..4 {
+            level = level
+                .iter()
+                .flat_map(|s| ["a", "b", "é", "🙂"].map(|c| format!("{s}{c}")))
+                .collect();
+            strings.extend(level.clone());
+        }
+        for a in &strings {
+            for b in &strings {
+                let got = super::suffix_prefix_overlap_len(a, b);
+                assert_eq!(got, oracle(a, b), "{a:?} {b:?}");
+                assert!(b.is_char_boundary(got));
+            }
+        }
+    }
+
+    #[test]
+    fn stream_overlap_handles_long_repeated_and_unicode_suffixes() {
+        let a = format!("{}é🙂ababab", "Contexte français. ".repeat(100_000));
+        assert_eq!(
+            super::suffix_prefix_overlap_len(&a, "é🙂ababab suite"),
+            "é🙂ababab".len()
+        );
+        assert_eq!(super::suffix_prefix_overlap_len(&a, &"z".repeat(2000)), 0);
+        assert_eq!(super::suffix_prefix_overlap_len("é🙂", "🙂fin"), "🙂".len());
     }
 
     #[test]
@@ -10365,6 +10591,22 @@ mod tests {
         assert!(!codex_turn_requires_tool_activity(
             "You must not edit files. Give a text-only answer.",
             "Here is the answer."
+        ));
+    }
+
+    #[test]
+    fn codex_tool_activity_handles_labeled_negative_instructions() {
+        assert!(!codex_turn_requires_tool_activity(
+            "Streaming probe: Do not use tools or access files. Write a Markdown table about software testing.",
+            "Here is the table."
+        ));
+        assert!(codex_turn_requires_tool_activity(
+            "Run cargo test: do not modify files. Report the result.",
+            "Here is the result."
+        ));
+        assert!(codex_turn_requires_tool_activity(
+            "Task: Do not modify files; run cargo test.",
+            "Here is the result."
         ));
     }
 

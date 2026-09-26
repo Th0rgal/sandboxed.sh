@@ -1,0 +1,13 @@
+[Unit]
+Description=Reconcile fleet Codex CLI from the official stable package
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/sandboxed-codex-update.env
+ExecStart=/usr/bin/python3 /usr/local/sbin/update-node-codex
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=10min
+UMask=0022

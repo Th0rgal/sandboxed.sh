@@ -1,4 +1,8 @@
 //! SQLite-based mission store with full event logging.
+#[path = "sqlite_transfer.rs"]
+mod machine_transfer;
+#[path = "sqlite_local_origin.rs"]
+mod sqlite_local_origin;
 
 use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, AwaitingKind, BoardOutboxItem,
@@ -1057,6 +1061,8 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to set busy_timeout: {}", e))?;
 
             // Run schema
+            conn.execute_batch(machine_transfer::SCHEMA)
+                .map_err(|e| e.to_string())?;
             conn.execute_batch(SCHEMA)
                 .map_err(|e| format!("Failed to run schema: {}", e))?;
 
@@ -2965,6 +2971,12 @@ fn read_project_columns(
 
 #[async_trait]
 impl MissionStore for SqliteMissionStore {
+    async fn sync_local_origin(
+        &self,
+        snapshot: crate::local_origin::Snapshot,
+    ) -> Result<(), String> {
+        sqlite_local_origin::sync(self, snapshot).await
+    }
     fn is_persistent(&self) -> bool {
         true
     }
@@ -3453,6 +3465,17 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn machine_transfers(&self, id: Uuid) -> Result<Vec<super::transfer::Transfer>, String> {
+        machine_transfer::list(self, id).await
+    }
+    async fn save_machine_transfer(
+        &self,
+        action: super::transfer::Transfer,
+        expected: Option<u64>,
+    ) -> Result<super::transfer::Transfer, String> {
+        machine_transfer::save(self, action, expected).await
+    }
+
     async fn begin_mission_run(
         &self,
         mission_id: Uuid,
@@ -3465,6 +3488,10 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let mut conn = conn.blocking_lock();
             let tx = conn.transaction().map_err(|error| error.to_string())?;
+            machine_transfer::guard_start(&tx, mission_id)?;
+            machine_transfer::guard_placement(&tx,mission_id,&owner_actor_id,scope_unit.as_deref())?;
+            let cwd=scope_unit.as_deref().and_then(|s|s.strip_prefix("orb-cwd:"));
+            machine_transfer::guard_workspace(&tx,mission_id,cwd)?;
             let mission_status = tx
                 .query_row(
                     "SELECT status FROM missions WHERE id = ?1",
@@ -3481,7 +3508,7 @@ impl MissionStore for SqliteMissionStore {
                     "acknowledged mission {mission_id} cannot acquire a non-terminal run"
                 ));
             }
-            if !matches!(mission_status.as_str(), "pending" | "active") {
+            if !owner_actor_id.starts_with("orb-client:") && !matches!(mission_status.as_str(), "pending" | "active") {
                 return Err(format!(
                     "mission {mission_id} has status {mission_status}; activate it before acquiring a non-terminal run"
                 ));
@@ -3500,6 +3527,9 @@ impl MissionStore for SqliteMissionStore {
                     "mission {mission_id} already has non-terminal run {} generation {}",
                     existing.run_id, existing.generation
                 ));
+            }
+            if owner_actor_id.starts_with("orb-client:") {
+                tx.execute("UPDATE missions SET status='active',updated_at=?2,working_directory=COALESCE(?3,working_directory) WHERE id=?1",params![mission_id.to_string(),now_string(),cwd]).map_err(|e|e.to_string())?;
             }
             let generation = tx
                 .query_row(
@@ -5096,82 +5126,19 @@ impl MissionStore for SqliteMissionStore {
 
     async fn get_all_active_missions(&self) -> Result<Vec<Mission>, String> {
         let conn = self.conn.clone();
-
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, status, title, workspace_id, workspace_name, agent, model_override,
-                            created_at, updated_at, interrupted_at, resumable, desktop_sessions,
-                            COALESCE(backend, 'opencode') as backend,
-                            COALESCE(mission_mode, 'task') as mission_mode,
-                            COALESCE(goal_mode, 0) as goal_mode,
-                            goal_objective
-                     FROM missions
-                     WHERE status = 'active'",
-                )
-                .map_err(|e| e.to_string())?;
-
+            // Recovery decisions require placement tags, origin and project
+            // metadata. A reduced projection silently classified native Orb
+            // processes as orphaned Core runs after a service restart.
+            let sql =
+                format!("SELECT {MISSION_LIST_COLUMNS} FROM missions WHERE status = 'active'");
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
             let missions = stmt
-                .query_map(params![], |row| {
-                    let id_str: String = row.get(0)?;
-                    let status_str: String = row.get(1)?;
-                    let workspace_id_str: String = row.get(3)?;
-                    let desktop_sessions_json: Option<String> = row.get(11)?;
-                    let backend: String = row.get(12)?;
-
-                    Ok(Mission {
-                        id: parse_uuid_or_nil(&id_str),
-                        status: parse_status(&status_str),
-                        title: row.get(2)?,
-                        short_description: None,
-                        metadata_updated_at: None,
-                        metadata_source: None,
-                        metadata_model: None,
-                        metadata_version: None,
-                        workspace_id: Uuid::parse_str(&workspace_id_str)
-                            .unwrap_or(crate::workspace::DEFAULT_WORKSPACE_ID),
-                        workspace_name: row.get(4)?,
-                        agent: row.get(5)?,
-                        model_override: row.get(6)?,
-                        model_effort: None, // Not needed for active mission checks
-                        fast_mode: false,
-                        backend,
-                        config_profile: None, // Not needed for active mission checks
-                        history: vec![],
-                        created_at: row.get(7)?,
-                        updated_at: row.get(8)?,
-                        interrupted_at: row.get(9)?,
-                        paused_at: None,
-                        resumable: row.get::<_, i32>(10)? != 0,
-                        desktop_sessions: desktop_sessions_json
-                            .and_then(|s| serde_json::from_str(&s).ok())
-                            .unwrap_or_default(),
-                        session_id: None,
-                        terminal_reason: None,
-                        terminal_evidence: None,
-                        parent_mission_id: None,
-                        working_directory: None,
-                        requires_local_disk: true,
-                        mission_mode: row
-                            .get::<_, Option<String>>(13)?
-                            .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
-                            .unwrap_or_default(),
-                        goal_mode: row.get::<_, i32>(14).unwrap_or(0) != 0,
-                        goal_objective: row.get(15).ok().flatten(),
-                        first_viewed_at: None,
-                        scheduling: Default::default(),
-                        project: MissionProject::default(),
-                        activity: MissionActivity::default(),
-                        awaiting_kind: None,
-                        origin: None,
-                        origin_session_id: None,
-                    })
-                })
+                .query_map(params![], row_to_mission)
                 .map_err(|e| e.to_string())?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
-
             Ok(missions)
         })
         .await
@@ -5238,9 +5205,8 @@ impl MissionStore for SqliteMissionStore {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, status, title, workspace_id, workspace_name, agent, model_override,
+            let sql = format!(
+                "SELECT id, status, title, workspace_id, workspace_name, agent, model_override,
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend,
                             COALESCE(mission_mode, 'task') as mission_mode,
@@ -5248,10 +5214,11 @@ impl MissionStore for SqliteMissionStore {
                             goal_objective,
                             COALESCE(priority, 0) as priority, not_before, deadline
                      FROM missions
-                     WHERE status = 'pending' AND deferred_goal IS NOT NULL
+                     WHERE status = 'pending' AND deferred_goal IS NOT NULL{}
                      ORDER BY created_at ASC",
-                )
-                .map_err(|e| e.to_string())?;
+                crate::api::control::client_placement::SQL_EXCLUDE
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
             let missions = stmt
                 .query_map(params![], |row| {
@@ -5576,7 +5543,11 @@ impl MissionStore for SqliteMissionStore {
                 Some(id.to_string()),
                 None,
                 None,
-                content.clone(),
+                if source.as_deref() == Some("scheduler") {
+                    crate::api::control::deferred_messages::strip(content)
+                } else {
+                    content.clone()
+                },
                 {
                     // Always record `queued`; record `source` only when present so
                     // the persisted metadata is the forensic record of who/what
@@ -5585,6 +5556,13 @@ impl MissionStore for SqliteMissionStore {
                     meta.insert("queued".to_string(), serde_json::json!(queued));
                     if let Some(src) = source {
                         meta.insert("source".to_string(), serde_json::json!(src));
+                        if src == "scheduler" {
+                            let messages =
+                                crate::api::control::deferred_messages::decode(content).1;
+                            if !messages.is_empty() {
+                                meta.insert("messages".into(), serde_json::json!(messages));
+                            }
+                        }
                     }
                     serde_json::Value::Object(meta)
                 },
@@ -13686,6 +13664,41 @@ mod tests {
                 "{col} board_tasks column must survive concurrent migration"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn active_mission_scan_preserves_client_placement_for_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteMissionStore::new(dir.path().to_path_buf(), "test-user")
+            .await
+            .unwrap();
+        let mission = store
+            .create_mission(Some("Native goal"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .update_mission_project(
+                mission.id,
+                MissionProjectPatch {
+                    tags: Some(vec!["placement:client".into()]),
+                    project: Some(Some("verity".into())),
+                    track: Some(Some("import".into())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .unwrap();
+        let active = store.get_all_active_missions().await.unwrap();
+        let found = active.iter().find(|m| m.id == mission.id).unwrap();
+        assert!(crate::api::control::client_placement::is_tagged(
+            &found.project.tags
+        ));
+        assert_eq!(found.project.project.as_deref(), Some("verity"));
+        assert_eq!(found.project.track.as_deref(), Some("import"));
     }
 
     #[tokio::test]

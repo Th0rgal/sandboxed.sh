@@ -1,0 +1,14 @@
+[[permission]]
+identifier = "allow-paloma-ssh-pubkey"
+description = "Read the Paloma SSH public key"
+commands.allow = ["paloma_ssh_pubkey"]
+
+[[permission]]
+identifier = "allow-window-theme"
+description = "Apply the selected Orb window appearance"
+commands.allow = ["set_window_theme"]
+
+[[permission]]
+identifier = "allow-open-url"
+description = "Open validated external links in the default browser"
+commands.allow = ["open_url"]

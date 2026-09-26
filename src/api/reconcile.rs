@@ -264,6 +264,8 @@ pub enum MissionVerdict {
 /// here so the policy is unit-testable without systemd or a live actor.
 #[derive(Debug, Clone, Copy)]
 pub struct MissionFacts {
+    /// Orb owns native liveness; absence of a Core runner proves nothing.
+    pub is_client_placed: bool,
     pub status: MissionStatus,
     pub is_assistant_mode: bool,
     /// The control actor currently lists this mission as running.
@@ -281,6 +283,9 @@ pub struct MissionFacts {
 }
 
 pub fn classify_mission(facts: &MissionFacts) -> MissionVerdict {
+    if facts.is_client_placed {
+        return MissionVerdict::Keep;
+    }
     match facts.status {
         MissionStatus::Active => {
             if facts.is_assistant_mode
@@ -317,6 +322,7 @@ pub fn classify_mission(facts: &MissionFacts) -> MissionVerdict {
 /// the mission stuck `interrupted` forever (needing a manual resume).
 #[derive(Debug, Clone, Copy)]
 pub struct InterruptedFacts {
+    pub is_client_placed: bool,
     pub status: MissionStatus,
     /// The mission's `terminal_reason` is a restart/deploy interrupt
     /// (`service_restart`, `server_shutdown`, or a cancel-timeout kill
@@ -339,7 +345,8 @@ pub struct InterruptedFacts {
 /// True iff an `interrupted(service_restart)` mission with no live backing,
 /// recently touched, and no competing live retry should be auto-resumed.
 pub fn should_reresume_interrupted(facts: &InterruptedFacts) -> bool {
-    facts.status == MissionStatus::Interrupted
+    !facts.is_client_placed
+        && facts.status == MissionStatus::Interrupted
         && facts.is_service_restart
         && !facts.running_in_actor
         && !facts.has_live_scope
@@ -580,6 +587,9 @@ pub async fn run(state: &Arc<AppState>) -> ReconcileReport {
                 .unwrap_or(false);
             let short = mission.id.simple().to_string()[..8].to_string();
             let facts = MissionFacts {
+                is_client_placed: super::control::client_placement::is_tagged(
+                    &mission.project.tags,
+                ),
                 status: mission.status,
                 is_assistant_mode: mission.mission_mode == MissionMode::Assistant,
                 running_in_actor: running_ids.contains(&mission.id),
@@ -671,6 +681,9 @@ pub async fn run(state: &Arc<AppState>) -> ReconcileReport {
                 .flatten()
                 .is_some();
             let facts = MissionFacts {
+                is_client_placed: super::control::client_placement::is_tagged(
+                    &mission.project.tags,
+                ),
                 status: mission.status,
                 is_assistant_mode: mission.mission_mode == MissionMode::Assistant,
                 running_in_actor: running_ids.contains(&mission.id),
@@ -783,6 +796,9 @@ send a new message or re-create the mission.",
                 .map(|p| live_project_tracks.contains(&(p.clone(), mission.project.track.clone())))
                 .unwrap_or(false);
             let facts = InterruptedFacts {
+                is_client_placed: super::control::client_placement::is_tagged(
+                    &mission.project.tags,
+                ),
                 status: mission.status,
                 is_service_restart,
                 running_in_actor: running_ids.contains(&mission.id),
@@ -1007,6 +1023,7 @@ mod tests {
 
     fn base_active_facts() -> MissionFacts {
         MissionFacts {
+            is_client_placed: false,
             status: MissionStatus::Active,
             is_assistant_mode: false,
             running_in_actor: false,
@@ -1016,6 +1033,19 @@ mod tests {
             has_events: true,
             already_tagged_orphaned: false,
         }
+    }
+
+    #[test]
+    fn client_missions_are_never_recovered_by_core() {
+        let mut active = base_active_facts();
+        active.is_client_placed = true;
+        assert_eq!(classify_mission(&active), MissionVerdict::Keep);
+        active.status = MissionStatus::AwaitingUser;
+        active.has_events = false;
+        assert_eq!(classify_mission(&active), MissionVerdict::Keep);
+        let mut interrupted = base_interrupted_facts();
+        interrupted.is_client_placed = true;
+        assert!(!should_reresume_interrupted(&interrupted));
     }
 
     #[test]
@@ -1085,6 +1115,7 @@ mod tests {
 
     fn base_interrupted_facts() -> InterruptedFacts {
         InterruptedFacts {
+            is_client_placed: false,
             status: MissionStatus::Interrupted,
             is_service_restart: true,
             running_in_actor: false,

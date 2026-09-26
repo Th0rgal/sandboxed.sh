@@ -133,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
     // Periodic disk GC for lean-build checkouts and lake cache slots
     // (SANDBOXED_NODE_MIN_FREE_GB, default 10).
     sandboxed_sh::node::spawn_cache_gc(work_root.clone());
+    sandboxed_sh::node::resource_history::start();
 
     let state = Arc::new(NodeState {
         node_id,
@@ -147,8 +148,24 @@ async fn main() -> anyhow::Result<()> {
         runner,
         managed_auth,
     });
+    sandboxed_sh::agent_software::start_worker();
+    sandboxed_sh::node::project_context::start(state.work_root.clone());
     let app = Router::new()
+        .route("/project-context/prepare", post(prepare_project_context))
         .route("/heartbeat", get(heartbeat))
+        .route("/software", get(software_inventory))
+        .route("/software/updates", post(software_update))
+        .route("/software/updates/cancel", post(software_cancel))
+        .route("/machine-transfer/capabilities", get(transfer_capabilities))
+        .route("/machine-transfer/browse", post(transfer_browse))
+        .route(
+            "/machine-transfer/files",
+            post(transfer_files).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/uploads",
+            post(upload_file).layer(DefaultBodyLimit::max(sandboxed_sh::uploads::MAX_BODY_BYTES)),
+        )
         .route("/execute", post(execute))
         // Private-source jobs carry bounded payloads before base64 encoding,
         // so this route needs the same bounded wire allowance as the core
@@ -162,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
                 .get(list_jobs),
         )
         .route("/jobs/:id", get(get_job))
+        .route("/jobs/:id/files", post(job_files))
         .route("/jobs/:id/log", get(get_job_log))
         .route("/jobs/:id/cancel", post(cancel_job))
         .with_state(state);
@@ -242,6 +260,7 @@ async fn heartbeat(
     let lean_runtime_ready = sandboxed_sh::node::lean_runtime_ready(&state.work_root);
     let labels = advertised_labels(&state.labels, lean_runtime_ready);
     Ok(Json(NodeHeartbeat {
+        resource_history: sandboxed_sh::node::resource_history::snapshot(),
         node_id: state.node_id.clone(),
         online: true,
         capacity_total: state.capacity_total,
@@ -308,6 +327,9 @@ async fn execute(
     Json(request): Json<LeaseRequest>,
 ) -> Result<Json<ExecuteResponse>, (StatusCode, String)> {
     check_auth(&headers, &state)?;
+    let _software_execution =
+        sandboxed_sh::agent_software::begin(&uuid::Uuid::new_v4().to_string(), "node-lease", None)
+            .map_err(|e| (StatusCode::CONFLICT, e))?;
     // Leases may be signed with the previous token during rotation; pick the
     // secret that validates (run_lease_command re-validates internally).
     let signing_secret = validate_lease_any(
@@ -614,6 +636,116 @@ mod tests {
 
     async fn test_state(work_root: PathBuf) -> Arc<NodeState> {
         test_state_with_capacity(work_root, 2).await
+    }
+
+    #[tokio::test]
+    async fn machine_transfer_node_protocol_copies_and_browses_the_verified_workspace() {
+        use sandboxed_sh::machine_transfer::{Manifest, Operation};
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().into()).await;
+        let mid = Uuid::new_v4();
+        let tid = Uuid::new_v4();
+        let root = dir.path().join(mid.to_string());
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("proof.txt"), "complete proof").unwrap();
+        let request = |side: &str, operation| TransferFilesRequest {
+            mission_id: mid,
+            transfer_id: tid,
+            source_transfer: None,
+            source_mission_id: None,
+            side: side.into(),
+            operation,
+        };
+        assert!(transfer_files(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(request("source", Operation::Snapshot))
+        )
+        .await
+        .is_err());
+        let m = transfer_files(
+            State(state.clone()),
+            auth_headers("node-secret"),
+            Json(request("source", Operation::Snapshot)),
+        )
+        .await
+        .unwrap()
+        .0;
+        let manifest: Manifest = serde_json::from_value(m).unwrap();
+        transfer_files(
+            State(state.clone()),
+            auth_headers("node-secret"),
+            Json(request("destination", Operation::Stage { manifest })),
+        )
+        .await
+        .unwrap();
+        let data = transfer_files(
+            State(state.clone()),
+            auth_headers("node-secret"),
+            Json(request(
+                "source",
+                Operation::Read {
+                    path: "proof.txt".into(),
+                    offset: 0,
+                },
+            )),
+        )
+        .await
+        .unwrap()
+        .0["data"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        transfer_files(
+            State(state.clone()),
+            auth_headers("node-secret"),
+            Json(request(
+                "destination",
+                Operation::Write {
+                    path: "proof.txt".into(),
+                    offset: 0,
+                    data,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        transfer_files(
+            State(state.clone()),
+            auth_headers("node-secret"),
+            Json(request("destination", Operation::Verify)),
+        )
+        .await
+        .unwrap();
+        let browse = TransferBrowseRequest {
+            transfer_id: tid,
+            operation: sandboxed_sh::file_browser::Request {
+                action: "read".into(),
+                path: "proof.txt".into(),
+                ..Default::default()
+            },
+        };
+        let read = transfer_browse(
+            State(state.clone()),
+            auth_headers("node-secret"),
+            Json(browse),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(read["content"], "complete proof");
+        state
+            .jobs
+            .create(Uuid::new_v4(), mid, "{}".into(), "unused".into())
+            .await
+            .unwrap();
+        assert!(transfer_files(
+            State(state),
+            auth_headers("node-secret"),
+            Json(request("source", Operation::Snapshot))
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]
@@ -939,4 +1071,207 @@ mod tests {
         .0;
         assert!(listed.iter().any(|job| job.job_id == job_id));
     }
+}
+
+async fn job_files(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<sandboxed_sh::file_browser::Request>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    let record = state
+        .jobs
+        .get(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "Job not found".into()))?;
+    let root = state.work_root.join(record.mission_id.to_string());
+    let value =
+        tokio::task::spawn_blocking(move || sandboxed_sh::file_browser::execute(&root, &request))
+            .await
+            .map_err(|e| internal_error(e.into()))?
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(value))
+}
+
+async fn upload_file(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    Json(request): Json<sandboxed_sh::uploads::Upload>,
+) -> Result<Json<sandboxed_sh::uploads::Receipt>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    let root = state.work_root.join("uploads");
+    let slot = sandboxed_sh::uploads::SLOTS.try_acquire().map_err(|_| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Other uploads are in progress".into(),
+        )
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        sandboxed_sh::uploads::store(&root, request)
+    })
+    .await
+    .map_err(|e| internal_error(e.into()))?
+    .map(Json)
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))
+}
+
+#[derive(serde::Deserialize)]
+struct TransferFilesRequest {
+    mission_id: Uuid,
+    transfer_id: Uuid,
+    source_transfer: Option<Uuid>,
+    source_mission_id: Option<Uuid>,
+    side: String,
+    operation: sandboxed_sh::machine_transfer::Operation,
+}
+async fn transfer_capabilities(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    let mut harnesses = Vec::new();
+    for bin in ["grok", "codex", "opencode"] {
+        let found = std::env::var_os("PATH")
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join(bin).is_file()));
+        if found && (bin != "grok" || state.managed_auth.advertised().iter().any(|p| p == "grok")) {
+            harnesses.push(bin);
+        }
+    }
+    Ok(Json(serde_json::json!({"version":1,"harnesses":harnesses})))
+}
+async fn transfer_files(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    Json(req): Json<TransferFilesRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    if !matches!(req.side.as_str(), "source" | "destination") {
+        return Err((StatusCode::BAD_REQUEST, "Invalid side".into()));
+    }
+    if state
+        .jobs
+        .mission_has_live_jobs(req.mission_id)
+        .await
+        .map_err(internal_error)?
+        || state
+            .jobs
+            .mission_has_live_jobs(req.source_mission_id.unwrap_or(req.mission_id))
+            .await
+            .map_err(internal_error)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Source execution has not terminated".into(),
+        ));
+    }
+    let area = state
+        .work_root
+        .join(".transfers")
+        .join(req.transfer_id.to_string())
+        .join(&req.side);
+    let source = req
+        .source_transfer
+        .map(|id| {
+            state
+                .work_root
+                .join(".transfers")
+                .join(id.to_string())
+                .join("destination/workspace")
+        })
+        .unwrap_or_else(|| {
+            state
+                .work_root
+                .join(req.source_mission_id.unwrap_or(req.mission_id).to_string())
+        });
+    let value = tokio::task::spawn_blocking(move || {
+        sandboxed_sh::machine_transfer::operate(&area, Some(&source), req.operation)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::CONFLICT, e))?;
+    Ok(Json(value))
+}
+
+#[derive(serde::Deserialize)]
+struct TransferBrowseRequest {
+    transfer_id: Uuid,
+    operation: sandboxed_sh::file_browser::Request,
+}
+async fn transfer_browse(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    Json(req): Json<TransferBrowseRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    let area = state
+        .work_root
+        .join(".transfers")
+        .join(req.transfer_id.to_string())
+        .join("destination");
+    if !area.join("verified").is_file() {
+        return Err((StatusCode::CONFLICT, "Workspace is not verified".into()));
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        sandboxed_sh::file_browser::execute(&area.join("workspace"), &req.operation)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::CONFLICT, e))?;
+    Ok(Json(result))
+}
+
+async fn prepare_project_context(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    Json(request): Json<sandboxed_sh::node::project_context::Request>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    sandboxed_sh::node::project_context::prepare(&state.work_root, request)
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))
+}
+
+async fn software_inventory(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    Query(q): Query<sandboxed_sh::api::agent_software::Params>,
+) -> Result<Json<sandboxed_sh::agent_software::Inventory>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    let mut inventory = tokio::task::spawn_blocking(move || {
+        if q.force {
+            sandboxed_sh::agent_software::clear_versions();
+        }
+        sandboxed_sh::agent_software::scan("Node runner", &std::collections::HashMap::new())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sandboxed_sh::agent_software::releases(&mut inventory, q.force).await;
+    Ok(Json(inventory))
+}
+async fn software_update(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    Json(body): Json<sandboxed_sh::api::agent_software::Update>,
+) -> Result<Json<sandboxed_sh::agent_software::UpdateJob>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    tokio::task::spawn_blocking(move || {
+        sandboxed_sh::agent_software::queue(&body.component, &body.version, &body.path)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map(Json)
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))
+}
+async fn software_cancel(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+    Json(body): Json<sandboxed_sh::api::agent_software::Cancel>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_auth(&headers, &state)?;
+    sandboxed_sh::agent_software::cancel(&body.id).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(serde_json::json!({"ok":true})))
 }

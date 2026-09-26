@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "provider_id": "zai",
+  "access_profile": "api",
+  "source": "curated",
+  "observed_at": null,
+  "completeness": "partial",
+  "models": [
+    {
+      "id": "glm-5.3",
+      "name": "GLM-5.3",
+      "description": "Flagship reasoning and coding model, 1M-token context"
+    },
+    {
+      "id": "glm-5.2",
+      "name": "GLM-5.2",
+      "description": "Previous flagship; Coding Plan routes this to GLM-5.3"
+    },
+    {
+      "id": "glm-5.1",
+      "name": "GLM-5.1",
+      "description": "Previous flagship GLM reasoning model"
+    },
+    {
+      "id": "glm-5-turbo",
+      "name": "GLM-5 Turbo",
+      "description": "Fast reasoning model with deep thinking"
+    },
+    {
+      "id": "glm-4.7",
+      "name": "GLM-4.7",
+      "description": "Most capable GLM model"
+    },
+    {
+      "id": "glm-4.6",
+      "name": "GLM-4.6",
+      "description": "Balanced capability and speed"
+    },
+    {
+      "id": "glm-4.5",
+      "name": "GLM-4.5",
+      "description": "Fast and economical"
+    },
+    {
+      "id": "glm-4.6v-flash",
+      "name": "GLM-4.6V Flash",
+      "description": "Vision model, fast variant"
+    }
+  ]
+}

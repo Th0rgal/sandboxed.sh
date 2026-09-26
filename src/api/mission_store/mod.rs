@@ -8,6 +8,7 @@
 mod file;
 mod memory;
 pub(crate) mod sqlite;
+pub mod transfer;
 
 pub use file::FileMissionStore;
 pub use memory::InMemoryMissionStore;
@@ -2078,6 +2079,17 @@ pub trait MissionStore: Send + Sync {
         Ok(counts)
     }
 
+    async fn machine_transfers(&self, _id: Uuid) -> Result<Vec<transfer::Transfer>, String> {
+        Ok(vec![])
+    }
+    async fn save_machine_transfer(
+        &self,
+        _action: transfer::Transfer,
+        _expected: Option<u64>,
+    ) -> Result<transfer::Transfer, String> {
+        Err("Machine transfer requires the updated SQLite store".into())
+    }
+
     /// Get a single mission by ID.
     async fn get_mission(&self, id: Uuid) -> Result<Option<Mission>, String>;
 
@@ -2204,6 +2216,13 @@ pub trait MissionStore: Send + Sync {
                 .find(|entry| entry.role == "user")
                 .map(|entry| entry.content)
         }))
+    }
+
+    async fn sync_local_origin(
+        &self,
+        _snapshot: crate::local_origin::Snapshot,
+    ) -> Result<(), String> {
+        Err("Local offline imports are not supported by this store".into())
     }
 
     /// Create a new mission.

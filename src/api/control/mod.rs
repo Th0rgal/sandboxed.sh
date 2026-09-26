@@ -7,10 +7,14 @@
 //! - supports frontend/interactive tools by accepting tool results
 //! - supports persistent missions (goal-oriented sessions)
 
+pub(crate) mod client_placement;
+pub(crate) mod deferred_messages;
 pub(crate) mod dispatch_admission;
 #[cfg(test)]
 pub(crate) mod dispatch_admission_tests;
 pub(crate) mod execution_ownership;
+pub mod fork;
+pub(crate) mod machine_transfer;
 mod remote_grok;
 #[cfg(test)]
 use dispatch_admission::admit_dispatch;
@@ -306,7 +310,7 @@ pub(crate) fn deferred_goal_for_incoming_message(
 ) -> String {
     if status == MissionStatus::Pending {
         match previous_goal {
-            Some(prev) if !prev.is_empty() => format!("{prev}\n{content}"),
+            Some(prev) if !prev.is_empty() => deferred_messages::join(prev, content),
             _ => content.to_string(),
         }
     } else {
@@ -910,6 +914,197 @@ mod campaign_guard_tests {
             .await
             .expect("tag");
         mission.id
+    }
+
+    /// A mission with an explicit model selection and a live native session,
+    /// as it exists on disk before any turn is dispatched.
+    async fn mk_selected(
+        store: &Arc<dyn MissionStore>,
+        backend: &str,
+        model: Option<&str>,
+    ) -> Mission {
+        let mission = store
+            .create_mission(Some("selected"), None, None, None, None, None, None)
+            .await
+            .expect("create");
+        store
+            .update_mission_run_settings(
+                mission.id,
+                Some(backend),
+                Some(Some("writer")),
+                Some(model.map(|m| m).map(Some).unwrap_or(None)),
+                Some(Some("high")),
+                Some(true),
+                Some(Some("telegram")),
+                "native-session-1",
+            )
+            .await
+            .expect("settings");
+        store
+            .get_mission(mission.id)
+            .await
+            .expect("load")
+            .expect("present")
+    }
+
+    #[tokio::test]
+    async fn dispatch_never_drops_a_model_this_deployment_still_runs() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        // The regression this guards: returning None here silently erased the
+        // user's selection and fell back to the harness default.
+        for (backend, model) in [
+            ("codex", "gpt-6-astra"),
+            ("codex", "gpt-5.6-sol"),
+            ("claudecode", crate::model_policy::CURRENT_CLAUDE_FABLE),
+            ("claudecode", crate::model_policy::CURRENT_CLAUDE_OPUS),
+            ("claudecode", "claude-sonnet-4-6"),
+            ("grok", "grok-4.6"),
+            ("opencode", "xai/grok-4.6"),
+            ("opencode", "anthropic/claude-opus-5"),
+        ] {
+            let mission = mk_selected(&store, backend, Some(model)).await;
+            assert_eq!(
+                model_for_dispatch(&store, &mission).await.as_deref(),
+                Some(model),
+                "{backend}/{model} must reach the runner unchanged"
+            );
+            let reloaded = store.get_mission(mission.id).await.unwrap().unwrap();
+            assert_eq!(reloaded.model_override.as_deref(), Some(model));
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_leaves_an_unset_model_unset() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = mk_selected(&store, "claudecode", None).await;
+        assert_eq!(mission.model_override, None);
+        assert_eq!(model_for_dispatch(&store, &mission).await, None);
+        let reloaded = store.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.model_override, None, "no override was invented");
+    }
+
+    #[tokio::test]
+    async fn dispatch_upgrades_a_retired_model_and_records_it() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = mk_selected(&store, "claudecode", Some("claude-opus-4-1")).await;
+        let before = store.get_mission(mission.id).await.unwrap().unwrap();
+
+        let effective = model_for_dispatch(&store, &mission).await;
+        assert_eq!(
+            effective.as_deref(),
+            Some(crate::model_policy::CURRENT_CLAUDE_OPUS)
+        );
+
+        // What clients read must match what the turn will run — the whole point
+        // of persisting the upgrade rather than only applying it in the runner.
+        let after = store.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(after.model_override.as_deref(), effective.as_deref());
+
+        // A model change must not cost the conversation its native session, its
+        // history, or any other run setting.
+        assert_eq!(after.session_id, before.session_id);
+        assert!(
+            after.session_id.is_some(),
+            "session was preserved, not cleared"
+        );
+        assert_eq!(after.backend, before.backend);
+        assert_eq!(after.agent, before.agent);
+        assert_eq!(after.model_effort, before.model_effort);
+        assert_eq!(after.fast_mode, before.fast_mode);
+        assert_eq!(after.config_profile, before.config_profile);
+        assert_eq!(after.history.len(), before.history.len());
+        assert_eq!(after.created_at, before.created_at);
+    }
+
+    #[tokio::test]
+    async fn dispatch_keeps_the_provider_prefix_when_upgrading() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        // OpenCode addresses models as provider/model; dropping the prefix
+        // would produce an id it cannot resolve.
+        let mission = mk_selected(&store, "opencode", Some("anthropic/claude-opus-4-8")).await;
+        assert_eq!(
+            model_for_dispatch(&store, &mission).await.as_deref(),
+            Some("anthropic/claude-opus-5")
+        );
+        let after = store.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.model_override.as_deref(),
+            Some("anthropic/claude-opus-5")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_is_refused_rather_than_run_on_a_retired_model() {
+        use crate::api::mission_runner::refuse_retired_model;
+
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = mk_selected(&store, "claudecode", Some("claude-opus-4-1")).await;
+
+        // Make the upgrade unrecordable: the write `model_for_dispatch` needs
+        // now fails, exactly as it would against an unavailable store.
+        assert!(store.delete_mission(mission.id).await.expect("delete"));
+
+        // Dispatch hands back the stored id rather than a model nothing reports.
+        let dispatched = model_for_dispatch(&store, &mission)
+            .await
+            .expect("a model is still resolved");
+        assert_eq!(dispatched, "claude-opus-4-1");
+
+        // The pre-harness guard then refuses the turn. This is the fail-closed
+        // half: no harness is spawned, locally or remotely, and the retired
+        // model never runs.
+        let refusal = refuse_retired_model(mission.id, &dispatched)
+            .expect("a retired model must not reach a harness");
+        assert!(!refusal.success);
+        assert_eq!(refusal.cost_cents, 0);
+        assert!(refusal.output.contains("claude-opus-4-1"));
+        assert!(refusal
+            .output
+            .contains(crate::model_policy::CURRENT_CLAUDE_OPUS));
+        assert!(
+            refusal.output.contains("Nothing was started"),
+            "the refusal must say no work began: {}",
+            refusal.output
+        );
+    }
+
+    #[tokio::test]
+    async fn the_guard_never_refuses_a_model_this_deployment_runs() {
+        use crate::api::mission_runner::refuse_retired_model;
+
+        let id = Uuid::new_v4();
+        for allowed in [
+            crate::model_policy::CURRENT_CLAUDE_OPUS,
+            crate::model_policy::CURRENT_CLAUDE_FABLE,
+            "claude-opus-6",
+            "claude-opus-5-20260101",
+            "claude-sonnet-4-6",
+            "gpt-6-astra",
+            "grok-4.6",
+            "anthropic/claude-opus-5",
+        ] {
+            assert!(
+                refuse_retired_model(id, allowed).is_none(),
+                "{allowed} must be allowed to run"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_does_not_downgrade_a_newer_model() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        for newer in [
+            "claude-opus-6",
+            "claude-fable-6-1",
+            "claude-opus-5-20260101",
+        ] {
+            let mission = mk_selected(&store, "claudecode", Some(newer)).await;
+            assert_eq!(
+                model_for_dispatch(&store, &mission).await.as_deref(),
+                Some(newer),
+                "{newer} must not be rewritten"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3601,6 +3796,9 @@ pub struct ControlMessageRequest {
     pub track: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+    /// Follow-up `@` chips: written into the live workspace before this message.
+    #[serde(default)]
+    pub attachments: Option<Vec<crate::api::mission_payload::MissionAttachment>>,
     /// Catch-all for unrecognized request fields — surfaced as `warnings` in
     /// the response instead of being silently dropped (a mistyped targeting
     /// field once silently rerouted a message to the wrong mission).
@@ -3643,6 +3841,23 @@ pub struct QueuedMessage {
     /// interrupted and an explicit resume is required.
     #[serde(default)]
     pub inflight: bool,
+}
+
+/// A scheduler batch keeps one transport entry, but every original receipt ID
+/// remains an admission identity. Never insert aliases into the persisted queue:
+/// that would replay/display the same batch more than once.
+fn control_message_contains_id(
+    outer_id: Uuid,
+    content: &str,
+    source: Option<&str>,
+    candidate: Uuid,
+) -> bool {
+    outer_id == candidate
+        || (source == Some("scheduler")
+            && deferred_messages::decode(content)
+                .1
+                .iter()
+                .any(|(id, _)| *id == candidate))
 }
 
 fn partition_restored_control_messages(
@@ -4064,6 +4279,10 @@ impl FrontendToolHub {
         rx
     }
 
+    pub async fn unregister(&self, tool_call_id: &str) {
+        self.pending.lock().await.remove(tool_call_id);
+    }
+
     /// Resolve a pending tool call by id.
     ///
     /// Returns `true` if a live waiter received the result (the running mission
@@ -4092,8 +4311,7 @@ impl FrontendToolHub {
             {
                 let mut pending = self.pending.lock().await;
                 if let Some(tx) = pending.remove(tool_call_id) {
-                    let _ = tx.send(result);
-                    return true;
+                    return tx.send(result).is_ok();
                 }
             }
             if attempt < REGISTER_GRACE_ATTEMPTS {
@@ -4101,6 +4319,11 @@ impl FrontendToolHub {
             }
         }
 
+        // Native requests are registered before publication. Never replay an
+        // expired answer into a future waiter.
+        if tool_call_id.starts_with("native-") {
+            return false;
+        }
         let mut early = self.early_results.lock().await;
         const MAX_EARLY_RESULTS: usize = 256;
         if early.len() >= MAX_EARLY_RESULTS {
@@ -4871,7 +5094,8 @@ pub async fn post_message(
     if content.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "content is required".to_string()));
     }
-
+    crate::api::mission_payload::validate_user_content(&content)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let id = req.client_message_id.unwrap_or_else(Uuid::new_v4);
     let agent = req.agent;
     let target_mission_id = req.mission_id;
@@ -4900,11 +5124,32 @@ pub async fn post_message(
     }
     let control = control_for_user(&state, &user).await;
     if let Some(mid) = target_mission_id {
+        machine_transfer::guard(&control.mission_store, mid)
+            .await
+            .map_err(internal_error)?;
+        if mission_is_client_placed(&control, mid)
+            .await
+            .map_err(internal_error)?
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "this mission runs on the Orb client; the backend will not execute it".into(),
+            ));
+        }
         if let Some(placement) =
             remote_grok::placement(&state.config.working_dir, &control.mission_store, mid)
                 .await
                 .map_err(internal_error)?
         {
+            if req.attachments.as_ref().is_some_and(|a| {
+                a.iter()
+                    .any(|item| item.kind != crate::api::mission_payload::AttachmentKind::Context)
+            }) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "remote follow-up attachments are not supported".into(),
+                ));
+            }
             if agent.is_some()
                 || req.github_pr.is_some()
                 || req.track.is_some()
@@ -4935,6 +5180,47 @@ pub async fn post_message(
             }));
         }
     }
+    let content = if let Some(attachments) = req.attachments.as_ref().filter(|a| !a.is_empty()) {
+        let mid = target_mission_id.ok_or((
+            StatusCode::BAD_REQUEST,
+            "attachments require mission_id".into(),
+        ))?;
+        let mission = control
+            .mission_store
+            .get_mission(mid)
+            .await
+            .map_err(internal_error)?
+            .ok_or((StatusCode::NOT_FOUND, "mission not found".into()))?;
+        let mut payload = crate::api::mission_payload::MissionPayload {
+            attachments: attachments.clone(),
+            project: mission.project.project.clone(),
+            controller_md: None,
+        };
+        if attachments
+            .iter()
+            .any(|a| a.kind == crate::api::mission_payload::AttachmentKind::Controller)
+        {
+            if let Some(project) = payload.project.as_deref() {
+                payload.controller_md = Some(
+                    super::projects_overview::controller_snapshot_markdown(&state, project).await,
+                );
+            }
+        }
+        let (content, report) = crate::api::mission_payload::stage_message(
+            &state.config.working_dir,
+            mid,
+            id,
+            &content,
+            &payload,
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("attachments: {e}")))?;
+        if !report.skipped.is_empty() || report.truncated {
+            warnings.push(format!("Some attachments were skipped or capped; see .paloma/messages/{id}/.paloma/attach.md"));
+        }
+        content
+    } else {
+        content
+    };
     let (queued_tx, queued_rx) = oneshot::channel();
     tracing::info!(
         user_id = %user.id,
@@ -5443,10 +5729,17 @@ pub async fn post_cancel(
 
 // ==================== Queue Management Endpoints ====================
 
-/// Get the current message queue.
+#[derive(Deserialize, Default)]
+pub struct QueueQuery {
+    pub mission_id: Option<Uuid>,
+}
+
+/// Get the current message queue, including durable scheduled/capacity deferrals
+/// when requesting a mission. The control store is scoped to the authenticated user.
 pub async fn get_queue(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
+    Query(query): Query<QueueQuery>,
 ) -> Result<Json<Vec<QueuedMessage>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let (tx, rx) = oneshot::channel();
@@ -5455,12 +5748,92 @@ pub async fn get_queue(
         .send(ControlCommand::GetQueue { respond: tx })
         .await
         .map_err(session_unavailable)?;
-    let queue = rx.await.map_err(|_| {
+    let mut queue = rx.await.map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to get queue".to_string(),
         )
     })?;
+    if let Some(mid) = query.mission_id {
+        let mission = control
+            .mission_store
+            .get_mission(mid)
+            .await
+            .map_err(internal_error)?
+            .ok_or((StatusCode::NOT_FOUND, "mission not found".into()))?;
+        queue.retain(|entry| entry.mission_id == Some(mid));
+        // The asynchronous transcript logger can lag dispatch. The durable
+        // snapshot retains `inflight=true` only after a run lease was acquired,
+        // so a fresh reader can reconcile that ID even before history catches up.
+        // Keep the unscoped queue's existing pending-only contract unchanged.
+        let durable = control
+            .mission_store
+            .load_control_queue(&user.id)
+            .await
+            .map_err(internal_error)?;
+        if !durable.is_empty() {
+            let persisted: Vec<QueuedMessage> =
+                serde_json::from_str(&durable).map_err(internal_error)?;
+            let mut snapshot = Vec::new();
+            for entry in persisted
+                .into_iter()
+                .filter(|entry| entry.mission_id == Some(mid))
+            {
+                let parts = if entry.source.as_deref() == Some("scheduler") {
+                    deferred_messages::decode(&entry.content).1
+                } else {
+                    Vec::new()
+                };
+                if parts.is_empty() {
+                    snapshot.push(entry);
+                } else {
+                    for (id, content) in parts {
+                        snapshot.push(QueuedMessage {
+                            id,
+                            content,
+                            agent: entry.agent.clone(),
+                            mission_id: entry.mission_id,
+                            source: entry.source.clone(),
+                            inflight: entry.inflight,
+                        });
+                    }
+                }
+            }
+            let ids: HashSet<Uuid> = snapshot.iter().map(|entry| entry.id).collect();
+            snapshot.extend(queue.into_iter().filter(|entry| !ids.contains(&entry.id)));
+            queue = snapshot;
+        }
+        if mission.status == MissionStatus::Pending {
+            if let Some(goal) = control
+                .mission_store
+                .get_deferred_goal(mid)
+                .await
+                .map_err(internal_error)?
+            {
+                let mut deferred: Vec<QueuedMessage> = deferred_messages::decode(&goal)
+                    .1
+                    .into_iter()
+                    .map(|(id, content)| QueuedMessage {
+                        id,
+                        content,
+                        agent: None,
+                        mission_id: Some(mid),
+                        source: Some("scheduler".into()),
+                        inflight: false,
+                    })
+                    .collect();
+                let delivered: HashSet<Uuid> = queue
+                    .iter()
+                    .filter(|entry| entry.inflight)
+                    .map(|entry| entry.id)
+                    .collect();
+                deferred.retain(|entry| !delivered.contains(&entry.id));
+                let ids: HashSet<Uuid> = deferred.iter().map(|entry| entry.id).collect();
+                deferred.extend(queue.into_iter().filter(|entry| !ids.contains(&entry.id)));
+                queue = deferred;
+            }
+        }
+    }
     Ok(Json(queue))
 }
 
@@ -6099,7 +6472,7 @@ pub async fn list_missions(
         user_wait_starts_for_runs(control.mission_store.as_ref(), active_runs.values()).await;
     let (remote_handles, remote_outcomes) = remote_job_projection_inputs(&state).await;
     let now = chrono::Utc::now();
-    let values = missions
+    let mut values: Vec<serde_json::Value> = missions
         .into_iter()
         .map(|mission| {
             let value = serde_json::to_value(&mission).unwrap_or(serde_json::Value::Null);
@@ -6123,6 +6496,16 @@ pub async fn list_missions(
             )
         })
         .collect();
+    for value in &mut values {
+        if let Some(id) = value["id"].as_str().and_then(|s| Uuid::parse_str(s).ok()) {
+            if let Some(t) = machine_transfer::committed(&control.mission_store, id)
+                .await
+                .map_err(internal_error)?
+            {
+                machine_transfer::project(value, &t);
+            }
+        }
+    }
     Ok(Json(values))
 }
 
@@ -7133,6 +7516,12 @@ pub async fn get_mission(
                     chrono::Utc::now(),
                 ),
             );
+            if let Some(t) = machine_transfer::committed(&control.mission_store, id)
+                .await
+                .map_err(internal_error)?
+            {
+                machine_transfer::project(&mut value, &t);
+            }
             let host_configured =
                 state.config.spark_arbiter_url.is_some() || state.config.spark_ssh_target.is_some();
             let enabled = workspace
@@ -7822,6 +8211,13 @@ pub struct CreateMissionRequest {
     /// External conversation that spawned this mission — the Hermes session id
     /// when `origin` is "hermes". Only stored when `origin` is set.
     pub origin_session_id: Option<String>,
+    /// Orb `@` chips: materialized into `.paloma/` before the harness starts.
+    #[serde(default)]
+    pub attachments: Option<Vec<crate::api::mission_payload::MissionAttachment>>,
+    /// `"client"` means the Orb desktop that created the mission runs the CLI.
+    /// The backend records the mission and does not start a harness.
+    #[serde(default)]
+    pub placement: Option<String>,
     /// Catch-all for unrecognized request fields. Serde ignores unknown fields
     /// by default, which has repeatedly hidden client bugs (a `prompt` sent
     /// before the field existed, a mistyped `target_mission_id`). Captured
@@ -9614,6 +10010,80 @@ async fn find_recent_identical_mission(
     })
 }
 
+/// The model a turn about to be dispatched should actually use, persisting the
+/// choice so the UI and the harness agree.
+///
+/// A mission created before this deployment retired a model still carries that
+/// model in `model_override`. That field is current configuration, not
+/// transcript — it is what every client reads to say which model the *next*
+/// turn will use — so leaving it stale would show one model while another ran.
+/// Rewriting it here, on the mission that is dispatching right now, keeps the
+/// two the same on both a new turn and a plain refresh. Recorded events and
+/// completed turns are untouched, and a mission that is not dispatching is
+/// never rewritten. Every dispatch path (new turn, queued message, resume,
+/// remote) funnels through this, so they cannot diverge.
+///
+/// When the upgrade cannot be recorded this returns the stored model unchanged,
+/// which for a retired id the pre-harness guard in `mission_runner` then refuses
+/// to run. A turn that fails loudly is the intended outcome: it is better than
+/// running a retired model, and better than running a model no client reports.
+async fn model_for_dispatch(
+    mission_store: &Arc<dyn MissionStore>,
+    mission: &Mission,
+) -> Option<String> {
+    let stored = mission.model_override.clone()?;
+    // Everything this deployment still runs — every Codex, Grok, OpenCode and
+    // current Claude selection — passes straight through. Only a retired id is
+    // touched, and only ever by replacing it with the current model of its own
+    // line, keeping any provider prefix (`anthropic/…`) the caller relies on.
+    let upgraded = crate::model_policy::current_claude_model(&stored);
+    if upgraded == stored {
+        return Some(stored);
+    }
+    let upgraded = upgraded.into_owned();
+    match mission_store
+        .update_mission_run_settings(
+            mission.id,
+            None,
+            None,
+            Some(Some(&upgraded)),
+            None,
+            None,
+            None,
+            // Settings writes also rewrite `session_id`. Passing the mission's
+            // own id back keeps the native harness session — a model upgrade
+            // must not cost the conversation its context.
+            mission.session_id.as_deref().unwrap_or(""),
+        )
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                mission_id = %mission.id,
+                from = %stored,
+                to = %upgraded,
+                "retired model upgraded for the next turn"
+            );
+            Some(upgraded)
+        }
+        Err(error) => {
+            // The upgrade could not be recorded. Hand back the stored id
+            // unchanged rather than a model no client would report: the
+            // pre-harness guard refuses to run a retired id, so this turn fails
+            // instead of quietly running either the wrong model or a retired
+            // one. The next dispatch retries the upgrade.
+            tracing::warn!(
+                mission_id = %mission.id,
+                from = %stored,
+                to = %upgraded,
+                %error,
+                "could not persist the model upgrade; this turn will be refused rather than run a retired model"
+            );
+            Some(stored)
+        }
+    }
+}
+
 /// Whether a mission in this status holds its project's single campaign slot.
 ///
 /// Campaign missions are long-running per-project drivers; two of them racing
@@ -9857,10 +10327,36 @@ async fn interrupt_new_mission(control: &ControlState, mission_id: Uuid, reason:
     });
 }
 
+// Coalescing a create must not acknowledge attachment selections that were
+// never saved on the existing mission. New context belongs in a follow-up.
+fn verify_coalesced_attachments(
+    config: &Config,
+    req: &CreateMissionRequest,
+    existing: &Mission,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(attachments) = req.attachments.as_ref().filter(|a| !a.is_empty()) {
+        let saved = crate::api::mission_payload::read_sidecar(&config.working_dir, existing.id)
+            .map_err(internal_error)?;
+        if !saved.is_some_and(|p| p.attachments == *attachments && p.project == req.project) {
+            return Err((StatusCode::CONFLICT, format!("mission {} already exists with different or unavailable attachments; send the attachments as a follow-up or use a distinct title", existing.id)));
+        }
+    }
+    Ok(())
+}
+
 pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     body: Option<Json<CreateMissionRequest>>,
+) -> Result<(axum::http::HeaderMap, Json<serde_json::Value>), (StatusCode, String)> {
+    create_mission_inner(State(state), Extension(user), body, false).await
+}
+
+pub(super) async fn create_mission_inner(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    body: Option<Json<CreateMissionRequest>>,
+    shared_side_workspace: bool,
 ) -> Result<(axum::http::HeaderMap, Json<serde_json::Value>), (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
 
@@ -9897,8 +10393,40 @@ pub async fn create_mission(
         estimated_disk_gib: None,
         origin: None,
         origin_session_id: None,
+        attachments: None,
+        placement: None,
         extra: Default::default(),
     });
+
+    if let Some(prompt) = req.prompt.as_deref() {
+        crate::api::mission_payload::validate_user_content(prompt)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    }
+
+    if let Some(attachments) = req.attachments.as_ref().filter(|a| !a.is_empty()) {
+        if req.remote_node_id.is_some()
+            && attachments
+                .iter()
+                .any(|item| item.kind != crate::api::mission_payload::AttachmentKind::Context)
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "remote launch attachments are not supported".into(),
+            ));
+        }
+        if req.project.as_deref().is_none_or(|p| p.trim().is_empty()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "attachments require a project".into(),
+            ));
+        }
+        crate::api::mission_payload::validate(&crate::api::mission_payload::MissionPayload {
+            attachments: attachments.clone(),
+            project: req.project.clone(),
+            controller_md: None,
+        })
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
 
     // Persist the roster slug, not a nickname. An inverted alias
     // (`coldcard-rng-cracker` → `ec-defensive-research`) made Coldcard
@@ -9957,6 +10485,7 @@ pub async fn create_mission(
                     // rejected remote submission) is not the work the retry
                     // asks for; only live or finished attempts coalesce.
                     if existing.status != MissionStatus::Failed {
+                        verify_coalesced_attachments(&state.config, &req, &existing)?;
                         tracing::info!(
                             mission_id = %existing.id,
                             idempotency_key = key,
@@ -9990,6 +10519,7 @@ pub async fn create_mission(
         )
         .await
         {
+            verify_coalesced_attachments(&state.config, &req, &existing)?;
             tracing::info!(
                 mission_id = %existing.id,
                 title = %title,
@@ -10162,7 +10692,7 @@ pub async fn create_mission(
     // worker (`6f1e92b0`) on the same workspace as the existing writer;
     // ChatGPT OAuth is single-use and the extra occupant also races the
     // files. Sequential certify-after-repair is fine: the writer is terminal.
-    if let Some(ws_id) = req.workspace_id {
+    if let Some(ws_id) = req.workspace_id.filter(|_| !shared_side_workspace) {
         let control_state = control_for_user(&state, &user).await;
         if let Some(existing) = live_mission_on_workspace(&control_state.mission_store, ws_id).await
         {
@@ -10379,11 +10909,27 @@ pub async fn create_mission(
     // Remote-node missions execute on the selected node, not in the local
     // workspace, so probing the local/container CLI would reject perfectly
     // runnable work — skip the preflight for them.
-    let runs_locally = req
-        .remote_node_id
-        .as_deref()
-        .map(str::trim)
-        .is_none_or(str::is_empty);
+    let client_placement = client_placement::is_client_placement(req.placement.as_deref());
+    if client_placement
+        && req
+            .remote_node_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|id| !id.is_empty())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "placement client cannot target a remote node".into(),
+        ));
+    }
+    // A client placement executes on the Orb machine, same as a remote node:
+    // do not probe the backend host for the CLI.
+    let runs_locally = !client_placement
+        && req
+            .remote_node_id
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty);
     if let (true, Some(ws_id), Some(backend_id)) = (runs_locally, workspace_id, backend.as_deref())
     {
         if matches!(backend_id, "codex" | "claudecode" | "gemini" | "grok") {
@@ -10483,6 +11029,12 @@ pub async fn create_mission(
             "disk-reservation-v1 tags are reserved internal admission state".to_string(),
         ));
     }
+    if client_placement {
+        let tags = normalized_request_tags.get_or_insert_with(Vec::new);
+        if !client_placement::is_tagged(tags) {
+            tags.push(client_placement::TAG.to_string());
+        }
+    }
     if let Some(estimated_gib) = effective_estimated_disk_gib {
         let tag = format!("disk-estimate-gib:{estimated_gib}");
         let tags = normalized_request_tags.get_or_insert_with(Vec::new);
@@ -10519,7 +11071,7 @@ pub async fn create_mission(
     // runs on the node (an explicit raw `remote_command` stays supported).
     // Planned before the mission exists so an unsupported selection is a
     // clean 400, never a failed mission.
-    let remote_plan = match remote_node_id.as_deref() {
+    let mut remote_plan = match remote_node_id.as_deref() {
         Some(_) => Some(
             plan_remote_harness(
                 remote_command.as_deref(),
@@ -10531,6 +11083,13 @@ pub async fn create_mission(
         ),
         None => None,
     };
+    if let Some(RemoteHarnessPlan::Codex {
+        effort, fast_mode, ..
+    }) = remote_plan.as_mut()
+    {
+        *effort = model_effort.clone();
+        *fast_mode = req.fast_mode;
+    }
     if let Some(node_id) = remote_node_id.as_deref() {
         if remote_dispatch_is_scheduled_for_future(
             Some(node_id),
@@ -11009,6 +11568,61 @@ pub async fn create_mission(
         mission.origin_session_id = origin_session_id.map(str::to_string);
     }
 
+    // Persist attachments before publishing the deferred-goal dispatch ticket.
+    // The scheduler can run at every await after set_deferred_goal.
+    if let Some(attachments) = req.attachments.as_ref().filter(|rows| !rows.is_empty()) {
+        let mut payload = crate::api::mission_payload::MissionPayload {
+            attachments: attachments.clone(),
+            project: mission.project.project.clone(),
+            controller_md: None,
+        };
+        if attachments
+            .iter()
+            .any(|row| row.kind == crate::api::mission_payload::AttachmentKind::Controller)
+        {
+            if let Some(project) = mission.project.project.as_deref() {
+                payload.controller_md = Some(
+                    super::projects_overview::controller_snapshot_markdown(&state, project).await,
+                );
+            }
+        }
+        if let Err(error) = crate::api::mission_payload::write_sidecar(
+            &state.config.working_dir,
+            mission.id,
+            &payload,
+        ) {
+            // A retry must not coalesce onto a half-created mission and report
+            // success while discarding both its prompt and attachments.
+            control
+                .mission_store
+                .update_mission_status_with_reason(
+                    mission.id,
+                    MissionStatus::Failed,
+                    Some("attachment_persistence_failed"),
+                )
+                .await
+                .map_err(internal_error)?;
+            state
+                .projects
+                .release_leases_for_attempt(&mission.id.to_string())
+                .map_err(internal_error)?;
+            release_local_mission_disk(&state.config, mission.id)
+                .await
+                .map_err(internal_error)?;
+            let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                completion: None,
+                execution: None,
+                mission_id: mission.id,
+                status: MissionStatus::Failed,
+                summary: Some("attachment_persistence_failed".into()),
+            });
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persist attachments: {error}"),
+            ));
+        }
+    }
+
     // Atomic create+start: stash the initial prompt as the deferred goal. The
     // FLEET-001 scheduler pass (every ~5s) dispatches pending missions with a
     // deferred goal as soon as parallel capacity allows, honoring `not_before`
@@ -11032,10 +11646,17 @@ pub async fn create_mission(
         // deferred goal is later re-injected verbatim, and the backend goal
         // drivers only recognise `/goal <objective>` with a space.
         let prompt = canonical_goal_message(&prompt).unwrap_or(prompt);
-        if !remote_launch {
+        let prompt_event_id = Uuid::new_v4();
+        // Client placements keep the prompt out of the scheduler ticket.
+        // `get_scheduled_pending_missions` only returns rows that still have
+        // a deferred goal, and the stores also exclude `placement:client`.
+        if !remote_launch && !client_placement {
             control
                 .mission_store
-                .set_deferred_goal(mission.id, Some(prompt.clone()))
+                .set_deferred_goal(
+                    mission.id,
+                    Some(deferred_messages::encode(prompt_event_id, &prompt)),
+                )
                 .await
                 .map_err(internal_error)?;
         }
@@ -11054,7 +11675,6 @@ pub async fn create_mission(
             mission.goal_objective = Some(objective);
         }
         // Surface the queued goal so UIs show it as pending until dispatch.
-        let prompt_event_id = Uuid::new_v4();
         let _ = control.events_tx.send(AgentEvent::UserMessage {
             id: prompt_event_id,
             content: prompt.clone(),
@@ -11117,6 +11737,14 @@ pub async fn create_mission(
                 return Err((StatusCode::BAD_GATEWAY, message));
             }
         }
+    }
+
+    if client_placement {
+        persist_remote_mission_prompt(&control, mission.id, &user.id, initial_prompt.take())
+            .await
+            .map_err(internal_error)?;
+        let value = mission_create_response(&state, &control, mission).await?;
+        return Ok((headers, Json(value)));
     }
 
     let value = mission_create_response(&state, &control, mission).await?;
@@ -11315,7 +11943,7 @@ impl RemoteMissionOwner {
 /// Harnesses a remote node can run for a typed launch. Nodes ship the
 /// `claude`, `opencode`, and native `grok` CLIs. Other harnesses are rejected
 /// before the mission exists instead of being silently swapped.
-pub(crate) const REMOTE_NODE_HARNESSES: &[&str] = &["claudecode", "opencode", "grok"];
+pub(crate) const REMOTE_NODE_HARNESSES: &[&str] = &["claudecode", "opencode", "grok", "codex"];
 
 /// Stable prefixes of the plain-text `400` bodies a typed remote launch can
 /// return before any mission exists. Clients match on the prefix, not the
@@ -11330,6 +11958,7 @@ pub(crate) const REMOTE_MODEL_REQUIRED: &str = "REMOTE_MODEL_REQUIRED";
 pub(crate) fn remote_launch_capabilities() -> crate::remote_node::RemoteLaunchCapabilities {
     crate::remote_node::RemoteLaunchCapabilities {
         typed: true,
+        requires_proxy_harnesses: vec!["claudecode".into(), "opencode".into(), "codex".into()],
         harnesses: REMOTE_NODE_HARNESSES
             .iter()
             .map(|h| h.to_string())
@@ -11340,6 +11969,7 @@ pub(crate) fn remote_launch_capabilities() -> crate::remote_node::RemoteLaunchCa
             REMOTE_HARNESS_UNSUPPORTED.to_string(),
             REMOTE_PROMPT_REQUIRED.to_string(),
             REMOTE_MODEL_REQUIRED.to_string(),
+            "REMOTE_GOAL_UNSUPPORTED".to_string(),
             remote_grok::REMOTE_AUTH_REQUIRED.to_string(),
         ],
     }
@@ -11349,6 +11979,13 @@ pub(crate) fn remote_launch_capabilities() -> crate::remote_node::RemoteLaunchCa
 /// from the client's selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteHarnessPlan {
+    Codex {
+        effort: Option<String>,
+        fast_mode: bool,
+        model: String,
+        prompt: String,
+        resume_session_id: Option<String>,
+    },
     Grok {
         model: Option<String>,
         prompt: String,
@@ -11367,6 +12004,7 @@ pub(crate) enum RemoteHarnessPlan {
     OpenCode {
         model: Option<String>,
         prompt: String,
+        resume_session_id: Option<String>,
     },
 }
 
@@ -11374,12 +12012,15 @@ impl RemoteHarnessPlan {
     pub(crate) fn uses_core_proxy(&self) -> bool {
         matches!(
             self,
-            RemoteHarnessPlan::ClaudeCode { .. } | RemoteHarnessPlan::OpenCode { .. }
+            RemoteHarnessPlan::ClaudeCode { .. }
+                | RemoteHarnessPlan::OpenCode { .. }
+                | RemoteHarnessPlan::Codex { .. }
         )
     }
 
     pub(crate) fn label(&self) -> String {
         match self {
+            RemoteHarnessPlan::Codex { model, .. } => format!("codex/{model}"),
             RemoteHarnessPlan::Raw { .. } => "raw command".to_string(),
             RemoteHarnessPlan::Grok { model, .. } => {
                 format!("grok/{}", model.as_deref().unwrap_or("node default model"))
@@ -11424,6 +12065,14 @@ pub(crate) fn plan_remote_harness(
         .filter(|m| !m.is_empty())
         .map(str::to_string);
     match backend {
+        "codex" if prompt.starts_with("/goal") => Err("REMOTE_GOAL_UNSUPPORTED: remote Codex supports native exec sessions, but not app-server goals yet; use Codex on core for /goal".to_string()),
+        "codex" => Ok(RemoteHarnessPlan::Codex {
+            effort: None,
+            fast_mode: false,
+            model: model.ok_or_else(|| format!("{REMOTE_MODEL_REQUIRED}: a Codex remote launch needs model_override"))?,
+            prompt,
+            resume_session_id: None,
+        }),
         "grok" => Ok(remote_grok::plan(model, prompt)),
         "claudecode" => Ok(RemoteHarnessPlan::ClaudeCode {
             // Claude Code expects bare model ids.
@@ -11449,6 +12098,7 @@ pub(crate) fn plan_remote_harness(
                     )
                 })?;
             Ok(RemoteHarnessPlan::OpenCode {
+                resume_session_id: None,
                 model: Some(model),
                 prompt,
             })
@@ -11537,6 +12187,65 @@ pub(crate) fn remote_execution_for_plan(
 ) -> RemoteExecution {
     let label = plan.label();
     match plan {
+        RemoteHarnessPlan::Codex {
+            effort,
+            fast_mode,
+            model,
+            prompt,
+            resume_session_id,
+        } => {
+            let mut command = String::from(
+                "command -v codex >/dev/null 2>&1 || { echo 'codex is not installed on this node' >&2; exit 127; }; exec codex",
+            );
+            // CLI overrides keep configuration and credentials out of project files.
+            for setting in [
+                "model_provider=\"sandboxed\"".to_string(),
+                "model_providers.sandboxed.name=\"Sandboxed\"".to_string(),
+                format!(
+                    "model_providers.sandboxed.base_url={}",
+                    serde_json::to_string(&format!("{}/v1", api_base_url.trim_end_matches('/')))
+                        .unwrap()
+                ),
+                "model_providers.sandboxed.wire_api=\"responses\"".to_string(),
+                format!("model_providers.sandboxed.env_key=\"{REMOTE_PROXY_KEY_ENV}\""),
+            ] {
+                command.push_str(" -c ");
+                command.push_str(&shell_single_quote(&setting));
+            }
+            if let Some(effort) = effort {
+                command.push_str(" -c ");
+                command.push_str(&shell_single_quote(&format!(
+                    "model_reasoning_effort={}",
+                    serde_json::to_string(effort).unwrap()
+                )));
+            }
+            if *fast_mode {
+                command.push_str(" -c 'service_tier=\"fast\"'");
+            }
+            command.push_str(" exec");
+            if resume_session_id.is_some() {
+                command.push_str(" resume");
+            }
+            command.push_str(
+                " --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --model ",
+            );
+            command.push_str(&shell_single_quote(model));
+            command.push_str(" -- ");
+            if let Some(session) = resume_session_id {
+                command.push_str(&shell_single_quote(session));
+                command.push(' ');
+            }
+            command.push_str(&shell_single_quote(prompt));
+            RemoteExecution {
+                managed_auth: Vec::new(),
+                command,
+                label,
+                env: Some(HashMap::from([
+                    (REMOTE_PROXY_KEY_ENV.to_string(), proxy_key.to_string()),
+                    ("NO_COLOR".to_string(), "1".to_string()),
+                ])),
+            }
+        }
         RemoteHarnessPlan::Grok {
             model,
             prompt,
@@ -11580,7 +12289,11 @@ pub(crate) fn remote_execution_for_plan(
                 label,
             }
         }
-        RemoteHarnessPlan::OpenCode { model, prompt } => {
+        RemoteHarnessPlan::OpenCode {
+            model,
+            prompt,
+            resume_session_id,
+        } => {
             // Inline config through OPENCODE_CONFIG_CONTENT: nothing is
             // written into the job cwd (the node's per-mission directory,
             // also its HOME), and nothing depends on the service user's home.
@@ -11595,6 +12308,10 @@ pub(crate) fn remote_execution_for_plan(
             // `plan_remote_harness` guarantees a model for OpenCode; the
             // config registers exactly that id under `builtin`.
             let model = model.as_deref().unwrap_or_default();
+            if let Some(session) = resume_session_id {
+                command.push_str(" --session ");
+                command.push_str(&shell_single_quote(session));
+            }
             command.push_str(" --model ");
             command.push_str(&shell_single_quote(&remote_opencode_model_argument(model)));
             env.insert(
@@ -12590,6 +13307,32 @@ async fn submit_leased_remote_job(
     job_id: Uuid,
     plan: &RemoteHarnessPlan,
 ) -> Result<Mission, String> {
+    let mut resolved_plan = plan.clone();
+    let prompt = match &mut resolved_plan {
+        RemoteHarnessPlan::Codex { prompt, .. }
+        | RemoteHarnessPlan::Grok { prompt, .. }
+        | RemoteHarnessPlan::ClaudeCode { prompt, .. }
+        | RemoteHarnessPlan::OpenCode { prompt, .. } => Some(prompt),
+        RemoteHarnessPlan::Raw { .. } => None,
+    };
+    if let Some(prompt) = prompt {
+        if super::context_execution::has_mentions(prompt) {
+            let project = mission
+                .project
+                .project
+                .as_deref()
+                .ok_or("Context references require a project")?;
+            *prompt = super::context_execution::remote(state, project, &node, prompt).await?;
+        }
+    }
+    let plan = &resolved_plan;
+    let workspace_prefix =
+        if let Some(t) = machine_transfer::committed(&control.mission_store, mission.id).await? {
+            let root = t.destination_root.ok_or("Transferred workspace missing")?;
+            format!("cd -- {} || exit 78; ", shell_single_quote(&root))
+        } else {
+            fork::workspace_prefix(control, mission, &node.id, &state.config.working_dir).await?
+        };
     if let RemoteHarnessPlan::Grok {
         new_session_id: Some(session_id),
         resume_session_id: None,
@@ -12656,7 +13399,7 @@ async fn submit_leased_remote_job(
         mission_id: mission.id,
         lease_token,
         payload: crate::remote_node::JobPayload::RawCommand {
-            command: execution.command.clone(),
+            command: format!("{workspace_prefix}{}", execution.command),
             timeout_secs: None,
             env: execution.env.clone(),
             managed_auth: execution.managed_auth.clone(),
@@ -13461,8 +14204,22 @@ async fn poll_remote_job(
     // The preserved-status terminal note is durable once; retries of the
     // ledger cleanup must not duplicate it.
     let mut preserved_terminal_noted = false;
+    // Stream only incremental logs between the existing status/lease checks.
+    // A delayed network request must not cause a burst of catch-up polls.
+    let mut log_tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    log_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_status_check: Option<std::time::Instant> = None;
     loop {
-        tokio::time::sleep(POLL_INTERVAL).await;
+        log_tick.tick().await;
+        if last_status_check.is_some_and(|at| at.elapsed() < POLL_INTERVAL) {
+            if failures == 0 && terminal_observation.is_none() {
+                if let Some(observer) = grok.as_mut() {
+                    observer.pump(&client, &node, &shared_token).await;
+                }
+            }
+            continue;
+        }
+        last_status_check = Some(std::time::Instant::now());
 
         // Honor external mission cancellation when trivially observable: if
         // an operator moved the mission out of Active (cancel/interrupt/pause),
@@ -13558,6 +14315,15 @@ async fn poll_remote_job(
                 }
                 if terminal {
                     terminal_observation = Some(status.clone());
+                    // Publish the observed node result before terminal mission/lease
+                    // state and ledger retirement become visible to API readers.
+                    // Cleanup may retry, but the job itself has already terminated.
+                    fleet.record_outcome(outcome(
+                        &status.state,
+                        status.exit_code,
+                        status.error.clone(),
+                        true,
+                    ));
                     let success = status.state == "succeeded";
                     let content = format!(
                         "Remote node '{}' job {} finished with state '{}' (exit {:?}){}\n\nlog tail:\n{}",
@@ -13675,12 +14441,6 @@ async fn poll_remote_job(
                         dispatch_admission_tests::notify_wait(job_id, "remote_cleanup_failed");
                         continue;
                     }
-                    fleet.record_outcome(outcome(
-                        &status.state,
-                        status.exit_code,
-                        status.error.clone(),
-                        true,
-                    ));
                     return;
                 }
                 // A successful non-terminal observation is the liveness proof
@@ -14308,11 +15068,32 @@ pub async fn update_mission_settings(
     }
 
     let mut effective_model = match &model_override {
+        // Explicitly requested: validated below, and refused if retired.
         Some(Some(model)) => normalize_model_override_for_backend(Some(&effective_backend), model),
         Some(None) => None,
-        None => current.model_override.as_deref().and_then(|model| {
-            normalize_model_override_for_backend(Some(&effective_backend), model)
-        }),
+        // Carried forward from the mission. A mission stored before a model was
+        // retired must not be stuck — blocking an unrelated settings change
+        // (effort, agent, backend) because of an old stored model would be a
+        // worse failure than the stale model itself. Migrate it to the current
+        // model of its line for the next turn instead; the transcript and the
+        // recorded history of what already ran are untouched.
+        None => current
+            .model_override
+            .as_deref()
+            .and_then(|model| normalize_model_override_for_backend(Some(&effective_backend), model))
+            .map(|model| {
+                if let Some(replacement) = crate::model_policy::retired_claude_model(&model) {
+                    tracing::info!(
+                        mission_id = %id,
+                        from = %model,
+                        to = %replacement,
+                        "migrating retired Claude model for the next turn"
+                    );
+                    replacement.to_string()
+                } else {
+                    model
+                }
+            }),
     };
     if let Some(ref model) = effective_model {
         if model_override.as_ref().and_then(|value| value.as_ref()) != Some(model) {
@@ -14475,6 +15256,145 @@ pub async fn mark_mission_opened(
 }
 
 /// Set mission status (completed/failed).
+async fn mission_is_client_placed(control: &ControlState, id: Uuid) -> Result<bool, String> {
+    let Some(mission) = control.mission_store.get_mission(id).await? else {
+        return Ok(false);
+    };
+    Ok(client_placement::is_tagged(&mission.project.tags))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClientTranscriptRequest {
+    pub run_id: Option<Uuid>,
+    pub generation: Option<u64>,
+    pub id: Uuid,
+    /// `user` or `assistant`.
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClientStatusRequest {
+    pub run_id: Option<Uuid>,
+    pub generation: Option<u64>,
+    pub status: String,
+}
+
+/// Append one transcript row for a mission the Orb client is executing.
+/// Refused for every other mission so this cannot inject history into a
+/// backend-owned run.
+pub async fn append_client_transcript(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ClientTranscriptRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let content = req.content.trim().to_string();
+    if content.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "content is required".into()));
+    }
+    let control = control_for_user(&state, &user).await;
+    if !mission_is_client_placed(&control, id)
+        .await
+        .map_err(internal_error)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "transcript append is only for client-placed missions".into(),
+        ));
+    }
+    machine_transfer::check_client_receipt(&control, id, req.run_id, req.generation).await?;
+    let event = match req.role.as_str() {
+        "user" => AgentEvent::UserMessage {
+            id: req.id,
+            content,
+            queued: false,
+            mission_id: Some(id),
+            source: Some(format!("orb-client:{}", user.id)),
+        },
+        "assistant" => AgentEvent::AssistantMessage {
+            id: req.run_id.unwrap_or(req.id),
+            content,
+            success: true,
+            cost_cents: 0,
+            cost_source: crate::agents::CostSource::Unknown,
+            usage: None,
+            model: None,
+            model_normalized: None,
+            mission_id: Some(id),
+            shared_files: None,
+            resumable: false,
+            completion_evidence: None,
+        },
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "role must be user or assistant".into(),
+            ))
+        }
+    };
+    control
+        .mission_store
+        .log_event(id, &event)
+        .await
+        .map_err(internal_error)?;
+    let _ = control.events_tx.send(event);
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Terminal status for a client-placed mission. Does not start a runner.
+pub async fn set_client_mission_status(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ClientStatusRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let status = match req.status.as_str() {
+        "completed" => MissionStatus::Completed,
+        "failed" => MissionStatus::Failed,
+        "interrupted" => MissionStatus::Interrupted,
+        "awaiting_user" => MissionStatus::AwaitingUser,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unsupported client status {other}"),
+            ))
+        }
+    };
+    let control = control_for_user(&state, &user).await;
+    if !mission_is_client_placed(&control, id)
+        .await
+        .map_err(internal_error)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "status updates of this kind are only for client-placed missions".into(),
+        ));
+    }
+    let run =
+        machine_transfer::check_client_receipt(&control, id, req.run_id, req.generation).await?;
+    control
+        .mission_store
+        .update_mission_status_with_reason(id, status, Some("client_runner"))
+        .await
+        .map_err(internal_error)?;
+    if let Some(run) = run {
+        control
+            .mission_store
+            .finish_mission_run(run.run_id, run.generation, Some("client_runner"))
+            .await
+            .map_err(internal_error)?;
+    }
+    let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+        completion: None,
+        execution: None,
+        mission_id: id,
+        status,
+        summary: Some("client_runner".into()),
+    });
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 pub async fn set_mission_status(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -15748,6 +16668,18 @@ pub async fn cancel_mission(
     let (tx, rx) = oneshot::channel();
 
     let control = control_for_user(&state, &user).await;
+    if mission_is_client_placed(&control, mission_id)
+        .await
+        .map_err(internal_error)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Stop this mission on its Orb computer so termination can be confirmed".into(),
+        ));
+    }
+    machine_transfer::guard(&control.mission_store, mission_id)
+        .await
+        .map_err(internal_error)?;
     control
         .cmd_tx
         .send(ControlCommand::CancelMission {
@@ -15775,6 +16707,9 @@ async fn finish_detached_run_for_cancel(
     let Some(run) = mission_store.get_active_mission_run(mission_id).await? else {
         return Ok(false);
     };
+    if run.owner_actor_id.starts_with("orb-client:") {
+        return Err("Orb must confirm native termination before releasing this run".into());
+    }
     mission_store
         .heartbeat_mission_run(
             run.run_id,
@@ -15816,6 +16751,15 @@ pub async fn pause_mission(
 ) -> Result<Json<Mission>, (StatusCode, String)> {
     let actor = resolve_actor(body.and_then(|b| b.0.actor), &user);
     let control = control_for_user(&state, &user).await;
+    if mission_is_client_placed(&control, mission_id)
+        .await
+        .map_err(internal_error)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Stop this mission on its Orb computer".into(),
+        ));
+    }
     let mission = control
         .mission_store
         .get_mission(mission_id)
@@ -15994,6 +16938,8 @@ pub async fn clone_mission(
         // vanished from the worker strip of the session that asked for it.
         origin: source.origin.clone(),
         origin_session_id: source.origin_session_id.clone(),
+        attachments: None,
+        placement: None,
         extra: Default::default(),
     };
 
@@ -16063,11 +17009,27 @@ pub async fn resume_mission(
     body: Option<Json<ResumeMissionRequest>>,
 ) -> Result<Json<Mission>, (StatusCode, String)> {
     let request = body.map(|b| b.0).unwrap_or_default();
+    if let Some(content) = request.content.as_deref() {
+        crate::api::mission_payload::validate_user_content(content)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    }
     let clean_workspace = request.clean_workspace;
     let skip_message = request.skip_message;
     let actor = resolve_actor(request.actor.clone(), &user);
 
     let control = control_for_user(&state, &user).await;
+    machine_transfer::guard(&control.mission_store, mission_id)
+        .await
+        .map_err(internal_error)?;
+    if mission_is_client_placed(&control, mission_id)
+        .await
+        .map_err(internal_error)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "this mission runs on the Orb client; resume it there".into(),
+        ));
+    }
     tracing::info!(mission_id = %mission_id, actor = %actor, "FLEET-004 mission resume requested");
 
     if let Some(placement) = remote_grok::placement(
@@ -16520,7 +17482,22 @@ fn stored_event_to_agent_event(event: &mission_store::StoredEvent) -> Option<Age
                 .as_deref()
                 .and_then(|id| Uuid::parse_str(id).ok())
                 .unwrap_or_else(Uuid::new_v4),
-            content: event.content.clone(),
+            content: if event
+                .metadata
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                == Some("scheduler")
+            {
+                let messages = event
+                    .metadata
+                    .get("messages")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default();
+                deferred_messages::wrap(&event.content, messages)
+            } else {
+                event.content.clone()
+            },
             queued: false,
             mission_id,
             source: event
@@ -17040,7 +18017,7 @@ pub async fn stream(
                             }
                             let outbound = text_op_events_for_stream(ev, &mut text_op_buffers);
                             for ev in outbound {
-                                match serde_json::to_string(&ev) {
+                                match deferred_messages::stream_payload(&ev) {
                                     Ok(payload) => {
                                         metrics.record_sse_chunk(payload.len());
                                         metrics.record_broadcast(ev.mission_id());
@@ -17122,7 +18099,7 @@ pub async fn stream(
                             // length closely enough for p50/p99 use.
                             let outbound = text_op_events_for_stream(ev, &mut text_op_buffers);
                             for ev in outbound {
-                                match serde_json::to_string(&ev) {
+                                match deferred_messages::stream_payload(&ev) {
                                     Ok(payload) => {
                                         metrics.record_sse_chunk(payload.len());
                                         metrics.record_broadcast(ev.mission_id());
@@ -17336,7 +18313,9 @@ async fn callback_snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn paloma_webhook_forwarder_loop(
+    app_state: Arc<std::sync::OnceLock<std::sync::Weak<AppState>>>,
     mut events_rx: broadcast::Receiver<AgentEvent>,
     mission_store: Arc<dyn MissionStore>,
     workspaces: workspace::SharedWorkspaceStore,
@@ -17416,6 +18395,7 @@ async fn paloma_webhook_forwarder_loop(
                         event_execution: Option<MissionRun>,
                         event_completion: Option<MissionCompletionSnapshot>,
                         reconcile_current: bool| {
+        let app_state = app_state.clone();
         let http = http_c.clone();
         let url = url_c.clone();
         let secret = secret_c.clone();
@@ -17688,6 +18668,24 @@ async fn paloma_webhook_forwarder_loop(
                         // exhausted retry leaves it unset, so the 60s sweep
                         // re-sends until the consumer is reachable again.
                         markers.lock().await.set(mission_id, status);
+                        if webhook_forwardable_status(status) {
+                            if let Some(slug) = mission
+                                .as_ref()
+                                .and_then(|m| m.project.project.clone())
+                                .filter(|slug| !slug.is_empty())
+                            {
+                                if let Some(state) =
+                                    app_state.get().and_then(std::sync::Weak::upgrade)
+                                {
+                                    tokio::spawn(async move {
+                                        super::project_controller::wake_controller_for_slug(
+                                            state, &slug,
+                                        )
+                                        .await;
+                                    });
+                                }
+                            }
+                        }
                         break;
                     }
                     Ok(resp) => {
@@ -17903,6 +18901,7 @@ fn spawn_control_session(
         .filter(|url| !url.is_empty())
     {
         tokio::spawn(paloma_webhook_forwarder_loop(
+            control_hub.admission_state.clone(),
             events_tx.subscribe(),
             Arc::clone(&state.mission_store),
             workspaces.clone(),
@@ -20273,6 +21272,11 @@ async fn control_actor_loop(
     // below re-drives task-mode missions (assistant-mode missions remain idle).
     if let Ok(inherited_runs) = mission_store.list_active_mission_runs().await {
         for run in inherited_runs {
+            // Orb owns this native process. A Core restart cannot prove it
+            // stopped; retain its fence until the computer confirms termination.
+            if run.owner_actor_id.starts_with("orb-client:") {
+                continue;
+            }
             if run.execution_state == MissionExecutionState::WaitingRemoteJob {
                 let mission_status = match mission_store.get_mission(run.mission_id).await {
                     Ok(Some(mission)) => mission.status,
@@ -20443,6 +21447,9 @@ async fn control_actor_loop(
     // messages (re-injected as commands above) rely on this same guard: the
     // first occurrence runs, any later duplicate is dropped.
     let mut accepted_user_message_ids: HashSet<Uuid> = HashSet::new();
+    // Alias membership follows the outer acceptance bit. Rejection/release
+    // removes that bit, so constituent IDs cannot suppress a legitimate retry.
+    let mut accepted_user_message_batches: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
     // One bounded same-mission retry for structured transport failures. Auth,
     // quota/capacity, source failures, stalls, and loops are deliberately not
     // eligible. Writer leases are re-acquired by the normal start path.
@@ -21033,10 +22040,47 @@ async fn control_actor_loop(
                     ControlCommand::AdmitDispatch { admission, command } => {
                         // Deduplication is an admission decision too: a retry
                         // cannot smuggle a new assignment into an accepted id.
-                        if let ControlCommand::UserMessage { id, .. } = command.as_ref() {
-                            if recovered_consumed_user_messages.contains_key(id) || accepted_user_message_ids.contains(id) {
+                        if let ControlCommand::UserMessage { id, target_mission_id, .. } = command.as_ref() {
+                            let pending_in_queue = queue.iter().any(|entry| control_message_contains_id(entry.0, &entry.1, entry.4.as_deref(), *id))
+                                || parallel_runners.values().any(|runner| runner.queue.iter().any(|entry| control_message_contains_id(entry.id, &entry.content, entry.source.as_deref(), *id)));
+                            let consumed = recovered_consumed_user_messages.values().any(|entry| control_message_contains_id(entry.id, &entry.content, entry.source.as_deref(), *id))
+                                || parallel_runners.values().any(|runner| runner.inflight_message().is_some_and(|entry| control_message_contains_id(entry.id, &entry.content, entry.source.as_deref(), *id)));
+                            let pending_deferred = if let Some(mid) = target_mission_id {
+                                match mission_store.get_mission(*mid).await {
+                                    Ok(Some(mission)) if mission.status == MissionStatus::Pending => {
+                                        mission_store.get_deferred_goal(*mid).await.ok().flatten()
+                                            .is_some_and(|goal| deferred_messages::decode(&goal).1.iter().any(|(message_id, _)| message_id == id))
+                                    }
+                                    _ => false,
+                                }
+                            } else { false };
+                            let pending = pending_in_queue || pending_deferred;
+                            let accepted = accepted_user_message_ids.contains(id)
+                                || accepted_user_message_batches.iter().any(|(outer, ids)| accepted_user_message_ids.contains(outer) && ids.contains(id));
+                            // Completed runners leave the live snapshot. Their durable
+                            // transcript still owns both the outer ID and constituent
+                            // scheduler IDs across later control-session restarts.
+                            let delivered_history = if !pending && !consumed && !accepted {
+                                if let Some(mid) = target_mission_id {
+                                    match mission_store.get_events(*mid, Some(&["user_message"]), None, None).await {
+                                        Ok(events) => events.iter().filter(|event| event.metadata.get("queued").and_then(|value| value.as_bool()) != Some(true)).any(|event| {
+                                            event.event_id.as_deref().and_then(|value| Uuid::parse_str(value).ok()) == Some(*id)
+                                                || (event.metadata.get("source").and_then(|value| value.as_str()) == Some("scheduler")
+                                                    && event.metadata.get("messages").and_then(|value| serde_json::from_value::<Vec<(Uuid, String)>>(value.clone()).ok())
+                                                        .is_some_and(|messages| messages.iter().any(|(message_id, _)| message_id == id)))
+                                        }),
+                                        Err(error) => {
+                                            if let ControlCommand::UserMessage { respond, .. } = *command {
+                                                let _ = respond.send(UserMessageAck::Rejected(format!("failed to check prior message receipts: {error}")));
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                } else { false }
+                            } else { false };
+                            if pending || consumed || delivered_history || accepted {
                                 if let ControlCommand::UserMessage { respond, .. } = *command {
-                                    let _ = respond.send(UserMessageAck::Delivered);
+                                    let _ = respond.send(if pending { UserMessageAck::Queued } else { UserMessageAck::Delivered });
                                 }
                                 continue;
                             }
@@ -21091,7 +22135,7 @@ async fn control_actor_loop(
                             }
                         }
 
-                        if recovered_consumed_user_messages.contains_key(&id) {
+                        if recovered_consumed_user_messages.values().any(|entry| control_message_contains_id(entry.id, &entry.content, entry.source.as_deref(), id)) {
                             // The previous actor had already started this exact
                             // deterministic delivery. Its run was interrupted
                             // during startup recovery, so acknowledge the retry
@@ -21108,6 +22152,10 @@ async fn control_actor_loop(
                                 UserMessageAck::Delivered
                             });
                             continue;
+                        }
+
+                        if source.as_deref() == Some("scheduler") {
+                            accepted_user_message_batches.insert(id, deferred_messages::decode(&content).1.into_iter().map(|(id, _)| id).collect());
                         }
 
                         // Smart routing: decide where to send this message based on target_mission_id
@@ -21181,7 +22229,11 @@ async fn control_actor_loop(
                             }
                         }
 
-                        let mut content = content;
+                        // Only scheduler-owned envelopes are transport metadata.
+                        // Direct operator text that resembles one stays literal.
+                        let (mut content, deferred_parts) = if source.as_deref() == Some("scheduler") {
+                            deferred_messages::decode(&content)
+                        } else { (content, Vec::new()) };
                         // Canonicalise `/goal\n…` to the space form at the single
                         // entry point, so every downstream space-only parser (the
                         // grok kickoff below, the mission_runner dispatch paths,
@@ -21219,6 +22271,7 @@ async fn control_actor_loop(
                                 }
                             }
                         }
+                        let content = deferred_messages::wrap(&content, deferred_parts);
 
                         // Reject paused targets before writer capability is
                         // acquired. Retagging a paused read-only audit for a
@@ -21288,7 +22341,7 @@ async fn control_actor_loop(
                                             let combined = deferred_goal_for_incoming_message(
                                                 m.status,
                                                 previous_goal.as_deref(),
-                                                &content,
+                                                &if source.as_deref() == Some("scheduler") { content.clone() } else { deferred_messages::encode(id, &content) },
                                             );
                                             if let Err(e) = mission_store
                                                 .set_deferred_goal(tid, Some(combined))
@@ -21582,7 +22635,7 @@ async fn control_actor_loop(
                                     let combined = deferred_goal_for_incoming_message(
                                         mission.status,
                                         previous_goal.as_deref(),
-                                        &content,
+                                        &if source.as_deref() == Some("scheduler") { content.clone() } else { deferred_messages::encode(id, &content) },
                                     );
                                     match mission_store.set_deferred_goal(tid, Some(combined)).await
                                     {
@@ -21699,7 +22752,7 @@ async fn control_actor_loop(
                                                 Some(mission.backend.clone()),
                                                 mission.session_id.clone(),
                                                 mission.config_profile.clone(),
-                                                mission.model_override.clone(),
+                                                model_for_dispatch(&mission_store, &mission).await,
                                                 mission.model_effort.clone(),
                                                 mission.fast_mode,
                                             );
@@ -22184,7 +23237,7 @@ async fn control_actor_loop(
                                             }
                                             (
                                                 Some(mission.workspace_id),
-                                                mission.model_override.clone(),
+                                                model_for_dispatch(&mission_store, &mission).await,
                                                 mission.model_effort.clone(),
                                                 mission.fast_mode,
                                                 mission.agent.clone(),
@@ -22286,7 +23339,7 @@ async fn control_actor_loop(
                                         status_ref,
                                         cancel,
                                         hist_snapshot,
-                                        msg.clone(),
+                                        if msg_source.as_deref() == Some("scheduler") { deferred_messages::strip(&msg) } else { msg.clone() },
                                         Some(mission_ctrl),
                                         tree_ref,
                                         progress_ref,
@@ -22819,7 +23872,7 @@ async fn control_actor_loop(
                                 Some(mission.backend.clone()),
                                 mission.session_id.clone(),
                                 mission.config_profile.clone(),
-                                mission.model_override.clone(),
+                                model_for_dispatch(&mission_store, &mission).await,
                                 mission.model_effort.clone(),
                                 mission.fast_mode,
                             );
@@ -23467,7 +24520,7 @@ async fn control_actor_loop(
                                         Some(mission.backend.clone()),
                                         mission.session_id.clone(),
                                         mission.config_profile.clone(),
-                                        mission.model_override.clone(),
+                                        model_for_dispatch(&mission_store, &mission).await,
                                         mission.model_effort.clone(),
                                         mission.fast_mode,
                                     );
@@ -23697,7 +24750,7 @@ async fn control_actor_loop(
                                         let progress_ref = Arc::clone(&progress);
                                         let workspace_id = Some(mission.workspace_id);
                                         let backend_id = Some(mission.backend.clone());
-                                        let model_override = mission.model_override.clone();
+                                        let model_override = model_for_dispatch(&mission_store, &mission).await;
                                         let model_effort = mission.model_effort.clone();
                                         let fast_mode = mission.fast_mode;
                                         // Resume uses mission agent (no per-message override for resumes)
@@ -23766,7 +24819,7 @@ async fn control_actor_loop(
                                                 status_ref,
                                                 cancel,
                                                 hist_snapshot,
-                                                msg.clone(),
+                                                if msg_source.as_deref() == Some("scheduler") { deferred_messages::strip(&msg) } else { msg.clone() },
                                                 Some(mission_ctrl),
                                                 tree_ref,
                                                 progress_ref,
@@ -24830,7 +25883,7 @@ async fn control_actor_loop(
                         match mission_store.get_mission(mid).await {
                             Ok(Some(mission)) => (
                                 Some(mission.workspace_id),
-                                mission.model_override.clone(),
+                                model_for_dispatch(&mission_store, &mission).await,
                                 mission.model_effort.clone(),
                                 mission.fast_mode,
                                 mission.agent.clone(),
@@ -24884,7 +25937,7 @@ async fn control_actor_loop(
                             status_ref,
                             cancel,
                             hist_snapshot,
-                            msg.clone(),
+                            if msg_source.as_deref() == Some("scheduler") { deferred_messages::strip(&msg) } else { msg.clone() },
                             Some(mission_ctrl),
                             tree_ref,
                             progress_ref,
@@ -26279,10 +27332,12 @@ async fn control_actor_loop(
                     if let AgentEvent::UserMessage {
                         content,
                         mission_id: Some(mid),
+                        source,
                         ..
                     } = &event
                     {
-                        if let Some(objective) = parse_goal_objective(content) {
+                        let prompt = if source.as_deref() == Some("scheduler") { deferred_messages::strip(content) } else { content.clone() };
+                        if let Some(objective) = parse_goal_objective(&prompt) {
                             if let Err(err) = mission_store
                                 .update_mission_goal(*mid, true, Some(&objective))
                                 .await
@@ -26355,6 +27410,9 @@ async fn run_single_control_turn(
     #[cfg(test)]
     if let Some(mid) = mission_id {
         if let Some(result) = dispatch_admission_tests::native_goal_fixture(
+            &config,
+            &workspaces,
+            Some(&mission_store),
             mid,
             &user_message,
             events_tx.clone(),
@@ -26456,6 +27514,25 @@ async fn run_single_control_turn(
                 config.working_dir.clone(),
             )),
         )
+    };
+
+    let user_message = if let Some(mid) = mission_id {
+        match crate::api::mission_payload::materialize_turn(
+            &config.working_dir,
+            &working_dir_path,
+            mid,
+            &user_message,
+        ) {
+            Ok(message) => message,
+            Err(error) => {
+                return crate::agents::AgentResult::failure(
+                    format!("materialize attachments: {error}"),
+                    0,
+                )
+            }
+        }
+    } else {
+        user_message
     };
 
     if let Some(ws) = runtime_workspace.as_ref() {
@@ -35372,6 +36449,65 @@ Investigate <service/> failures.
     }
 
     #[test]
+    fn scheduler_batch_recovery_retains_all_ids_without_serializing_aliases() {
+        let outer = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let content = deferred_messages::join(
+            &deferred_messages::encode(a, "same"),
+            &deferred_messages::encode(b, "same"),
+        );
+        for inflight in [false, true] {
+            let entry = QueuedMessage {
+                id: outer,
+                content: content.clone(),
+                agent: None,
+                mission_id: Some(Uuid::new_v4()),
+                source: Some("scheduler".into()),
+                inflight,
+            };
+            let (pending, consumed) = partition_restored_control_messages(vec![entry]);
+            let restored = pending.first().or_else(|| consumed.first()).unwrap();
+            for id in [outer, a, b] {
+                assert!(control_message_contains_id(
+                    restored.id,
+                    &restored.content,
+                    restored.source.as_deref(),
+                    id
+                ));
+            }
+            // User prose resembling an internal envelope never owns another ID.
+            assert!(!control_message_contains_id(
+                outer,
+                &content,
+                Some("api:test"),
+                a
+            ));
+            let queue = pending
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.id,
+                        entry.content,
+                        entry.agent,
+                        entry.mission_id,
+                        entry.source,
+                    )
+                })
+                .collect();
+            let recovered = consumed
+                .into_iter()
+                .map(|entry| (entry.id, entry))
+                .collect();
+            let serialized = serialize_queue_snapshot(&queue, &HashMap::new(), &recovered);
+            let rows: Vec<QueuedMessage> = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, outer);
+            assert_eq!(rows[0].inflight, inflight);
+        }
+    }
+
+    #[test]
     fn test_accept_user_message_id_rejects_duplicate_retry_id() {
         let message_id = Uuid::new_v4();
         let mut accepted = HashSet::new();
@@ -35640,6 +36776,7 @@ Investigate <service/> failures.
         assert_eq!(
             plan_remote_harness(None, "opencode", Some("xai/grok-4.6"), Some("do it")).unwrap(),
             RemoteHarnessPlan::OpenCode {
+                resume_session_id: None,
                 model: Some("xai/grok-4.6".into()),
                 prompt: "do it".into()
             }
@@ -35653,6 +36790,7 @@ Investigate <service/> failures.
             )
             .unwrap(),
             RemoteHarnessPlan::OpenCode {
+                resume_session_id: None,
                 model: Some("xai/grok-4.6".into()),
                 prompt: "do it".into()
             }
@@ -35677,6 +36815,54 @@ Investigate <service/> failures.
             no_prompt.starts_with("REMOTE_PROMPT_REQUIRED: "),
             "{no_prompt}"
         );
+    }
+
+    #[test]
+    fn remote_codex_uses_native_cli_and_secret_env_for_launch_and_resume() {
+        let plan = plan_remote_harness(
+            None,
+            "codex",
+            Some("openai/gpt-5.4"),
+            Some("say 'hi'; $(false)"),
+        )
+        .unwrap();
+        assert!(plan.uses_core_proxy());
+        let execution =
+            remote_execution_for_plan(&plan, "https://core.example/", "secret-test-key");
+        assert!(!execution.command.contains("secret-test-key"));
+        assert!(execution.command.contains("exec codex"));
+        assert!(execution.command.contains("wire_api=\"responses\""));
+        assert!(execution.command.contains("https://core.example/v1"));
+        assert!(execution
+            .command
+            .contains(&shell_single_quote("say 'hi'; $(false)")));
+        assert_eq!(
+            execution.env.unwrap()[REMOTE_PROXY_KEY_ENV],
+            "secret-test-key"
+        );
+        let resume = RemoteHarnessPlan::Codex {
+            effort: Some("high".into()),
+            fast_mode: true,
+            model: "openai/gpt-5.4".into(),
+            prompt: "continue".into(),
+            resume_session_id: Some("thread-123".into()),
+        };
+        let execution =
+            remote_execution_for_plan(&resume, "https://core.example", "secret-test-key");
+        assert!(execution.command.contains("exec resume --json"));
+        assert!(execution
+            .command
+            .contains("model_reasoning_effort=\"high\""));
+        assert!(execution.command.contains("service_tier=\"fast\""));
+        assert!(
+            plan_remote_harness(None, "codex", Some("gpt-6-astra"), Some("/goal test"))
+                .unwrap_err()
+                .starts_with("REMOTE_GOAL_UNSUPPORTED")
+        );
+        assert!(execution.command.ends_with("-- 'thread-123' 'continue'"));
+        assert!(plan_remote_harness(None, "codex", None, Some("do it"))
+            .unwrap_err()
+            .starts_with(REMOTE_MODEL_REQUIRED));
     }
 
     #[test]
@@ -35706,6 +36892,7 @@ Investigate <service/> failures.
         assert_eq!(exec.label, "claudecode/claude-opus-5");
 
         let plan = RemoteHarnessPlan::OpenCode {
+            resume_session_id: None,
             model: Some("xai/grok-4.6".into()),
             prompt: "build".into(),
         };
@@ -36381,6 +37568,7 @@ Investigate <service/> failures.
             let workspaces =
                 Arc::new(workspace::WorkspaceStore::new(dir.path().to_path_buf()).await);
             let forwarder = tokio::spawn(paloma_webhook_forwarder_loop(
+                Arc::new(std::sync::OnceLock::new()),
                 rx,
                 store,
                 workspaces,

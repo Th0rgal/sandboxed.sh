@@ -1,0 +1,13 @@
+[Unit]
+Description=Reconcile stable native harnesses with CLI validation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/sandboxed-harness-update.env
+ExecStart=/usr/bin/python3 /usr/local/sbin/update-node-harnesses
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=20min
+UMask=0022

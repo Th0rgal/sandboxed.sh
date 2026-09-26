@@ -1,0 +1,6 @@
+# Keep the standalone Orb package independent of any parent pnpm workspace.
+packages:
+  - "."
+
+onlyBuiltDependencies:
+  - esbuild

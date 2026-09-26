@@ -1,0 +1,11 @@
+Package 0.3.278 https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/-/claude-agent-sdk-0.3.278.tgz
+export interface TodoWriteInput {
+  /**
+   * The updated todo list
+   */
+  todos: {
+    content: string;
+    status: "pending" | "in_progress" | "completed";
+    activeForm: string;
+  }[];
+}

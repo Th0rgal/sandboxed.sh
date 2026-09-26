@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "provider_id": "kimi",
+  "access_profile": "coding",
+  "source": "curated",
+  "observed_at": null,
+  "completeness": "partial",
+  "models": [
+    {
+      "id": "kimi-for-coding",
+      "name": "K2.7 Coding",
+      "description": "Stable Kimi K2.7 coding alias"
+    },
+    {
+      "id": "kimi-for-coding-highspeed",
+      "name": "K2.7 Coding Highspeed",
+      "description": "High-speed Kimi K2.7 coding alias"
+    },
+    {
+      "id": "k3",
+      "name": "K3",
+      "description": "Kimi K3 with up to a 1M-token context window"
+    },
+    {
+      "id": "k3-256k",
+      "name": "K3-256K",
+      "description": "Kimi K3 with a 256K-token context window"
+    }
+  ]
+}

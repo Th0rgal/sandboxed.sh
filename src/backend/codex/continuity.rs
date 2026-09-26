@@ -114,10 +114,19 @@ pub fn read(path: &Path) -> anyhow::Result<Option<Binding>> {
 /// Held until the app-server has stopped. Existing actor/track fences remain
 /// authoritative; this also excludes two processes attaching one native thread.
 pub struct Lease {
-    _file: std::fs::File,
+    _file: LockedFile,
     path: PathBuf,
     pub binding: Binding,
     pub resumed: bool,
+}
+
+// Explicitly unlock before closing: a concurrent fork may briefly inherit the
+// descriptor, and closing our copy alone would keep the lock alive in the child.
+struct LockedFile(std::fs::File);
+impl Drop for LockedFile {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
 }
 
 impl Lease {
@@ -141,6 +150,7 @@ impl Lease {
             let file = options.open(config.path.with_extension("lock"))?;
             fs2::FileExt::try_lock_exclusive(&file)
                 .context("codex_continuity_busy: native thread already attached")?;
+            let file = LockedFile(file);
             let existing = read(&config.path)?;
             let resumed = existing.is_some();
             let binding = match existing {
@@ -211,11 +221,5 @@ impl Lease {
         std::fs::rename(&tmp, &self.path)?;
         std::fs::File::open(self.path.parent().unwrap())?.sync_all()?;
         Ok(())
-    }
-}
-
-impl Drop for Lease {
-    fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self._file);
     }
 }

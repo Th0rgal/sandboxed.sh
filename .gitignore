@@ -82,3 +82,11 @@ ios_dashboard/SandboxedDashboard.xcodeproj/*
 # Android simulator run artifacts
 android_dashboard/test-artifacts/
 .sandboxed-sh/
+
+# Orb browser test output
+orb/test-results/
+orb/playwright-report/
+
+# Python bytecode
+__pycache__/
+*.pyc

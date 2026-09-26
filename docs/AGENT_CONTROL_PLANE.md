@@ -16,12 +16,14 @@ intent -> observe -> decide -> act -> receive receipt -> reconcile -> learn
 ```
 
 Every Paloma component exists to make one edge of this loop reliable. Hermes
-holds the operator conversation and the coordinator's working judgment;
-sandboxed.sh owns canonical structured project intent, authority, execution,
-observations, and receipts. Hermes proposes intent changes through project
-commands rather than maintaining a second writable intent store. Skills supply
-policy. Projections make the whole loop legible to an agent and operator
-without creating another source of truth.
+holds the scheduler and the coordinator's working judgment; sandboxed.sh owns
+canonical structured project intent, authority, execution, observations, and
+receipts. The operator surface is Orb (cron page + steers, mission rows). The
+bound conversation is an implementation route, not something to open. Hermes
+proposes intent changes through project commands rather than maintaining a
+second writable intent store. Skills supply policy. Projections make the
+whole loop legible to an agent and operator without creating another source
+of truth.
 
 ## The design objective
 
@@ -55,7 +57,7 @@ Portfolio                    What deserves attention across the whole system?
           Receipt            What does the system prove happened?
             Evidence         Which immutable observation supports the claim?
 
-Conversation route          Where does judgment and operator communication continue?
+Conversation route          Implementation delivery path (v1 bind / inject). Not the operator surface.
 Resource lease              What scarce capacity/authority is temporarily reserved?
 Knowledge item              What reusable lesson was promoted from experience?
 ```
@@ -74,7 +76,7 @@ The target model evolves the existing system; it does not discard it.
 | mission row | attempt | explicit generation, owner lease, and causal action |
 | mission event / terminal evidence / PR or job handle | evidence candidate | normalized evidence references, freshness, and acceptance |
 | decision row + tool response + placement record | partial action receipt | one durable receipt schema across all action kinds |
-| `project_bindings` + Hermes route replica | conversation route | visible lag/reconciliation behind one authority contract |
+| `project_bindings` + Hermes route replica | conversation route (implementation) | visible lag/reconciliation; operator looks at Orb cron + steers |
 | mission caps, writer flag, fleet slots | partial resource/ownership lease | uniform scoped leases with expiry and holder evidence |
 | skills, runbooks, tests, incident notes | knowledge | provenance, promotion, supersession, and review lifecycle |
 

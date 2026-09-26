@@ -5,9 +5,11 @@ without a human in the loop.
 
 [`HERMES_ASSISTANT_MIGRATION.md`](HERMES_ASSISTANT_MIGRATION.md) describes the
 migration that made Hermes the assistant runtime. This document describes the
-orchestration layer that runs on top of it: how a project keeps one durable
-conversation, how work is attributed back to it, and what makes progress
-visible.
+orchestration layer that runs on top of it: how a project keeps one
+controller, how work is attributed, and what makes progress visible. The
+operator path is the Orb cron page plus steers. The bound Hermes session
+(`origin_session_id`, `deliver: project:<slug>`) is implementation plumbing
+in v1 — not a chat to open.
 
 The target system model is defined in
 [`AGENT_CONTROL_PLANE.md`](AGENT_CONTROL_PLANE.md). In that model this document
@@ -18,8 +20,9 @@ loop; it is not a second architecture.
 
 ## The split
 
-**Hermes owns the conversation.** It wakes on a schedule, reasons, talks to the
-operator, and decides what to do next. Its state lives in `state.db`.
+**Hermes owns the scheduler and the tick.** It wakes on a schedule, reasons,
+and decides what to do next. Its state lives in `state.db`. The operator
+does not pilot by talking in the bound session.
 
 **sandboxed.sh owns the execution and the record.** It runs missions in isolated
 workspaces, stores their metadata, and answers questions about what happened.
@@ -36,7 +39,7 @@ sandboxed.sh never decides what to work on.
 | **session** | Hermes `state.db` | a durable conversation, e.g. `20260804_103847_86ca5c` |
 | **mission** | sandboxed.sh | one unit of work, in a workspace, with an agent and a model |
 | **controller** | Hermes cron | a job that drives one project, one agent turn per tick |
-| **route** | sandboxed `project_bindings` (replica: Hermes `project_session_routes`) | the one control conversation for the project |
+| **route** | sandboxed `project_bindings` (replica: Hermes `project_session_routes`) | v1 delivery plumbing for the tick copy — not the operator surface |
 
 A session carries a **source**: `desktop`, `webhook`, `cli`, `tui`,
 `api_server`, `telegram`, `cron`. The source decides how a report reaches it.
@@ -59,7 +62,9 @@ completion.
                       │                            │
                       │                            │ origin_session_id
                       ▼                            ▼
-                 delivery ──────────▶ session ◀── the operator reads here
+                 delivery ──────────▶ Orb cron / mission row
+                      │
+                      └── (v1) optional copy on bound session — plumbing
 ```
 
 1. The cron fires the controller on its interval.
@@ -67,10 +72,11 @@ completion.
 3. It decides, then dispatches missions through the `sandboxed_assistant` MCP
    server.
 4. sandboxed.sh returns an action receipt and arranges a wake condition.
-5. Mission completion routes back into the bound session, where the controller
-   reconciles the receipt against external evidence and the track's acceptance
-   criteria.
-6. Only material judgment is reported to the operator.
+5. Mission completion is a mission row. The next controller tick (or an
+   additive wake of the cron job) reconciles the receipt against external
+   evidence and the track's acceptance criteria. The bound session may still
+   receive a v1 inject copy — that is not where you look.
+6. Only material judgment is reported on the Orb cron page.
 
 Today some of those steps are separate writes and controller conventions. The
 target API makes one logical action atomic and wakes the controller from a
@@ -112,12 +118,12 @@ throwaway one.
 
 ---
 
-## Attribution: `origin_session_id`
+## Attribution: `origin_session_id` (implementation)
 
-Every mission a controller dispatches is stamped with the conversation it came
-from. A Hermes plugin adds it automatically, so the model never has to pass its
-own session id — it does not reliably know it, and a wrong id is worse than
-none.
+Every mission a controller dispatches may still be stamped with a conversation
+id. That field is routing plumbing for v1 webhooks, not the operator path.
+A Hermes plugin adds it automatically when a chat spawn exists. Controllers
+should pass `project` / `track` and treat completion as a mission row.
 
 The plugin refuses to stamp an id prefixed `cron_`. A per-tick session dies with
 its tick, so a mission filed under one is unreachable forever. An unstamped

@@ -1,0 +1,31 @@
+{
+  "method": "turn/plan/updated",
+  "params": {
+    "threadId": "fixture-thread",
+    "turnId": "fixture-turn",
+    "explanation": "Check source and tests",
+    "plan": [
+      {
+        "step": "Inspect implementation",
+        "status": "inProgress"
+      },
+      {
+        "step": "Run tests",
+        "status": "pending"
+      }
+    ]
+  },
+  "normalized": {
+    "explanation": "Check source and tests",
+    "plan": [
+      {
+        "step": "Inspect implementation",
+        "status": "in_progress"
+      },
+      {
+        "step": "Run tests",
+        "status": "pending"
+      }
+    ]
+  }
+}

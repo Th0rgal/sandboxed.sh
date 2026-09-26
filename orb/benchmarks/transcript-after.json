@@ -1,0 +1,15 @@
+{
+  "events": 1500,
+  "updates": 60,
+  "renderMedian": 45.5,
+  "renderP95": 56.19999980926514,
+  "replayMedian": 0.5,
+  "replayP95": 1.1999998092651367,
+  "median": 4.600000381469727,
+  "p95": 6.899999618530273,
+  "added": 60,
+  "removed": 59,
+  "foldRetained": true,
+  "foldOpen": true,
+  "elements": 3013
+}

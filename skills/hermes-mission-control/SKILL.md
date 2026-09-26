@@ -157,30 +157,31 @@ Match the signal to the fix. The health `recommendation` usually tells you which
   reasonable decisions and continue.")` Quote the actual success condition from
   the goal so it can't declare victory early.
 
-## Mission results come back to this conversation — the platform wires it
+## Mission completion is a mission row
 
-A mission started from a conversation is a worker of that conversation.
-Hermes stamps `origin_session_id`, enrolls the mission in the
-async-delegation ledger, and the terminal webhook folds the result back
-here (or appends a `[Mission callback]` and wakes this session if the
-ledger row is missing). Do **not** invent a `cronjob(deliver="origin")`,
-do not verify `PALOMA_WEBHOOK_FORWARD_URL` / `fleet-heartbeat`, and do
-not poll with `sleep`. End the turn after dispatch.
+`start_mission` with `project` / `track` is the dispatch. Confirm
+`pending`/`active`, then stop. Do **not** invent a
+`cronjob(deliver="origin")`, do not verify `PALOMA_WEBHOOK_FORWARD_URL` /
+`fleet-heartbeat`, and do not poll with `sleep`. Do not wait for a
+callback in this chat. Completion shows on the mission row; the
+controller reads it on the next tick (Orb cron page / `get_situation`).
+`origin_session_id` is v1 routing plumbing when a Hermes plugin injects
+it — pass it through unchanged, never invent another session's id.
 
 ### Conversational launch
 
-Desktop / API / TUI chat. `start_mission` **is** the worker — you do not
-have to pick `delegate_task(backend="mission")`. Leave
-`origin_session_id` empty (the plugin injects this session). Confirm the
-mission is `pending`/`active`, then stop. The result comes back here.
+Desktop / API / TUI / Orb. `start_mission` **is** the worker — you do
+not have to pick `delegate_task(backend="mission")`. Leave
+`origin_session_id` empty. Confirm the mission is `pending`/`active`,
+then stop. Look at the mission row, not a chat inject.
 
 ### Controller launch
 
-A cron tick with `deliver: project:<canonical-slug>`. Pass `project` as
-the roster slug (`verity-core`, `verity-lido`, …) and `track` as the
-**item** this mission is an attempt on. Do **not** enroll a worker
-wakeup and do not wait. Report on the next tick or via the project
-route. A `cron_*` session dies with the tick; never stamp one as origin.
+A cron tick with `deliver: project:<canonical-slug>` (plumbing). Pass
+`project` as the roster slug (`verity-core`, `verity-lido`, …) and
+`track` as the **item** this mission is an attempt on. Do **not** enroll
+a worker wakeup and do not wait. Report on the next tick. A `cron_*`
+session dies with the tick; never stamp one as origin.
 
 The project's items **are** the roadmap (`get_situation` / `get_project`
 return the same list: `project_tracks` + live attempts, with one `summary`).
@@ -535,12 +536,12 @@ the track's current evidence contract. Reviewers remain bounded with
 
 ## Check-in cadence for multi-day missions
 
-You can't sit in a chat for a week. Conversational `start_mission` already
-wakes this conversation on the terminal webhook (ledger fold, else origin
-route). For a long babysit that needs mid-flight intervention, schedule one
-durable wakeup with increasing backoff — not a `sleep`/poll loop. On that
-wakeup, call `get_mission_health` once, intervene per the playbook, then
-reschedule only if the mission is still live. Keep a short per-mission state
+You can't sit in a chat for a week. Completion is a mission row; the
+project controller ticks (or is woken) to reconcile it. For a long
+babysit that needs mid-flight intervention, schedule one durable wakeup
+with increasing backoff — not a `sleep`/poll loop. On that wakeup, call
+`get_mission_health` once, intervene per the playbook, then reschedule
+only if the mission is still live. Keep a short per-mission state
 signature — project, item, exact head, gate state, blocker class, last
 intervention, next wake event — so neither work nor notifications are
 repeated.

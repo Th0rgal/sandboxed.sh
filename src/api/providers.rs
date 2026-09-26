@@ -80,6 +80,7 @@ const OPENROUTER_PROVIDER_ID: &str = "open-router";
 /// Best-effort seed slugs kept in the default config; prioritized when capping
 /// the models.dev OpenRouter catalog (which has no popularity sort).
 const OPENROUTER_SEED_MODEL_IDS: &[&str] = &[
+    "anthropic/claude-opus-5.5",
     "anthropic/claude-opus-5",
     "anthropic/claude-sonnet-4.6",
     "google/gemini-3.1-pro-preview",
@@ -94,8 +95,9 @@ const OPENROUTER_SEED_MODEL_IDS: &[&str] = &[
 /// OAuth-based Grok Build path. This is intentionally narrower than xAI's
 /// OpenAI-compatible `/v1/models` catalog: API-routable models such as
 /// rolling aliases can still appear for the custom router, but the `grok`
-/// backend only offers canonical IDs documented for Grok Build. Actual access
-/// remains account/region-dependent and is diagnosed by the CLI at runtime.
+/// backend offers cataloged, versioned text classes and these compatibility
+/// entries, never rolling aliases or media models. Actual access remains
+/// account/region-dependent and is diagnosed by the CLI at runtime.
 const GROK_CLI_TEXT_MODEL_IDS: &[&str] = &[
     "grok-4.6",
     "grok-4.5",
@@ -198,28 +200,7 @@ pub struct ProviderModel {
 /// connected accounts are refreshed from the live endpoint, so future Kimi
 /// models become selectable without a Sandboxed.sh release.
 pub(crate) fn kimi_fallback_models() -> Vec<ProviderModel> {
-    vec![
-        ProviderModel {
-            id: "kimi-for-coding".to_string(),
-            name: "K2.7 Coding".to_string(),
-            description: Some("Stable Kimi K2.7 coding alias".to_string()),
-        },
-        ProviderModel {
-            id: "kimi-for-coding-highspeed".to_string(),
-            name: "K2.7 Coding Highspeed".to_string(),
-            description: Some("High-speed Kimi K2.7 coding alias".to_string()),
-        },
-        ProviderModel {
-            id: "k3".to_string(),
-            name: "K3".to_string(),
-            description: Some("Kimi K3 with up to a 1M-token context window".to_string()),
-        },
-        ProviderModel {
-            id: "k3-256k".to_string(),
-            name: "K3-256K".to_string(),
-            description: Some("Kimi K3 with a 256K-token context window".to_string()),
-        },
-    ]
+    crate::model_catalog::bundled_models("kimi", "coding")
 }
 
 /// A provider configuration.
@@ -310,7 +291,7 @@ pub(crate) async fn catalog_model_options_for_state(
     merge_cached_provider_models(&mut config, &cached, include_unverified);
 
     let mut configured = get_configured_provider_ids(state.config.working_dir.as_path());
-    let store_providers = state.ai_providers.list().await;
+    let store_providers = discovery_accounts(state.ai_providers.list().await);
     for provider in &store_providers {
         if !provider.enabled || !provider.has_credentials() {
             continue;
@@ -338,6 +319,11 @@ pub(crate) async fn catalog_model_options_for_state(
         &store_providers,
         &cached,
         include_unverified,
+    );
+    apply_connection_models(
+        &mut providers,
+        &store_providers,
+        state.config.working_dir.as_path(),
     );
     drop(cached);
 
@@ -776,513 +762,16 @@ async fn resolve_visible_codex_models(
 
 /// Default provider configuration.
 fn default_providers_config() -> ProvidersConfig {
-    ProvidersConfig {
-        providers: vec![
-            Provider {
-                id: "anthropic".to_string(),
-                name: "Claude (Subscription)".to_string(),
-                billing: "subscription".to_string(),
-                description: "Included in Claude Max".to_string(),
-                models: vec![
-                    // Check Anthropic's current model IDs here:
-                    // https://platform.claude.com/docs/en/about-claude/models/overview
-                    ProviderModel {
-                        id: "claude-opus-5".to_string(),
-                        name: "Claude Opus 5".to_string(),
-                        description: Some(
-                            "Default for complex agentic coding, adaptive thinking, 1M context"
-                                .to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "claude-fable-5-1".to_string(),
-                        name: "Claude Fable 5.1".to_string(),
-                        description: Some(
-                            "Demanding reasoning and long-horizon agentic work, adaptive thinking, 1M context"
-                                .to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "claude-fable-5".to_string(),
-                        name: "Claude Fable 5".to_string(),
-                        description: Some(
-                            "Previous-generation Fable model retained for explicit compatibility"
-                                .to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "claude-opus-4-8".to_string(),
-                        name: "Claude Opus 4.8".to_string(),
-                        description: Some(
-                            "Previous-generation Opus model retained for explicit compatibility"
-                                .to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "claude-opus-4-7".to_string(),
-                        name: "Claude Opus 4.7".to_string(),
-                        description: Some(
-                            "Most capable, recommended for complex tasks".to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "claude-opus-4-6".to_string(),
-                        name: "Claude Opus 4.6".to_string(),
-                        description: Some(
-                            "Most capable, recommended for complex tasks".to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "claude-sonnet-4-6".to_string(),
-                        name: "Claude Sonnet 4.6".to_string(),
-                        description: Some(
-                            "Latest Sonnet, balanced speed and capability".to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "claude-sonnet-4-5-20250929".to_string(),
-                        name: "Claude Sonnet 4.5".to_string(),
-                        description: Some("Balanced speed and capability".to_string()),
-                    },
-                    ProviderModel {
-                        id: "claude-opus-4-5-20251101".to_string(),
-                        name: "Claude Opus 4.5".to_string(),
-                        description: Some(
-                            "Most capable, recommended for complex tasks".to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "claude-sonnet-5".to_string(),
-                        name: "Claude Sonnet 5".to_string(),
-                        description: Some("Balanced speed and capability".to_string()),
-                    },
-                    ProviderModel {
-                        id: "claude-sonnet-4-20250514".to_string(),
-                        name: "Claude Sonnet 4".to_string(),
-                        description: Some("Good balance of speed and capability".to_string()),
-                    },
-                    ProviderModel {
-                        id: "claude-3-5-haiku-20241022".to_string(),
-                        name: "Claude Haiku 3.5".to_string(),
-                        description: Some("Fastest, most economical".to_string()),
-                    },
-                ],
-            },
-            Provider {
-                id: "openai".to_string(),
-                name: "OpenAI (Subscription)".to_string(),
-                billing: "subscription".to_string(),
-                description: "ChatGPT Plus/Pro via OAuth".to_string(),
-                models: vec![
-                    // Only current models. OpenAI's ChatGPT-account Codex keeps
-                    // a small recent set, so the older codex variants (gpt-5-codex
-                    // … gpt-5.3-codex) and stale generics (gpt-5.1/5.2/5.3) were
-                    // removed — gpt-5.3-codex now 404s ("model not supported when
-                    // using Codex with a ChatGPT account"), and everything older
-                    // than it is dead too. Newest first.
-                    ProviderModel {
-                        id: "gpt-6-astra".to_string(),
-                        name: "GPT-6 Astra".to_string(),
-                        description: Some(
-                            "OpenAI's GPT-6 flagship in Codex (efforts low..ultra). Default."
-                                .to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.6".to_string(),
-                        name: "GPT-5.6".to_string(),
-                        description: Some(
-                            "Alias for GPT-5.6 Sol, OpenAI's flagship reasoning and coding model"
-                                .to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.6-sol".to_string(),
-                        name: "GPT-5.6 Sol".to_string(),
-                        description: Some(
-                            "Flagship GPT-5.6 model for complex reasoning and coding".to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "gpt-daybreak-blue-latest".to_string(),
-                        name: "Daybreak Blue".to_string(),
-                        description: Some(
-                            "Frontier model for approved defensive cybersecurity work; requires Daybreak access"
-                                .to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.6-terra".to_string(),
-                        name: "GPT-5.6 Terra".to_string(),
-                        description: Some(
-                            "Preview GPT-5.6 model with lower cost than Sol".to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.6-luna".to_string(),
-                        name: "GPT-5.6 Luna".to_string(),
-                        description: Some(
-                            "Preview GPT-5.6 model optimized for speed and cost".to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.5".to_string(),
-                        name: "GPT-5.5".to_string(),
-                        description: Some(
-                            "Latest frontier coding model in Codex (Spud, 2026-04)".to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.5-pro".to_string(),
-                        name: "GPT-5.5 Pro".to_string(),
-                        description: Some("Highest-capability GPT-5.5 model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.5-codex".to_string(),
-                        name: "GPT-5.5 Codex".to_string(),
-                        description: Some("Latest Codex-optimized coding model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.4".to_string(),
-                        name: "GPT-5.4".to_string(),
-                        description: Some("Previous frontier coding model in Codex".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.4-pro".to_string(),
-                        name: "GPT-5.4 Pro".to_string(),
-                        description: Some("Highest-capability GPT-5.4 model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.4-mini".to_string(),
-                        name: "GPT-5.4 Mini".to_string(),
-                        description: Some("Smaller, lower-latency GPT-5.4 model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.4-nano".to_string(),
-                        name: "GPT-5.4 Nano".to_string(),
-                        description: Some("Smallest, lowest-cost GPT-5.4 model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.3-codex".to_string(),
-                        name: "GPT-5.3 Codex".to_string(),
-                        description: Some("Codex-specialized model".to_string()),
-                    },
-                ],
-            },
-            Provider {
-                id: "open-router".to_string(),
-                name: "OpenRouter (API Key)".to_string(),
-                billing: "pay-per-token".to_string(),
-                description: "Aggregator routing through OpenRouter".to_string(),
-                models: vec![
-                    // OpenRouter model IDs are vendor-prefixed (provider/model).
-                    // The live catalog is merged from models.dev and /v1/models
-                    // when available; these keep the picker useful before the
-                    // background catalog finishes. IDs verified against
-                    // OpenRouter's public catalog on 2026-07-25 — treat as
-                    // best-effort seeds that the live catalog supersedes (slugs
-                    // can drift as models are retired).
-                    ProviderModel {
-                        id: "anthropic/claude-opus-5".to_string(),
-                        name: "Claude Opus 5".to_string(),
-                        description: Some("Anthropic Claude via OpenRouter".to_string()),
-                    },
-                    ProviderModel {
-                        id: "anthropic/claude-sonnet-4.6".to_string(),
-                        name: "Claude Sonnet 4.6".to_string(),
-                        description: Some("Anthropic Claude via OpenRouter".to_string()),
-                    },
-                    ProviderModel {
-                        id: "google/gemini-3.1-pro-preview".to_string(),
-                        name: "Gemini 3.1 Pro Preview".to_string(),
-                        description: Some("Google Gemini via OpenRouter".to_string()),
-                    },
-                    ProviderModel {
-                        id: "openai/gpt-5.6".to_string(),
-                        name: "GPT-5.6".to_string(),
-                        description: Some("OpenAI GPT via OpenRouter".to_string()),
-                    },
-                    ProviderModel {
-                        id: "meta-llama/llama-3.3-70b-instruct:free".to_string(),
-                        name: "Llama 3.3 70B Instruct (free)".to_string(),
-                        description: Some("Meta Llama via OpenRouter".to_string()),
-                    },
-                ],
-            },
-            Provider {
-                id: "google".to_string(),
-                name: "Google AI (OAuth)".to_string(),
-                billing: "subscription".to_string(),
-                description: "Gemini models via Google OAuth".to_string(),
-                models: vec![
-                    // Check Gemini model IDs here:
-                    // https://ai.google.dev/gemini-api/docs/models
-                    ProviderModel {
-                        id: "gemini-3.1-pro-preview".to_string(),
-                        name: "Gemini 3.1 Pro Preview".to_string(),
-                        description: Some(
-                            "Advanced reasoning with three-tier thinking".to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "gemini-3-pro-preview".to_string(),
-                        name: "Gemini 3 Pro Preview".to_string(),
-                        description: Some("State-of-the-art reasoning and multimodal".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gemini-3-flash-preview".to_string(),
-                        name: "Gemini 3 Flash Preview".to_string(),
-                        description: Some("Fast frontier-class performance".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gemini-2.5-pro".to_string(),
-                        name: "Gemini 2.5 Pro".to_string(),
-                        description: Some("Advanced reasoning and long context".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gemini-2.5-flash".to_string(),
-                        name: "Gemini 2.5 Flash".to_string(),
-                        description: Some("Fast and efficient with thinking".to_string()),
-                    },
-                ],
-            },
-            Provider {
-                id: "xai".to_string(),
-                name: "xAI (API Key)".to_string(),
-                billing: "pay-per-token".to_string(),
-                description: "Grok models via xAI API key".to_string(),
-                models: vec![
-                    ProviderModel {
-                        id: "grok-4.6".to_string(),
-                        name: "Grok 4.6".to_string(),
-                        description: Some("Latest flagship Grok model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "grok-4.6-latest".to_string(),
-                        name: "Grok 4.6 (Latest)".to_string(),
-                        description: Some("Rolling alias for Grok 4.6".to_string()),
-                    },
-                    ProviderModel {
-                        id: "grok-4.5".to_string(),
-                        name: "Grok 4.5".to_string(),
-                        description: Some("Previous flagship Grok model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "grok-4.5-latest".to_string(),
-                        name: "Grok 4.5 (Latest)".to_string(),
-                        description: Some("Rolling alias for Grok 4.5".to_string()),
-                    },
-                    ProviderModel {
-                        id: "grok-build-latest".to_string(),
-                        name: "Grok Build (Latest)".to_string(),
-                        description: Some(
-                            "Rolling Grok Build alias backed by Grok 4.5".to_string(),
-                        ),
-                    },
-                    // Legacy IDs retained for accounts that still advertise them.
-                    // Native Grok CLI choices are filtered separately below.
-                    ProviderModel {
-                        id: "grok-build-0.1".to_string(),
-                        name: "Grok Build".to_string(),
-                        description: Some(
-                            "Grok Build coding model (xAI's \"Composer\"-class agent model; \
-                             marketing name \"Composer 2.5\" is NOT a valid API id)"
-                                .to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "grok-4.3".to_string(),
-                        name: "Grok 4.3".to_string(),
-                        description: Some("Previous flagship Grok model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "grok-4.20-0309-reasoning".to_string(),
-                        name: "Grok 4.20 (Reasoning)".to_string(),
-                        description: Some("Grok 4.20 reasoning model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "grok-4.20-0309-non-reasoning".to_string(),
-                        name: "Grok 4.20 (Non-Reasoning)".to_string(),
-                        description: Some("Grok 4.20 non-reasoning model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "grok-4.20-multi-agent-0309".to_string(),
-                        name: "Grok 4.20 Multi-Agent".to_string(),
-                        description: Some("Grok 4.20 multi-agent model".to_string()),
-                    },
-                ],
-            },
-            Provider {
-                id: "cerebras".to_string(),
-                name: "Cerebras (API Key)".to_string(),
-                billing: "pay-per-token".to_string(),
-                description: "Ultra-fast inference via Cerebras".to_string(),
-                models: vec![
-                    // Keep aligned with the live catalog: GET /v1/models only
-                    // serves these two IDs now (Qwen and the `-cs` aliases are
-                    // retired).
-                    ProviderModel {
-                        id: "zai-glm-4.7".to_string(),
-                        name: "GLM-4.7 (Cerebras)".to_string(),
-                        description: Some("Most capable Cerebras-hosted model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-oss-120b".to_string(),
-                        name: "GPT-OSS 120B".to_string(),
-                        description: Some("Open-weight reasoning model, ultra-fast".to_string()),
-                    },
-                ],
-            },
-            Provider {
-                id: "zai".to_string(),
-                name: "Z.AI (API Key)".to_string(),
-                billing: "pay-per-token".to_string(),
-                description: "GLM models via Z.AI API key".to_string(),
-                models: vec![
-                    // Check Z.AI / GLM model IDs here:
-                    // https://docs.z.ai/guides/llm/glm
-                    ProviderModel {
-                        id: "glm-5.3".to_string(),
-                        name: "GLM-5.3".to_string(),
-                        description: Some(
-                            "Current flagship GLM reasoning and coding model".to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "glm-5.3[1m]".to_string(),
-                        name: "GLM-5.3 (1M context)".to_string(),
-                        description: Some(
-                            "GLM-5.3 with the Coding Plan 1M-token context window".to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "glm-5.2".to_string(),
-                        name: "GLM-5.2".to_string(),
-                        description: Some(
-                            "Previous flagship; Coding Plan routes this to GLM-5.3".to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "glm-5.1".to_string(),
-                        name: "GLM-5.1".to_string(),
-                        description: Some("Previous flagship GLM reasoning model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "glm-5-turbo".to_string(),
-                        name: "GLM-5 Turbo".to_string(),
-                        description: Some("Fast reasoning model with deep thinking".to_string()),
-                    },
-                    ProviderModel {
-                        id: "glm-4.7".to_string(),
-                        name: "GLM-4.7".to_string(),
-                        description: Some("Most capable GLM model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "glm-4.6".to_string(),
-                        name: "GLM-4.6".to_string(),
-                        description: Some("Balanced capability and speed".to_string()),
-                    },
-                    ProviderModel {
-                        id: "glm-4.5".to_string(),
-                        name: "GLM-4.5".to_string(),
-                        description: Some("Fast and economical".to_string()),
-                    },
-                    ProviderModel {
-                        id: "glm-4.6v-flash".to_string(),
-                        name: "GLM-4.6V Flash".to_string(),
-                        description: Some("Vision model, fast variant".to_string()),
-                    },
-                ],
-            },
-            Provider {
-                id: "minimax".to_string(),
-                name: "Minimax (API Key)".to_string(),
-                billing: "pay-per-token".to_string(),
-                description: "MiniMax models via Minimax API key".to_string(),
-                models: vec![
-                    // Check MiniMax text model IDs here:
-                    // https://platform.minimaxi.com/document/ChatCompletion%20v2
-                    ProviderModel {
-                        id: "MiniMax-M3".to_string(),
-                        name: "MiniMax M3".to_string(),
-                        description: Some(
-                            "Latest MiniMax coding and agentic model with 1M context".to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "MiniMax-M2.7".to_string(),
-                        name: "MiniMax M2.7".to_string(),
-                        description: Some("Previous flagship MiniMax model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "MiniMax-M2.5".to_string(),
-                        name: "MiniMax M2.5".to_string(),
-                        description: Some("Previous flagship MiniMax model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "MiniMax-M2.5-highspeed".to_string(),
-                        name: "MiniMax M2.5 Highspeed".to_string(),
-                        description: Some("Fast variant of M2.5".to_string()),
-                    },
-                    ProviderModel {
-                        id: "MiniMax-M2.1".to_string(),
-                        name: "MiniMax M2.1".to_string(),
-                        description: Some("Balanced capability and speed".to_string()),
-                    },
-                    ProviderModel {
-                        id: "MiniMax-M2".to_string(),
-                        name: "MiniMax M2".to_string(),
-                        description: Some("Fast and economical".to_string()),
-                    },
-                ],
-            },
-            Provider {
-                id: "kimi".to_string(),
-                name: "Kimi (Subscription)".to_string(),
-                billing: "subscription".to_string(),
-                description: "Kimi Code via Moonshot OAuth (device login)".to_string(),
-                models: kimi_fallback_models(),
-            },
-            Provider {
-                id: "muse".to_string(),
-                name: "Meta Muse".to_string(),
-                billing: "api_key".to_string(),
-                description: "Meta's Muse family via api.meta.ai (OpenCode native meta Responses provider)".to_string(),
-                // Verified live against /models on 2026-08-06; the catalog
-                // refresh overwrites this with the fetched list when the key
-                // is present.
-                models: vec![
-                    ProviderModel {
-                        id: "muse-spark-1.3-contributor".to_string(),
-                        name: "Muse Spark 1.3 Contributor".to_string(),
-                        description: Some(
-                            "Spark 1.3, data-sharing tier (~12x cheaper). Default.".to_string(),
-                        ),
-                    },
-                    ProviderModel {
-                        id: "muse-spark-1.3".to_string(),
-                        name: "Muse Spark 1.3".to_string(),
-                        description: Some("Spark 1.3, no-training tier".to_string()),
-                    },
-                    ProviderModel {
-                        id: "muse-spark-1.2".to_string(),
-                        name: "Muse Spark 1.2".to_string(),
-                        description: Some("Coding-focused Spark 1.2".to_string()),
-                    },
-                    ProviderModel {
-                        id: "muse-spark-1.1".to_string(),
-                        name: "Muse Spark 1.1".to_string(),
-                        description: None,
-                    },
-                    ProviderModel {
-                        id: "muse-spark-1.2-contributor".to_string(),
-                        name: "Muse Spark 1.2 Contributor".to_string(),
-                        description: Some("Lower-cost Spark 1.2 tier".to_string()),
-                    },
-                ],
-            },
-        ],
+    let mut config: ProvidersConfig =
+        serde_json::from_str(include_str!("../../catalog/providers.json"))
+            .expect("validated bundled provider metadata");
+    for provider in &mut config.providers {
+        provider.models = crate::model_catalog::bundled_models(
+            &provider.id,
+            crate::model_catalog::default_profile(&provider.id),
+        );
     }
+    config
 }
 
 // ==================== Dynamic Model Catalog Fetching ====================
@@ -2055,331 +1544,163 @@ pub async fn refresh_model_catalog(
     })
 }
 
+fn discovery_accounts(mut providers: Vec<AIProvider>) -> Vec<AIProvider> {
+    // Legacy API keys in OpenCode files/env are independent connections. OAuth
+    // tokens are never sent to an API-key catalog endpoint.
+    for id in DEFAULT_CATALOG_PROVIDER_IDS {
+        let Some(kind) = ProviderType::from_id(id) else {
+            continue;
+        };
+        if providers.iter().any(|p| {
+            p.enabled
+                && p.provider_type == kind
+                && p.api_key.as_ref().is_some_and(|k| !k.is_empty())
+        }) {
+            continue;
+        }
+        let key = if kind == ProviderType::Anthropic {
+            get_anthropic_models_api_key(&[])
+        } else {
+            get_openai_compatible_models_api_key(kind, &[])
+        };
+        let Some(key) = key else {
+            continue;
+        };
+        let mut provider = AIProvider::new(kind, id.to_string());
+        provider.id = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_OID,
+            format!("catalog:{id}:{key}").as_bytes(),
+        );
+        provider.api_key = Some(key);
+        providers.push(provider);
+    }
+    providers
+}
+
 async fn fetch_model_catalog(
     ai_providers: &AIProviderStore,
-    _working_dir: &Path,
+    working_dir: &Path,
 ) -> (HashMap<String, Vec<CatalogEntry>>, u64) {
-    // Kimi access tokens are short-lived. Refresh a due store credential
-    // synchronously before taking the provider snapshot so the initial catalog
-    // probe cannot race the independent refresh task at startup.
-    let (_, refreshed) = crate::api::ai_providers::refresh_due_store_oauth(
+    let _ = crate::api::ai_providers::refresh_due_store_oauth(
         ai_providers,
         ProviderType::Kimi,
         10 * 60 * 1000,
     )
     .await;
-    if refreshed > 0 {
-        tracing::info!(
-            refreshed,
-            "Refreshed Kimi OAuth credentials before model catalog discovery"
-        );
+    let providers = discovery_accounts(ai_providers.list().await);
+    let mut result = fetch_models_dev_catalog().await.unwrap_or_default();
+    let state = match crate::model_discovery::refresh(working_dir, providers.clone()).await {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(%error, "Could not persist model discovery; retaining last successful observations");
+            crate::model_catalog::read_state(working_dir)
+        }
+    };
+    // Connected routes replace public metadata; public catalogs never establish
+    // account access. Union only the effective lists of active connections.
+    let active = active_discovery(&state, &providers);
+    let connected: HashSet<_> = active.iter().map(|o| o.provider_id.clone()).collect();
+    for id in &connected {
+        result.remove(id);
     }
-
-    let catalog_generation = kimi_catalog_generation();
-    let providers_list = ai_providers.list().await;
-    let mut result = HashMap::new();
-
-    // Define fetchable providers (Google uses OAuth which is complex, skip it)
-    struct FetchTarget {
-        provider_type: ProviderType,
-        provider_id: &'static str,
-        base_url: &'static str,
-        prefix_filters: Vec<&'static str>,
-        /// Extra query on `/models` (e.g. OpenRouter `?sort=most-popular`).
-        models_query: Option<&'static str>,
-        /// When false, keep the API response order (popularity sorts).
-        sort_results_by_id: bool,
-        /// Fetch even when no API key is configured (public catalog endpoints).
-        allow_unauthenticated: bool,
-        /// Upper bound on models merged from this provider's `/v1/models`.
-        /// Set for prefix-less, large catalogs (OpenRouter) to keep the
-        /// routing picker bounded; `None` means no cap.
-        max_models: Option<usize>,
+    for observation in active {
+        for model in observation.effective_models() {
+            let discovered = observation
+                .last_success
+                .as_ref()
+                .is_some_and(|s| s.models.iter().any(|m| m.id == model.id));
+            let entry = CatalogEntry::from_provider_model(
+                &observation.provider_id,
+                model,
+                if discovered {
+                    CatalogSource::ProviderApi
+                } else {
+                    CatalogSource::HardcodedFallback
+                },
+                if discovered && observation.status == "discovered" {
+                    CatalogAvailability::Available
+                } else {
+                    CatalogAvailability::Known
+                },
+                observation
+                    .last_success
+                    .as_ref()
+                    .map(|s| s.observed_at)
+                    .unwrap_or(observation.checked_at),
+            );
+            merge_catalog_entries(&mut result, &observation.provider_id, vec![entry]);
+        }
     }
+    (result, kimi_catalog_generation())
+}
 
-    let targets = vec![
-        FetchTarget {
-            provider_type: ProviderType::OpenAI,
-            provider_id: "openai",
-            base_url: "https://api.openai.com/v1",
-            prefix_filters: vec!["gpt-", "o1-", "o3-", "o4-", "chatgpt-"],
-            models_query: None,
-            sort_results_by_id: true,
-            allow_unauthenticated: false,
-            max_models: None,
-        },
-        FetchTarget {
-            provider_type: ProviderType::OpenRouter,
-            provider_id: "open-router",
-            base_url: "https://openrouter.ai/api/v1",
-            // No usable prefix; ask OpenRouter for weekly token volume order.
-            prefix_filters: vec![],
-            models_query: Some("?sort=most-popular"),
-            sort_results_by_id: false,
-            allow_unauthenticated: true,
-            max_models: Some(MAX_CATALOG_MODELS_PER_PROVIDER),
-        },
-        FetchTarget {
-            provider_type: ProviderType::Xai,
-            provider_id: "xai",
-            base_url: "https://api.x.ai/v1",
-            prefix_filters: vec!["grok-"],
-            models_query: None,
-            sort_results_by_id: true,
-            allow_unauthenticated: false,
-            max_models: None,
-        },
-        FetchTarget {
-            provider_type: ProviderType::Cerebras,
-            provider_id: "cerebras",
-            base_url: "https://api.cerebras.ai/v1",
-            prefix_filters: vec![],
-            models_query: None,
-            sort_results_by_id: true,
-            allow_unauthenticated: false,
-            max_models: None,
-        },
-        FetchTarget {
-            provider_type: ProviderType::Zai,
-            provider_id: "zai",
-            base_url: "https://open.bigmodel.cn/api/paas/v4",
-            prefix_filters: vec!["glm-"],
-            models_query: None,
-            sort_results_by_id: true,
-            allow_unauthenticated: false,
-            max_models: None,
-        },
-        FetchTarget {
-            provider_type: ProviderType::Minimax,
-            provider_id: "minimax",
-            base_url: "https://api.minimax.io/v1",
-            prefix_filters: vec!["MiniMax-"],
-            models_query: None,
-            sort_results_by_id: true,
-            allow_unauthenticated: false,
-            max_models: None,
-        },
-        FetchTarget {
-            provider_type: ProviderType::Muse,
-            provider_id: "muse",
-            base_url: "https://api.meta.ai/v1",
-            prefix_filters: vec!["muse-"],
-            models_query: None,
-            sort_results_by_id: true,
-            allow_unauthenticated: false,
-            max_models: None,
-        },
-    ];
-
-    // Resolve API keys for all targets + Anthropic
-    let anthropic_key = get_anthropic_models_api_key(&providers_list);
-    let target_keys: Vec<(FetchTarget, Option<String>)> = targets
-        .into_iter()
-        .map(|t| {
-            let key = get_openai_compatible_models_api_key(t.provider_type, &providers_list);
-            (t, key)
+fn active_discovery<'a>(
+    state: &'a crate::model_catalog::DiscoveryState,
+    providers: &[AIProvider],
+) -> Vec<&'a crate::model_catalog::Observation> {
+    let keys: HashSet<_> = providers
+        .iter()
+        .filter(|p| p.enabled)
+        .map(|p| {
+            let route = crate::model_discovery::route(p);
+            crate::model_catalog::route_key(&p.id.to_string(), &route.base, &route.profile)
         })
         .collect();
+    state
+        .connections
+        .iter()
+        .filter(|o| keys.contains(&o.connection))
+        .collect()
+}
 
-    // Fetch public catalog in parallel with provider APIs. These entries are
-    // not account-verified and are hidden unless include_unverified=true.
-    let models_dev_handle = tokio::spawn(async move {
-        match fetch_models_dev_catalog().await {
-            Ok(catalog) => {
-                let model_count: usize = catalog.values().map(Vec::len).sum();
-                tracing::info!(
-                    providers = catalog.len(),
-                    models = model_count,
-                    "Fetched public model metadata from models.dev"
-                );
-                Some(catalog)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to fetch models.dev catalog: {}", e);
-                None
-            }
-        }
-    });
-
-    // Fetch Anthropic (special format)
-    let anthropic_handle = tokio::spawn(async move {
-        match anthropic_key {
-            Some(key) => match fetch_anthropic_models(&key).await {
-                Ok(models) => {
-                    tracing::info!("Fetched {} models from Anthropic API", models.len());
-                    Some(("anthropic".to_string(), models))
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to fetch Anthropic models: {}", e);
-                    None
-                }
-            },
-            None => {
-                tracing::debug!("No API key for Anthropic, skipping model fetch");
-                None
-            }
-        }
-    });
-
-    // Kimi has an OpenAI-compatible catalog but requires its coding User-Agent.
-    // Use the shared, credential-aware cache so startup refresh also primes
-    // mission workspace generation.
-    let kimi_provider = preferred_usable_kimi_provider(&providers_list);
-    let kimi_handle = tokio::spawn(async move {
-        match kimi_provider {
-            Some(provider) => match fetch_kimi_models(&provider).await {
-                Ok(models) => {
-                    tracing::info!("Fetched {} models from Kimi API", models.len());
-                    Some(("kimi".to_string(), models))
-                }
-                Err(error) => {
-                    tracing::warn!("Failed to fetch Kimi models: {}", error);
-                    None
-                }
-            },
-            None => {
-                tracing::debug!("No Kimi OAuth account, skipping model fetch");
-                None
-            }
-        }
-    });
-
-    // Fetch OpenAI-compatible providers concurrently
-    let mut handles = vec![anthropic_handle, kimi_handle];
-    for (target, key) in target_keys {
-        let provider_id = target.provider_id.to_string();
-        let base_url = target.base_url.to_string();
-        let max_models = target.max_models;
-        let models_query = target.models_query.map(str::to_string);
-        let sort_results_by_id = target.sort_results_by_id;
-        let allow_unauthenticated = target.allow_unauthenticated;
-        let prefix_filters: Vec<String> = target
-            .prefix_filters
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        handles.push(tokio::spawn(async move {
-            let api_key = match key {
-                Some(k) if !k.is_empty() => Some(k),
-                _ if allow_unauthenticated => Some(String::new()),
-                _ => None,
-            };
-            match api_key {
-                Some(api_key) => {
-                    let filters: Vec<&str> = prefix_filters.iter().map(|s| s.as_str()).collect();
-                    match fetch_openai_compatible_models(
-                        &base_url,
-                        &api_key,
-                        &filters,
-                        models_query.as_deref(),
-                        sort_results_by_id,
-                    )
-                    .await
-                    {
-                        Ok(mut models) => {
-                            // Bound large catalogs (OpenRouter). OpenRouter
-                            // keeps the API's most-popular order; others are
-                            // sorted by id before truncation.
-                            if let Some(limit) = max_models {
-                                if models.len() > limit {
-                                    tracing::info!(
-                                        "Capping {} catalog from {} to {} models",
-                                        provider_id,
-                                        models.len(),
-                                        limit
-                                    );
-                                    models.truncate(limit);
-                                }
-                            }
-                            tracing::info!(
-                                "Fetched {} models from {} API",
-                                models.len(),
-                                provider_id
-                            );
-                            Some((provider_id, models))
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to fetch {} models: {}", provider_id, e);
-                            None
-                        }
-                    }
-                }
-                None => {
-                    tracing::debug!("No API key for {}, skipping model fetch", provider_id);
-                    None
-                }
-            }
-        }));
+fn apply_connection_models(providers: &mut Vec<Provider>, store: &[AIProvider], root: &Path) {
+    let state = crate::model_catalog::read_state(root);
+    let observations = active_discovery(&state, store);
+    let mut grouped: std::collections::BTreeMap<String, Vec<ProviderModel>> =
+        std::collections::BTreeMap::new();
+    for observation in observations {
+        merge_provider_models(
+            grouped.entry(observation.provider_id.clone()).or_default(),
+            observation.effective_models(),
+        );
     }
-
-    // Custom providers (self-hosted OpenAI-compatible routers, e.g. the
-    // dgx-spark-router) expose /v1/models. Fetch their live model list so the
-    // catalog reflects what the router actually serves instead of the
-    // operator's hardcoded `custom_models`, which drift out of date.
-    for provider in &providers_list {
-        if provider.provider_type != ProviderType::Custom || !provider.enabled {
-            continue;
-        }
-        let Some(base_url) = provider.base_url.clone().filter(|u| !u.trim().is_empty()) else {
-            continue;
-        };
-        let provider_id = sanitize_custom_provider_id(&provider.name);
-        // /v1/models is usually unauthenticated on these routers; send the key
-        // when present, empty otherwise.
-        let api_key = provider.api_key.clone().unwrap_or_default();
-        handles.push(tokio::spawn(async move {
-            match fetch_openai_compatible_models(&base_url, &api_key, &[], None, true).await {
-                Ok(models) if !models.is_empty() => {
-                    tracing::info!(
-                        "Fetched {} models from custom provider {} ({})",
-                        models.len(),
-                        provider_id,
-                        base_url
-                    );
-                    Some((provider_id, models))
-                }
-                Ok(_) => None,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to fetch custom provider {} models from {}: {}",
-                        provider_id,
-                        base_url,
-                        e
-                    );
-                    None
-                }
-            }
-        }));
-    }
-
-    if let Ok(Some(public_catalog)) = models_dev_handle.await {
-        for (provider_id, entries) in public_catalog {
-            merge_catalog_entries(&mut result, &provider_id, entries);
+    for (id, models) in grouped {
+        if let Some(p) = providers.iter_mut().find(|p| p.id == id) {
+            p.models = models;
+        } else {
+            providers.push(Provider {
+                id: id.clone(),
+                name: id,
+                billing: "configured".into(),
+                description: "Connected provider".into(),
+                models,
+            });
         }
     }
+}
 
-    // Collect provider API results. These are account-verified and selectable
-    // by default.
-    let now = chrono::Utc::now();
-    for handle in handles {
-        if let Ok(Some((provider_id, models))) = handle.await {
-            if !models.is_empty() {
-                let entries = models.into_iter().map(|model| {
-                    CatalogEntry::from_provider_model(
-                        provider_id.clone(),
-                        model,
-                        CatalogSource::ProviderApi,
-                        CatalogAvailability::Available,
-                        now,
-                    )
-                });
-                merge_catalog_entries(&mut result, &provider_id, entries);
-            }
-        }
-    }
+pub async fn model_discovery_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let snapshot = crate::model_catalog::read_state(&state.config.working_dir);
+    let providers = discovery_accounts(state.ai_providers.list().await);
+    let connections: Vec<_> = active_discovery(&snapshot,&providers).into_iter().map(|o| serde_json::json!({
+        "connection":o.connection, "provider_id":o.provider_id, "access_profile":o.access_profile,
+        "checked_at":o.checked_at, "status":o.status, "diagnostic":o.diagnostic,
+        "source":o.effective_source(), "last_success":o.last_success,
+        "models":o.effective_models(),
+    })).collect();
+    Json(serde_json::json!({"schema_version":1,"connections":connections}))
+}
 
-    (result, catalog_generation)
+pub async fn export_model_snapshots(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<crate::model_catalog::Snapshot>> {
+    let mut snapshot = crate::model_catalog::read_state(&state.config.working_dir);
+    let providers = discovery_accounts(state.ai_providers.list().await);
+    snapshot.connections = active_discovery(&snapshot, &providers)
+        .into_iter()
+        .cloned()
+        .collect();
+    Json(crate::model_catalog::export_snapshots(&snapshot))
 }
 
 /// Check if a JSON value contains valid auth credentials.
@@ -2550,7 +1871,7 @@ pub async fn list_providers(
             .collect()
     };
 
-    let store_providers = state.ai_providers.list().await;
+    let store_providers = discovery_accounts(state.ai_providers.list().await);
     merge_store_provider_models(&mut providers, &store_providers, query.include_all);
 
     apply_live_authoritative_provider_models(
@@ -2559,7 +1880,24 @@ pub async fn list_providers(
         &cached,
         query.include_unverified,
     );
+    apply_connection_models(
+        &mut providers,
+        &store_providers,
+        state.config.working_dir.as_path(),
+    );
     drop(cached);
+    retire_superseded_claude_models(&mut providers);
+
+    for provider in &mut providers {
+        if matches!(provider.id.as_str(), "anthropic" | "openai" | "xai") {
+            let ids: Vec<_> = provider.models.iter().map(|m| m.id.as_str()).collect();
+            let indices = crate::model_selection::preferred_indices(&ids);
+            provider.models = indices
+                .into_iter()
+                .map(|i| provider.models[i].clone())
+                .collect();
+        }
+    }
 
     Json(ProvidersResponse {
         providers,
@@ -2612,7 +1950,7 @@ pub async fn list_backend_model_options(
             .collect()
     };
 
-    let store_providers = state.ai_providers.list().await;
+    let store_providers = discovery_accounts(state.ai_providers.list().await);
     merge_store_provider_models(&mut providers, &store_providers, query.include_all);
     apply_live_authoritative_provider_models(
         &mut providers,
@@ -2620,7 +1958,18 @@ pub async fn list_backend_model_options(
         &cached,
         query.include_unverified,
     );
+    apply_connection_models(
+        &mut providers,
+        &store_providers,
+        state.config.working_dir.as_path(),
+    );
     drop(cached);
+    // This endpoint is what the desktop client's harness/model pickers read
+    // (`listBackendModels` in orb/src/api.ts), and it assembles its own provider
+    // list from the dynamic catalog and the live account. Filtering only in
+    // `list_providers` and `validate_model_override` left retired models
+    // selectable here — visibly offered, then refused on submit.
+    retire_superseded_claude_models(&mut providers);
 
     let mut backends: std::collections::HashMap<String, Vec<BackendModelOption>> =
         std::collections::HashMap::new();
@@ -2723,7 +2072,47 @@ pub async fn list_backend_model_options(
         *opencode_opts = chain_options;
     }
 
+    // Filter only after native-harness and account availability checks. A newer
+    // inaccessible release must not hide the newest usable older release.
+    for backend in ["claudecode", "codex", "grok"] {
+        if let Some(options) = backends.get_mut(backend) {
+            let ids: Vec<_> = options.iter().map(|m| m.value.as_str()).collect();
+            let indices = crate::model_selection::preferred_indices(&ids);
+            *options = indices.into_iter().map(|i| options[i].clone()).collect();
+        }
+    }
+
     Json(BackendModelOptionsResponse { backends })
+}
+
+/// Drop Claude models this deployment has retired.
+///
+/// The hardcoded list above is only one source: `merge_cached_provider_models`,
+/// `merge_store_provider_models` and `apply_live_authoritative_provider_models`
+/// all add whatever Anthropic currently exposes to the account, which still
+/// includes the older Opus and Fable aliases. Filtering after the merge is what
+/// keeps them out of the pickers, not just out of the defaults.
+///
+/// A provider whose every model is retired is left empty on purpose: an empty
+/// picker says "nothing current is available here", which is true, whereas
+/// offering a retired model because it is the only one left would hand the user
+/// exactly the selection this policy exists to prevent.
+fn retire_superseded_claude_models(providers: &mut [Provider]) {
+    for provider in providers.iter_mut() {
+        let before = provider.models.len();
+        provider
+            .models
+            .retain(|model| !crate::model_policy::is_retired_claude_model(&model.id));
+        let dropped = before - provider.models.len();
+        if dropped > 0 {
+            tracing::debug!(
+                provider = %provider.id,
+                dropped,
+                remaining = provider.models.len(),
+                "filtered retired Claude models"
+            );
+        }
+    }
 }
 
 /// Validate a model override for a specific backend.
@@ -2743,10 +2132,11 @@ pub async fn validate_model_override(
 
     // Load all providers (including configured and non-default)
     let mut providers = config.providers;
-    let store_providers = state.ai_providers.list().await;
+    let store_providers = discovery_accounts(state.ai_providers.list().await);
     merge_store_provider_models(&mut providers, &store_providers, true);
     apply_live_authoritative_provider_models(&mut providers, &store_providers, &cached, true);
     drop(cached);
+    retire_superseded_claude_models(&mut providers);
 
     match backend {
         "opencode" => {
@@ -2783,6 +2173,17 @@ pub async fn validate_model_override(
             }
         }
         "claudecode" => {
+            // The `claude-*` escape hatch below exists so a model Anthropic
+            // ships tomorrow works today, without a release. It also accepted
+            // every model Anthropic shipped *yesterday*: production mission
+            // f77ee08c stored `claude-opus-4-1` through exactly this path,
+            // which is why the retirement check has to come first.
+            if let Some(replacement) = crate::model_policy::retired_claude_model(model_override) {
+                return Err(crate::model_policy::retired_model_message(
+                    model_override,
+                    replacement,
+                ));
+            }
             // Claude Code expects raw model IDs from Anthropic
             let anthropic = providers.iter().find(|p| p.id == "anthropic");
             if let Some(provider) = anthropic {
@@ -2945,7 +2346,8 @@ fn reject_known_unsupported_codex_model(model_id: &str) -> Result<(), String> {
 }
 
 fn is_codex_backend_model_id(model_id: &str) -> bool {
-    model_id.contains("codex")
+    (crate::model_selection::is_versioned_text_model(model_id, "gpt") && model_id != "gpt-5.5-sol")
+        || model_id.contains("codex")
         || matches!(
             model_id,
             "gpt-daybreak-blue-latest"
@@ -2966,11 +2368,29 @@ fn is_codex_backend_model_id(model_id: &str) -> bool {
 
 fn is_grok_backend_model_id(model_id: &str) -> bool {
     GROK_CLI_TEXT_MODEL_IDS.contains(&model_id)
+        || (crate::model_selection::is_versioned_text_model(model_id, "grok")
+            && !model_id.ends_with("-latest"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opus_55_catalog_survives_retirement_policy() {
+        let mut config = default_providers_config();
+        retire_superseded_claude_models(&mut config.providers);
+        for (provider, id) in [
+            ("anthropic", "claude-opus-5-5"),
+            ("open-router", "anthropic/claude-opus-5.5"),
+        ] {
+            let p = config.providers.iter().find(|p| p.id == provider).unwrap();
+            assert!(p
+                .models
+                .iter()
+                .any(|m| m.id == id && m.name == "Claude Opus 5.5"));
+        }
+    }
 
     #[test]
     fn kimi_catalog_skips_a_higher_priority_account_without_oauth() {
@@ -3144,22 +2564,105 @@ mod tests {
     }
 
     #[test]
-    fn default_anthropic_catalog_leads_with_opus_5() {
+    fn default_anthropic_catalog_offers_the_current_opus_and_fable_only() {
         let defaults = default_providers_config();
         let anthropic = defaults
             .providers
             .iter()
             .find(|provider| provider.id == "anthropic")
             .expect("anthropic provider");
-        assert_eq!(anthropic.models[0].id, "claude-opus-5");
+        assert_eq!(
+            anthropic.models[0].id,
+            crate::model_policy::CURRENT_CLAUDE_OPUS
+        );
         assert!(anthropic
             .models
             .iter()
-            .any(|model| model.id == "claude-opus-4-8"));
+            .any(|model| model.id == crate::model_policy::CURRENT_CLAUDE_FABLE));
+        // The older Opus/Fable aliases this deployment has moved off are not
+        // offered — previously `claude-opus-4-8` and friends were listed here.
+        for retired in [
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-opus-4-5-20251101",
+            "claude-fable-5",
+        ] {
+            assert!(
+                !anthropic.models.iter().any(|model| model.id == retired),
+                "{retired} must not be selectable"
+            );
+        }
+        // Other families are untouched by the policy.
         assert!(anthropic
             .models
             .iter()
-            .any(|model| model.id == "claude-fable-5-1"));
+            .any(|model| model.id == "claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn retirement_filter_drops_legacy_ids_and_never_falls_back_to_offering_them() {
+        let mut providers = vec![
+            Provider {
+                id: "anthropic".to_string(),
+                name: "Claude".to_string(),
+                billing: "subscription".to_string(),
+                description: String::new(),
+                models: vec![
+                    ProviderModel {
+                        id: "claude-opus-4-8".to_string(),
+                        name: "Opus 4.8".to_string(),
+                        description: None,
+                    },
+                    ProviderModel {
+                        id: crate::model_policy::CURRENT_CLAUDE_OPUS.to_string(),
+                        name: "Opus 5".to_string(),
+                        description: None,
+                    },
+                    ProviderModel {
+                        id: "claude-sonnet-4-6".to_string(),
+                        name: "Sonnet 4.6".to_string(),
+                        description: None,
+                    },
+                ],
+            },
+            Provider {
+                id: "legacy-only".to_string(),
+                name: "Legacy".to_string(),
+                billing: "subscription".to_string(),
+                description: String::new(),
+                models: vec![
+                    ProviderModel {
+                        id: "claude-opus-4-1".to_string(),
+                        name: "Opus 4.1".to_string(),
+                        description: None,
+                    },
+                    ProviderModel {
+                        id: "claude-fable-5".to_string(),
+                        name: "Fable 5".to_string(),
+                        description: None,
+                    },
+                ],
+            },
+        ];
+        retire_superseded_claude_models(&mut providers);
+
+        let anthropic: Vec<&str> = providers[0].models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            anthropic,
+            vec![
+                crate::model_policy::CURRENT_CLAUDE_OPUS,
+                "claude-sonnet-4-6"
+            ]
+        );
+
+        // A provider whose every model is retired is left empty on purpose:
+        // "nothing current here" is true, and offering the legacy id because it
+        // is the only one left would defeat the policy entirely.
+        assert!(
+            providers[1].models.is_empty(),
+            "a legacy-only provider must not fall back to offering legacy models"
+        );
     }
 
     #[test]

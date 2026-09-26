@@ -289,6 +289,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     });
 
     // Initialize backend config store (persisted settings).
+    crate::agent_software::start_worker();
     // Probe each backend's declared CLI names so backends whose CLI is missing
     // default to disabled. CLI binary names live on the `Backend` trait
     // (`cli_names()`); this loop reads them via short-lived instances so the
@@ -577,6 +578,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // `/api/remote-nodes` and dispatch decisions read cached statuses
     // (REMOTE_NODE_MONITOR_SECS, default 15s, 0 disables). Only spawned when
     // remote nodes are enabled and configured.
+    super::project_files::start_context_observer(config.working_dir.clone());
     if config.remote_nodes.enabled && !config.remote_nodes.nodes.is_empty() {
         crate::remote_node::spawn_fleet_monitor(
             Arc::clone(&state.fleet),
@@ -757,7 +759,18 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024 * 1024));
 
     let protected_routes = Router::new()
+        .route(
+            "/api/uploads",
+            post(super::uploads::upload)
+                .layer(DefaultBodyLimit::max(crate::uploads::MAX_BODY_BYTES)),
+        )
         .route("/api/stats", get(get_stats))
+        .route("/api/software", get(super::agent_software::inventory))
+        .route("/api/software/updates", post(super::agent_software::update))
+        .route(
+            "/api/software/updates/cancel",
+            post(super::agent_software::cancel),
+        )
         .route("/api/remote-nodes", get(list_remote_nodes))
         .route("/api/nodes/:name/cordon", post(cordon_remote_node))
         .route("/api/nodes/:name/uncordon", post(uncordon_remote_node))
@@ -866,6 +879,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(control::set_mission_status),
         )
         .route(
+            "/api/control/missions/:id/client-transcript",
+            post(control::append_client_transcript),
+        )
+        .route(
+            "/api/control/missions/:id/client-status",
+            post(control::set_client_mission_status),
+        )
+        .route(
             "/api/control/missions/:id/title",
             post(control::set_mission_title),
         )
@@ -898,12 +919,24 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(control::resume_mission),
         )
         .route(
+            "/api/control/missions/:id/btw/agent",
+            post(control::fork::btw_agent),
+        )
+        .route(
+            "/api/control/missions/:id/fork",
+            post(control::fork::fork_mission),
+        )
+        .route(
             "/api/control/missions/:id/clone",
             post(control::clone_mission),
         )
         .route(
             "/api/control/missions/:id/parallel",
             post(control::start_mission_parallel),
+        )
+        .route(
+            "/api/control/missions/:id/btw",
+            post(crate::api::ask::btw::send).layer(DefaultBodyLimit::max(26 * 1024 * 1024)),
         )
         // Ask assistant (non-interrupting sidecar co-pilot)
         .route(
@@ -961,6 +994,21 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/control/missions/:id/automation-executions",
             get(control::get_mission_automation_executions),
+        )
+        .route(
+            "/api/control/missions/:id/machine-transfer",
+            get(control::machine_transfer::inspect)
+                .post(control::machine_transfer::operate)
+                .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/api/control/missions/:id/client-run",
+            post(control::machine_transfer::client_run),
+        )
+        .route(
+            "/api/control/local-origins",
+            post(control::machine_transfer::local_origin)
+                .layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
         )
         // Mission portability — export a mission for transfer to another
         // instance, and import one coming from elsewhere. The import route
@@ -1151,6 +1199,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/runs/:id/tasks", get(get_run_tasks))
         .route("/api/memory/search", get(search_memory))
         // Remote file explorer endpoints (use Authorization header)
+        .route("/api/file-resources", post(super::file_resources::operate))
         .route("/api/fs/list", get(fs::list))
         .route("/api/fs/download", get(fs::download))
         .route("/api/fs/validate", get(fs::validate))
@@ -1173,6 +1222,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/tools/:name/toggle", post(mcp_api::toggle_tool))
         // Provider management endpoints
         .route("/api/providers", get(super::providers::list_providers))
+        .route(
+            "/api/providers/discovery",
+            get(super::providers::model_discovery_status),
+        )
+        .route(
+            "/api/providers/snapshots",
+            get(super::providers::export_model_snapshots),
+        )
         .route(
             "/api/providers/backend-models",
             get(super::providers::list_backend_model_options),
@@ -3048,6 +3105,8 @@ async fn oauth_token_refresher_loop(
                 "Reconciled store records from queued tier rotations"
             );
         }
+
+        ai_providers_api::reconcile_openai_store_from_codex_homes(&ai_providers).await;
 
         // Refresh store-backed OAuth accounts FIRST. For any account that also
         // owns the shared credential tiers, this rotates the token AND writes it

@@ -347,6 +347,18 @@ pub async fn require_auth(
         .or_else(|| auth_header.strip_prefix("bearer "))
         .unwrap_or("");
 
+    if token.starts_with("ctx1.") {
+        return if super::context_auth::permits(&state.config, token, req.uri().path(), req.method())
+        {
+            next.run(req).await
+        } else {
+            (
+                StatusCode::FORBIDDEN,
+                "Context grant does not authorize this operation",
+            )
+                .into_response()
+        };
+    }
     match authenticate_token(&state.config, token) {
         Ok(user) => {
             req.extensions_mut().insert(user);

@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <radialGradient id="sphere" cx="44%" cy="40%" r="72%">
+      <stop offset="0%" stop-color="#f4f4f2"/>
+      <stop offset="70%" stop-color="#d4d4d1"/>
+      <stop offset="100%" stop-color="#bdbdb9"/>
+    </radialGradient>
+    <linearGradient id="ring" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f4f4f2"/>
+      <stop offset="100%" stop-color="#c7c7c4"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" rx="228" fill="#191918"/>
+
+  <!-- orbit ring, back half (sphere masks the middle) -->
+  <g transform="rotate(-24 512 512)">
+    <ellipse cx="512" cy="512" rx="392" ry="146" fill="none" stroke="#8a8a87" stroke-width="34"/>
+  </g>
+
+  <!-- sphere -->
+  <circle cx="512" cy="512" r="238" fill="url(#sphere)"/>
+  <ellipse cx="436" cy="428" rx="76" ry="46" fill="#ffffff" opacity="0.22" transform="rotate(-28 436 428)"/>
+
+  <!-- orbit ring, front sweep (bottom arc over the sphere) -->
+  <g transform="rotate(-24 512 512)">
+    <path d="M 880 562 A 392 146 0 0 1 144 562" fill="none" stroke="url(#ring)" stroke-width="34" stroke-linecap="round"/>
+    <!-- satellite on the ring, upper right -->
+    <circle cx="880" cy="462" r="36" fill="#f0f0ee"/>
+  </g>
+</svg>

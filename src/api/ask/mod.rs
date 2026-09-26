@@ -12,6 +12,7 @@
 //!
 //! See `ASK_ASSISTANT_DESIGN.md` for the full design.
 
+pub mod btw;
 pub mod client;
 pub mod http;
 pub mod store;

@@ -1,0 +1,74 @@
+{
+  "providers": [
+    {
+      "id": "anthropic",
+      "name": "Claude (Subscription)",
+      "billing": "subscription",
+      "description": "Included in Claude Max",
+      "models": []
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI (Subscription)",
+      "billing": "subscription",
+      "description": "ChatGPT Plus/Pro via OAuth",
+      "models": []
+    },
+    {
+      "id": "open-router",
+      "name": "OpenRouter (API Key)",
+      "billing": "pay-per-token",
+      "description": "Aggregator routing through OpenRouter",
+      "models": []
+    },
+    {
+      "id": "google",
+      "name": "Google AI (OAuth)",
+      "billing": "subscription",
+      "description": "Gemini models via Google OAuth",
+      "models": []
+    },
+    {
+      "id": "xai",
+      "name": "xAI (API Key)",
+      "billing": "pay-per-token",
+      "description": "Grok models via xAI API key",
+      "models": []
+    },
+    {
+      "id": "cerebras",
+      "name": "Cerebras (API Key)",
+      "billing": "pay-per-token",
+      "description": "Ultra-fast inference via Cerebras",
+      "models": []
+    },
+    {
+      "id": "zai",
+      "name": "Z.AI (API Key)",
+      "billing": "pay-per-token",
+      "description": "GLM models via Z.AI API key",
+      "models": []
+    },
+    {
+      "id": "minimax",
+      "name": "Minimax (API Key)",
+      "billing": "pay-per-token",
+      "description": "MiniMax models via Minimax API key",
+      "models": []
+    },
+    {
+      "id": "kimi",
+      "name": "Kimi (Subscription)",
+      "billing": "subscription",
+      "description": "Kimi Code via Moonshot OAuth (device login)",
+      "models": []
+    },
+    {
+      "id": "muse",
+      "name": "Meta Muse",
+      "billing": "api_key",
+      "description": "Meta's Muse family via api.meta.ai (OpenCode native meta Responses provider)",
+      "models": []
+    }
+  ]
+}

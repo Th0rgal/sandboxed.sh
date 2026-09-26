@@ -41,17 +41,28 @@ hermes cron create --name "<nom>" --every 30m \
   --skill controllers-policy --deliver project:<slug> --prompt "$(cat prompt.txt)"
 ```
 
-`--deliver project:<slug>` est important : la livraison suit le projet, pas une
-session qui peut être compactée ou abandonnée. `--deliver origin` gèle la cible
-sur la session de création — à éviter pour tout ce qui doit durer. Un job en
-`deliver: origin` sans `origin` capturé ne livre nulle part : refuse-le et
-recréé-le en `project:<slug>`.
+`--deliver project:<slug>` est du **plomberie** : ça route encore la copie
+Hermes du tick (v1). Ce n'est pas un chat à ouvrir pour piloter. Le chemin
+opérateur est la page cron Orb : **Steer the next tick…** puis **Run now**.
+`--deliver origin` gèle la cible sur la session de création — à éviter pour
+tout ce qui doit durer. Un job en `deliver: origin` sans `origin` capturé ne
+livre nulle part : refuse-le et recréé-le en `project:<slug>`.
 
 **3. Répondre une fois à ses cinq questions.** Au premier tick, le contrôleur te
 demande : périmètre, autorité de merge, plafond de budget, ce qui doit le mettre
-en pause, et ce qui mérite une livraison. Tes réponses sont écrites dans son
-tracker sous un bloc `GRANT:` — elles survivent ainsi à toute réécriture de
-prompt. Il ne les redemandera pas.
+en pause, et ce qui mérite une livraison. Tes réponses sont le **grant**
+(`set_project_grant`) — elles survivent ainsi à toute réécriture de prompt.
+Il ne les redemandera pas.
+
+## Piloter le prochain tick
+
+Un ordre ponctuel — « merge ces PRs », « regarde le dossier notes » — est un
+**steer**, pas un grant et pas un message dans Hermes. Depuis Orb, ouvre le
+contrôleur du projet (`c:<slug>`), écris dans *Steer the next tick…*, et
+laisse **Run now** coché. Le tick lit `steers.pending` via `get_situation` /
+`get_project` (étape 0 de `controllers-policy`) : s'il y en a, ils **battent**
+« nothing to do » / `[SILENT]`. `update_project_status.consumed_steer_ids` acquitte uniquement les IDs lus et traités. Le
+grant reste l'autorité permanente.
 
 ## Ce qu'il fait sans demander
 
@@ -136,9 +147,11 @@ Si le dispatch est refusé (disque, auth, capacité), le projet **garde son
 objectif** avec un blocker infra nommé (`blocked:disk`, …). Le travail
 plateforme s'ouvre sous `sandboxed-sh`. On ne retitre pas, on ne réutilise
 pas la session de campagne (Lido « Corriger et merger les PRs » devenue un
-P0 disque). Un ordre explicite dans le chat (« merge these PRs ») met à jour
-`merge_authority` — `material_bar` seulement si l'ordre change aussi ce qui
-mérite une livraison. Un « never merge to main » périmé ne le surclasse pas.
+P0 disque). Un ordre ponctuel (« merge these PRs ») est un **steer** sur la page cron,
+pas un message dans le chat Hermes. Un changement d'autorité permanente
+passe par `set_project_grant`. `material_bar` seulement si l'ordre change
+aussi ce qui mérite une livraison. Un « never merge to main » périmé ne
+le surclasse pas.
 
 ## Le board
 
@@ -168,11 +181,11 @@ hermes cron resume <id>              # réarmer
 # état de tous les contrôleurs
 hermes cron list
 
-# forcer un tick et voir ce qu'il fait
+# forcer un tick (Orb : Run now sur la page cron)
 hermes cron run <id>
 
-# le dernier rapport d'un projet, trailer compris
-grep -o '\[CTRL:[^]]*\]' <(hermes chat --resume <session> --last)
+# le dernier rapport : page cron Orb (`RunCard`), pas Hermes chat
+# (le trailer [CTRL:] reste sur la run ; la session liée n'est pas à ouvrir)
 ```
 
 Si un contrôleur ticque `ok` mais que rien ne bouge, la question à poser est
@@ -182,9 +195,8 @@ le contournement a échoué et que l'escalade arrive.
 
 Un système agent-native ne doit finalement plus consommer un tick pour constater
 qu'une attente n'a pas changé. Toute attente doit devenir un prédicat durable
-(mission terminale, check GitHub, job fini, date atteinte) qui réveille la
-conversation ; le cron n'est plus qu'un filet de sécurité pour les échéances et
-la réconciliation.
+(mission terminale, check GitHub, job fini, date atteinte) qui réveille le
+**contrôleur** ; le cron d'intervalle n'est plus qu'un filet de sécurité.
 
 ## Coordination between controllers
 
@@ -251,3 +263,35 @@ native).
   `references/autonomy-playbook.md`.
 - Les questions d'installation et le bloc `GRANT:` :
   `references/controller-setup-questions.md`.
+
+### Steer acknowledgement and attachment delivery
+
+A tick acknowledges only the steer IDs it actually read and handled, using
+`update_project_status.consumed_steer_ids`. Missing IDs leave the inbox pending.
+Cron deliveries and `[CTRL:]` trailers never clear it: another order may have
+arrived during the tick, or fallen outside the bounded inbox read.
+
+Orb attachments are local mission context. Before queue acceptance, follow-ups
+save immutable snapshots in private server storage keyed by mission and message
+ID. The durable queue carries that reference, including through deferred-goal
+aggregation and replay. Only turn dispatch copies the snapshot into
+`.paloma/messages/<message-id>/.paloma/`; queued or rejected sends never write to
+the running mission's workspace. Retries keep the accepted file version, and a
+missing snapshot or failed destination write fails the turn explicitly. Initial
+mission sidecars are saved before publishing the scheduler's deferred-goal ticket.
+Failed saves fail the creation and release its reservations; coalesced retries
+verify that the requested attachment selections were actually saved.
+A later send cannot replace an earlier send's files. The manifest
+records missing, secret, linked, oversized and capped files. Source symlinks and
+hard links are excluded; destination writes do not follow symlinks. Limits are
+16 attachments, 512 KiB per file, 40 files / 256 KiB per folder, and a bounded
+folder walk. Remote attachment transfer is not implemented; those requests fail
+explicitly and retain the Orb draft.
+
+Terminal mission wake is optional and disabled by default. Set
+`SANDBOXED_SH_CONTROLLER_TERMINAL_WAKE=1` to enable best-effort, 90-second-deduped
+cron wake after a successful terminal webhook delivery. Automatic wake requires
+the project's registered controller ID, an active project, and an enabled cron
+that is neither paused nor already running. It never falls back to another
+matching cron; explicit operator Run now remains separate. It is not a durable
+wake guarantee; scheduled ticks remain the fallback.

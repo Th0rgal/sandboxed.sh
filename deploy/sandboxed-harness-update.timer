@@ -1,0 +1,10 @@
+[Unit]
+Description=Reconcile fleet harnesses daily
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

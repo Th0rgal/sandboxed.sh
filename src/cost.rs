@@ -96,6 +96,12 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
         aliases: &["claude-fable-5"],
         pricing: pricing(10_000, 50_000, Some(12_500), Some(1_000)),
     },
+    // Anthropic Opus 5.5 overview, verified 2026-09-23 ($/MTok: 4/20/5/0.20).
+    PricingEntry {
+        canonical: "claude-opus-5-5",
+        aliases: &["claude-opus-5-5", "claude-opus-5.5"],
+        pricing: pricing(4_000, 20_000, Some(5_000), Some(200)),
+    },
     PricingEntry {
         canonical: "claude-opus-5",
         aliases: &["claude-opus-5", "claude-5-opus"],
@@ -622,6 +628,27 @@ pub fn resolve_cost_cents_and_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opus_55_pricing_does_not_fall_back_to_opus_5() {
+        for id in [
+            "claude-opus-5-5",
+            "anthropic/claude-opus-5.5",
+            "claude-opus-5-5-20260922",
+        ] {
+            let p = pricing_for_model(id).unwrap();
+            assert_eq!(p.input_nano_per_token, 4000);
+            assert_eq!(p.output_nano_per_token, 20000);
+            assert_eq!(p.cache_create_nano_per_token, Some(5000));
+            assert_eq!(p.cache_read_nano_per_token, Some(200));
+        }
+        assert_eq!(
+            pricing_for_model("claude-opus-5")
+                .unwrap()
+                .input_nano_per_token,
+            5000
+        );
+    }
 
     #[test]
     fn test_normalize_model() {
