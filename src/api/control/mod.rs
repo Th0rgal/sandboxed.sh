@@ -14315,6 +14315,15 @@ async fn poll_remote_job(
                 }
                 if terminal {
                     terminal_observation = Some(status.clone());
+                    // Publish the observed node result before terminal mission/lease
+                    // state and ledger retirement become visible to API readers.
+                    // Cleanup may retry, but the job itself has already terminated.
+                    fleet.record_outcome(outcome(
+                        &status.state,
+                        status.exit_code,
+                        status.error.clone(),
+                        true,
+                    ));
                     let success = status.state == "succeeded";
                     let content = format!(
                         "Remote node '{}' job {} finished with state '{}' (exit {:?}){}\n\nlog tail:\n{}",
@@ -14432,12 +14441,6 @@ async fn poll_remote_job(
                         dispatch_admission_tests::notify_wait(job_id, "remote_cleanup_failed");
                         continue;
                     }
-                    fleet.record_outcome(outcome(
-                        &status.state,
-                        status.exit_code,
-                        status.error.clone(),
-                        true,
-                    ));
                     return;
                 }
                 // A successful non-terminal observation is the liveness proof
