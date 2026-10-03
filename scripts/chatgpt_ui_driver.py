@@ -23,15 +23,20 @@ COMPAT_VERSION = "chatgpt-ui-v2"
 CHATGPT_URL = "https://chatgpt.com/"
 MAX_DOWNLOAD_FILES = 8
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
-# Both observed ChatGPT layouts. Exclude nested current-layout nodes inside
+# Observed ChatGPT layouts. Exclude nested current-layout nodes inside
 # legacy wrappers so one message is counted once during gradual UI rollouts.
 USER_MESSAGE_SELECTOR = (
     '[data-message-author-role="user"], '
-    'main [class~="group/user-message"]:not([data-message-author-role="user"] *)'
+    'main [class~="group/user-message"]'
+    ':not([data-message-author-role="user"] *)'
+    ':not([class~="group/user-message"] *)'
 )
 ASSISTANT_MESSAGE_SELECTOR = (
     '[data-message-author-role="assistant"], '
     'main [data-conversation-role="assistant"] + [data-chatgpt-selection-message-id]'
+    ':not([data-message-author-role="assistant"] *), '
+    'main [data-conversation-role="assistant"] + * [data-chatgpt-selection-message-id]'
+    ':not([data-chatgpt-selection-message-id] *)'
     ':not([data-message-author-role="assistant"] *)'
 )
 

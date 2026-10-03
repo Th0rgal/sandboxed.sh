@@ -37,6 +37,12 @@ class MessageLayouts(unittest.TestCase):
     def test_current_excludes_reasoning_and_accessibility_labels(self):
         self.check('<div><h4>You said:</h4><div class="group/user-message">prompt</div></div><div>Worked for 21s</div><div><h4 data-conversation-role="assistant">ChatGPT said:</h4><div data-chatgpt-selection-message-id="a">answer</div></div>')
 
+    def test_wrapped_answer_and_nested_user_groups(self):
+        self.check('<div class="group/user-message"><div><div class="group/user-message">prompt</div></div></div><div><h4 data-conversation-role="assistant">ChatGPT said:</h4><div><div data-chatgpt-selection-message-id="a"><div data-markdown-text-style="assistant-message">answer</div></div></div></div>')
+
+    def test_wrapped_answer_inside_legacy_is_counted_once(self):
+        self.check('<div data-message-author-role="user"><div class="group/user-message"><div class="group/user-message">prompt</div></div></div><div data-message-author-role="assistant"><h4 data-conversation-role="assistant" hidden>ChatGPT said:</h4><div><div data-chatgpt-selection-message-id="a">answer</div></div></div>')
+
     def test_mixed_layout_does_not_double_count_nested_nodes(self):
         self.check('<div data-message-author-role="user"><div class="group/user-message">prompt</div></div><div data-message-author-role="assistant"><h4 data-conversation-role="assistant" style="display:none">ChatGPT said:</h4><div data-chatgpt-selection-message-id="a">answer</div></div>')
 
