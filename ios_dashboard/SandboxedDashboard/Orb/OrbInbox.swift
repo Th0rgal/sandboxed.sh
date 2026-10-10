@@ -102,8 +102,7 @@ final class OrbSharedInboxState {
     func unread(_ row: OrbRow) -> Bool? {
         ensureScope()
         guard scope == account, let stamp = seen[row.id] else { return nil }
-        let date = ISO8601DateFormatter(); date.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let turn = (date.date(from: row.updatedAt) ?? ISO8601DateFormatter().date(from: row.updatedAt))?.timeIntervalSince1970 ?? 0
+        let turn = inboxTimestamp(row.updatedAt) ?? 0
         if stamp < 0 { return turn * 1000 <= abs(stamp) + 2000 ? true : nil }
         return turn * 1000 <= stamp + 2000 ? false : nil
     }
@@ -139,9 +138,16 @@ final class OrbSharedInboxState {
     }
 }
 
+nonisolated(unsafe) private let inboxIsoFractionalFormatter: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f
+}()
+nonisolated(unsafe) private let inboxIsoFallbackFormatter = ISO8601DateFormatter()
+
 private func inboxTimestamp(_ text: String) -> Double? {
-    let fractional = ISO8601DateFormatter(); fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    return (fractional.date(from: text) ?? ISO8601DateFormatter().date(from: text))?.timeIntervalSince1970
+    guard !text.isEmpty else { return nil }
+    return (inboxIsoFractionalFormatter.date(from: text) ?? inboxIsoFallbackFormatter.date(from: text))?.timeIntervalSince1970
 }
 
 struct OrbInboxModelPreset: Identifiable, Equatable, Sendable {
@@ -308,7 +314,6 @@ final class OrbInboxDigestStore {
         let account = OrbInboxAccount.current
 
         inFlight.insert(key)
-        version += 1
         queue.append((priority: priority, work: { [weak self] in
             guard let self else { return }
             defer { self.inFlight.remove(key); self.version += 1 }
@@ -319,7 +324,6 @@ final class OrbInboxDigestStore {
                 if let digest = Self.parseDigest(answer, updatedAt: row.updatedAt, model: model) {
                     self.failedAt.removeValue(forKey: key)
                     self.cache[key] = digest
-                    self.version += 1
                     OrbDisk.saveAsync(self.cache, key: self.diskKey, accountScope: account)
                 } else {
                     self.failedAt[key] = Date()
@@ -1161,11 +1165,63 @@ enum OrbInboxModel {
     }
 
     @MainActor
+    static func unreadCount(
+        missions: [OrbRow],
+        projects: [OrbRow]
+    ) -> Int {
+        var projectsBySlug: Set<String> = ["default"]
+        for p in projects {
+            projectsBySlug.insert(p.id)
+        }
+        let includeAuto = OrbInboxSettings.shared.includeAutonomous
+        let unreadStore = OrbMissionUnreadStore.shared
+        var childrenByParent: [String: [OrbRow]] = [:]
+        var seenChildren: Set<String> = []
+        for child in missions where !seenChildren.contains(child.id) {
+            seenChildren.insert(child.id)
+            let parentID = !child.raw["parent_mission_id"].text.isEmpty
+                ? child.raw["parent_mission_id"].text
+                : child.raw["callback_parent_mission_id"].text
+            guard !parentID.isEmpty, !hiddenStatuses.contains(child.state) else { continue }
+            childrenByParent[parentID, default: []].append(child)
+        }
+
+        var count = 0
+        var seen: Set<String> = []
+        for row in missions where !seen.contains(row.id) {
+            seen.insert(row.id)
+            let rawSlug = row.raw["project"].text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !projects.isEmpty {
+                let isClient = row.raw["tags"].items.contains(where: { $0.text == "placement:client" })
+                if rawSlug.isEmpty && !isClient { continue }
+                let slug = rawSlug.isEmpty ? "default" : rawSlug
+                if !projectsBySlug.contains(slug) { continue }
+            }
+            let cat = classify(row: row, interaction: nil, includeAutonomous: includeAuto)
+            guard cat == .needsYou || cat == .ready else { continue }
+            var isRowUnread = unreadStore.isUnread(row: row)
+            if !isRowUnread, let children = childrenByParent[row.id] {
+                for child in children where ["failed", "not_feasible", "blocked"].contains(child.state) {
+                    if unreadStore.isUnread(row: child) {
+                        isRowUnread = true
+                        break
+                    }
+                }
+            }
+            if isRowUnread {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    @MainActor
     static func buildItem(
         row: OrbRow,
         projectsBySlug: [String: String],
         events: [StoredEvent] = [],
-        answered: Set<String> = []
+        answered: Set<String> = [],
+        includePeekTurns: Bool = false
     ) -> OrbInboxItem? {
         let interaction = extractInteraction(row: row, events: events, answered: answered)
         let category = classify(row: row, interaction: interaction, includeAutonomous: OrbInboxSettings.shared.includeAutonomous)
@@ -1180,23 +1236,25 @@ enum OrbInboxModel {
             ? rawTitle
             : (!firstUser.isEmpty ? clipToSentence(firstUser, maxChars: 54) : "Untitled conversation")
 
-        let rawSummary = extractSummary(row: row, events: events, interaction: interaction)
-        let digest = OrbInboxDigestStore.shared.get(row: row)
+        let isWorking = category == .working
+        let rawSummary = isWorking ? "Working in the background…" : extractSummary(row: row, events: events, interaction: interaction)
+        let digest = isWorking ? nil : OrbInboxDigestStore.shared.get(row: row)
         let summary = (interaction == nil && !(digest?.outcome.isEmpty ?? true)) ? (digest?.outcome ?? rawSummary) : rawSummary
         let lastRequest: String? = {
+            if isWorking { return nil }
             if let dt = digest?.task, !dt.isEmpty {
                 return dt.caseInsensitiveCompare(headline) == .orderedSame ? nil : dt
             }
             return extractLastRequest(row: row, events: events, headline: headline)
         }()
-        let workReceipt = extractWorkReceipt(events: events)
+        let workReceipt = (includePeekTurns && !isWorking) ? extractWorkReceipt(events: events) : nil
 
         let (badge, tone) = resolveBadgeAndTone(row: row, summary: summary, interaction: interaction)
         let isGoal = row.raw["goal_mode"].flag || OrbStyle.goalObjective(row.raw["title"].text) != nil
         let unread = OrbMissionUnreadStore.shared.isUnread(row: row, hasInteraction: interaction != nil)
         let attention = interaction != nil || ["blocked", "failed", "not_feasible"].contains(row.state)
         let canRetry = ["failed", "not_feasible", "interrupted", "blocked"].contains(row.state)
-        let peekTurns = extractPeekTurns(row: row, events: events, summaryFallback: summary)
+        let peekTurns = includePeekTurns ? extractPeekTurns(row: row, events: events, summaryFallback: summary) : []
 
         return OrbInboxItem(
             id: row.id,
@@ -1239,7 +1297,8 @@ enum OrbInboxModel {
         projects: [OrbRow],
         eventsByMission: [String: [StoredEvent]] = [:],
         answeredCallIDs: Set<String> = [],
-        dismissedIDs: Set<String> = []
+        dismissedIDs: Set<String> = [],
+        peekedIDs: Set<String> = []
     ) -> (needsYou: [OrbInboxItem], ready: [OrbInboxItem], working: [OrbInboxItem]) {
         var projectsBySlug: [String: String] = ["default": "Default"]
         for p in projects {
@@ -1276,7 +1335,8 @@ enum OrbInboxModel {
                 row: row,
                 projectsBySlug: projectsBySlug,
                 events: events,
-                answered: answeredCallIDs
+                answered: answeredCallIDs,
+                includePeekTurns: peekedIDs.contains(row.id)
             ) else { continue }
 
             if let children = childrenByParent[row.id], !children.isEmpty {
@@ -1363,6 +1423,7 @@ struct OrbInboxView: View {
     let onOpenMission: (OrbRow) -> Void
 
     @State private var missions: [OrbRow] = []
+    @State private var cachedSections: (needsYou: [OrbInboxItem], ready: [OrbInboxItem], working: [OrbInboxItem]) = ([], [], [])
     @State private var loading = true
     @State private var error = ""
     @State private var filterMode: OrbInboxFilterMode = .unread
@@ -1384,6 +1445,22 @@ struct OrbInboxView: View {
     private let digestStore = OrbInboxDigestStore.shared
     private let inboxSettings = OrbInboxSettings.shared
 
+    private func recomputeSections() {
+        let built = OrbInboxModel.buildSections(
+            missions: missions,
+            projects: projects,
+            eventsByMission: eventsByMission,
+            answeredCallIDs: answeredCallIDs,
+            dismissedIDs: dismissedIDs,
+            peekedIDs: peekedIDs
+        )
+        cachedSections = built
+        let newUnread = (built.needsYou + built.ready).filter(\.unread).count
+        if actionableCount != newUnread {
+            actionableCount = newUnread
+        }
+    }
+
     private func markItemAndChildrenRead(_ item: OrbInboxItem) {
         unreadStore.markRead(item.row)
         if let cs = item.childSummary {
@@ -1391,19 +1468,27 @@ struct OrbInboxView: View {
                 unreadStore.markRead(child.row)
             }
         }
+        recomputeSections()
     }
 
     private func togglePeek(_ item: OrbInboxItem) {
         withAnimation(.snappy(duration: 0.2)) {
             if peekedIDs.contains(item.id) {
                 peekedIDs.remove(item.id)
+                recomputeSections()
             } else {
                 peekedIDs.insert(item.id)
+                let diskCached = OrbReadCache.readEvents(item.id)
+                if !diskCached.isEmpty && eventsByMission[item.id] == nil {
+                    eventsByMission[item.id] = diskCached
+                }
+                recomputeSections()
                 if eventsByMission[item.id] == nil {
                     Task {
                         if let batch = try? await APIService.shared.getMissionEventsWithMeta(id: item.id, limit: 120, sinceSeq: nil) {
                             OrbReadCache.saveEvents(item.id, events: batch.events)
                             eventsByMission[item.id] = batch.events
+                            recomputeSections()
                         }
                     }
                 }
@@ -1412,16 +1497,7 @@ struct OrbInboxView: View {
     }
 
     private var computed: (needsYou: [OrbInboxItem], ready: [OrbInboxItem], working: [OrbInboxItem]) {
-        _ = unreadStore.version
-        _ = digestStore.version
-        _ = inboxSettings.version
-        return OrbInboxModel.buildSections(
-            missions: missions,
-            projects: projects,
-            eventsByMission: eventsByMission,
-            answeredCallIDs: answeredCallIDs,
-            dismissedIDs: dismissedIDs
-        )
+        cachedSections
     }
 
     private func matchesFilter(_ item: OrbInboxItem, mode: OrbInboxFilterMode? = nil) -> Bool {
@@ -1551,9 +1627,10 @@ struct OrbInboxView: View {
                 }
             }
         }
-        .onChange(of: unreadCount) { _, newValue in
-            actionableCount = newValue
-        }
+        .onChange(of: projects) { _, _ in recomputeSections() }
+        .onChange(of: unreadStore.version) { _, _ in recomputeSections() }
+        .onChange(of: digestStore.version) { _, _ in recomputeSections() }
+        .onChange(of: inboxSettings.version) { _, _ in recomputeSections() }
     }
 
     private var modeFilterBar: some View {
@@ -2423,9 +2500,10 @@ struct OrbInboxView: View {
         defer { loading = false }
         if missions.isEmpty, let cached = OrbDisk.read("inbox:missions", as: OrbJSON.self) {
             OrbReadCache.seedFromGlobalMissions(cached.items)
-            missions = cached.items.map { OrbRow($0) }.filter(\.mobile)
-            seedCachedEvents(for: missions)
-            actionableCount = unreadCount
+            let rows = cached.items.map { OrbRow($0) }.filter(\.mobile)
+            missions = rows
+            seedCachedEvents(for: rows)
+            recomputeSections()
         }
         // Cached rows paint immediately even when shared Core state is offline.
         await OrbSharedInboxState.shared.refresh()
@@ -2436,10 +2514,9 @@ struct OrbInboxView: View {
             missions = rows
             OrbDisk.saveAsync(raw, key: "inbox:missions")
             seedCachedEvents(for: rows)
-            actionableCount = unreadCount
+            recomputeSections()
             error = ""
             await prefetchActiveEvents(for: rows)
-            actionableCount = unreadCount
         } catch {
             if missions.isEmpty {
                 self.error = error.localizedDescription
@@ -2448,11 +2525,18 @@ struct OrbInboxView: View {
     }
 
     private func seedCachedEvents(for rows: [OrbRow]) {
+        var next = eventsByMission
+        var changed = false
         for row in rows {
-            let cached = OrbReadCache.readEvents(row.id)
-            if !cached.isEmpty {
-                eventsByMission[row.id] = cached
+            if next[row.id] != nil { continue }
+            let mem = OrbReadCache.readMemoryEvents(row.id)
+            if !mem.isEmpty {
+                next[row.id] = mem
+                changed = true
             }
+        }
+        if changed {
+            eventsByMission = next
         }
     }
 
@@ -2469,16 +2553,23 @@ struct OrbInboxView: View {
         for (idx, row) in candidates.enumerated() {
             guard !Task.isCancelled else { return }
             var events = eventsByMission[row.id] ?? []
-            if events.isEmpty && idx < 12 {
-                if let batch = try? await APIService.shared.getMissionEventsWithMeta(id: row.id, limit: 120, sinceSeq: nil) {
-                    OrbReadCache.saveEvents(row.id, events: batch.events)
-                    eventsByMission[row.id] = batch.events
-                    events = batch.events
+            if events.isEmpty {
+                let diskCached = OrbReadCache.readEvents(row.id)
+                if !diskCached.isEmpty {
+                    eventsByMission[row.id] = diskCached
+                    events = diskCached
+                } else if idx < 10 {
+                    if let batch = try? await APIService.shared.getMissionEventsWithMeta(id: row.id, limit: 120, sinceSeq: nil) {
+                        OrbReadCache.saveEvents(row.id, events: batch.events)
+                        eventsByMission[row.id] = batch.events
+                        events = batch.events
+                    }
                 }
             }
             let priority = unreadStore.isUnread(row: row) ? idx : idx + 20
             digestStore.request(row: row, events: events, priority: priority)
         }
+        recomputeSections()
     }
 
     private func markDone(_ item: OrbInboxItem) async {
@@ -2492,9 +2583,8 @@ struct OrbInboxView: View {
                 replyDraft = ""
             }
             undoItem = (id: item.id, title: item.headline)
+            markItemAndChildrenRead(item)
         }
-        markItemAndChildrenRead(item)
-        actionableCount = unreadCount
         do {
             _ = try await api.call(
                 "/api/control/missions/\(OrbCore.escape(item.id))/status",
@@ -2506,6 +2596,7 @@ struct OrbInboxView: View {
             withAnimation(.snappy(duration: 0.2)) {
                 dismissedIDs.remove(item.id)
                 undoItem = nil
+                recomputeSections()
             }
             self.error = error.localizedDescription
         }
@@ -2518,8 +2609,8 @@ struct OrbInboxView: View {
         withAnimation(.snappy(duration: 0.22)) {
             for id in ids { dismissedIDs.insert(id) }
             for item in items { markItemAndChildrenRead(item) }
+            recomputeSections()
         }
-        actionableCount = unreadCount
         do {
             for item in items {
                 _ = try await api.call(
@@ -2539,8 +2630,8 @@ struct OrbInboxView: View {
             undoItem = nil
             dismissedIDs.remove(last.id)
             unreadStore.markUnread(id: last.id, updatedAt: missions.first(where: { $0.id == last.id })?.updatedAt)
+            recomputeSections()
         }
-        actionableCount = unreadCount
         do {
             _ = try await api.call(
                 "/api/control/missions/\(OrbCore.escape(last.id))/status",

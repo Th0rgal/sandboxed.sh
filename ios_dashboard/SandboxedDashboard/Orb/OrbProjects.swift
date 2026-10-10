@@ -293,7 +293,7 @@ struct OrbHome: View {
     @State private var renamedTitle = ""
     @State private var homeTab = ProcessInfo.processInfo.arguments.contains("-orb_open_inbox") ? "inbox" : "projects"
     @State private var inboxCount = 0
-    @State private var inboxWorkingCount = 0
+    @State private var workingByProject: [String: Int] = [:]
     @State private var linkedProjectObj: OrbRow?
     private let api = OrbCore.shared
     private let appearance = OrbProjectAppearance.shared
@@ -427,55 +427,6 @@ struct OrbHome: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 if !error.isEmpty { OrbNotice(message: error).padding(.vertical, 6) }
-                if search.isEmpty && (!projects.isEmpty || inboxCount > 0 || inboxWorkingCount > 0) {
-                    Button {
-                        withAnimation(.snappy(duration: 0.2)) { homeTab = "inbox" }
-                        OrbHaptics.selection()
-                    } label: {
-                        HStack(spacing: 14) {
-                            OrbListIcon(symbol: "tray.full")
-                            Text("Inbox")
-                                .font(.body.weight(.medium))
-                                .foregroundStyle(.primary)
-                                .lineLimit(1)
-                                .fixedSize(horizontal: true, vertical: false)
-                            Spacer()
-                            if inboxWorkingCount > 0 {
-                                HStack(spacing: 5) {
-                                    OrbRunningDots(size: 10)
-                                    Text("\(inboxWorkingCount) working")
-                                        .font(.caption)
-                                        .foregroundStyle(OrbStyle.textSecondary)
-                                        .monospacedDigit()
-                                        .lineLimit(1)
-                                        .fixedSize(horizontal: true, vertical: false)
-                                }
-                            }
-                            if inboxCount > 0 {
-                                Text("\(inboxCount)")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.primary)
-                                    .monospacedDigit()
-                                    .lineLimit(1)
-                                    .fixedSize(horizontal: true, vertical: false)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 2.5)
-                                    .background(OrbStyle.elevated, in: Capsule())
-                                    .overlay(Capsule().stroke(OrbStyle.borderStrong, lineWidth: 0.5))
-                            }
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.tertiary)
-                        }
-                        .padding(.vertical, 12)
-                        .contentShape(Rectangle())
-                        .overlay(alignment: .bottom) {
-                            Rectangle().fill(OrbStyle.border).frame(height: 0.5).padding(.leading, 34)
-                        }
-                    }
-                    .buttonStyle(OrbPressButtonStyle())
-                    .accessibilityIdentifier("home.inbox")
-                }
                 ForEach(projects.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) }) { project in
                     NavigationLink { OrbProjectPage(project: project) } label: {
                         HStack(spacing: 14) {
@@ -486,6 +437,18 @@ struct OrbHome: View {
                                 .lineLimit(1)
                                 .truncationMode(.tail)
                             Spacer()
+                            if let working = workingByProject[project.id], working > 0 {
+                                HStack(spacing: 5) {
+                                    OrbRunningDots(size: 10)
+                                    Text("\(working) working")
+                                        .font(.caption)
+                                        .foregroundStyle(OrbStyle.textSecondary)
+                                        .monospacedDigit()
+                                        .lineLimit(1)
+                                        .fixedSize(horizontal: true, vertical: false)
+                                }
+                                .accessibilityIdentifier("project.working.\(project.id)")
+                            }
                             if !project.updatedAt.isEmpty {
                                 Text(OrbStyle.relativeTime(project.updatedAt))
                                     .font(.caption)
@@ -549,6 +512,21 @@ struct OrbHome: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Loading projects")
     }
+    private static func countWorkingByProject(_ rows: [OrbRow]) -> [String: Int] {
+        let activeStates: Set<String> = ["active", "running", "starting", "pending", "queued", "resuming", "waiting_background"]
+        var counts: [String: Int] = [:]
+        var seen: Set<String> = []
+        for row in rows where row.mobile && !seen.contains(row.id) {
+            seen.insert(row.id)
+            guard activeStates.contains(row.state) else { continue }
+            let tags = row.raw["tags"].items.map(\.text)
+            if tags.contains("superseded") || tags.contains(where: { $0.hasPrefix("superseded-by:") }) { continue }
+            let rawSlug = row.raw["project"].text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let slug = rawSlug.isEmpty ? "default" : rawSlug
+            counts[slug, default: 0] += 1
+        }
+        return counts
+    }
     private func load() async {
         defer { loading = false }
         if projects.isEmpty, let cached = OrbDisk.read("projects", as: OrbJSON.self) {
@@ -557,9 +535,8 @@ struct OrbHome: View {
         if let cachedMissions = OrbDisk.read("inbox:missions", as: OrbJSON.self) {
             OrbReadCache.seedFromGlobalMissions(cachedMissions.items)
             let rows = cachedMissions.items.map { OrbRow($0) }.filter(\.mobile)
-            let sections = OrbInboxModel.buildSections(missions: rows, projects: projects)
-            inboxCount = sections.needsYou.count + sections.ready.count
-            inboxWorkingCount = sections.working.count
+            workingByProject = Self.countWorkingByProject(rows)
+            inboxCount = OrbInboxModel.unreadCount(missions: rows, projects: projects)
         }
         do {
             let requested = Date(), endpoint = api.endpoint
@@ -574,9 +551,8 @@ struct OrbHome: View {
                     OrbDisk.saveAsync(rawMissions, key: "inbox:missions")
                     OrbReadCache.seedFromGlobalMissions(rawMissions.items)
                     let rows = rawMissions.items.map { OrbRow($0) }.filter(\.mobile)
-                    let sections = OrbInboxModel.buildSections(missions: rows, projects: roster)
-                    inboxCount = sections.needsYou.count + sections.ready.count
-                    inboxWorkingCount = sections.working.count
+                    workingByProject = Self.countWorkingByProject(rows)
+                    inboxCount = OrbInboxModel.unreadCount(missions: rows, projects: roster)
                     await OrbReadCache.prefetch(rows)
                 }
             }

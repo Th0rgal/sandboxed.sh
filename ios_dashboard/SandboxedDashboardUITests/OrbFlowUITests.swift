@@ -13,8 +13,16 @@ final class OrbFlowUITests: XCTestCase {
     }
     @MainActor func testPolishedInboxAndReplyLayout() throws {
         let app = XCUIApplication()
-        app.launchArguments = ["-api_base_url", "http://127.0.0.1:18766", "-orb_test_reset", "YES", "-orb_open_inbox"]
+        app.launchArguments = ["-api_base_url", "http://127.0.0.1:18766", "-orb_test_reset", "YES"]
         app.launch()
+        let projectRow = app.buttons["project.orb-test"]
+        XCTAssertTrue(projectRow.waitForExistence(timeout: 20))
+        XCTAssertFalse(app.buttons["home.inbox"].exists)
+        XCTAssertTrue(app.staticTexts["1 working"].exists)
+        capture(app, "home-projects-working")
+        let inboxTab = app.buttons["home.tab.inbox"]
+        XCTAssertTrue(inboxTab.exists)
+        inboxTab.tap()
         let row = app.otherElements["inbox.row.reconnect"]
         XCTAssertTrue(row.waitForExistence(timeout: 20))
         XCTAssertTrue(app.staticTexts["Needs you"].exists)

@@ -45,7 +45,7 @@ final class OrbLiveUITests: XCTestCase {
         app.launchArguments = ["-api_base_url", "http://127.0.0.1:18779", "-orb_test_reset", "YES"]
         app.launch()
 
-        let homeInbox = app.buttons["home.inbox"]
+        let homeInbox = app.buttons["home.tab.inbox"]
         XCTAssertTrue(homeInbox.waitForExistence(timeout: 20))
         Thread.sleep(forTimeInterval: 1.0)
         try? app.screenshot().pngRepresentation.write(to: URL(fileURLWithPath: "/tmp/orb-ios-home-prod.png"))

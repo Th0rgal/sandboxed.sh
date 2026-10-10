@@ -344,6 +344,11 @@ enum OrbReadCache {
             }
         }
     }
+    static func readMemoryEvents(_ missionID: String) -> [StoredEvent] {
+        let cacheName = "events:\(missionID)"
+        let scope = key(cacheName)
+        return eventValues[scope] ?? []
+    }
     static func readEvents(_ missionID: String) -> [StoredEvent] {
         let cacheName = "events:\(missionID)"
         let scope = key(cacheName)
